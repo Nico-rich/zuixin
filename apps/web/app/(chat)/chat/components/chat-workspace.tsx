@@ -24,6 +24,7 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [tasks, setTasks] = useState<ActiveTask[]>([]);
   const [thinking, setThinking] = useState('');
+  const [currentTool, setCurrentTool] = useState('');
   const [streaming, setStreaming] = useState(false);
   const [fatalError, setFatalError] = useState('');
   const abortRef = useRef<AbortController | null>(null);
@@ -100,6 +101,18 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
             break;
           }
           case 'status': { setThinking((data as ChatStreamEventMap['status']).message); break; }
+          case 'tool.start': {
+            const t = data as ChatStreamEventMap['tool_start'];
+            setCurrentTool(t.toolName);
+            setThinking(`正在调用 ${t.toolName}…`);
+            break;
+          }
+          case 'tool.end': {
+            const te = data as ChatStreamEventMap['tool_end'];
+            setCurrentTool('');
+            setThinking(te.outputSummary ?? '工具执行完成');
+            break;
+          }
           case 'task.created': {
             const d = data as ChatStreamEventMap['task_created'];
             setTasks((prev) => [...prev, { taskId: d.taskId, kind: d.kind }]);
@@ -173,6 +186,11 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
             {tasks.map((t) => (
               <TaskCard key={t.taskId} taskId={t.taskId} kind={t.kind} onDone={onTaskDone} />
             ))}
+            {currentTool && (
+              <div className="flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-400">
+                🔧 正在执行 {currentTool}
+              </div>
+            )}
             {thinking && <p className="text-xs text-zinc-500">💭 {thinking}</p>}
             {fatalError && <p className="text-sm text-red-400">⚠ {fatalError}</p>}
           </div>

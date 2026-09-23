@@ -29,4 +29,11 @@ export interface ChatStreamEventMap {
   status: { stage: string; message: string };
   task_created: { taskId: string; kind: 'image' | 'video' };
   error: { code: string; message: string; requestId?: string };
+  agent_start: { agentId: string; runId: string };
+  agent_end: { agentId: string; runId: string; status: 'completed' | 'failed' | 'cancelled' | 'timeout' };
+  tool_start: { toolName: string; runId: string };
+  tool_end: { toolName: string; runId: string; status: 'completed' | 'failed'; outputSummary?: string };
+  run_created: { runId: string; agentId: string };
+  run_progress: { runId: string; currentStep: number; maxSteps: number };
+  run_completed: { runId: string; status: 'completed' | 'failed' | 'cancelled' | 'timeout' };
 }
