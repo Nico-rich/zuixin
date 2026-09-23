@@ -2111,3 +2111,21 @@ git add -A && git commit -m "docs: M1 完成——架构文档同步 + 执行偏
 **Spec 覆盖对照（M1 规格 1~21 节）**：认证/用户(T3)、登录+HttpOnly Cookie+refresh 轮换+logout+disabled(T3)、seed 管理员(已有)、auth API(T3)、Conversation CRUD+越权校验(T4)、Message 含 role/status 扩展(T2/T5)、POST /chat 自动建会话(T5)、LLM Streaming SSE(T5)、SSE 协议可扩展(T1)、Router 架构保留(T5)、Provider 抽象复用+Mock 全程可跑(T5)、模型不写死(默认模型解析器 T5)、Mock 模式无 Key 可体验(T5 e2e)、前端聊天页(T6/T7)、Markdown/高亮/流式/停止/重试/复制/新建/历史(T7)、统一错误结构(T1/T5)、数据库事务终态(T5)、并发锁(T5)、结构化日志(T5)、JWT/Cookie/CORS/CSRF/Rate(T3)。
 
 **占位符扫描**：无。**类型一致性**：`ChatStreamEvent`/`AgentEvent(含 usage)`/`KVStore(setNX/del)` 三处接口变更均已列出对应测试与实现。**已知边界**：Router 的 routerModelId 为 null 时 M1 全部走 chat 快速兜底（零额外 LLM 调用），M4 配置路由模型后自动激活分类；消息分页 M1 取最新 50/200 条（游标留待 M5）。
+
+---
+
+## 执行偏差记录（2026-09-23 实际执行）
+
+| # | 计划 | 实际 | 原因 |
+|---|---|---|---|
+| 1 | Controller 构造注入靠类型元数据 | 所有构造注入显式 `@Inject`（项目约定固化） | vitest/esbuild 下元数据不可靠（M1 复现两次：AuthController、ChatController） |
+| 2 | ChatController 构造参数属性名 `chat` | 改名 `chatService` | **实例字段遮蔽同名路由方法** → `callback.apply is not a function`（Nest 路由查找取到的是字段） |
+| 3 | 控制器返回裸数据 | 新增全局 TransformInterceptor 统一包 `{data}` | 与统一信封约定一致；SSE 等 headersSent 场景自动跳过 |
+| 4 | e2e 断言 `toContain('mock')` | 解析 message_delta 帧拼接后断言 | mock 逐字符流式，原始文本中不存在连续子串 |
+| 5 | `RouterService` 直接可用 | 补建 RouterModule（@Global） | Phase 3 只做了单测未挂模块，M1 ChatService 注入时暴露 |
+| 6 | `/chat/[[id]]` 可选参数路由 | 拆为 `/chat` + `/chat/[id]` 两个页面 | Next.js 15.1 不支持可选动态段 |
+| 7 | 计划中 e2e 的 MOCK_DELAY_MS 调整 | 保留（beforeAll 设 0） | 与 curl 冒烟共用同一 dev server 时需注意端口冲突（本机 3000/3001 曾有残留进程，已清理） |
+
+**最终验证**：`pnpm test`（89 全绿）、`pnpm build`（3 包）、`pnpm typecheck` 零错误；全栈冒烟通过——登录/SSE 流式（message_start→status→逐字符 delta→message_end）/消息持久化/并发锁/越权校验/CSRF/限流。
+
+**M1 交付能力**：Mock Provider 零 Key 完整链路（浏览器登录 admin@example.com / admin123456 → /chat 对话流式）；填入真实 Key 后（M5 后台或 seed）自动切真实模型，前端零改动。
