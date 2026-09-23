@@ -15,7 +15,7 @@ export class StorageLocalAdapter implements StorageAdapter {
     await pipeline(stream, createWriteStream(path));
   }
 
-  async createPresignedUrl(key: string): Promise<string> { return `local://${key}`; }
+  async createPresignedUrl(key: string, _expiresInSec: number): Promise<string> { return `local://${key}`; }
 
   async delete(key: string): Promise<void> {
     await rm(this.safePath(key), { force: true });

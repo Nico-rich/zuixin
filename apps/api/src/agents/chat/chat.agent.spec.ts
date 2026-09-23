@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { ChatAgent } from './chat.agent';
 import { AgentContext } from '../agent.types';
 import { AppError } from '../../common/errors/app-error';
+import { LLMProvider } from '../../providers/llm/llm.types';
 
 const ctx = (over: Partial<AgentContext> = {}): AgentContext => ({
   userId: 'u1', conversationId: 'c1', messageId: 'm1', userMessage: '你好',
@@ -42,11 +43,12 @@ describe('ChatAgent', () => {
 
   it('history 注入 systemPrompt 并排在历史之前', async () => {
     let captured: { messages: Array<{ role: string; content: string }> } = { messages: [] };
-    const spyAdapter = {
-      kind: 'llm' as const,
+    const spyAdapter: LLMProvider = {
+      kind: 'llm',
       chat: async () => ({ content: '' }),
-      stream: async function* (p: { messages: Array<{ role: string; content: string }> }) {
-        captured = p; yield { type: 'text' as const, text: 'x' };
+      stream: async function* (p) {
+        captured = p as unknown as { messages: Array<{ role: string; content: string }> };
+        yield { type: 'text' as const, text: 'x' };
       },
     };
     const agent = new ChatAgent({ llmManager: {} as never }, {
@@ -60,11 +62,12 @@ describe('ChatAgent', () => {
 
   it('多模态：图片附件 + 文字组装为 content parts', async () => {
     let captured: { messages: Array<{ content: unknown }> } = { messages: [] };
-    const spyAdapter = {
-      kind: 'llm' as const,
+    const spyAdapter: LLMProvider = {
+      kind: 'llm',
       chat: async () => ({ content: '' }),
-      stream: async function* (p: { messages: Array<{ content: unknown }> }) {
-        captured = p; yield { type: 'text' as const, text: 'ok' };
+      stream: async function* (p) {
+        captured = p as unknown as { messages: Array<{ content: unknown }> };
+        yield { type: 'text' as const, text: 'ok' };
       },
     };
     const agent = new ChatAgent({ llmManager: {} as never }, { resolveLLM: async () => ({ adapter: spyAdapter, apiModelId: 'm' }) });

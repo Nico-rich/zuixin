@@ -1,6 +1,7 @@
 import { AppError, ErrorCode } from '@ai-agent/shared';
 
-export interface ProviderLikeError extends Error { status?: number; code?: string; name?: string; }
+/** 不继承 Error：Error 的 name 为必填，厂商错误对象的 name 可能缺失 */
+export interface ProviderLikeError { status?: number; code?: string; name?: string; message?: string; }
 
 /** 厂商错误 → 归一化 AppError（retryable 标记驱动回退/熔断决策）——common 层，供 core/providers 共用 */
 export function mapProviderError(err: ProviderLikeError): AppError {

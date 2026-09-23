@@ -1,11 +1,11 @@
 import OpenAI from 'openai';
 import { ChatMessage, ChatParams, ChatResponse, LLMChunk, LLMProvider } from '../llm.types';
-import { mapProviderError } from '../errors';
+import { mapProviderError, ProviderLikeError } from '../../../common/errors/provider-error';
 
 export interface OpenAICompatibleConfig { baseUrl: string; apiKey: string; timeoutMs: number; }
 
 type ChatFn = (body: Record<string, unknown>) => Promise<Record<string, unknown>>;
-type StreamFn = (body: Record<string, unknown>) => Promise<AsyncIterable<Record<string, unknown>>>;
+type StreamFn = (body: Record<string, unknown>) => AsyncIterable<Record<string, unknown>> | Promise<AsyncIterable<Record<string, unknown>>>;
 
 /** OpenAI / DeepSeek / Kimi / 阿里百炼 / 火山方舟 / 智谱 六家共用一个 adapter（baseUrl + key 配置化） */
 export class OpenAICompatibleAdapter implements LLMProvider {
@@ -28,7 +28,7 @@ export class OpenAICompatibleAdapter implements LLMProvider {
         content: choice?.message?.content ?? '',
         usage: usage ? { inputTokens: usage.prompt_tokens ?? 0, outputTokens: usage.completion_tokens ?? 0 } : undefined,
       };
-    } catch (err) { throw mapProviderError(err as Error); }
+    } catch (err) { throw mapProviderError(err as ProviderLikeError); }
   }
 
   async *stream(params: ChatParams): AsyncIterable<LLMChunk> {
@@ -38,7 +38,7 @@ export class OpenAICompatibleAdapter implements LLMProvider {
         const delta = (chunk.choices as Array<{ delta?: { content?: string } }>)?.[0]?.delta?.content;
         if (delta) yield { type: 'text', text: delta };
       }
-    } catch (err) { throw mapProviderError(err as Error); }
+    } catch (err) { throw mapProviderError(err as ProviderLikeError); }
   }
 
   private buildBody(p: ChatParams, isStream: boolean): Record<string, unknown> {

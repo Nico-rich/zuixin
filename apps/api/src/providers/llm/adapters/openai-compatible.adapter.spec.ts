@@ -41,7 +41,8 @@ describe('OpenAICompatibleAdapter', () => {
   it('messages 透传多模态 content', async () => {
     const adapter = new OpenAICompatibleAdapter(cfg, {
       chat: async (p) => {
-        expect(p.messages[0].content).toEqual([{ type: 'image_url', image_url: { url: 'http://x/a.png' } }, { type: 'text', text: '分析' }]);
+        const msgs = p.messages as Array<{ content: unknown }>;
+        expect(msgs[0].content).toEqual([{ type: 'image_url', image_url: { url: 'http://x/a.png' } }, { type: 'text', text: '分析' }]);
         return { choices: [{ message: { content: 'ok' } }] };
       },
     });
