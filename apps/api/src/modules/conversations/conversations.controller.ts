@@ -1,10 +1,11 @@
-import { Body, Controller, Delete, Get, Inject, Param, Patch, Post, Req, UseGuards, UsePipes } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Inject, Param, Patch, Post, Req, UseGuards } from '@nestjs/common';
 import { Request } from 'express';
 import { ConversationsService } from './conversations.service';
 import { CreateConversationDtoSchema, UpdateConversationDtoSchema } from './conversations.dto';
 import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe';
 import { AuthedUser, JwtAuthGuard } from '../auth/jwt-auth.guard';
 
+// 注：校验管道挂在 @Body 参数上而非方法级——方法级 @UsePipes 会作用于 @Param('id')，把路径参数当 DTO 校验
 @Controller('conversations')
 @UseGuards(JwtAuthGuard)
 export class ConversationsController {
@@ -16,8 +17,7 @@ export class ConversationsController {
   }
 
   @Post()
-  @UsePipes(new ZodValidationPipe(CreateConversationDtoSchema))
-  create(@Req() req: Request & { user: AuthedUser }, @Body() dto: { title?: string }) {
+  create(@Req() req: Request & { user: AuthedUser }, @Body(new ZodValidationPipe(CreateConversationDtoSchema)) dto: { title?: string }) {
     return this.conversations.create(req.user.userId, dto);
   }
 
@@ -27,8 +27,7 @@ export class ConversationsController {
   }
 
   @Patch(':id')
-  @UsePipes(new ZodValidationPipe(UpdateConversationDtoSchema))
-  rename(@Req() req: Request & { user: AuthedUser }, @Param('id') id: string, @Body() dto: { title: string }) {
+  rename(@Req() req: Request & { user: AuthedUser }, @Param('id') id: string, @Body(new ZodValidationPipe(UpdateConversationDtoSchema)) dto: { title: string }) {
     return this.conversations.rename(req.user.userId, id, dto.title);
   }
 
