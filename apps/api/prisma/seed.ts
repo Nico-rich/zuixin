@@ -148,7 +148,7 @@ async function main() {
   for (const a of agents) {
     await prisma.agent.upsert({
       where: { id: a.id },
-      update: { systemPrompt: a.systemPrompt, tools: a.tools, kind: a.kind, version: { increment: 0 } },
+      update: { systemPrompt: a.systemPrompt, tools: a.tools, kind: a.kind },
       create: { id: a.id, slug: a.slug, name: a.name, kind: a.kind, systemPrompt: a.systemPrompt, tools: a.tools, builtin: true, enabled: true, priority: a.slug === 'general-assistant' ? 1 : 10 },
     });
   }
