@@ -6,19 +6,20 @@ import { AppError, ErrorCode } from '../../common/errors/app-error';
 export class ConversationsService {
   constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
 
-  list(userId: string) {
+  list(userId: string, projectId?: string) {
     return this.prisma.conversation.findMany({
-      where: { userId, deletedAt: null },
+      where: { userId, deletedAt: null, ...(projectId ? { projectId } : {}) },
       orderBy: { updatedAt: 'desc' },
       take: 50,
-      select: { id: true, title: true, createdAt: true, updatedAt: true },
+      select: { id: true, title: true, projectId: true, createdAt: true, updatedAt: true },
     });
   }
 
-  create(userId: string, dto: { title?: string }) {
+  async create(userId: string, dto: { title?: string; projectId?: string | null }) {
+    if (dto.projectId) await this.requireProject(userId, dto.projectId);
     return this.prisma.conversation.create({
-      data: { userId, title: dto.title ?? '新对话' },
-      select: { id: true, title: true, createdAt: true, updatedAt: true },
+      data: { userId, title: dto.title ?? '新对话', projectId: dto.projectId ?? null },
+      select: { id: true, title: true, projectId: true, createdAt: true, updatedAt: true },
     });
   }
 
@@ -26,9 +27,14 @@ export class ConversationsService {
     return this.requireOwned(userId, id);
   }
 
-  async rename(userId: string, id: string, title: string) {
+  /** 更新标题 / 移动项目（null = 移出项目） */
+  async update(userId: string, id: string, dto: { title?: string; projectId?: string | null }) {
     await this.requireOwned(userId, id);
-    return this.prisma.conversation.update({ where: { id }, data: { title } });
+    if (dto.projectId) await this.requireProject(userId, dto.projectId);
+    const data: { title?: string; projectId?: string | null } = {};
+    if (dto.title) data.title = dto.title;
+    if (dto.projectId !== undefined) data.projectId = dto.projectId;
+    return this.prisma.conversation.update({ where: { id }, data });
   }
 
   async softDelete(userId: string, id: string) {
@@ -51,5 +57,11 @@ export class ConversationsService {
     const c = await this.prisma.conversation.findFirst({ where: { id, userId, deletedAt: null } });
     if (!c) throw new AppError(ErrorCode.NOT_FOUND, '对话不存在');
     return c;
+  }
+
+  /** 目标项目归属校验：非本人项目 → 404 */
+  private async requireProject(userId: string, projectId: string) {
+    const p = await this.prisma.project.findFirst({ where: { id: projectId, userId, deletedAt: null } });
+    if (!p) throw new AppError(ErrorCode.NOT_FOUND, '项目不存在');
   }
 }

@@ -10,6 +10,7 @@ function makeChat(agentEvents?: () => AsyncIterable<AgentEvent>) {
       create: vi.fn().mockResolvedValue({ id: 'c-new', userId: 'u1', title: '新对话' }),
       update: vi.fn(),
     },
+    project: { findFirst: vi.fn().mockResolvedValue({ id: 'p1', userId: 'u1' }) },
     message: {
       create: vi.fn().mockImplementation(({ data }) => Promise.resolve({ id: 'm-' + data.role, ...data })),
       update: vi.fn().mockResolvedValue({}),
@@ -84,6 +85,19 @@ describe('ChatService.prepareChat', () => {
     expect(context.assemble).toHaveBeenCalledWith({
       userId: 'u1', conversationId: 'c-new', excludeMessageId: 'm-user',
     });
+  });
+
+  it('projectId 挂载：非本人项目 → NOT_FOUND', async () => {
+    const { svc, prisma } = makeChat();
+    prisma.project.findFirst.mockResolvedValue(null);
+    await expect(svc.prepareChat('u1', { conversationId: null, projectId: 'p-other', message: 'hi' }, 'req1'))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('projectId 挂载：本人项目 → 会话带 projectId 创建', async () => {
+    const { svc, prisma } = makeChat();
+    await svc.prepareChat('u1', { conversationId: null, projectId: 'p1', message: 'hi' }, 'req1');
+    expect(prisma.conversation.create).toHaveBeenCalledWith({ data: { userId: 'u1', projectId: 'p1' } });
   });
 
   it('锁被占用 → CONCURRENT_CHAT', async () => {

@@ -41,7 +41,7 @@ export class ChatService {
     const startedAt = Date.now();
     const conversation = dto.conversationId
       ? await this.requireConversation(userId, dto.conversationId)
-      : await this.prisma.conversation.create({ data: { userId } });
+      : await this.createConversation(userId, dto.projectId);
 
     const lockKey = `chat:lock:${conversation.id}`;
     const locked = await this.kv.setNX(lockKey, requestId, 120);
@@ -148,5 +148,14 @@ export class ChatService {
     const c = await this.prisma.conversation.findFirst({ where: { id, userId, deletedAt: null } });
     if (!c) throw new AppError(ErrorCode.NOT_FOUND, '对话不存在');
     return c;
+  }
+
+  /** 新建会话：可挂载到用户自己的项目 */
+  private async createConversation(userId: string, projectId?: string | null) {
+    if (projectId) {
+      const p = await this.prisma.project.findFirst({ where: { id: projectId, userId, deletedAt: null } });
+      if (!p) throw new AppError(ErrorCode.NOT_FOUND, '项目不存在');
+    }
+    return this.prisma.conversation.create({ data: { userId, projectId: projectId ?? null } });
   }
 }

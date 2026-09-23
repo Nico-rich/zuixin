@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Inject, Param, Patch, Post, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Inject, Param, Patch, Post, Query, Req, UseGuards } from '@nestjs/common';
 import { Request } from 'express';
 import { ConversationsService } from './conversations.service';
 import { CreateConversationDtoSchema, UpdateConversationDtoSchema } from './conversations.dto';
@@ -12,12 +12,12 @@ export class ConversationsController {
   constructor(@Inject(ConversationsService) private readonly conversations: ConversationsService) {}
 
   @Get()
-  list(@Req() req: Request & { user: AuthedUser }) {
-    return this.conversations.list(req.user.userId);
+  list(@Req() req: Request & { user: AuthedUser }, @Query('projectId') projectId?: string) {
+    return this.conversations.list(req.user.userId, projectId);
   }
 
   @Post()
-  create(@Req() req: Request & { user: AuthedUser }, @Body(new ZodValidationPipe(CreateConversationDtoSchema)) dto: { title?: string }) {
+  create(@Req() req: Request & { user: AuthedUser }, @Body(new ZodValidationPipe(CreateConversationDtoSchema)) dto: { title?: string; projectId?: string | null }) {
     return this.conversations.create(req.user.userId, dto);
   }
 
@@ -27,8 +27,8 @@ export class ConversationsController {
   }
 
   @Patch(':id')
-  rename(@Req() req: Request & { user: AuthedUser }, @Param('id') id: string, @Body(new ZodValidationPipe(UpdateConversationDtoSchema)) dto: { title: string }) {
-    return this.conversations.rename(req.user.userId, id, dto.title);
+  update(@Req() req: Request & { user: AuthedUser }, @Param('id') id: string, @Body(new ZodValidationPipe(UpdateConversationDtoSchema)) dto: { title?: string; projectId?: string | null }) {
+    return this.conversations.update(req.user.userId, id, dto);
   }
 
   @Delete(':id')
