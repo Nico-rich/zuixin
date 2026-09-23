@@ -7,7 +7,9 @@ import { HealthModule } from './modules/health/health.module';
 import { CryptoModule } from './core/crypto/crypto.module';
 import { StorageModule } from './core/storage/storage.module';
 import { QueueModule } from './core/queue/queue.module';
+import { CircuitBreakerModule } from './core/circuit-breaker/circuit-breaker.module';
 import { ProvidersModule } from './providers/providers.module';
+import { AuthModule } from './modules/auth/auth.module';
 import { GlobalExceptionFilter } from './common/filters/global-exception.filter';
 
 @Module({
@@ -30,7 +32,9 @@ import { GlobalExceptionFilter } from './common/filters/global-exception.filter'
     CryptoModule,
     StorageModule,
     QueueModule,
+    CircuitBreakerModule,
     ProvidersModule,
+    AuthModule,
     HealthModule,
   ],
   providers: [GlobalExceptionFilter],

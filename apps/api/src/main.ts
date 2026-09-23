@@ -2,8 +2,10 @@ import './env';
 import { NestFactory } from '@nestjs/core';
 import { Logger } from 'nestjs-pino';
 import helmet from 'helmet';
+import cookieParser from 'cookie-parser';
 import { AppModule } from './app.module';
 import { GlobalExceptionFilter } from './common/filters/global-exception.filter';
+import { csrfProtection } from './modules/auth/csrf.middleware';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bufferLogs: true });
@@ -13,6 +15,8 @@ async function bootstrap() {
     origin: (process.env.CORS_ORIGINS ?? 'http://localhost:3000').split(','),
     credentials: true,
   });
+  app.use(cookieParser());
+  app.use('/api/v1', csrfProtection);
   app.setGlobalPrefix('api/v1');
   app.useGlobalFilters(app.get(GlobalExceptionFilter));
   const port = Number(process.env.API_PORT ?? 3001);

@@ -6,6 +6,7 @@ import { KVStore } from '../circuit-breaker/kv-store.interface';
 const kv: KVStore = {
   incr: async () => 1, get: async () => null,
   set: async () => undefined,
+  setNX: async () => true, del: async () => undefined,
 };
 const cb = new CircuitBreakerService(kv, () => 0);
 const noSleep = async () => undefined;
