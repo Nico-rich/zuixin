@@ -1,0 +1,311 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ===== 枚举 =====
+enum UserRole {
+  user
+  admin
+}
+enum UserStatus {
+  active
+  disabled
+}
+enum MessageRole {
+  user
+  assistant
+  system
+}
+enum MessageStatus {
+  pending
+  streaming
+  completed
+  failed
+  cancelled
+}
+enum IntentType {
+  chat
+  image_generation
+  video_generation
+  image_analysis
+  file_analysis
+  agent_task
+  workflow
+}
+enum AttachmentType {
+  image
+  video
+  file
+}
+enum AttachmentKind {
+  upload
+  generated_image
+  generated_video
+}
+enum AttachmentStatus {
+  uploading
+  ready
+  failed
+}
+enum ProviderType {
+  llm
+  image
+  video
+}
+enum HealthStatus {
+  untested
+  healthy
+  unhealthy
+}
+enum ModelType {
+  llm
+  image
+  video
+}
+enum TaskType {
+  image
+  video
+}
+enum TaskStatus {
+  pending
+  processing
+  completed
+  failed
+  cancelled
+}
+enum UsageKind {
+  llm_chat
+  llm_router
+  image
+  video
+}
+enum UsageStatus {
+  success
+  failed
+}
+
+// ===== 用户与认证 =====
+model User {
+  id           String    @id @default(uuid())
+  email        String    @unique
+  passwordHash String
+  displayName  String?
+  role         UserRole  @default(user)
+  status       UserStatus @default(active)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  lastLoginAt  DateTime?
+  conversations Conversation[]
+  messages      Message[]
+  attachments   Attachment[]
+  tasks         GenerationTask[]
+  usages        UsageRecord[]
+  sessions      Session[]
+}
+
+model Session {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  userAgent String?
+  ip        String?
+  createdAt DateTime  @default(now())
+  @@index([userId])
+}
+
+// ===== 对话 =====
+model Conversation {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String   @default("新对话")
+  deletedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  messages  Message[]
+  @@index([userId, updatedAt])
+}
+
+model Message {
+  id               String          @id @default(uuid())
+  conversationId   String
+  conversation     Conversation    @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  userId           String
+  user             User            @relation(fields: [userId], references: [id])
+  role             MessageRole
+  content          String          @db.Text
+  intentType       IntentType?
+  intentConfidence Float?
+  agentId          String?
+  agent            Agent?          @relation(fields: [agentId], references: [id])
+  modelId          String?
+  status           MessageStatus   @default(completed)
+  errorCode        String?
+  tokenUsage       Json?
+  createdAt        DateTime        @default(now())
+  attachments      Attachment[]
+  tasks            GenerationTask[]
+  @@index([conversationId, createdAt])
+}
+
+// ===== 附件（上传与生成产物统一管理）=====
+model Attachment {
+  id              String           @id @default(uuid())
+  userId          String
+  user            User             @relation(fields: [userId], references: [id])
+  conversationId  String?
+  messageId       String?
+  message         Message?         @relation(fields: [messageId], references: [id])
+  kind            AttachmentKind
+  type            AttachmentType
+  mimeType        String
+  storageKey      String
+  storageProvider String           @default("local")
+  originalName    String?
+  sizeBytes       Int
+  metadata        Json?
+  status          AttachmentStatus @default(ready)
+  taskId          String?
+  task            GenerationTask?  @relation(fields: [taskId], references: [id])
+  createdAt       DateTime         @default(now())
+  @@index([userId, createdAt])
+  @@index([messageId])
+}
+
+// ===== Agent =====
+model Agent {
+  id           String    @id @default(uuid())
+  slug         String    @unique
+  name         String
+  description  String?
+  systemPrompt String    @db.Text
+  modelId      String?
+  model        Model?    @relation(fields: [modelId], references: [id])
+  tools        Json      @default("[]")
+  temperature  Float     @default(0.7)
+  maxTokens    Int?
+  enabled      Boolean   @default(true)
+  priority     Int       @default(100)
+  builtin      Boolean   @default(false)
+  config       Json?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  messages     Message[]
+}
+
+// ===== Provider 与模型 =====
+model Provider {
+  id              String       @id @default(uuid())
+  name            String
+  type            ProviderType
+  adapter         String
+  baseUrl         String
+  apiKeyEncrypted String       @default("")
+  enabled         Boolean      @default(false)
+  priority        Int          @default(100)
+  timeoutMs       Int          @default(60000)
+  retryConfig     Json?
+  healthStatus    HealthStatus @default(untested)
+  health          Json?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  models          Model[]
+  tasks           GenerationTask[]
+  usages          UsageRecord[]
+  @@index([type, enabled])
+}
+
+model Model {
+  id            String     @id @default(uuid())
+  providerId    String
+  provider      Provider   @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  name          String
+  apiModelId    String
+  type          ModelType
+  capabilities  Json?
+  inputPrice    Float      @default(0)
+  outputPrice   Float      @default(0)
+  unitPrice     Float      @default(0)
+  contextWindow Int?
+  enabled       Boolean    @default(true)
+  priority      Int        @default(100)
+  isDefault     Boolean    @default(false)
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  agents        Agent[]
+  tasks         GenerationTask[]
+  usages        UsageRecord[]
+  @@index([type, enabled])
+}
+
+// ===== 生成任务 =====
+model GenerationTask {
+  id             String      @id @default(uuid())
+  userId         String
+  user           User        @relation(fields: [userId], references: [id])
+  conversationId String?
+  messageId      String?
+  message        Message?    @relation(fields: [messageId], references: [id])
+  type           TaskType
+  providerId     String?
+  provider       Provider?   @relation(fields: [providerId], references: [id])
+  modelId        String?
+  model          Model?      @relation(fields: [modelId], references: [id])
+  status         TaskStatus  @default(pending)
+  progress       Int?
+  statusMessage  String?
+  input          Json
+  output         Json?
+  remoteTaskId   String?
+  errorCode      String?
+  errorMessage   String?
+  attempts       Int         @default(0)
+  costEstimate   Float?
+  startedAt      DateTime?
+  completedAt    DateTime?
+  createdAt      DateTime    @default(now())
+  attachments    Attachment[]
+  @@index([userId, createdAt])
+  @@index([status])
+}
+
+// ===== 用量与成本 =====
+model UsageRecord {
+  id             String      @id @default(uuid())
+  userId         String?
+  user           User?       @relation(fields: [userId], references: [id])
+  conversationId String?
+  messageId      String?
+  taskId         String?
+  providerId     String?
+  provider       Provider?   @relation(fields: [providerId], references: [id])
+  modelId        String?
+  model          Model?      @relation(fields: [modelId], references: [id])
+  kind           UsageKind
+  inputTokens    Int         @default(0)
+  outputTokens   Int         @default(0)
+  imageCount     Int         @default(0)
+  videoSeconds   Int         @default(0)
+  latencyMs      Int?
+  estimatedCost  Float       @default(0)
+  status         UsageStatus @default(success)
+  errorCode      String?
+  createdAt      DateTime    @default(now())
+  @@index([createdAt])
+  @@index([userId, createdAt])
+}
+
+// ===== 系统配置 =====
+model SystemSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}
