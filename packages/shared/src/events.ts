@@ -38,8 +38,19 @@ export const TaskCreatedEventSchema = z.object({ type: z.literal('task.created')
 export const DoneEventSchema = z.object({ type: z.literal('done'), messageId: z.string(), usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional() });
 export const ErrorEventSchema = z.object({ type: z.literal('error'), code: z.string(), message: z.string(), requestId: z.string().optional() });
 
+// ===== M4: Agent / Tool / Run 事件（AgentLoop 输出，与 task.* 严格区分）=====
+export const AgentStartEventSchema = z.object({ type: z.literal('agent.start'), agentId: z.string(), runId: z.string() });
+export const AgentEndEventSchema = z.object({ type: z.literal('agent.end'), agentId: z.string(), runId: z.string(), status: z.enum(['completed', 'failed', 'cancelled', 'timeout']) });
+export const ToolStartEventSchema = z.object({ type: z.literal('tool.start'), toolName: z.string(), runId: z.string() });
+export const ToolEndEventSchema = z.object({ type: z.literal('tool.end'), toolName: z.string(), runId: z.string(), status: z.enum(['completed', 'failed']), outputSummary: z.string().optional() });
+export const RunCreatedEventSchema = z.object({ type: z.literal('run.created'), runId: z.string(), agentId: z.string() });
+export const RunProgressEventSchema = z.object({ type: z.literal('run.progress'), runId: z.string(), currentStep: z.number(), maxSteps: z.number() });
+export const RunCompletedEventSchema = z.object({ type: z.literal('run.completed'), runId: z.string(), status: z.enum(['completed', 'failed', 'cancelled', 'timeout']) });
+
 export const AgentEventSchema = z.discriminatedUnion('type', [
   StatusEventSchema, TextDeltaEventSchema, TaskCreatedEventSchema, DoneEventSchema, ErrorEventSchema,
+  AgentStartEventSchema, AgentEndEventSchema, ToolStartEventSchema, ToolEndEventSchema,
+  RunCreatedEventSchema, RunProgressEventSchema, RunCompletedEventSchema,
 ]);
 export type AgentEvent = z.infer<typeof AgentEventSchema>;
 
@@ -53,5 +64,7 @@ export const ChatStreamEventSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('task.progress'), taskId: z.string(), progress: z.number(), message: z.string().optional() }),
   z.object({ type: z.literal('task.completed'), taskId: z.string(), artifact: z.record(z.string(), z.unknown()).optional() }),
   z.object({ type: z.literal('error'), code: z.string(), message: z.string(), requestId: z.string().optional() }),
+  AgentStartEventSchema, AgentEndEventSchema, ToolStartEventSchema, ToolEndEventSchema,
+  RunCreatedEventSchema, RunProgressEventSchema, RunCompletedEventSchema,
 ]);
 export type ChatStreamEvent = z.infer<typeof ChatStreamEventSchema>;
