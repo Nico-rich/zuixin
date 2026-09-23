@@ -10,6 +10,7 @@ import { QueueModule } from './core/queue/queue.module';
 import { CircuitBreakerModule } from './core/circuit-breaker/circuit-breaker.module';
 import { ProvidersModule } from './providers/providers.module';
 import { AuthModule } from './modules/auth/auth.module';
+import { ConversationsModule } from './modules/conversations/conversations.module';
 import { GlobalExceptionFilter } from './common/filters/global-exception.filter';
 
 @Module({
@@ -35,6 +36,7 @@ import { GlobalExceptionFilter } from './common/filters/global-exception.filter'
     CircuitBreakerModule,
     ProvidersModule,
     AuthModule,
+    ConversationsModule,
     HealthModule,
   ],
   providers: [GlobalExceptionFilter],
