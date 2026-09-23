@@ -5,6 +5,8 @@ import { randomUUID } from 'node:crypto';
 import { PrismaModule } from './modules/prisma/prisma.module';
 import { HealthModule } from './modules/health/health.module';
 import { CryptoModule } from './core/crypto/crypto.module';
+import { StorageModule } from './core/storage/storage.module';
+import { QueueModule } from './core/queue/queue.module';
 import { ProvidersModule } from './providers/providers.module';
 import { GlobalExceptionFilter } from './common/filters/global-exception.filter';
 
@@ -26,6 +28,8 @@ import { GlobalExceptionFilter } from './common/filters/global-exception.filter'
     }),
     PrismaModule,
     CryptoModule,
+    StorageModule,
+    QueueModule,
     ProvidersModule,
     HealthModule,
   ],
