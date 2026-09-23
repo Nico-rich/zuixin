@@ -1,6 +1,37 @@
 import { z } from 'zod';
 
-// SSE 事件协议（与架构文档 §12.2 一致；M1 起接线 chat 流）
+// ===== SSE 线上事件命名注册表（M1 定稿锁定，见架构文档 §12.2）=====
+// 状态约定：
+//   implemented —— 已上线，ChatStreamEventSchema 有对应 schema，前端已处理
+//   reserved    —— 未来里程碑预留命名，仅锁定字符串，无 schema、无业务逻辑、前端暂不处理
+// 原则：已锁定的名字永不改名（改名 = 前端协议层返工）；新事件只允许追加。
+export const ChatStreamEventNames = {
+  // ===== M1 已实现 =====
+  message_start: 'message_start',
+  message_delta: 'message_delta',
+  message_end: 'message_end',
+  status: 'status',
+  error: 'error',
+  // ===== M2~M3 预留（生图/生视频任务；schema 已就位）=====
+  task_created: 'task.created',
+  task_progress: 'task.progress',
+  task_completed: 'task.completed',
+  // ===== M4~M5 预留（Agent 注册中心 / 多 Agent）=====
+  agent_start: 'agent.start',
+  agent_end: 'agent.end',
+  // ===== M6 预留（Artifact / Tool Calling / Human Approval）=====
+  artifact_created: 'artifact.created',
+  tool_start: 'tool.start',
+  tool_end: 'tool.end',
+  approval_requested: 'approval.requested',
+  // ===== M6+ 预留（长任务 Workflow / AgentRun）=====
+  run_created: 'run.created',
+  run_progress: 'run.progress',
+  run_completed: 'run.completed',
+} as const;
+export type ChatStreamEventName = (typeof ChatStreamEventNames)[keyof typeof ChatStreamEventNames];
+
+// ===== 内部 Agent 事件流（Agent 实现层，与架构文档 §7.1 一致）=====
 export const StatusEventSchema = z.object({ type: z.literal('status'), stage: z.string(), message: z.string() });
 export const TextDeltaEventSchema = z.object({ type: z.literal('text.delta'), text: z.string() });
 export const TaskCreatedEventSchema = z.object({ type: z.literal('task.created'), taskId: z.string(), kind: z.enum(['image', 'video']) });

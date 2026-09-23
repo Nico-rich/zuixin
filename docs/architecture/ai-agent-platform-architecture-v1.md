@@ -759,6 +759,16 @@ event: error           data: {"type":"error","code":"PROVIDER_TIMEOUT","message"
 
 对应 zod schema 位于 `packages/shared/src/events.ts`（ChatStreamEventSchema），前后端共用。
 
+**事件命名注册表（M1 定稿锁定，`shared/src/events.ts` 的 `ChatStreamEventNames`）：** 已锁定的事件名永不改名（改名 = 前端协议层返工），新事件只允许追加。
+
+| 事件名 | 状态 | 里程碑 |
+|---|---|---|
+| message.start / message.delta / message.end / status / error | ✅ 已实现 | M1 |
+| task.created / task.progress / task.completed | 🟡 预留（schema 已就位） | M2~M3 |
+| agent.start / agent.end | 🔵 预留（仅命名） | M4~M5 |
+| artifact.created / tool.start / tool.end / approval.requested | 🔵 预留（仅命名） | M6 |
+| run.created / run.progress / run.completed | 🔵 预留（仅命名） | M6+ |
+
 > 说明：`task.progress` / `task.completed` 事件在聊天流中仅在任务极快完成（Agent 仍在流内）时出现；常规路径（尤其视频）下，MVP 由前端轮询 `GET /tasks/:id` 呈现任务终态。这两个事件是 Phase 5 任务 SSE 通道（`/tasks/stream`）的正式协议。
 
 ### 12.3 实现要点
