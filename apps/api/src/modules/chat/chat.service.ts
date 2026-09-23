@@ -17,7 +17,9 @@ import { SSEWriter } from './sse-writer';
 export interface ChatRunContext {
   conversationId: string; userMessageId: string; assistantMessageId: string;
   userMessage: string; history: ChatMessage[]; intent: TaskIntent;
-  resolved: ResolvedLLM; lockKey: string; startedAt: number; userId: string;
+  /** chat 意图必有；生图等非 LLM 意图为 null（按需解析，省一次模型调用） */
+  resolved: ResolvedLLM | null;
+  lockKey: string; startedAt: number; userId: string;
   projectId?: string | null;
   attachments: AttachmentMeta[];
 }
@@ -40,6 +42,7 @@ export class ChatService {
     @Inject(ModelResolverService) private readonly modelResolver: ModelResolverService,
     @Inject(UsageService) private readonly usage: UsageService,
     @Inject('CHAT_AGENT_FACTORY') private readonly agentFactory: AgentFactory,
+    @Inject('IMAGE_AGENT_FACTORY') private readonly imageAgentFactory: { create: () => Agent },
   ) {}
 
   /** 第一步（HTTP 阶段，出错走统一 JSON envelope）：会话/锁/消息/路由/模型 */
@@ -69,7 +72,8 @@ export class ChatService {
         userId, conversationId: conversation.id, projectId: conversation.projectId ?? undefined, excludeMessageId: userMessage.id,
       });
       const intent = await this.router.classify({ userMessage: dto.message, attachments: [], history: history.slice(-2) });
-      const resolved = await this.modelResolver.resolveDefaultLLM();
+      // 仅 LLM 类意图解析 LLM（生图等直接走各自 Agent，不浪费一次模型解析）
+      const resolved = intent.type === 'chat' ? await this.modelResolver.resolveDefaultLLM() : null;
       // 意图落库可观测（M4 后台看分类命中率）
       await this.prisma.message.update({ where: { id: userMessage.id }, data: { intentType: intent.type, intentConfidence: intent.confidence } });
       return {
@@ -92,7 +96,10 @@ export class ChatService {
 
     try {
       writer.event('message_start', { type: 'message_start', messageId: ctx.assistantMessageId, conversationId: ctx.conversationId, role: 'assistant', createdAt: new Date().toISOString() });
-      const agent = this.agentFactory.create({ resolved: ctx.resolved });
+      // 按意图选择 Agent（M2：chat / image；M3+ 扩展 video/analysis，M4 起走 DB 配置的 Agent 注册表）
+      const agent = ctx.intent.type === 'image_generation'
+        ? this.imageAgentFactory.create()
+        : this.agentFactory.create({ resolved: ctx.resolved! });
       const events = agent.execute({
         userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.assistantMessageId,
         userMessage: ctx.userMessage, attachments: ctx.attachments, history: ctx.history, intent: ctx.intent,

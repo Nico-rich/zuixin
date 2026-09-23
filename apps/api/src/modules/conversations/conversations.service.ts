@@ -48,7 +48,7 @@ export class ConversationsService {
       where: { conversationId },
       orderBy: { createdAt: 'asc' },
       take: 200,
-      select: { id: true, conversationId: true, role: true, content: true, status: true, errorCode: true, createdAt: true },
+      select: { id: true, conversationId: true, role: true, content: true, status: true, errorCode: true, intentType: true, intentConfidence: true, createdAt: true },
     });
   }
 

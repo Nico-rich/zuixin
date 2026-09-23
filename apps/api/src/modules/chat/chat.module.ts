@@ -7,9 +7,12 @@ import { ChatAgent } from '../../agents/chat/chat.agent';
 import { ContextModule } from '../../core/context/context.module';
 import { MemoryModule } from '../../core/memory/memory.module';
 import { AttachmentsModule } from '../attachments/attachments.module';
+import { GenerationsModule } from '../generations/generations.module';
+import { ImageGenerationService } from '../generations/image-generation.service';
+import { ImageAgent } from '../../agents/image/image.agent';
 
 @Module({
-  imports: [ContextModule, MemoryModule, AttachmentsModule],
+  imports: [ContextModule, MemoryModule, AttachmentsModule, GenerationsModule],
   controllers: [ChatController],
   providers: [
     ChatService,
@@ -20,6 +23,13 @@ import { AttachmentsModule } from '../attachments/attachments.module';
           new ChatAgent({ llmManager }, { resolveLLM: async () => ({ adapter: input.resolved.adapter, apiModelId: input.resolved.apiModelId }) }),
       }),
       inject: [LLMManagerService],
+    },
+    {
+      provide: 'IMAGE_AGENT_FACTORY',
+      useFactory: (generations: ImageGenerationService) => ({
+        create: () => new ImageAgent({ generations }),
+      }),
+      inject: [ImageGenerationService],
     },
   ],
 })

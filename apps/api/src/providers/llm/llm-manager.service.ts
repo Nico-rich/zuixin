@@ -4,6 +4,7 @@ import { CryptoService } from '../../core/crypto/crypto.service';
 import { LLMProvider } from './llm.types';
 import { OpenAICompatibleAdapter } from './adapters/openai-compatible.adapter';
 import { MockLLMAdapter } from './adapters/mock.adapter';
+import { MockRouterAdapter } from './adapters/mock-router.adapter';
 
 export interface ResolvedLLM {
   providerId: string; providerName: string;
@@ -59,6 +60,7 @@ export class LLMManagerService implements OnModuleInit {
     switch (name) {
       case 'openai-compatible': return new OpenAICompatibleAdapter(cfg);
       case 'mock': return new MockLLMAdapter(Number(process.env.MOCK_DELAY_MS ?? 20));
+      case 'mock-router': return new MockRouterAdapter();
       default: throw new Error(`未知 LLM adapter: ${name}`);
     }
   }

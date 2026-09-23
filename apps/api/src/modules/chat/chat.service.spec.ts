@@ -33,8 +33,9 @@ function makeChat(agentEvents?: () => AsyncIterable<AgentEvent>) {
     yield { type: 'done', messageId: 'm-assistant' };
   });
   const agentFactory = { create: vi.fn(() => ({ id: 'chat', execute: () => events() })) };
-  const svc = new ChatService(prisma as never, kv as never, router as never, context as never, attachmentsService as never, memoryExtractor as never, modelResolver as never, usage as never, agentFactory as never);
-  return { svc, prisma, kv, usage, context, memoryExtractor, attachmentsService };
+  const imageAgentFactory = { create: vi.fn(() => ({ id: 'image', execute: () => events() })) };
+  const svc = new ChatService(prisma as never, kv as never, router as never, context as never, attachmentsService as never, memoryExtractor as never, modelResolver as never, usage as never, agentFactory as never, imageAgentFactory as never);
+  return { svc, prisma, kv, usage, context, memoryExtractor, attachmentsService, agentFactory, imageAgentFactory };
 }
 
 /** 收集 SSE 帧的 fake sink（缓冲式按 \n\n 分帧解析） */
@@ -182,5 +183,18 @@ describe('ChatService.streamChat', () => {
     const { writer } = collectFrames();
     await svc.streamChat(baseCtx(), writer, new AbortController().signal, 'req1');
     expect(usage.recordChatUsage).toHaveBeenCalledWith(expect.objectContaining({ inputTokens: 3, outputTokens: 4 }));
+  });
+
+  it('image_generation 意图 → 走 ImageAgent（task.created 透传，不触碰 LLM Agent）', async () => {
+    const { svc, agentFactory, imageAgentFactory } = makeChat(async function* () {
+      yield { type: 'status', stage: 'image_generation', message: '正在创建图片生成任务…' };
+      yield { type: 'task.created', taskId: 't1', kind: 'image' };
+      yield { type: 'done', messageId: 'm-assistant' };
+    });
+    const { writer, events } = collectFrames();
+    await svc.streamChat({ ...baseCtx(), intent: { type: 'image_generation', confidence: 0.98, parameters: { prompt: '主图' } } }, writer, new AbortController().signal, 'req1');
+    expect(imageAgentFactory.create).toHaveBeenCalled();
+    expect(agentFactory.create).not.toHaveBeenCalled();
+    expect(events.map((e) => e.event)).toContain('task.created');
   });
 });
