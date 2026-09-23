@@ -30,9 +30,10 @@ function makeLoop(opts: { tools?: Tool[]; streamFn?: (params: unknown) => AsyncI
   const adapter = {
     stream: opts.streamFn ?? (async function* () { yield { type: 'text', text: '你好' }; }),
   };
-  const modelResolver = { resolveDefaultLLM: vi.fn().mockResolvedValue({ adapter, apiModelId: 'm' }) };
-  const llmManager = { resolve: vi.fn().mockResolvedValue({ adapter, apiModelId: 'm' }) };
-  const svc = new AgentLoopService(prisma as never, registry as never, modelResolver as never, llmManager as never);
+  const modelResolver = { resolveDefaultLLM: vi.fn().mockResolvedValue({ adapter, apiModelId: 'm', providerId: 'p1', modelId: 'm1', providerName: 'Mock', timeoutMs: 1000 }) };
+  const llmManager = { resolve: vi.fn().mockResolvedValue({ adapter, apiModelId: 'm', providerId: 'p1', modelId: 'm1', providerName: 'Mock', timeoutMs: 1000 }) };
+  const usage = { recordChatUsage: vi.fn().mockResolvedValue(undefined) };
+  const svc = new AgentLoopService(prisma as never, registry as never, modelResolver as never, llmManager as never, usage as never);
   const input = {
     userId: 'u1', projectId: undefined, conversationId: 'c1', messageId: 'm1',
     userMessage: '你好', history: [],

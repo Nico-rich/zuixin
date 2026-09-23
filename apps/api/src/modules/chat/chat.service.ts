@@ -6,26 +6,18 @@ import { RedisKVService } from '../../core/circuit-breaker/redis-kv.service';
 import { RouterService } from '../../core/router/router.service';
 import { ContextAssembler } from '../../core/context/context-assembler';
 import { MemoryExtractor, MEMORY_EXTRACTOR } from '../../core/memory/memory-extractor';
-import { ModelResolverService } from '../../providers/llm/model-resolver.service';
-import { ResolvedLLM } from '../../providers/llm/llm-manager.service';
+import { AgentRegistryService } from '../../agents/agent-registry.service';
+import { AttachmentMeta } from '../../agents/agent.types';
 import { ChatMessage } from '../../providers/llm/llm.types';
-import { Agent, AttachmentMeta } from '../../agents/agent.types';
-import { UsageService } from '../usage/usage.service';
 import { ChatDto } from './chat.dto';
 import { SSEWriter } from './sse-writer';
 
 export interface ChatRunContext {
   conversationId: string; userMessageId: string; assistantMessageId: string;
   userMessage: string; history: ChatMessage[]; intent: TaskIntent;
-  /** chat 意图必有；生图等非 LLM 意图为 null（按需解析，省一次模型调用） */
-  resolved: ResolvedLLM | null;
   lockKey: string; startedAt: number; userId: string;
   projectId?: string | null;
   attachments: AttachmentMeta[];
-}
-
-export interface AgentFactory {
-  create(input: { resolved: ResolvedLLM }): Agent;
 }
 
 @Injectable()
@@ -39,14 +31,10 @@ export class ChatService {
     @Inject(ContextAssembler) private readonly context: ContextAssembler,
     @Inject(AttachmentsService) private readonly attachmentsService: AttachmentsService,
     @Inject(MEMORY_EXTRACTOR) private readonly memoryExtractor: MemoryExtractor,
-    @Inject(ModelResolverService) private readonly modelResolver: ModelResolverService,
-    @Inject(UsageService) private readonly usage: UsageService,
-    @Inject('CHAT_AGENT_FACTORY') private readonly agentFactory: AgentFactory,
-    @Inject('IMAGE_AGENT_FACTORY') private readonly imageAgentFactory: { create: () => Agent },
-    @Inject('VIDEO_AGENT_FACTORY') private readonly videoAgentFactory: { create: () => Agent },
+    @Inject(AgentRegistryService) private readonly agentRegistry: AgentRegistryService,
   ) {}
 
-  /** 第一步（HTTP 阶段，出错走统一 JSON envelope）：会话/锁/消息/路由/模型 */
+  /** 第一步（HTTP 阶段，出错走统一 JSON envelope）：会话/锁/消息/路由/上下文 */
   async prepareChat(userId: string, dto: ChatDto, requestId: string): Promise<ChatRunContext> {
     const startedAt = Date.now();
     const conversation = dto.conversationId
@@ -78,13 +66,11 @@ export class ChatService {
         .filter((x) => x.scope === 'conversation')
         .map((x) => x.message);
       const intent = await this.router.classify({ userMessage: dto.message, attachments: [], history: conversationOnly.slice(-2) });
-      // 仅 LLM 类意图解析 LLM（生图等直接走各自 Agent，不浪费一次模型解析）
-      const resolved = intent.type === 'chat' ? await this.modelResolver.resolveDefaultLLM() : null;
       // 意图落库可观测（M4 后台看分类命中率）
       await this.prisma.message.update({ where: { id: userMessage.id }, data: { intentType: intent.type, intentConfidence: intent.confidence } });
       return {
         conversationId: conversation.id, userMessageId: userMessage.id, assistantMessageId: assistantMessage.id,
-        userMessage: dto.message, history, intent, resolved, lockKey, startedAt, userId,
+        userMessage: dto.message, history, intent, lockKey, startedAt, userId,
         projectId: conversation.projectId, attachments,
       };
     } catch (err) {
@@ -96,20 +82,16 @@ export class ChatService {
   /** 第二步（SSE 阶段）：Agent 事件流 → 线上协议；无论成败终态必落库 */
   async streamChat(ctx: ChatRunContext, writer: SSEWriter, signal: AbortSignal, requestId: string): Promise<void> {
     let buffer = '';
-    let usage: { inputTokens: number; outputTokens: number } | undefined;
     let finalStatus: 'completed' | 'failed' | 'cancelled' = 'completed';
     let errorCode: string | undefined;
 
     try {
       writer.event('message_start', { type: 'message_start', messageId: ctx.assistantMessageId, conversationId: ctx.conversationId, role: 'assistant', createdAt: new Date().toISOString() });
-      // 按意图选择 Agent（M2：chat / image；M3：+video；M4 起走 DB 配置的 Agent 注册表）
-      const agent = ctx.intent.type === 'image_generation'
-        ? this.imageAgentFactory.create()
-        : ctx.intent.type === 'video_generation'
-          ? this.videoAgentFactory.create()
-          : this.agentFactory.create({ resolved: ctx.resolved! });
+      // 意图 → Agent（DB 注册表；M1~M3 行为兼容：chat/image/video 映射与 seed agentMapping 一致）
+      const agent = await this.agentRegistry.resolveForIntent(ctx.intent);
       const events = agent.execute({
         userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.assistantMessageId,
+        projectId: ctx.projectId ?? undefined,
         userMessage: ctx.userMessage, attachments: ctx.attachments, history: ctx.history, intent: ctx.intent,
         mode: 'normal', signal,
       });
@@ -119,13 +101,25 @@ export class ChatService {
           case 'text.delta': buffer += ev.text; writer.event('message_delta', { type: 'message_delta', delta: ev.text }); break;
           case 'task.created': writer.event('task.created', ev); break;
           case 'done':
-            usage = (ev as { usage?: { inputTokens: number; outputTokens: number } }).usage;
             writer.event('message_end', { type: 'message_end', messageId: ctx.assistantMessageId, status: 'completed' });
+            break;
+          case 'agent.start': case 'agent.end': case 'tool.start': case 'tool.end':
+          case 'run.created': case 'run.progress': case 'run.completed':
+            writer.event(ev.type, ev);
+            if (ev.type === 'agent.end') {
+              if (ev.status === 'completed') writer.event('message_end', { type: 'message_end', messageId: ctx.assistantMessageId, status: 'completed' });
+              else if (ev.status === 'cancelled') {
+                finalStatus = 'cancelled';
+                writer.event('message_end', { type: 'message_end', messageId: ctx.assistantMessageId, status: 'stopped' });
+              } else {
+                finalStatus = 'failed';
+                writer.event('message_end', { type: 'message_end', messageId: ctx.assistantMessageId, status: 'failed' });
+              }
+            }
             break;
           case 'error':
             errorCode = ev.code; finalStatus = 'failed';
             writer.event('error', { type: 'error', code: ev.code, message: ev.message, requestId });
-            writer.event('message_end', { type: 'message_end', messageId: ctx.assistantMessageId, status: 'failed' });
             break;
         }
       }
@@ -139,28 +133,17 @@ export class ChatService {
         writer.event('message_end', { type: 'message_end', messageId: ctx.assistantMessageId, status: 'failed' });
       }
     } finally {
-      await this.finalize(ctx, buffer, finalStatus, errorCode, usage, requestId);
+      await this.finalize(ctx, buffer, finalStatus, errorCode, requestId);
       await this.kv.del(ctx.lockKey).catch(() => undefined);
     }
   }
 
-  private async finalize(
-    ctx: ChatRunContext, content: string, status: 'completed' | 'failed' | 'cancelled',
-    errorCode: string | undefined, usage: { inputTokens: number; outputTokens: number } | undefined, requestId: string,
-  ) {
+  private async finalize(ctx: ChatRunContext, content: string, status: 'completed' | 'failed' | 'cancelled', errorCode: string | undefined, requestId: string) {
     const latencyMs = Date.now() - ctx.startedAt;
     await this.prisma.message.update({
       where: { id: ctx.assistantMessageId },
-      data: { content, status, errorCode, tokenUsage: usage ?? undefined },
+      data: { content, status, errorCode },
     }).catch((err) => this.logger.error(`消息落库失败: ${(err as Error).message}`));
-    if (ctx.resolved) {
-      await this.usage.recordChatUsage({
-        userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.assistantMessageId,
-        providerId: ctx.resolved.providerId, modelId: ctx.resolved.modelId,
-        inputTokens: usage?.inputTokens ?? 0, outputTokens: usage?.outputTokens ?? 0,
-        latencyMs, status: status === 'completed' ? 'success' : 'failed', errorCode,
-      }).catch((err) => this.logger.error(`用量记录失败: ${(err as Error).message}`));
-    }
     // 记忆提取：fire-and-forget，不阻塞 SSE 收尾；失败/无候选静默（提取器内部兜底）
     if (status === 'completed' && content) {
       void this.memoryExtractor.extractCandidates({
@@ -168,18 +151,11 @@ export class ChatService {
         userMessage: ctx.userMessage, assistantReply: content, sourceMessageId: ctx.assistantMessageId,
       }).catch(() => undefined);
     }
-    // 结构化日志（M5 统计：成本/成功率/latency/provider 健康度）
+    // 结构化日志（LLM 用量由 AgentLoop 记录并关联 runId；本行只记录会话维度）
     this.logger.log({
       requestId, userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.assistantMessageId,
-      provider: ctx.resolved?.providerName ?? 'none', model: ctx.resolved?.apiModelId ?? 'none', intentType: ctx.intent.type,
-      latencyMs, status, errorCode, tokens: usage,
+      intentType: ctx.intent.type, latencyMs, status, errorCode,
     }, 'chat 完成');
-  }
-
-  private async requireConversation(userId: string, id: string) {
-    const c = await this.prisma.conversation.findFirst({ where: { id, userId, deletedAt: null } });
-    if (!c) throw new AppError(ErrorCode.NOT_FOUND, '对话不存在');
-    return c;
   }
 
   /** 解析消息附件：M2 仅图片进入 Agent 上下文（vision/参考图，base64 data URL）；其他文件仅可下载 */
@@ -194,6 +170,12 @@ export class ChatService {
       }
     }
     return metas;
+  }
+
+  private async requireConversation(userId: string, id: string) {
+    const c = await this.prisma.conversation.findFirst({ where: { id, userId, deletedAt: null } });
+    if (!c) throw new AppError(ErrorCode.NOT_FOUND, '对话不存在');
+    return c;
   }
 
   /** 新建会话：可挂载到用户自己的项目 */

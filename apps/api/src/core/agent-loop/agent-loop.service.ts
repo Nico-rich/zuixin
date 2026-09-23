@@ -4,8 +4,10 @@ import { ZodSchema } from 'zod';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import { AgentEvent, AppError, ErrorCode } from '@ai-agent/shared';
 import { PrismaService } from '../../modules/prisma/prisma.service';
+import { UsageService } from '../../modules/usage/usage.service';
 import { ModelResolverService } from '../../providers/llm/model-resolver.service';
 import { LLMManagerService } from '../../providers/llm/llm-manager.service';
+import { ResolvedLLM } from '../../providers/llm/llm-manager.service';
 import { ChatMessage, ToolDefinitionWire } from '../../providers/llm/llm.types';
 import { ToolRegistry } from '../tools/tool-registry.service';
 import { ToolContext } from '../tools/tool.types';
@@ -54,6 +56,7 @@ export class AgentLoopService {
     @Inject(ToolRegistry) private readonly registry: ToolRegistry,
     @Inject(ModelResolverService) private readonly modelResolver: ModelResolverService,
     @Inject(LLMManagerService) private readonly llmManager: LLMManagerService,
+    @Inject(UsageService) private readonly usage: UsageService,
   ) {}
 
   async *execute(input: AgentLoopInput): AsyncIterable<AgentEvent> {
@@ -85,9 +88,10 @@ export class AgentLoopService {
         if (input.signal.aborted) { finalStatus = 'cancelled'; break; }
         if (Date.now() >= deadline) { finalStatus = 'timeout'; errorCode = ErrorCode.AGENT_RUN_TIMEOUT; break; }
 
-        const { adapter, apiModelId } = await this.resolveLLM(input.agent);
-        const stream = adapter.stream({
-          model: apiModelId, messages, temperature: input.agent.temperature ?? 0.7,
+        const resolved = await this.resolveLLM(input.agent);
+        const turnStarted = Date.now();
+        const stream = resolved.adapter.stream({
+          model: resolved.apiModelId, messages, temperature: input.agent.temperature ?? 0.7,
           maxTokens: input.agent.maxTokens, tools: toolDefs.length ? toolDefs : undefined, signal: input.signal,
         });
         let toolCalls: Array<{ id: string; name: string; arguments: string }> | undefined;
@@ -95,6 +99,12 @@ export class AgentLoopService {
           if (chunk.type === 'text') yield { type: 'text.delta', text: chunk.text };
           else if (chunk.type === 'tool_calls') toolCalls = chunk.toolCalls;
         }
+        // 每回合 LLM 用量落库（runId 关联 → 未来按 Run 聚合四类成本）
+        await this.usage.recordChatUsage({
+          userId: input.userId, conversationId: input.conversationId ?? '', messageId: input.messageId,
+          providerId: resolved.providerId, modelId: resolved.modelId, runId: run.id,
+          inputTokens: 0, outputTokens: 0, latencyMs: Date.now() - turnStarted, status: 'success',
+        }).catch(() => undefined);
         if (!toolCalls?.length) break; // final 回答已流式输出
 
         // 循环检测：连续两次相同 Tool 同参数
@@ -115,6 +125,11 @@ export class AgentLoopService {
           yield { type: 'status', stage: 'tool', message: `正在调用 ${call.name}…` };
           yield { type: 'tool.start', toolName: call.name, runId: run.id };
           const result = await this.executeToolCall(input, run.id, stepRow.id, toolIndex, call, toolDefs, input.signal);
+          // 生成类工具 → 转发 task.created（前端 TaskCard 依赖，与 Image/Video Agent 行为一致）
+          const taskId = (result.output as { taskId?: string } | undefined)?.taskId;
+          if (result.status === 'completed' && taskId && (call.name === 'image.generate' || call.name === 'video.generate')) {
+            yield { type: 'task.created', taskId, kind: call.name === 'image.generate' ? 'image' : 'video' };
+          }
           // 回喂模型（无论成败——失败让模型看到错误并修正）
           messages.push({ role: 'assistant', content: '', tool_calls: toolCalls });
           messages.push({ role: 'tool', content: JSON.stringify(result.output ?? result.error ?? {}), tool_call_id: call.id });
@@ -228,7 +243,7 @@ export class AgentLoopService {
     }));
   }
 
-  private async resolveLLM(agent: AgentLoopAgentConfig) {
+  private async resolveLLM(agent: AgentLoopAgentConfig): Promise<ResolvedLLM> {
     if (agent.modelId) return this.llmManager.resolve(agent.modelId);
     return this.modelResolver.resolveDefaultLLM();
   }

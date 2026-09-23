@@ -7,6 +7,8 @@ export interface AgentContext {
   userId: string;
   conversationId: string;
   messageId: string;
+  /** 会话所属项目（Loop 上下文/记忆/制品归属） */
+  projectId?: string;
   userMessage: string;
   attachments: AttachmentMeta[];
   history: ChatMessage[];

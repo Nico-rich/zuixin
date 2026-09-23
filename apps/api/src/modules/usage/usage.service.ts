@@ -7,6 +7,7 @@ export interface ChatUsageInput {
   providerId: string; modelId: string;
   inputTokens: number; outputTokens: number;
   latencyMs: number; status: 'success' | 'failed'; errorCode?: string;
+  runId?: string;   // AgentRun 关联（按 Run 聚合成本）
 }
 
 export interface MediaUsageInput {
@@ -30,7 +31,7 @@ export class UsageService {
     await this.prisma.usageRecord.create({
       data: {
         userId: input.userId, conversationId: input.conversationId, messageId: input.messageId,
-        providerId: input.providerId, modelId: input.modelId,
+        providerId: input.providerId, modelId: input.modelId, runId: input.runId,
         kind: UsageKind.llm_chat,
         inputTokens: input.inputTokens, outputTokens: input.outputTokens,
         latencyMs: input.latencyMs, estimatedCost,
