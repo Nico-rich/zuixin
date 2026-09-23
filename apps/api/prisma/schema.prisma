@@ -47,6 +47,39 @@ enum AttachmentKind {
   upload
   generated_image
   generated_video
+  generated_file
+}
+
+// ===== M2 枚举 =====
+enum MemoryScope {
+  user
+  project
+}
+enum MemoryCategory {
+  preference
+  profile
+  instruction
+  project_context
+  workflow
+  other
+}
+enum MemoryStatus {
+  candidate
+  active
+  rejected
+}
+enum ArtifactType {
+  creative_brief
+  image
+  video
+  report
+  analysis
+  other
+}
+enum ArtifactStatus {
+  draft
+  ready
+  failed
 }
 enum AttachmentStatus {
   uploading
@@ -107,6 +140,9 @@ model User {
   tasks         GenerationTask[]
   usages        UsageRecord[]
   sessions      Session[]
+  projects      Project[]
+  memories      Memory[]
+  artifacts     Artifact[]
 }
 
 model Session {
@@ -127,12 +163,17 @@ model Conversation {
   id        String   @id @default(uuid())
   userId    String
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId String?
+  project   Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
   title     String   @default("新对话")
   deletedAt DateTime?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   messages  Message[]
+  summaries ConversationSummary[]
+  artifacts Artifact[]
   @@index([userId, updatedAt])
+  @@index([projectId])
 }
 
 model Message {
@@ -309,4 +350,82 @@ model SystemSetting {
   key       String   @id
   value     Json
   updatedAt DateTime @updatedAt
+}
+
+// ===== M2: Project =====
+model Project {
+  id            String       @id @default(uuid())
+  userId        String
+  user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name          String
+  description   String?      @db.Text
+  metadata      Json?
+  deletedAt     DateTime?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  conversations Conversation[]
+  memories      Memory[]
+  artifacts     Artifact[]
+  @@index([userId, updatedAt])
+}
+
+// ===== M2: Memory（单表，scope 区分 user/project）=====
+// confidence：AI 判断"这是否值得保存"的置信度（提取时，0~1）
+// importance：该记忆对未来任务的重要程度（0~100，ContextAssembler 读取排序用）
+// 两者是不同概念，不合并。
+model Memory {
+  id              String         @id @default(uuid())
+  userId          String
+  user            User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  scope           MemoryScope
+  projectId       String?        // scope=project 时必填（服务层校验）
+  project         Project?       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  content         String         @db.Text
+  category        MemoryCategory
+  source          String?        // manual | extractor | assistant
+  sourceMessageId String?
+  importance      Int            @default(50) // 0~100
+  confidence      Float?                       // 提取置信度（candidate 阶段）
+  status          MemoryStatus   @default(candidate)
+  lastUsedAt      DateTime?                    // 最近一次被上下文组装使用（暂不参与排序，供统计/淘汰预留）
+  metadata        Json?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  @@index([userId, scope, status])
+  @@index([projectId, scope, status])
+}
+
+// ===== M2: ConversationSummary（仅结构，M6 自动摘要）=====
+model ConversationSummary {
+  id                        String       @id @default(uuid())
+  conversationId            String       @unique
+  conversation              Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  summary                   String       @db.Text
+  summarizedThroughMessageId String?
+  createdAt                 DateTime     @default(now())
+  updatedAt                 DateTime     @updatedAt
+}
+
+// ===== M2: Artifact（制品层，仅结构，不做 Workflow）=====
+model Artifact {
+  id             String         @id @default(uuid())
+  userId         String
+  user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId      String?
+  project        Project?       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  conversationId String?
+  conversation   Conversation?  @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  messageId      String?
+  taskId         String?
+  type           ArtifactType
+  title          String
+  summary        String?        @db.Text
+  content        Json?
+  storageKey     String?
+  status         ArtifactStatus @default(ready)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  @@index([userId, createdAt])
+  @@index([projectId])
+  @@index([conversationId])
 }

@@ -75,21 +75,53 @@ async function main() {
     },
   });
 
+  // dev/e2e 替身：意图路由（启发式分类仅存在于该替身 adapter；生产配置真实路由模型后自动接管）
+  const mockRouter = await prisma.provider.upsert({
+    where: { id: 'seed-llm-mock-router' },
+    update: {},
+    create: { id: 'seed-llm-mock-router', name: '本地路由替身', type: ProviderType.llm, adapter: 'mock-router', baseUrl: '', enabled: true, healthStatus: HealthStatus.healthy },
+  });
+  await prisma.model.upsert({
+    where: { id: 'seed-model-mock-router-1' },
+    update: {},
+    create: { id: 'seed-model-mock-router-1', providerId: mockRouter.id, name: 'Mock Router', apiModelId: 'mock-router-1', type: ModelType.llm, capabilities: { jsonObject: true }, enabled: true, priority: 1 },
+  });
+
+  // 生图 Provider：mock-image（dev/e2e 替身，1×1 PNG）+ 三家真实（禁用，待后台填 key）
+  const imageProviders = [
+    { id: 'seed-img-mock', name: '本地生图替身', adapter: 'mock-image', baseUrl: '', enabled: true, api: 'mock-image-1' },
+    { id: 'seed-img-openai', name: 'OpenAI Image', adapter: 'openai-image', baseUrl: 'https://api.openai.com/v1', enabled: false, api: 'gpt-image-1' },
+    { id: 'seed-img-zhipu', name: '智谱 CogView', adapter: 'zhipu-image', baseUrl: 'https://open.bigmodel.cn/api/paas/v4', enabled: false, api: 'cogview-4' },
+    { id: 'seed-img-dashscope', name: '阿里通义万相', adapter: 'dashscope-image', baseUrl: 'https://dashscope.aliyuncs.com/api/v1', enabled: false, api: 'wanx2.1-t2i-turbo' },
+  ];
+  for (const p of imageProviders) {
+    const provider = await prisma.provider.upsert({
+      where: { id: p.id },
+      update: {},
+      create: { id: p.id, name: p.name, type: ProviderType.image, adapter: p.adapter, baseUrl: p.baseUrl, enabled: p.enabled, healthStatus: p.enabled ? HealthStatus.healthy : HealthStatus.untested },
+    });
+    await prisma.model.upsert({
+      where: { id: `${p.id}-model` },
+      update: {},
+      create: { id: `${p.id}-model`, providerId: provider.id, name: p.name, apiModelId: p.api, type: ModelType.image, capabilities: { sizes: ['1024x1024'] }, unitPrice: 0, enabled: p.enabled, priority: p.enabled ? 1 : 100 },
+    });
+  }
+
+  const routingPolicy = {
+    confidenceThreshold: 0.7,
+    routerModelId: 'seed-model-mock-router-1',
+    defaults: { llm: 'seed-model-mock-echo', image: 'seed-img-mock-model', video: null, vision: null },
+  };
   await prisma.systemSetting.upsert({
     where: { key: 'routingPolicy' },
-    update: {},
-    create: {
-      key: 'routingPolicy',
-      value: {
-        confidenceThreshold: 0.7, routerModelId: null,
-        defaults: { llm: 'seed-model-mock-echo', image: null, video: null, vision: null },
-      },
-    },
+    update: { value: routingPolicy },
+    create: { key: 'routingPolicy', value: routingPolicy },
   });
+  const limits = { dailyImage: 50, dailyMemoryCandidates: 20, videoConcurrency: 1, monthlyTokenBudget: 0 };
   await prisma.systemSetting.upsert({
     where: { key: 'limits' },
-    update: {},
-    create: { key: 'limits', value: { dailyImage: 50, videoConcurrency: 1, monthlyTokenBudget: 0 } },
+    update: { value: limits },
+    create: { key: 'limits', value: limits },
   });
 
   console.log('seed done');
