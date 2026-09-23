@@ -8,19 +8,21 @@ import { GlobalExceptionFilter } from '../src/common/filters/global-exception.fi
 import { TransformInterceptor } from '../src/common/interceptors/transform.interceptor';
 import { csrfProtection } from '../src/modules/auth/csrf.middleware';
 import { MediaGenerationService } from '../src/modules/generations/media-generation.service';
+import { MediaCleanupService } from '../src/modules/generations/media-cleanup.service';
 import { PrismaService } from '../src/modules/prisma/prisma.service';
 
 const XRW = { 'X-Requested-With': 'XMLHttpRequest' };
 
 /**
- * 图片生成全链路 e2e（mock-router 分类 + mock-image 生图 + worker 消费）：
- * POST /chat "帮我做一张主图" → SSE task.created → 任务 completed → messages 带 generated_image 附件。
+ * 视频生成全链路 e2e（mock-router 分类 + mock-video 替身 + 统一 MediaGenerationService）：
+ * POST /chat "帮我做一个视频" → SSE task.created(kind=video) → 任务完成 → generated_video 附件。
+ * 另验证：孤儿清扫（人为造 processing 超时任务 → sweep → failed MEDIA_TASK_TIMEOUT）。
  */
-describe('Image Generation (e2e, mock 全链路)', () => {
+describe('Video Generation (e2e, mock 全链路)', () => {
   let app: INestApplication;
   let cookie: string;
   let taskId: string;
-  let convId = ''; // 从本套件 SSE 流捕获，避免并行 e2e 共享 DB 污染
+  let convId = '';
 
   beforeAll(async () => {
     process.env.MOCK_DELAY_MS = '0';
@@ -39,14 +41,14 @@ describe('Image Generation (e2e, mock 全链路)', () => {
 
   afterAll(async () => { await app.close(); });
 
-  it('聊天生图：SSE task.created → 任务进入队列', async () => {
+  it('聊天生视频：SSE task.created(kind=video) → 任务进入视频队列', async () => {
     const res = await request(app.getHttpServer()).post('/api/v1/chat').set(XRW).set('Cookie', cookie)
-      .send({ message: '帮我做一张科技感主图' })
+      .send({ message: '帮我做一个产品视频' })
       .buffer(true).parse((r, cb) => { let s = ''; r.on('data', (c) => (s += c)); r.on('end', () => cb(null, s)); })
       .expect(200);
     const text = res.body as string;
     expect(text).toContain('event: task.created');
-    expect(text).toContain('"kind":"image"');
+    expect(text).toContain('"kind":"video"');
     const match = text.match(/"taskId":"([0-9a-f-]+)"/);
     expect(match).toBeTruthy();
     taskId = match![1];
@@ -55,14 +57,8 @@ describe('Image Generation (e2e, mock 全链路)', () => {
     convId = convMatch![1];
   });
 
-  it('用户消息 intentType 落库为 image_generation', async () => {
-    const msgs = await request(app.getHttpServer()).get(`/api/v1/conversations/${convId}/messages`).set('Cookie', cookie).expect(200);
-    const userMsg = msgs.body.data.find((m: { role: string }) => m.role === 'user');
-    expect(userMsg.intentType).toBe('image_generation');
-  });
-
-  it('任务完成：generated_image 附件挂到消息 + 用量落库', async () => {
-    // 经 app 容器取服务执行任务（等价于 worker 消费队列；生产由独立 worker 进程执行）
+  it('任务完成：generated_video 附件（video/mp4）挂到消息 + video 用量落库', async () => {
+    // 经 app 容器执行任务（等价于 Worker 消费；mock-video 约 10s 轮询完成）
     const appAny = app as unknown as { get: <T>(type: unknown) => T };
     await appAny.get<MediaGenerationService>(MediaGenerationService).executeTask(taskId);
 
@@ -74,12 +70,41 @@ describe('Image Generation (e2e, mock 全链路)', () => {
     const assistant = msgs.body.data.find((m: { role: string }) => m.role === 'assistant') as { id: string };
     const attachments = await appAny.get<PrismaService>(PrismaService).attachment.findMany({ where: { messageId: assistant.id } });
     expect(attachments.length).toBe(1);
-    expect(attachments[0].kind).toBe('generated_image');
+    expect(attachments[0].kind).toBe('generated_video');
+    expect(attachments[0].mimeType).toBe('video/mp4');
+    const usage = await appAny.get<PrismaService>(PrismaService).usageRecord.findFirst({
+      where: { taskId, kind: 'video' }, orderBy: { createdAt: 'desc' },
+    });
+    expect(usage?.status).toBe('success');
+    expect(usage?.videoSeconds).toBeGreaterThanOrEqual(0);
+  }, 30000);
+
+  it('孤儿清扫：processing 超时任务 → failed(MEDIA_TASK_TIMEOUT)', async () => {
+    const appAny = app as unknown as { get: <T>(type: unknown) => T };
+    const prisma = appAny.get<PrismaService>(PrismaService);
+    const orphan = await prisma.generationTask.create({
+      data: {
+        userId: (await prisma.user.findFirst())!.id,
+        type: 'image', status: 'processing', input: { prompt: 'x' },
+        startedAt: new Date(Date.now() - 10 * 60_000), // 10 分钟前开始（超过 5min 护栏）
+      },
+    });
+    const swept = await appAny.get<MediaCleanupService>(MediaCleanupService).sweep();
+    expect(swept).toBeGreaterThanOrEqual(1);
+    const after = await prisma.generationTask.findUnique({ where: { id: orphan.id } });
+    expect(after?.status).toBe('failed');
+    expect(after?.errorCode).toBe('MEDIA_TASK_TIMEOUT');
+    // 幂等：再次清扫不影响（已经 failed）
+    await appAny.get<MediaCleanupService>(MediaCleanupService).sweep();
+    const again = await prisma.generationTask.findUnique({ where: { id: orphan.id } });
+    expect(again?.status).toBe('failed');
   });
 
-  it('越权访问任务 → 404；取消已完成任务 → 409', async () => {
-    await request(app.getHttpServer()).get(`/api/v1/tasks/${'0'.repeat(32)}`).set('Cookie', cookie).expect(404);
-    const res = await request(app.getHttpServer()).post(`/api/v1/tasks/${taskId}/cancel`).set(XRW).set('Cookie', cookie).expect(409);
-    expect(res.body.error.code).toBe('TASK_NOT_CANCELLABLE');
+  it('重复执行已完成任务 → 幂等跳过（单任务单结果）', async () => {
+    const appAny = app as unknown as { get: <T>(type: unknown) => T };
+    const prisma = appAny.get<PrismaService>(PrismaService);
+    await appAny.get<MediaGenerationService>(MediaGenerationService).executeTask(taskId);
+    const attachments = await prisma.attachment.findMany({ where: { taskId } });
+    expect(attachments.length).toBe(1); // 不产生第二个视频附件
   });
 });

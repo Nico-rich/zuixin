@@ -10,6 +10,7 @@ import { AttachmentsModule } from '../attachments/attachments.module';
 import { GenerationsModule } from '../generations/generations.module';
 import { MediaGenerationService } from '../generations/media-generation.service';
 import { ImageAgent } from '../../agents/image/image.agent';
+import { VideoAgent } from '../../agents/video/video.agent';
 
 @Module({
   imports: [ContextModule, MemoryModule, AttachmentsModule, GenerationsModule],
@@ -28,6 +29,13 @@ import { ImageAgent } from '../../agents/image/image.agent';
       provide: 'IMAGE_AGENT_FACTORY',
       useFactory: (generations: MediaGenerationService) => ({
         create: () => new ImageAgent({ generations }),
+      }),
+      inject: [MediaGenerationService],
+    },
+    {
+      provide: 'VIDEO_AGENT_FACTORY',
+      useFactory: (generations: MediaGenerationService) => ({
+        create: () => new VideoAgent({ generations }),
       }),
       inject: [MediaGenerationService],
     },

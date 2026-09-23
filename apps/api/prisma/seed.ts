@@ -107,17 +107,45 @@ async function main() {
     });
   }
 
+  // 生视频 Provider：mock-video（dev/e2e 替身）+ 阿里通义万相（禁用，待后台填 key）
+  const videoProviders = [
+    { id: 'seed-vid-mock', name: '本地视频替身', adapter: 'mock-video', baseUrl: '', enabled: true, api: 'mock-video-1' },
+    { id: 'seed-vid-dashscope', name: '阿里通义万相视频', adapter: 'dashscope-video', baseUrl: 'https://dashscope.aliyuncs.com/api/v1', enabled: false, api: 'wanx2.1-t2v-turbo' },
+  ];
+  for (const p of videoProviders) {
+    const provider = await prisma.provider.upsert({
+      where: { id: p.id },
+      update: {},
+      create: { id: p.id, name: p.name, type: ProviderType.video, adapter: p.adapter, baseUrl: p.baseUrl, enabled: p.enabled, healthStatus: p.enabled ? HealthStatus.healthy : HealthStatus.untested },
+    });
+    await prisma.model.upsert({
+      where: { id: `${p.id}-model` },
+      update: {},
+      create: {
+        id: `${p.id}-model`, providerId: provider.id, name: p.name, apiModelId: p.api, type: ModelType.video,
+        capabilities: {
+          supportedDurations: [5, 10],
+          supportedAspectRatios: ['16:9', '9:16', '1:1'],
+          supportedResolutions: ['720p', '1080p'],
+          supportsReferenceImage: true,
+          async: true,
+        },
+        unitPrice: 0, enabled: p.enabled, priority: p.enabled ? 1 : 100,
+      },
+    });
+  }
+
   const routingPolicy = {
     confidenceThreshold: 0.7,
     routerModelId: 'seed-model-mock-router-1',
-    defaults: { llm: 'seed-model-mock-echo', image: 'seed-img-mock-model', video: null, vision: null },
+    defaults: { llm: 'seed-model-mock-echo', image: 'seed-img-mock-model', video: 'seed-vid-mock-model', vision: null },
   };
   await prisma.systemSetting.upsert({
     where: { key: 'routingPolicy' },
     update: { value: routingPolicy },
     create: { key: 'routingPolicy', value: routingPolicy },
   });
-  const limits = { dailyImage: 50, dailyMemoryCandidates: 20, videoConcurrency: 1, monthlyTokenBudget: 0 };
+  const limits = { dailyImage: 50, dailyVideo: 10, dailyMemoryCandidates: 20, videoConcurrency: 1, monthlyTokenBudget: 0 };
   await prisma.systemSetting.upsert({
     where: { key: 'limits' },
     update: { value: limits },

@@ -10,7 +10,7 @@ import { UsageModule } from './modules/usage/usage.module';
 import { QueueModule } from './core/queue/queue.module';
 import { ImageWorkerModule } from './worker/image/image-worker.module';
 import { MediaCleanupWorkerModule } from './worker/media-cleanup/media-cleanup-worker.module';
-// M3 在此注册 video 队列处理器
+import { VideoWorkerModule } from './worker/video/video-worker.module';
 
 @Module({
   imports: [
@@ -18,6 +18,7 @@ import { MediaCleanupWorkerModule } from './worker/media-cleanup/media-cleanup-w
     PrismaModule, CryptoModule, ProvidersModule, CircuitBreakerModule, RouterModule,
     StorageModule, UsageModule, QueueModule,
     ImageWorkerModule,
+    VideoWorkerModule,
     MediaCleanupWorkerModule,
   ],
 })

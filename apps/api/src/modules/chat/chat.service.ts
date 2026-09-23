@@ -43,6 +43,7 @@ export class ChatService {
     @Inject(UsageService) private readonly usage: UsageService,
     @Inject('CHAT_AGENT_FACTORY') private readonly agentFactory: AgentFactory,
     @Inject('IMAGE_AGENT_FACTORY') private readonly imageAgentFactory: { create: () => Agent },
+    @Inject('VIDEO_AGENT_FACTORY') private readonly videoAgentFactory: { create: () => Agent },
   ) {}
 
   /** 第一步（HTTP 阶段，出错走统一 JSON envelope）：会话/锁/消息/路由/模型 */
@@ -101,10 +102,12 @@ export class ChatService {
 
     try {
       writer.event('message_start', { type: 'message_start', messageId: ctx.assistantMessageId, conversationId: ctx.conversationId, role: 'assistant', createdAt: new Date().toISOString() });
-      // 按意图选择 Agent（M2：chat / image；M3+ 扩展 video/analysis，M4 起走 DB 配置的 Agent 注册表）
+      // 按意图选择 Agent（M2：chat / image；M3：+video；M4 起走 DB 配置的 Agent 注册表）
       const agent = ctx.intent.type === 'image_generation'
         ? this.imageAgentFactory.create()
-        : this.agentFactory.create({ resolved: ctx.resolved! });
+        : ctx.intent.type === 'video_generation'
+          ? this.videoAgentFactory.create()
+          : this.agentFactory.create({ resolved: ctx.resolved! });
       const events = agent.execute({
         userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.assistantMessageId,
         userMessage: ctx.userMessage, attachments: ctx.attachments, history: ctx.history, intent: ctx.intent,

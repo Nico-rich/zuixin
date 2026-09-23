@@ -34,8 +34,9 @@ function makeChat(agentEvents?: () => AsyncIterable<AgentEvent>) {
   });
   const agentFactory = { create: vi.fn(() => ({ id: 'chat', execute: () => events() })) };
   const imageAgentFactory = { create: vi.fn(() => ({ id: 'image', execute: () => events() })) };
-  const svc = new ChatService(prisma as never, kv as never, router as never, context as never, attachmentsService as never, memoryExtractor as never, modelResolver as never, usage as never, agentFactory as never, imageAgentFactory as never);
-  return { svc, prisma, kv, usage, context, memoryExtractor, attachmentsService, agentFactory, imageAgentFactory };
+  const videoAgentFactory = { create: vi.fn(() => ({ id: 'video', execute: () => events() })) };
+  const svc = new ChatService(prisma as never, kv as never, router as never, context as never, attachmentsService as never, memoryExtractor as never, modelResolver as never, usage as never, agentFactory as never, imageAgentFactory as never, videoAgentFactory as never);
+  return { svc, prisma, kv, usage, context, memoryExtractor, attachmentsService, agentFactory, imageAgentFactory, videoAgentFactory };
 }
 
 /** 收集 SSE 帧的 fake sink（缓冲式按 \n\n 分帧解析） */
