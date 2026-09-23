@@ -29,14 +29,12 @@ export class ProjectsService {
 
   async update(userId: string, id: string, dto: UpdateProjectDto) {
     await this.requireOwned(userId, id);
-    return this.prisma.project.update({
-      where: { id },
-      data: {
-        ...(dto.name ? { name: dto.name } : {}),
-        ...(dto.description !== undefined ? { description: dto.description } : {}),
-        ...(dto.metadata !== undefined ? { metadata: dto.metadata as Prisma.InputJsonValue | null } : {}),
-      },
-    });
+    const data: Prisma.ProjectUpdateInput = {};
+    if (dto.name) data.name = dto.name;
+    if (dto.description !== undefined) data.description = dto.description;
+    if (dto.metadata === null) data.metadata = Prisma.JsonNull;
+    else if (dto.metadata !== undefined) data.metadata = dto.metadata as Prisma.InputJsonValue;
+    return this.prisma.project.update({ where: { id }, data });
   }
 
   async softDelete(userId: string, id: string) {
