@@ -10,8 +10,9 @@ function makeRegistry(tools: Tool[] = []) {
   return registry;
 }
 
-function makeLoop(opts: { tools?: Tool[]; streamFn?: (params: unknown) => AsyncIterable<unknown>; agent?: Partial<Parameters<AgentLoopService['execute']>[0]['agent']> } = {}) {
+function makeLoop(opts: { tools?: Tool[]; streamFn?: (params: { tools?: unknown }) => AsyncIterable<unknown>; agent?: Partial<Parameters<AgentLoopService['execute']>[0]['agent']>; capabilities?: Record<string, unknown> } = {}) {
   const prisma = {
+    systemSetting: { findUnique: vi.fn().mockResolvedValue({ key: 'limits', value: { agentRunTimeoutMs: 120000 } }) },
     agentRun: {
       create: vi.fn().mockImplementation(({ data }) => Promise.resolve({ id: 'run-1', ...data })),
       update: vi.fn().mockResolvedValue({}),
@@ -30,8 +31,9 @@ function makeLoop(opts: { tools?: Tool[]; streamFn?: (params: unknown) => AsyncI
   const adapter = {
     stream: opts.streamFn ?? (async function* () { yield { type: 'text', text: '你好' }; }),
   };
-  const modelResolver = { resolveDefaultLLM: vi.fn().mockResolvedValue({ adapter, apiModelId: 'm', providerId: 'p1', modelId: 'm1', providerName: 'Mock', timeoutMs: 1000 }) };
-  const llmManager = { resolve: vi.fn().mockResolvedValue({ adapter, apiModelId: 'm', providerId: 'p1', modelId: 'm1', providerName: 'Mock', timeoutMs: 1000 }) };
+  const capabilities = opts.capabilities ?? {};
+  const modelResolver = { resolveDefaultLLM: vi.fn().mockResolvedValue({ adapter, apiModelId: 'm', providerId: 'p1', modelId: 'm1', providerName: 'Mock', timeoutMs: 1000, capabilities }) };
+  const llmManager = { resolve: vi.fn().mockResolvedValue({ adapter, apiModelId: 'm', providerId: 'p1', modelId: 'm1', providerName: 'Mock', timeoutMs: 1000, capabilities }) };
   const usage = { recordChatUsage: vi.fn().mockResolvedValue(undefined) };
   const svc = new AgentLoopService(prisma as never, registry as never, modelResolver as never, llmManager as never, usage as never);
   const input = {
@@ -40,6 +42,7 @@ function makeLoop(opts: { tools?: Tool[]; streamFn?: (params: unknown) => AsyncI
     agent: {
       id: 'general-assistant', systemPrompt: '你是助手', modelId: null,
       tools: (opts.tools ?? []).map((t) => t.name), maxSteps: opts.agent?.maxSteps,
+      requiresTools: opts.agent?.requiresTools,
     },
     signal: new AbortController().signal,
   };
@@ -129,16 +132,80 @@ describe('AgentLoopService', () => {
     }));
   });
 
-  it('maxSteps：一直工具调用 → 超步终态 failed（AGENT_MAX_STEPS 语义由护栏触发）', async () => {
-    const { svc } = makeLoop({
+  it('maxSteps 硬限制：耗尽且最后一轮仍为工具调用 → failed(AGENT_MAX_STEPS)，Tool 恰好执行 maxSteps 次', async () => {
+    let turn = 0;
+    const { svc, prisma } = makeLoop({
       tools: [imageTool],
       agent: { maxSteps: 2 },
       streamFn: async function* () {
-        yield { type: 'tool_calls', toolCalls: [{ id: 'c1', name: 'image.generate', arguments: '{"prompt":"x"}' }] };
+        turn++;
+        // 各轮参数不同——避免触发循环检测（此处验证的是步数耗尽语义）
+        yield { type: 'tool_calls', toolCalls: [{ id: `c${turn}`, name: 'image.generate', arguments: JSON.stringify({ prompt: `x${turn}` }) }] };
       },
     });
     const events = await collect(svc.execute(makeLoop({ tools: [imageTool], agent: { maxSteps: 2 } }).input));
-    expect(events.at(-1)!.type).toBe('run.completed');
+    expect(imageTool.execute).toHaveBeenCalledTimes(2); // 硬限制：不会执行第 3 次
+    expect(events.at(-1)).toMatchObject({ type: 'run.completed', status: 'failed' });
+    expect(prisma.agentRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: 'failed', errorCode: 'AGENT_MAX_STEPS' }),
+    }));
+  });
+
+  it('exactly maxSteps：最后一轮 LLM final → completed（不误判）', async () => {
+    let turn = 0;
+    const { svc, prisma } = makeLoop({
+      tools: [imageTool],
+      agent: { maxSteps: 2 },
+      streamFn: async function* () {
+        turn++;
+        if (turn === 1) yield { type: 'tool_calls', toolCalls: [{ id: 'c1', name: 'image.generate', arguments: '{"prompt":"x"}' }] };
+        else yield { type: 'text', text: '完成' };
+      },
+    });
+    const events = await collect(svc.execute(makeLoop({ tools: [imageTool], agent: { maxSteps: 2 } }).input));
+    expect(events.at(-1)).toMatchObject({ type: 'run.completed', status: 'completed' });
+    expect(prisma.agentRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: 'completed', errorCode: undefined }),
+    }));
+  });
+
+  it('capability：未声明 functionCalling → 默认视为支持，携带 tools', async () => {
+    let capturedTools: unknown = 'unset';
+    const { svc } = makeLoop({
+      tools: [imageTool],
+      streamFn: async function* (p) { capturedTools = p.tools; yield { type: 'text', text: 'ok' }; },
+    });
+    await collect(svc.execute(makeLoop({ tools: [imageTool] }).input));
+    expect(capturedTools).toBeTruthy(); // 携带工具定义
+  });
+
+  it('capability：functionCalling=false + 普通 Agent → 不发送 tools，正常 final 完成', async () => {
+    let capturedTools: unknown = 'unset';
+    const { svc, prisma } = makeLoop({
+      tools: [imageTool],
+      capabilities: { functionCalling: false },
+      streamFn: async function* (p) { capturedTools = p.tools; yield { type: 'text', text: '普通回答' }; },
+    });
+    const events = await collect(svc.execute(makeLoop({ tools: [imageTool] }).input));
+    expect(capturedTools).toBeUndefined(); // 不发送 tools（情况 A：普通聊天 fallback）
+    expect(events.at(-1)).toMatchObject({ type: 'run.completed', status: 'completed' });
+    expect(prisma.agentRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: 'completed' }),
+    }));
+  });
+
+  it('capability：functionCalling=false + requiresTools Agent → NO_TOOL_CAPABILITY 明确失败（不伪装完成）', async () => {
+    const { svc, prisma } = makeLoop({
+      tools: [imageTool],
+      capabilities: { functionCalling: false },
+      agent: { requiresTools: true },
+      streamFn: async function* () { yield { type: 'text', text: '不应到达' }; },
+    });
+    const events = await collect(svc.execute(makeLoop({ tools: [imageTool], agent: { requiresTools: true } }).input));
+    expect(events.at(-1)).toMatchObject({ type: 'run.completed', status: 'failed' });
+    expect(prisma.agentRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: 'failed', errorCode: 'NO_TOOL_CAPABILITY' }),
+    }));
   });
 
   it('用户取消：signal abort → run cancelled', async () => {

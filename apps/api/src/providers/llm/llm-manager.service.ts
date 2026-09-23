@@ -10,6 +10,8 @@ export interface ResolvedLLM {
   providerId: string; providerName: string;
   modelId: string; apiModelId: string;
   adapter: LLMProvider; timeoutMs: number;
+  /** models.capabilities 声明（如 functionCalling: false 表示不支持工具调用） */
+  capabilities: Record<string, unknown>;
 }
 
 @Injectable()
@@ -51,6 +53,7 @@ export class LLMManagerService implements OnModuleInit {
       providerId: model.providerId, providerName: model.provider.name,
       modelId: model.id, apiModelId: model.apiModelId,
       adapter, timeoutMs: model.provider.timeoutMs,
+      capabilities: (model.capabilities ?? {}) as Record<string, unknown>,
     };
   }
 

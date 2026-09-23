@@ -8,6 +8,7 @@ import { GlobalExceptionFilter } from '../src/common/filters/global-exception.fi
 import { TransformInterceptor } from '../src/common/interceptors/transform.interceptor';
 import { csrfProtection } from '../src/modules/auth/csrf.middleware';
 import { PrismaService } from '../src/modules/prisma/prisma.service';
+import { MediaCleanupService } from '../src/modules/generations/media-cleanup.service';
 
 const XRW = { 'X-Requested-With': 'XMLHttpRequest' };
 
@@ -102,5 +103,26 @@ describe('Agent Loop (e2e, mock 全链路)', () => {
     const detail = await request(app.getHttpServer()).get(`/api/v1/agent-runs/${runId}`).set('Cookie', cookie).expect(200);
     expect(detail.body.data.steps.length).toBeGreaterThanOrEqual(2);
     await request(app.getHttpServer()).get(`/api/v1/agent-runs/${'0'.repeat(32)}`).set('Cookie', cookie).expect(404);
+  });
+
+  it('MUST-1 孤儿清扫：stale running run → timeout；已终态不受影响；重复清扫幂等', async () => {
+    const appAny = app as unknown as { get: <T>(type: unknown) => T };
+    const prisma = appAny.get<PrismaService>(PrismaService);
+    const user = (await prisma.user.findFirst())!;
+    const agentRow = await prisma.agent.findFirst();
+    const stale = await prisma.agentRun.create({
+      data: {
+        userId: user.id, agentId: agentRow!.id, status: 'running',
+        startedAt: new Date(Date.now() - 10 * 60_000),
+      },
+    });
+    const terminal = await prisma.agentRun.create({
+      data: { userId: user.id, agentId: agentRow!.id, status: 'completed', startedAt: new Date(Date.now() - 10 * 60_000) },
+    });
+    const cleanup = appAny.get<MediaCleanupService>(MediaCleanupService);
+    expect(await cleanup.sweepAgentRuns()).toBeGreaterThanOrEqual(1);
+    expect((await prisma.agentRun.findUnique({ where: { id: stale.id } }))?.status).toBe('timeout');
+    expect((await prisma.agentRun.findUnique({ where: { id: terminal.id } }))?.status).toBe('completed'); // 终态不复活
+    expect(await cleanup.sweepAgentRuns()).toBe(0); // 幂等：第二次无 stale
   });
 });

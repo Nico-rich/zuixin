@@ -16,6 +16,8 @@ export const ChatStreamEventNames = {
   task_created: 'task.created',
   task_progress: 'task.progress',
   task_completed: 'task.completed',
+  // 预留命名（M3 起任务失败经 task.progress + 轮询呈现；wire schema 待统一时补齐）
+  task_failed: 'task.failed',
   // ===== M4~M5 预留（Agent 注册中心 / 多 Agent）=====
   agent_start: 'agent.start',
   agent_end: 'agent.end',

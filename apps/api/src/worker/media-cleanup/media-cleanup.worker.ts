@@ -13,8 +13,10 @@ export class MediaCleanupProcessor extends WorkerHost {
     super();
   }
 
-  async process(_job: Job): Promise<number> {
-    return this.cleanup.sweep();
+  async process(_job: Job): Promise<{ tasks: number; runs: number }> {
+    const tasks = await this.cleanup.sweep();
+    const runs = await this.cleanup.sweepAgentRuns();
+    return { tasks, runs };
   }
 }
 

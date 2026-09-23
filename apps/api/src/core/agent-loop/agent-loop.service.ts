@@ -18,6 +18,8 @@ export interface AgentLoopAgentConfig {
   systemPrompt?: string;
   modelId?: string | null;
   tools: string[];                 // 允许的工具清单（服务端权限边界）
+  /** 该 Agent 的任务是否必须依赖工具（true 时模型不支持工具调用 → NO_TOOL_CAPABILITY 终态，不伪装完成） */
+  requiresTools?: boolean;
   temperature?: number;
   maxTokens?: number;
   maxSteps?: number;               // 默认 8
@@ -38,6 +40,8 @@ export interface AgentLoopInput {
 const DEFAULT_MAX_STEPS = 8;
 const DEFAULT_DEADLINE_MS = 120_000;
 const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
+/** final 步骤的 stepIndex（run 内唯一，避免与真实循环步冲突） */
+const FINAL_STEP_INDEX = 999;
 
 /**
  * 通用 Agent Loop（决策者）：
@@ -61,7 +65,10 @@ export class AgentLoopService {
 
   async *execute(input: AgentLoopInput): AsyncIterable<AgentEvent> {
     const maxSteps = input.agent.maxSteps ?? DEFAULT_MAX_STEPS;
-    const deadline = Date.now() + (input.deadlineMs ?? DEFAULT_DEADLINE_MS);
+    // 超时配置来自 system_settings.limits.agentRunTimeoutMs（与清扫阈值同源，不写死）
+    const limits = await this.prisma.systemSetting.findUnique({ where: { key: 'limits' } });
+    const configuredTimeout = (limits?.value as { agentRunTimeoutMs?: number } | null)?.agentRunTimeoutMs;
+    const deadline = Date.now() + (input.deadlineMs ?? configuredTimeout ?? DEFAULT_DEADLINE_MS);
     const run = await this.prisma.agentRun.create({
       data: {
         userId: input.userId, agentId: input.agent.id,
@@ -82,6 +89,7 @@ export class AgentLoopService {
     let finalStatus: 'completed' | 'failed' | 'cancelled' | 'timeout' = 'completed';
     let errorCode: string | undefined;
     let lastToolSignature: string | null = null;
+    let lastTurnHadToolCalls = false;
 
     try {
       for (let step = 0; step < maxSteps; step++) {
@@ -89,16 +97,27 @@ export class AgentLoopService {
         if (Date.now() >= deadline) { finalStatus = 'timeout'; errorCode = ErrorCode.AGENT_RUN_TIMEOUT; break; }
 
         const resolved = await this.resolveLLM(input.agent);
+        // Tool Calling 能力降级（MUST-3）：capabilities.functionCalling === false 时不发送 tools；
+        // requiresTools 的 Agent 直接 NO_TOOL_CAPABILITY 终态——绝不伪装完成。
+        const supportsTools = resolved.capabilities?.['functionCalling'] !== false;
+        if (toolDefs.length && !supportsTools && input.agent.requiresTools) {
+          finalStatus = 'failed';
+          errorCode = ErrorCode.NO_TOOL_CAPABILITY;
+          yield { type: 'status', stage: 'agent', message: '当前模型不支持工具调用，无法完成该任务' };
+          break;
+        }
+        const toolsToSend = toolDefs.length && supportsTools ? toolDefs : undefined;
         const turnStarted = Date.now();
         const stream = resolved.adapter.stream({
           model: resolved.apiModelId, messages, temperature: input.agent.temperature ?? 0.7,
-          maxTokens: input.agent.maxTokens, tools: toolDefs.length ? toolDefs : undefined, signal: input.signal,
+          maxTokens: input.agent.maxTokens, tools: toolsToSend, signal: input.signal,
         });
         let toolCalls: Array<{ id: string; name: string; arguments: string }> | undefined;
         for await (const chunk of stream) {
           if (chunk.type === 'text') yield { type: 'text.delta', text: chunk.text };
           else if (chunk.type === 'tool_calls') toolCalls = chunk.toolCalls;
         }
+        lastTurnHadToolCalls = !!toolCalls?.length;
         // 每回合 LLM 用量落库（runId 关联 → 未来按 Run 聚合四类成本）
         await this.usage.recordChatUsage({
           userId: input.userId, conversationId: input.conversationId ?? '', messageId: input.messageId,
@@ -141,9 +160,15 @@ export class AgentLoopService {
         await this.prisma.agentRun.update({ where: { id: run.id }, data: { currentStep: step + 1 } });
       }
       if (finalStatus === 'completed' && input.signal.aborted) finalStatus = 'cancelled';
+      // MUST-2：maxSteps 耗尽且最后一轮仍是工具调用 → 硬失败，不得伪装 completed
+      if (finalStatus === 'completed' && lastTurnHadToolCalls) {
+        finalStatus = 'failed';
+        errorCode = ErrorCode.AGENT_MAX_STEPS;
+        yield { type: 'status', stage: 'agent', message: '任务过于复杂，已达到最大步骤数' };
+      }
 
       await this.prisma.agentRunStep.create({
-        data: { runId: run.id, stepIndex: 999, type: 'final', status: finalStatus === 'completed' ? 'completed' : 'failed', output: { finalStatus } },
+        data: { runId: run.id, stepIndex: FINAL_STEP_INDEX, type: 'final', status: finalStatus === 'completed' ? 'completed' : 'failed', output: { finalStatus } },
       });
     } catch (err) {
       const appErr = err instanceof AppError ? err : mapProviderError(err as ProviderLikeError);

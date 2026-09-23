@@ -71,21 +71,33 @@ export class MediaGenerationService {
     });
     if (used >= dailyLimit) throw new AppError(ErrorCode.QUOTA_EXCEEDED, `今日${input.type === 'image' ? '生图' : '生视频'}次数已达上限`);
 
-    const task = await this.prisma.generationTask.create({
-      data: {
-        userId: input.userId,
-        conversationId: input.conversationId,
-        messageId: input.messageId,
-        type: input.type,
-        status: 'pending',
-        statusMessage: '排队中',
-        input: input.params as never,
-        idempotencyKey: input.idempotencyKey,
-      },
-    });
-    const queue = input.type === 'image' ? this.imageQueue : this.videoQueue;
-    await queue.add('generate', { taskId: task.id }, { attempts: 1, removeOnComplete: true, removeOnFail: true });
-    return task;
+    try {
+      const task = await this.prisma.generationTask.create({
+        data: {
+          userId: input.userId,
+          conversationId: input.conversationId,
+          messageId: input.messageId,
+          type: input.type,
+          status: 'pending',
+          statusMessage: '排队中',
+          input: input.params as never,
+          idempotencyKey: input.idempotencyKey,
+        },
+      });
+      const queue = input.type === 'image' ? this.imageQueue : this.videoQueue;
+      await queue.add('generate', { taskId: task.id }, { attempts: 1, removeOnComplete: true, removeOnFail: true });
+      return task;
+    } catch (err) {
+      // 幂等键冲突（UNIQUE）：同一 ToolCall 重试 → 返回已有任务，绝不产生第二个任务
+      if (input.idempotencyKey && (err as { code?: string }).code === 'P2002') {
+        const existing = await this.prisma.generationTask.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
+        if (existing) {
+          this.logger.warn({ taskId: existing.id }, '幂等键命中，返回已有任务');
+          return existing;
+        }
+      }
+      throw err;
+    }
   }
 
   /** 入口 2（Worker 侧）：统一任务执行——终态必落库、单任务单结果 */

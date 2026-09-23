@@ -66,13 +66,14 @@ export class AgentRegistryService implements OnModuleInit {
     const kind = row.kind === 'custom' ? 'general-assistant' : row.slug;
     switch (kind) {
       case 'general-assistant': {
-        const cfg = (row.config ?? {}) as { maxSteps?: number };
+        const cfg = (row.config ?? {}) as { maxSteps?: number; requiresTools?: boolean };
         return new GeneralAssistantAgent({
           loop: this.loop, context: this.context,
           config: {
             id: row.id, systemPrompt: row.systemPrompt, modelId: row.modelId,
             tools: (row.tools as string[]) ?? [], temperature: row.temperature,
             maxTokens: row.maxTokens ?? undefined, maxSteps: cfg.maxSteps,
+            requiresTools: cfg.requiresTools,
           },
         });
       }

@@ -35,6 +35,10 @@ describe('Image Generation (e2e, mock 全链路)', () => {
     const login = await request(app.getHttpServer()).post('/api/v1/auth/login').set(XRW)
       .send({ email: process.env.SEED_ADMIN_EMAIL ?? 'admin@example.com', password: process.env.SEED_ADMIN_PASSWORD ?? 'admin123456' });
     cookie = (login.headers['set-cookie'] as unknown as string[]).map((c) => c.split(';')[0]).join('; ');
+    // 幂等：重置本套件用户当日 image 用量，避免反复运行触发每日限额
+    const userId = login.body.data.user.id;
+    const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+    await moduleRef.get(PrismaService).usageRecord.deleteMany({ where: { userId, kind: 'image', createdAt: { gte: todayStart } } });
   });
 
   afterAll(async () => { await app.close(); });
