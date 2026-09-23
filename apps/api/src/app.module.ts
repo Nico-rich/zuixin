@@ -4,6 +4,8 @@ import { LoggerModule } from 'nestjs-pino';
 import { randomUUID } from 'node:crypto';
 import { PrismaModule } from './modules/prisma/prisma.module';
 import { HealthModule } from './modules/health/health.module';
+import { CryptoModule } from './core/crypto/crypto.module';
+import { ProvidersModule } from './providers/providers.module';
 import { GlobalExceptionFilter } from './common/filters/global-exception.filter';
 
 @Module({
@@ -23,6 +25,8 @@ import { GlobalExceptionFilter } from './common/filters/global-exception.filter'
       },
     }),
     PrismaModule,
+    CryptoModule,
+    ProvidersModule,
     HealthModule,
   ],
   providers: [GlobalExceptionFilter],
