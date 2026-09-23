@@ -18,5 +18,9 @@ export class RedisKVService implements KVStore, OnModuleDestroy {
     if (ttlSec) await this.client.set(key, value, 'EX', ttlSec);
     else await this.client.set(key, value);
   }
+  async setNX(key: string, value: string, ttlSec: number): Promise<boolean> {
+    return (await this.client.set(key, value, 'EX', ttlSec, 'NX')) === 'OK';
+  }
+  async del(key: string): Promise<void> { await this.client.del(key); }
   onModuleDestroy() { this.client.disconnect(); }
 }

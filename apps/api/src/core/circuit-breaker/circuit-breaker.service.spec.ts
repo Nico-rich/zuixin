@@ -11,6 +11,12 @@ class FakeKV implements KVStore {
     if (value === '') this.store.delete(key);
     else this.store.set(key, { v: value, expireAt: ttlSec ? this.now + ttlSec * 1000 : Number.POSITIVE_INFINITY });
   }
+  async setNX(key: string, value: string, ttlSec: number) {
+    if (this.store.get(key)) return false;
+    await this.set(key, value, ttlSec);
+    return true;
+  }
+  async del(key: string) { this.store.delete(key); }
 }
 
 describe('CircuitBreakerService', () => {

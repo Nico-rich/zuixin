@@ -4,10 +4,23 @@ import { z } from 'zod';
 export const StatusEventSchema = z.object({ type: z.literal('status'), stage: z.string(), message: z.string() });
 export const TextDeltaEventSchema = z.object({ type: z.literal('text.delta'), text: z.string() });
 export const TaskCreatedEventSchema = z.object({ type: z.literal('task.created'), taskId: z.string(), kind: z.enum(['image', 'video']) });
-export const DoneEventSchema = z.object({ type: z.literal('done'), messageId: z.string() });
+export const DoneEventSchema = z.object({ type: z.literal('done'), messageId: z.string(), usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional() });
 export const ErrorEventSchema = z.object({ type: z.literal('error'), code: z.string(), message: z.string(), requestId: z.string().optional() });
 
 export const AgentEventSchema = z.discriminatedUnion('type', [
   StatusEventSchema, TextDeltaEventSchema, TaskCreatedEventSchema, DoneEventSchema, ErrorEventSchema,
 ]);
 export type AgentEvent = z.infer<typeof AgentEventSchema>;
+
+// ===== Chat SSE 线上协议（前端消费；M2+ 追加 task.completed.artifact / tool.* 事件）=====
+export const ChatStreamEventSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('message_start'), messageId: z.string(), conversationId: z.string(), role: z.enum(['assistant']), createdAt: z.string() }),
+  z.object({ type: z.literal('message_delta'), delta: z.string() }),
+  z.object({ type: z.literal('message_end'), messageId: z.string(), status: z.enum(['completed', 'stopped', 'failed']) }),
+  z.object({ type: z.literal('status'), stage: z.string(), message: z.string() }),
+  z.object({ type: z.literal('task.created'), taskId: z.string(), kind: z.enum(['image', 'video']) }),
+  z.object({ type: z.literal('task.progress'), taskId: z.string(), progress: z.number(), message: z.string().optional() }),
+  z.object({ type: z.literal('task.completed'), taskId: z.string(), artifact: z.record(z.string(), z.unknown()).optional() }),
+  z.object({ type: z.literal('error'), code: z.string(), message: z.string(), requestId: z.string().optional() }),
+]);
+export type ChatStreamEvent = z.infer<typeof ChatStreamEventSchema>;
