@@ -1,9 +1,9 @@
 import { AgentEvent } from '@ai-agent/shared';
 import { Agent, AgentContext } from '../agent.types';
-import { ImageGenerationService } from '../../modules/generations/image-generation.service';
+import { MediaGenerationService } from '../../modules/generations/media-generation.service';
 
 export interface ImageAgentDeps {
-  generations: ImageGenerationService;
+  generations: MediaGenerationService;
 }
 
 /**
@@ -23,10 +23,12 @@ export class ImageAgent implements Agent {
         userId: ctx.userId,
         conversationId: ctx.conversationId,
         messageId: ctx.messageId,
-        prompt: ctx.intent.parameters.prompt,
-        aspectRatio: ctx.intent.parameters.aspectRatio,
-        count: 1,
-        referenceImages: ctx.attachments.filter((a) => a.type === 'image').map((a) => a.url),
+        params: {
+          prompt: ctx.intent.parameters.prompt,
+          aspectRatio: ctx.intent.parameters.aspectRatio,
+          count: 1,
+          referenceImages: ctx.attachments.filter((a) => a.type === 'image').map((a) => a.url),
+        },
       });
       yield { type: 'task.created', taskId: task.id, kind: 'image' };
       yield { type: 'done', messageId: ctx.messageId };

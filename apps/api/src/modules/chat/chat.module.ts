@@ -8,7 +8,7 @@ import { ContextModule } from '../../core/context/context.module';
 import { MemoryModule } from '../../core/memory/memory.module';
 import { AttachmentsModule } from '../attachments/attachments.module';
 import { GenerationsModule } from '../generations/generations.module';
-import { ImageGenerationService } from '../generations/image-generation.service';
+import { MediaGenerationService } from '../generations/media-generation.service';
 import { ImageAgent } from '../../agents/image/image.agent';
 
 @Module({
@@ -26,10 +26,10 @@ import { ImageAgent } from '../../agents/image/image.agent';
     },
     {
       provide: 'IMAGE_AGENT_FACTORY',
-      useFactory: (generations: ImageGenerationService) => ({
+      useFactory: (generations: MediaGenerationService) => ({
         create: () => new ImageAgent({ generations }),
       }),
-      inject: [ImageGenerationService],
+      inject: [MediaGenerationService],
     },
   ],
 })

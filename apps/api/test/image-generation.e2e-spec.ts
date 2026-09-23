@@ -7,7 +7,7 @@ import { AppModule } from '../src/app.module';
 import { GlobalExceptionFilter } from '../src/common/filters/global-exception.filter';
 import { TransformInterceptor } from '../src/common/interceptors/transform.interceptor';
 import { csrfProtection } from '../src/modules/auth/csrf.middleware';
-import { ImageGenerationService } from '../src/modules/generations/image-generation.service';
+import { MediaGenerationService } from '../src/modules/generations/media-generation.service';
 import { PrismaService } from '../src/modules/prisma/prisma.service';
 
 const XRW = { 'X-Requested-With': 'XMLHttpRequest' };
@@ -62,7 +62,7 @@ describe('Image Generation (e2e, mock 全链路)', () => {
   it('任务完成：generated_image 附件挂到消息 + 用量落库', async () => {
     // 经 app 容器取服务执行任务（等价于 worker 消费队列；生产由独立 worker 进程执行）
     const appAny = app as unknown as { get: <T>(type: unknown) => T };
-    await appAny.get<ImageGenerationService>(ImageGenerationService).executeTask(taskId);
+    await appAny.get<MediaGenerationService>(MediaGenerationService).executeTask(taskId);
 
     const polled = await request(app.getHttpServer()).get(`/api/v1/tasks/${taskId}`).set('Cookie', cookie).expect(200);
     expect(polled.body.data.status).toBe('completed');
