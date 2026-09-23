@@ -1,0 +1,116 @@
+import { Inject, Injectable } from '@nestjs/common';
+import { MemoryCategory, MemoryScope, MemoryStatus, Prisma } from '@prisma/client';
+import { PrismaService } from '../../modules/prisma/prisma.service';
+import { AppError, ErrorCode } from '../../common/errors/app-error';
+
+export interface MemoryListFilter {
+  scope?: MemoryScope;
+  projectId?: string;
+  status?: MemoryStatus;
+  q?: string;
+}
+
+export interface CreateMemoryInput {
+  scope: MemoryScope;
+  projectId?: string | null;
+  content: string;
+  category: MemoryCategory;
+  importance?: number;
+  confidence?: number;
+  status?: MemoryStatus;
+  source?: string;
+  sourceMessageId?: string;
+}
+
+export interface UpdateMemoryInput {
+  content?: string;
+  category?: MemoryCategory;
+  importance?: number;
+  confidence?: number | null;
+  status?: MemoryStatus;
+}
+
+/**
+ * 记忆服务（core 层，ContextAssembler 与 HTTP 模块共用）。
+ *
+ * 两个概念明确分离，不合并：
+ * - confidence：AI 判断"这是否值得保存"的置信度（0~1，提取阶段，仅 candidate 有意义）
+ * - importance：该记忆对未来任务的重要程度（0~100，ContextAssembler 读取排序用）
+ *
+ * 状态机：candidate → active（人工确认）| rejected；只有 active 参与上下文组装。
+ */
+@Injectable()
+export class MemoryService {
+  constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
+
+  /** 列表 + PG 普通文本搜索（ILIKE，M2 不做 embedding） */
+  list(userId: string, filter: MemoryListFilter = {}) {
+    const where: Prisma.MemoryWhereInput = { userId };
+    if (filter.scope) where.scope = filter.scope;
+    if (filter.projectId) where.projectId = filter.projectId; // 与 userId 双条件天然防越权
+    if (filter.status) where.status = filter.status;
+    if (filter.q) where.content = { contains: filter.q, mode: 'insensitive' };
+    return this.prisma.memory.findMany({
+      where,
+      orderBy: { importance: 'desc' },
+      take: 100,
+    });
+  }
+
+  async create(userId: string, input: CreateMemoryInput) {
+    if (input.scope === 'user' && input.projectId) {
+      throw new AppError(ErrorCode.VALIDATION_ERROR, '用户级记忆不能挂载项目');
+    }
+    if (input.scope === 'project') {
+      if (!input.projectId) throw new AppError(ErrorCode.VALIDATION_ERROR, '项目级记忆必须指定项目');
+      const p = await this.prisma.project.findFirst({ where: { id: input.projectId, userId, deletedAt: null } });
+      if (!p) throw new AppError(ErrorCode.NOT_FOUND, '项目不存在');
+    }
+    return this.prisma.memory.create({
+      data: {
+        userId,
+        scope: input.scope,
+        projectId: input.scope === 'project' ? input.projectId : null,
+        content: input.content,
+        category: input.category,
+        importance: input.importance ?? 50,
+        confidence: input.confidence,
+        status: input.status ?? MemoryStatus.candidate,
+        source: input.source,
+        sourceMessageId: input.sourceMessageId,
+      },
+    });
+  }
+
+  /** 更新（scope/projectId 不可变）；candidate→active/rejected 即"确认/拒绝" */
+  async update(userId: string, id: string, input: UpdateMemoryInput) {
+    await this.requireOwned(userId, id);
+    const data: Prisma.MemoryUpdateInput = {};
+    if (input.content !== undefined) data.content = input.content;
+    if (input.category !== undefined) data.category = input.category;
+    if (input.importance !== undefined) data.importance = input.importance;
+    if (input.confidence !== undefined) data.confidence = input.confidence;
+    if (input.status !== undefined) data.status = input.status;
+    return this.prisma.memory.update({ where: { id }, data });
+  }
+
+  async remove(userId: string, id: string) {
+    await this.requireOwned(userId, id);
+    await this.prisma.memory.delete({ where: { id } });
+  }
+
+  /** 上下文组装使用后刷新 lastUsedAt（暂不参与排序，供使用统计/淘汰预留） */
+  async markUsed(ids: string[]): Promise<void> {
+    if (!ids.length) return;
+    await this.prisma.memory.updateMany({
+      where: { id: { in: ids } },
+      data: { lastUsedAt: new Date() },
+    });
+  }
+
+  private async requireOwned(userId: string, id: string) {
+    const m = await this.prisma.memory.findFirst({ where: { id, userId } });
+    if (!m) throw new AppError(ErrorCode.NOT_FOUND, '记忆不存在');
+    return m;
+  }
+}
