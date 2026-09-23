@@ -18,6 +18,8 @@ export interface PrepareMediaInput {
   conversationId?: string;
   messageId?: string;
   params: Record<string, unknown>;
+  /** 幂等键（ToolCall 透传）：UNIQUE 兜底，同一 ToolCall 重试绝不产生第二个任务 */
+  idempotencyKey?: string;
 }
 
 const DEFAULT_DAILY_IMAGE_LIMIT = 50;
@@ -78,6 +80,7 @@ export class MediaGenerationService {
         status: 'pending',
         statusMessage: '排队中',
         input: input.params as never,
+        idempotencyKey: input.idempotencyKey,
       },
     });
     const queue = input.type === 'image' ? this.imageQueue : this.videoQueue;

@@ -1,0 +1,62 @@
+import { Inject, Injectable } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
+import { PrismaService } from '../prisma/prisma.service';
+import { AppError, ErrorCode } from '../../common/errors/app-error';
+
+export interface CreateArtifactInput {
+  type: 'creative_brief' | 'image' | 'video' | 'report' | 'analysis' | 'other';
+  title: string;
+  summary?: string;
+  content?: Record<string, unknown>;
+  projectId?: string;
+  conversationId?: string;
+  messageId?: string;
+  taskId?: string;
+}
+
+/** Artifact 最小写入方（M4）：仅 create/read，无 Workflow；归属校验与全站同模式 */
+@Injectable()
+export class ArtifactService {
+  constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
+
+  async create(userId: string, input: CreateArtifactInput) {
+    if (input.projectId) {
+      const p = await this.prisma.project.findFirst({ where: { id: input.projectId, userId, deletedAt: null } });
+      if (!p) throw new AppError(ErrorCode.NOT_FOUND, '项目不存在');
+    }
+    if (input.conversationId) {
+      const c = await this.prisma.conversation.findFirst({ where: { id: input.conversationId, userId, deletedAt: null } });
+      if (!c) throw new AppError(ErrorCode.NOT_FOUND, '对话不存在');
+    }
+    return this.prisma.artifact.create({
+      data: {
+        userId,
+        type: input.type,
+        title: input.title,
+        summary: input.summary,
+        content: (input.content ?? undefined) as Prisma.InputJsonValue | undefined,
+        projectId: input.projectId,
+        conversationId: input.conversationId,
+        messageId: input.messageId,
+        taskId: input.taskId,
+        status: 'ready',
+      },
+    });
+  }
+
+  async getById(userId: string, id: string) {
+    const artifact = await this.prisma.artifact.findFirst({ where: { id, userId } });
+    if (!artifact) throw new AppError(ErrorCode.NOT_FOUND, '制品不存在');
+    return artifact;
+  }
+
+  async listByConversation(userId: string, conversationId: string) {
+    const c = await this.prisma.conversation.findFirst({ where: { id: conversationId, userId, deletedAt: null } });
+    if (!c) throw new AppError(ErrorCode.NOT_FOUND, '对话不存在');
+    return this.prisma.artifact.findMany({
+      where: { conversationId, userId },
+      orderBy: { createdAt: 'desc' },
+      take: 20,
+    });
+  }
+}
