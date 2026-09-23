@@ -14,6 +14,7 @@ import { AuthModule } from './modules/auth/auth.module';
 import { ConversationsModule } from './modules/conversations/conversations.module';
 import { ProjectsModule } from './modules/projects/projects.module';
 import { MemoriesModule } from './modules/memories/memories.module';
+import { AttachmentsModule } from './modules/attachments/attachments.module';
 import { ChatModule } from './modules/chat/chat.module';
 import { UsageModule } from './modules/usage/usage.module';
 import { GlobalExceptionFilter } from './common/filters/global-exception.filter';
@@ -45,6 +46,7 @@ import { GlobalExceptionFilter } from './common/filters/global-exception.filter'
     ConversationsModule,
     ProjectsModule,
     MemoriesModule,
+    AttachmentsModule,
     ChatModule,
     UsageModule,
     HealthModule,

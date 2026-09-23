@@ -29,6 +29,11 @@ export class StorageS3Adapter implements StorageAdapter {
     return getSignedUrl(this.client, new GetObjectCommand({ Bucket: this.cfg.bucket, Key: key }), { expiresIn: expiresInSec });
   }
 
+  async getStream(key: string): Promise<Readable> {
+    const res = await this.client.send(new GetObjectCommand({ Bucket: this.cfg.bucket, Key: key }));
+    return res.Body as Readable;
+  }
+
   async delete(key: string): Promise<void> {
     await this.client.send(new DeleteObjectCommand({ Bucket: this.cfg.bucket, Key: key }));
   }

@@ -6,9 +6,10 @@ import { ResolvedLLM } from '../../providers/llm/llm-manager.service';
 import { ChatAgent } from '../../agents/chat/chat.agent';
 import { ContextModule } from '../../core/context/context.module';
 import { MemoryModule } from '../../core/memory/memory.module';
+import { AttachmentsModule } from '../attachments/attachments.module';
 
 @Module({
-  imports: [ContextModule, MemoryModule],
+  imports: [ContextModule, MemoryModule, AttachmentsModule],
   controllers: [ChatController],
   providers: [
     ChatService,

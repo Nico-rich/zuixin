@@ -1,6 +1,7 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { AppError, ErrorCode, TaskIntent } from '@ai-agent/shared';
 import { PrismaService } from '../prisma/prisma.service';
+import { AttachmentsService } from '../attachments/attachments.service';
 import { RedisKVService } from '../../core/circuit-breaker/redis-kv.service';
 import { RouterService } from '../../core/router/router.service';
 import { ContextAssembler } from '../../core/context/context-assembler';
@@ -8,7 +9,7 @@ import { MemoryExtractor, MEMORY_EXTRACTOR } from '../../core/memory/memory-extr
 import { ModelResolverService } from '../../providers/llm/model-resolver.service';
 import { ResolvedLLM } from '../../providers/llm/llm-manager.service';
 import { ChatMessage } from '../../providers/llm/llm.types';
-import { Agent } from '../../agents/agent.types';
+import { Agent, AttachmentMeta } from '../../agents/agent.types';
 import { UsageService } from '../usage/usage.service';
 import { ChatDto } from './chat.dto';
 import { SSEWriter } from './sse-writer';
@@ -18,6 +19,7 @@ export interface ChatRunContext {
   userMessage: string; history: ChatMessage[]; intent: TaskIntent;
   resolved: ResolvedLLM; lockKey: string; startedAt: number; userId: string;
   projectId?: string | null;
+  attachments: AttachmentMeta[];
 }
 
 export interface AgentFactory {
@@ -33,6 +35,7 @@ export class ChatService {
     @Inject(RedisKVService) private readonly kv: RedisKVService,
     @Inject(RouterService) private readonly router: RouterService,
     @Inject(ContextAssembler) private readonly context: ContextAssembler,
+    @Inject(AttachmentsService) private readonly attachmentsService: AttachmentsService,
     @Inject(MEMORY_EXTRACTOR) private readonly memoryExtractor: MemoryExtractor,
     @Inject(ModelResolverService) private readonly modelResolver: ModelResolverService,
     @Inject(UsageService) private readonly usage: UsageService,
@@ -60,6 +63,7 @@ export class ChatService {
       const assistantMessage = await this.prisma.message.create({
         data: { conversationId: conversation.id, userId, role: 'assistant', content: '', status: 'streaming' },
       });
+      const attachments = await this.resolveAttachments(userId, dto.attachmentIds);
       // 上下文组装统一走 ContextAssembler（最近消息 + 项目/用户记忆；未来 Summary/RAG 在此扩展）
       const { messages: history } = await this.context.assemble({
         userId, conversationId: conversation.id, projectId: conversation.projectId ?? undefined, excludeMessageId: userMessage.id,
@@ -71,7 +75,7 @@ export class ChatService {
       return {
         conversationId: conversation.id, userMessageId: userMessage.id, assistantMessageId: assistantMessage.id,
         userMessage: dto.message, history, intent, resolved, lockKey, startedAt, userId,
-        projectId: conversation.projectId,
+        projectId: conversation.projectId, attachments,
       };
     } catch (err) {
       await this.kv.del(lockKey).catch(() => undefined);
@@ -91,7 +95,7 @@ export class ChatService {
       const agent = this.agentFactory.create({ resolved: ctx.resolved });
       const events = agent.execute({
         userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.assistantMessageId,
-        userMessage: ctx.userMessage, attachments: [], history: ctx.history, intent: ctx.intent,
+        userMessage: ctx.userMessage, attachments: ctx.attachments, history: ctx.history, intent: ctx.intent,
         mode: 'normal', signal,
       });
       for await (const ev of events) {
@@ -159,6 +163,20 @@ export class ChatService {
     const c = await this.prisma.conversation.findFirst({ where: { id, userId, deletedAt: null } });
     if (!c) throw new AppError(ErrorCode.NOT_FOUND, '对话不存在');
     return c;
+  }
+
+  /** 解析消息附件：M2 仅图片进入 Agent 上下文（vision/参考图，base64 data URL）；其他文件仅可下载 */
+  private async resolveAttachments(userId: string, ids?: string[]): Promise<AttachmentMeta[]> {
+    if (!ids?.length) return [];
+    const metas: AttachmentMeta[] = [];
+    for (const id of ids) {
+      const att = await this.attachmentsService.getById(userId, id);
+      const url = await this.attachmentsService.imageDataUrl(att);
+      if (att.type === 'image' && url) {
+        metas.push({ id: att.id, type: 'image', mimeType: att.mimeType, url });
+      }
+    }
+    return metas;
   }
 
   /** 新建会话：可挂载到用户自己的项目 */

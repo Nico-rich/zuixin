@@ -1,4 +1,5 @@
 import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Injectable, Logger } from '@nestjs/common';
+import { MulterError } from 'multer';
 import { Request, Response } from 'express';
 import { AppError, ErrorCode } from '../errors/app-error';
 
@@ -13,6 +14,11 @@ export class GlobalExceptionFilter implements ExceptionFilter {
     const req = ctx.getRequest<Request & { id?: string }>();
     const requestId = req.id;
 
+    if (exception instanceof MulterError) {
+      const msg = exception.code === 'LIMIT_FILE_SIZE' ? '文件超过上传大小限制' : `上传失败：${exception.message}`;
+      res.status(HttpStatus.BAD_REQUEST).json({ error: { code: ErrorCode.VALIDATION_ERROR, message: msg, requestId } });
+      return;
+    }
     if (exception instanceof AppError) {
       this.logger.warn({ code: exception.code, requestId }, exception.message);
       res.status(this.httpStatusOf(exception.code)).json({ error: { code: exception.code, message: exception.message, requestId } });

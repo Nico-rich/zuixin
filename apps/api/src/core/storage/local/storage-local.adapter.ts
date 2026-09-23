@@ -17,6 +17,11 @@ export class StorageLocalAdapter implements StorageAdapter {
 
   async createPresignedUrl(key: string, _expiresInSec: number): Promise<string> { return `local://${key}`; }
 
+  async getStream(key: string): Promise<Readable> {
+    const { createReadStream } = await import('node:fs');
+    return createReadStream(this.safePath(key));
+  }
+
   async delete(key: string): Promise<void> {
     await rm(this.safePath(key), { force: true });
   }
