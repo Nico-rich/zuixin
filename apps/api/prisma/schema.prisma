@@ -144,6 +144,8 @@ model User {
   memories      Memory[]
   artifacts     Artifact[]
   agentRuns     AgentRun[]
+  knowledgeBases KnowledgeBase[]
+  documents      Document[]
 }
 
 model Session {
@@ -241,11 +243,15 @@ model Agent {
   builtin      Boolean   @default(false)
   kind         String    @default("builtin") // builtin(代码类) | custom(纯 prompt 配置)
   version      Int       @default(1)
+  scope        String    @default("system") // system | user(预留)
+  activeVersionId String?       @unique
+  activeVersion   AgentVersion? @relation("ActiveVersion", fields: [activeVersionId], references: [id], onDelete: SetNull)
   config       Json?
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
   messages     Message[]
   runs         AgentRun[]
+  versions     AgentVersion[]
 }
 
 // ===== Provider 与模型 =====
@@ -288,6 +294,7 @@ model Model {
   createdAt     DateTime   @default(now())
   updatedAt     DateTime   @updatedAt
   agents        Agent[]
+  agentVersions AgentVersion[]
   tasks         GenerationTask[]
   usages        UsageRecord[]
   @@index([type, enabled])
@@ -316,6 +323,8 @@ model GenerationTask {
   errorMessage   String?
   attempts       Int         @default(0)
   idempotencyKey String?     @unique
+  runId          String?
+  toolCallId     String?
   costEstimate   Float?
   startedAt      DateTime?
   completedAt    DateTime?
@@ -375,6 +384,7 @@ model Project {
   memories      Memory[]
   artifacts     Artifact[]
   agentRuns     AgentRun[]
+  knowledgeBases KnowledgeBase[]
   @@index([userId, updatedAt])
 }
 
@@ -426,6 +436,8 @@ model Artifact {
   conversation   Conversation?  @relation(fields: [conversationId], references: [id], onDelete: SetNull)
   messageId      String?
   taskId         String?
+  runId          String?
+  toolCallId     String?
   type           ArtifactType
   title          String
   summary        String?        @db.Text
@@ -472,6 +484,8 @@ model AgentRun {
   user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
   agentId        String
   agent          Agent          @relation(fields: [agentId], references: [id], onDelete: Restrict)
+  agentVersionId String?
+  agentVersion   AgentVersion?  @relation(fields: [agentVersionId], references: [id], onDelete: Restrict)
   projectId      String?
   project        Project?       @relation(fields: [projectId], references: [id], onDelete: SetNull)
   conversationId String?
@@ -523,4 +537,108 @@ model ToolCall {
   completedAt    DateTime?
   @@unique([runStepId, idempotencyKey])
   @@index([toolName, startedAt])
+}
+
+// ===== M5: Agent 版本 =====
+enum AgentVersionStatus {
+  draft
+  published
+  archived
+}
+
+model AgentVersion {
+  id           String             @id @default(uuid())
+  agentId      String
+  agent        Agent              @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  version      Int
+  status       AgentVersionStatus @default(draft)
+  systemPrompt String             @db.Text
+  modelId      String?
+  model        Model?             @relation(fields: [modelId], references: [id], onDelete: SetNull)
+  tools        Json               @default("[]")
+  temperature  Float              @default(0.7)
+  maxTokens    Int?
+  config       Json?
+  createdAt    DateTime           @default(now())
+  createdBy    String?
+  activeAgent  Agent?            @relation("ActiveVersion")
+  runs         AgentRun[]
+  @@unique([agentId, version])
+}
+
+// ===== M5: Knowledge =====
+enum KnowledgeScope {
+  user
+  project
+}
+enum KnowledgeBaseStatus {
+  active
+  disabled
+}
+enum DocumentSourceType {
+  upload
+}
+enum DocumentStatus {
+  uploaded
+  processing
+  ready
+  failed
+}
+
+model KnowledgeBase {
+  id               String             @id @default(uuid())
+  userId           String
+  user             User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  scope            KnowledgeScope
+  projectId        String?            // scope=project 必填（服务层校验）
+  project          Project?           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name             String
+  description      String?
+  embeddingModelId String?
+  topK             Int                @default(5)
+  scoreThreshold   Float              @default(0.3)
+  status           KnowledgeBaseStatus @default(active)
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+  documents        Document[]
+  @@index([userId, scope])
+  @@index([projectId])
+}
+
+model Document {
+  id          String             @id @default(uuid())
+  kbId        String
+  kb          KnowledgeBase      @relation(fields: [kbId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title       String
+  sourceType  DocumentSourceType @default(upload)
+  sourceUri   String?
+  storageKey  String
+  mimeType    String
+  sizeBytes   Int
+  contentHash String
+  status      DocumentStatus     @default(uploaded)
+  errorCode   String?
+  chunkCount  Int                @default(0)
+  version     Int                @default(1)
+  metadata    Json?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+  chunks      DocumentChunk[]
+  @@unique([kbId, contentHash])
+  @@index([kbId, status])
+}
+
+model DocumentChunk {
+  id             String   @id @default(uuid())
+  documentId     String
+  document       Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  chunkIndex     Int
+  content        String   @db.Text
+  tokenCount     Int      @default(0)
+  embedding      Unsupported("vector")?
+  embeddingModel String
+  createdAt      DateTime @default(now())
+  @@unique([documentId, chunkIndex])
 }
