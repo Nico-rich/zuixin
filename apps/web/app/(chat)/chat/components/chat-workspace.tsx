@@ -1,20 +1,28 @@
 'use client';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiFetch, ApiError, API_BASE } from '@/lib/api';
 import { consumeSSE } from '@/lib/sse';
 import { Sidebar } from './sidebar';
 import { ChatInput } from './chat-input';
 import { MessageBubble } from './message-bubble';
-import { ChatMessage, ChatStreamEventMap } from './types';
+import { TaskCard } from './task-card';
+import { ActiveTask, AttachmentView, ChatMessage, ChatStreamEventMap } from './types';
 
-interface HistoryMessage { id: string; role: 'user' | 'assistant'; content: string; status: string; errorCode: string | null; createdAt: string; }
+interface HistoryMessage {
+  id: string; role: 'user' | 'assistant'; content: string; status: string; errorCode: string | null;
+  intentType: string | null; createdAt: string;
+  attachments: Array<{ id: string; kind: AttachmentView['kind']; type: AttachmentView['type']; mimeType: string; originalName: string | null }>;
+}
 
 export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const projectId = searchParams.get('projectId') ?? undefined;
   const queryClient = useQueryClient();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [tasks, setTasks] = useState<ActiveTask[]>([]);
   const [thinking, setThinking] = useState('');
   const [streaming, setStreaming] = useState(false);
   const [fatalError, setFatalError] = useState('');
@@ -24,7 +32,7 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
   const assistantIdRef = useRef<string | null>(null);
   const activeIdRef = useRef<string | undefined>(conversationId);
 
-  // 历史消息加载
+  // 历史消息加载（含附件）
   const history = useQuery({
     queryKey: ['messages', conversationId],
     queryFn: async () => {
@@ -37,7 +45,7 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
 
   useEffect(() => {
     setMessages(history.data ?? []);
-    setThinking(''); setFatalError('');
+    setThinking(''); setFatalError(''); setTasks([]);
   }, [history.data]);
 
   const flushDelta = useCallback((targetId: string) => {
@@ -53,7 +61,7 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
     deltaTimer.current = setTimeout(() => flushDelta(messageId), 40); // 40ms 节流合并渲染
   }, [flushDelta]);
 
-  const send = useCallback(async (text: string) => {
+  const send = useCallback(async (text: string, attachmentIds: string[]) => {
     if (streaming || !text.trim()) return;
     setFatalError('');
     setMessages((prev) => [...prev, { id: `local-${Date.now()}`, role: 'user', content: text, status: 'completed' }]);
@@ -64,7 +72,7 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
       const res = await fetch(`${API_BASE}/api/v1/chat`, {
         method: 'POST', credentials: 'include', signal: ac.signal,
         headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
-        body: JSON.stringify({ conversationId: activeIdRef.current ?? null, message: text }),
+        body: JSON.stringify({ conversationId: activeIdRef.current ?? null, projectId: projectId ?? null, attachmentIds, message: text }),
       });
       if (!res.ok) {
         const body = await res.json().catch(() => null);
@@ -79,7 +87,7 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
             assistantIdRef.current = d.messageId;
             if (!activeIdRef.current) {
               activeIdRef.current = d.conversationId;
-              router.replace(`/chat/${d.conversationId}`, { scroll: false });
+              router.replace(`/chat/${d.conversationId}${projectId ? `?projectId=${projectId}` : ''}`, { scroll: false });
               queryClient.invalidateQueries({ queryKey: ['conversations'] });
             }
             setMessages((prev) => prev.some((m) => m.id === d.messageId) ? prev
@@ -92,6 +100,11 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
             break;
           }
           case 'status': { setThinking((data as ChatStreamEventMap['status']).message); break; }
+          case 'task.created': {
+            const d = data as ChatStreamEventMap['task_created'];
+            setTasks((prev) => [...prev, { taskId: d.taskId, kind: d.kind }]);
+            break;
+          }
           case 'message_end': {
             const d = data as ChatStreamEventMap['message_end'];
             flushDelta(d.messageId);
@@ -124,39 +137,41 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
       assistantIdRef.current = null;
       queryClient.invalidateQueries({ queryKey: ['conversations'] });
     }
-  }, [streaming, router, queryClient, appendDelta, flushDelta]);
+  }, [streaming, router, projectId, queryClient, appendDelta, flushDelta]);
 
   const stop = useCallback(() => { abortRef.current?.abort(); }, []);
 
   const retry = useCallback((messageId: string) => {
     const idx = messages.findIndex((m) => m.id === messageId);
     const userMsg = [...messages.slice(0, idx)].reverse().find((m) => m.role === 'user');
-    if (userMsg) void send(userMsg.content);
+    if (userMsg) void send(userMsg.content, []);
   }, [messages, send]);
 
-  const scrollRef = useRef<HTMLDivElement>(null);
-  useEffect(() => { scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }); }, [messages, thinking]);
+  // 任务完成 → 刷新消息（generated_image 附件挂到 assistant 消息）
+  const onTaskDone = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: ['messages', activeIdRef.current] });
+  }, [queryClient]);
 
-  const onNew = useCallback(() => {
-    activeIdRef.current = undefined;
-    setMessages([]); setFatalError(''); setThinking('');
-    router.push('/chat');
-  }, [router]);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => { scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }); }, [messages, thinking, tasks]);
 
   return (
     <div className="flex h-screen">
-      <Sidebar activeId={conversationId} onNew={onNew} />
+      <Sidebar activeId={conversationId} />
       <main className="flex flex-1 flex-col">
         <div ref={scrollRef} className="flex-1 overflow-y-auto">
           <div className="mx-auto max-w-3xl space-y-6 px-4 py-6">
-            {messages.length === 0 && (
+            {messages.length === 0 && tasks.length === 0 && (
               <div className="pt-32 text-center">
                 <h2 className="text-2xl font-semibold">你好，我是 AI 助手</h2>
-                <p className="mt-2 text-zinc-400">可以问我任何问题，或试试："帮我解释一下 React 和 Vue 的区别"</p>
+                <p className="mt-2 text-zinc-400">可以问我任何问题，或试试："帮我做一张科技感主图"</p>
               </div>
             )}
             {messages.map((m) => (
               <MessageBubble key={m.id} message={m} streaming={m.status === 'streaming'} onRetry={() => retry(m.id)} />
+            ))}
+            {tasks.map((t) => (
+              <TaskCard key={t.taskId} taskId={t.taskId} kind={t.kind} onDone={onTaskDone} />
             ))}
             {thinking && <p className="text-xs text-zinc-500">💭 {thinking}</p>}
             {fatalError && <p className="text-sm text-red-400">⚠ {fatalError}</p>}

@@ -3,6 +3,7 @@ import { useState } from 'react';
 import { Check, Copy, RotateCcw } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { MarkdownRenderer } from './markdown-renderer';
+import { API_BASE } from '@/lib/api';
 import { ChatMessage } from './types';
 
 export function MessageBubble({ message, streaming, onRetry }: { message: ChatMessage; streaming: boolean; onRetry: () => void }) {
@@ -36,6 +37,22 @@ export function MessageBubble({ message, streaming, onRetry }: { message: ChatMe
             <MarkdownRenderer content={message.content} />
           )}
           {streaming && <span className="animate-pulse text-zinc-400">▍</span>}
+          {message.attachments && message.attachments.length > 0 && (
+            <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
+              {message.attachments.filter((a) => a.type === 'image').map((a) => (
+                <a key={a.id} href={`${API_BASE}/api/v1/attachments/${a.id}`} target="_blank" rel="noreferrer">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img src={`${API_BASE}/api/v1/attachments/${a.id}`} alt={a.originalName ?? '图片'} className="max-h-64 w-full rounded-lg border border-zinc-800 object-cover" />
+                </a>
+              ))}
+              {message.attachments.filter((a) => a.type !== 'image').map((a) => (
+                <a key={a.id} href={`${API_BASE}/api/v1/attachments/${a.id}`} target="_blank" rel="noreferrer"
+                  className="flex items-center gap-2 rounded-lg border border-zinc-800 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800">
+                  📎 {a.originalName ?? '文件'}
+                </a>
+              ))}
+            </div>
+          )}
           {message.status === 'failed' && (
             <div className="mt-2 flex items-center gap-3 text-sm text-red-400">
               <span>生成失败{message.errorCode ? `（${message.errorCode}）` : ''}</span>

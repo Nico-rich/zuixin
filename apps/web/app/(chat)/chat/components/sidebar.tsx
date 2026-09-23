@@ -1,10 +1,12 @@
 'use client';
-import { useRouter } from 'next/navigation';
+import { useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { LogOut, Plus, Trash2 } from 'lucide-react';
+import { Folder, LogOut, Plus, Trash2 } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
 import { Button } from '@/components/ui/button';
-import { ConversationItem } from './types';
+import { Input } from '@/components/ui/input';
+import { ConversationItem, ProjectItem } from './types';
 
 function formatRelative(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime();
@@ -16,24 +18,52 @@ function formatRelative(iso: string): string {
   return new Date(iso).toLocaleDateString('zh-CN');
 }
 
-export function Sidebar({ activeId, onNew }: { activeId?: string; onNew: () => void }) {
+export function Sidebar({ activeId }: { activeId?: string }) {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const selectedProject = searchParams.get('projectId') ?? '';
   const queryClient = useQueryClient();
+  const [showNewProject, setShowNewProject] = useState(false);
+  const [newProjectName, setNewProjectName] = useState('');
+  const [creating, setCreating] = useState(false);
+
+  const projects = useQuery({
+    queryKey: ['projects'],
+    queryFn: () => apiFetch<{ data: ProjectItem[] }>('/api/v1/projects'),
+  });
   const conversations = useQuery({
-    queryKey: ['conversations'],
-    queryFn: () => apiFetch<{ data: ConversationItem[] }>('/api/v1/conversations'),
+    queryKey: ['conversations', selectedProject],
+    queryFn: () => apiFetch<{ data: ConversationItem[] }>(`/api/v1/conversations${selectedProject ? `?projectId=${selectedProject}` : ''}`),
   });
   const me = useQuery({
     queryKey: ['me'],
     queryFn: () => apiFetch<{ data: { user: { email: string; displayName: string | null } } }>('/api/v1/auth/me'),
   });
 
+  const switchProject = (projectId: string) => {
+    router.push(projectId ? `/chat?projectId=${projectId}` : '/chat');
+  };
+
+  const createProject = async () => {
+    const name = newProjectName.trim();
+    if (!name || creating) return;
+    setCreating(true);
+    try {
+      const res = await apiFetch<{ data: ProjectItem }>('/api/v1/projects', { method: 'POST', body: JSON.stringify({ name }) });
+      queryClient.invalidateQueries({ queryKey: ['projects'] });
+      setShowNewProject(false); setNewProjectName('');
+      switchProject(res.data.id);
+    } finally {
+      setCreating(false);
+    }
+  };
+
   const remove = async (id: string) => {
     try {
       await apiFetch(`/api/v1/conversations/${id}`, { method: 'DELETE' });
       queryClient.invalidateQueries({ queryKey: ['conversations'] });
-      if (activeId === id) onNew();
-    } catch { /* 忽略：列表刷新后自然消失 */ }
+      if (activeId === id) router.push(selectedProject ? `/chat?projectId=${selectedProject}` : '/chat');
+    } catch { /* 忽略 */ }
   };
 
   const logout = async () => {
@@ -43,11 +73,34 @@ export function Sidebar({ activeId, onNew }: { activeId?: string; onNew: () => v
   };
 
   const list = conversations.data?.data ?? [];
+  const projectList = projects.data?.data ?? [];
 
   return (
     <aside className="flex w-64 shrink-0 flex-col border-r border-zinc-800 bg-zinc-900/50">
-      <div className="p-3">
-        <Button onClick={onNew} className="w-full">
+      <div className="space-y-2 p-3">
+        {/* Project 选择器 */}
+        <div className="flex items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-900">
+          <Folder className="ml-2 size-4 shrink-0 text-zinc-500" />
+          <select
+            value={selectedProject}
+            onChange={(e) => switchProject(e.target.value)}
+            className="h-9 flex-1 bg-transparent text-sm text-zinc-200 focus:outline-none"
+          >
+            <option value="">全部对话</option>
+            {projectList.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+          <button onClick={() => setShowNewProject((v) => !v)} className="mr-1 rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200" title="新建项目">
+            <Plus className="size-3.5" />
+          </button>
+        </div>
+        {showNewProject && (
+          <div className="flex gap-1">
+            <Input value={newProjectName} onChange={(e) => setNewProjectName(e.target.value)} placeholder="项目名称" className="h-8 text-xs" autoFocus
+              onKeyDown={(e) => { if (e.key === 'Enter') void createProject(); }} />
+            <Button size="sm" className="h-8" onClick={() => void createProject()} disabled={creating || !newProjectName.trim()}>创建</Button>
+          </div>
+        )}
+        <Button onClick={() => router.push(selectedProject ? `/chat?projectId=${selectedProject}` : '/chat')} className="w-full" variant="outline">
           <Plus /> 新对话
         </Button>
       </div>
@@ -55,7 +108,7 @@ export function Sidebar({ activeId, onNew }: { activeId?: string; onNew: () => v
         {list.map((c) => (
           <div
             key={c.id}
-            onClick={() => router.push(`/chat/${c.id}`)}
+            onClick={() => router.push(`/chat/${c.id}${selectedProject ? `?projectId=${selectedProject}` : ''}`)}
             className={`group flex cursor-pointer items-center justify-between rounded-lg px-3 py-2 text-sm transition-colors ${
               activeId === c.id ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:bg-zinc-800/60 hover:text-zinc-200'
             }`}
