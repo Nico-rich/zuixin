@@ -82,9 +82,9 @@ describe('ChatService.prepareChat', () => {
   it('上下文组装走 ContextAssembler（排除当前用户消息）', async () => {
     const { svc, context } = makeChat();
     await svc.prepareChat('u1', { conversationId: null, message: '你好' }, 'req1');
-    expect(context.assemble).toHaveBeenCalledWith({
+    expect(context.assemble).toHaveBeenCalledWith(expect.objectContaining({
       userId: 'u1', conversationId: 'c-new', excludeMessageId: 'm-user',
-    });
+    }));
   });
 
   it('projectId 挂载：非本人项目 → NOT_FOUND', async () => {

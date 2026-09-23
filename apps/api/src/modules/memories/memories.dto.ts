@@ -9,6 +9,7 @@ export const CreateMemoryDtoSchema = z.object({
   category: z.enum(MEMORY_CATEGORIES),
   importance: z.number().int().min(0).max(100).optional(),
   confidence: z.number().min(0).max(1).nullable().optional(),
+  status: z.enum(['candidate', 'active', 'rejected']).optional(), // 默认 candidate；手动创建可显式 active
   source: z.string().max(50).optional(),
   sourceMessageId: z.string().uuid().nullable().optional(),
 });

@@ -25,7 +25,8 @@ export class MemoriesController {
   create(@Req() req: Request & { user: AuthedUser }, @Body(new ZodValidationPipe(CreateMemoryDtoSchema)) dto: {
     scope: 'user' | 'project'; projectId?: string | null; content: string;
     category: 'preference' | 'profile' | 'instruction' | 'project_context' | 'workflow' | 'other';
-    importance?: number; confidence?: number | null; source?: string; sourceMessageId?: string | null;
+    importance?: number; confidence?: number | null; status?: 'candidate' | 'active' | 'rejected';
+    source?: string; sourceMessageId?: string | null;
   }) {
     // zod 已校验；字面量类型与 Prisma 字符串枚举名义不兼容，显式收窄
     return this.memories.create(req.user.userId, dto as CreateMemoryInput);

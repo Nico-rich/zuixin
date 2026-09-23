@@ -57,9 +57,9 @@ export class ChatService {
       const assistantMessage = await this.prisma.message.create({
         data: { conversationId: conversation.id, userId, role: 'assistant', content: '', status: 'streaming' },
       });
-      // 上下文组装统一走 ContextAssembler（M1 仅最近消息源；未来 Memory/RAG 在此扩展）
+      // 上下文组装统一走 ContextAssembler（最近消息 + 项目/用户记忆；未来 Summary/RAG 在此扩展）
       const { messages: history } = await this.context.assemble({
-        userId, conversationId: conversation.id, excludeMessageId: userMessage.id,
+        userId, conversationId: conversation.id, projectId: conversation.projectId ?? undefined, excludeMessageId: userMessage.id,
       });
       const intent = await this.router.classify({ userMessage: dto.message, attachments: [], history: history.slice(-2) });
       const resolved = await this.modelResolver.resolveDefaultLLM();
