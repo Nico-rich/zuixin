@@ -135,10 +135,29 @@ async function main() {
     });
   }
 
+  // M4: 内置 Agent 三件套（kind=builtin 映射代码类；general-assistant 走 Agent Loop + 工具）
+  const agents = [
+    {
+      id: 'seed-agent-general', slug: 'general-assistant', name: '通用助手', kind: 'builtin',
+      systemPrompt: '你是 AI 智能创作平台的通用助手。当用户需要生成图片/视频/制品或建议保存记忆时，使用对应工具；普通问答直接回答。',
+      tools: ['image.generate', 'video.generate', 'artifact.create', 'memory.create_candidate'],
+    },
+    { id: 'seed-agent-image', slug: 'image', name: '图片生成 Agent', kind: 'builtin', systemPrompt: '你负责图片生成任务。', tools: [] },
+    { id: 'seed-agent-video', slug: 'video', name: '视频生成 Agent', kind: 'builtin', systemPrompt: '你负责视频生成任务。', tools: [] },
+  ];
+  for (const a of agents) {
+    await prisma.agent.upsert({
+      where: { id: a.id },
+      update: { systemPrompt: a.systemPrompt, tools: a.tools, kind: a.kind, version: { increment: 0 } },
+      create: { id: a.id, slug: a.slug, name: a.name, kind: a.kind, systemPrompt: a.systemPrompt, tools: a.tools, builtin: true, enabled: true, priority: a.slug === 'general-assistant' ? 1 : 10 },
+    });
+  }
+
   const routingPolicy = {
     confidenceThreshold: 0.7,
     routerModelId: 'seed-model-mock-router-1',
     defaults: { llm: 'seed-model-mock-echo', image: 'seed-img-mock-model', video: 'seed-vid-mock-model', vision: null },
+    agentMapping: { chat: 'general-assistant', image_generation: 'image', video_generation: 'video' },
   };
   await prisma.systemSetting.upsert({
     where: { key: 'routingPolicy' },

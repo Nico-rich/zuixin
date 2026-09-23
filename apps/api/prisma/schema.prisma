@@ -143,6 +143,7 @@ model User {
   projects      Project[]
   memories      Memory[]
   artifacts     Artifact[]
+  agentRuns     AgentRun[]
 }
 
 model Session {
@@ -172,6 +173,7 @@ model Conversation {
   messages  Message[]
   summaries ConversationSummary[]
   artifacts Artifact[]
+  agentRuns AgentRun[]
   @@index([userId, updatedAt])
   @@index([projectId])
 }
@@ -237,10 +239,13 @@ model Agent {
   enabled      Boolean   @default(true)
   priority     Int       @default(100)
   builtin      Boolean   @default(false)
+  kind         String    @default("builtin") // builtin(代码类) | custom(纯 prompt 配置)
+  version      Int       @default(1)
   config       Json?
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
   messages     Message[]
+  runs         AgentRun[]
 }
 
 // ===== Provider 与模型 =====
@@ -310,6 +315,7 @@ model GenerationTask {
   errorCode      String?
   errorMessage   String?
   attempts       Int         @default(0)
+  idempotencyKey String?     @unique
   costEstimate   Float?
   startedAt      DateTime?
   completedAt    DateTime?
@@ -327,6 +333,7 @@ model UsageRecord {
   conversationId String?
   messageId      String?
   taskId         String?
+  runId          String?
   providerId     String?
   provider       Provider?   @relation(fields: [providerId], references: [id])
   modelId        String?
@@ -343,6 +350,7 @@ model UsageRecord {
   createdAt      DateTime    @default(now())
   @@index([createdAt])
   @@index([userId, createdAt])
+  @@index([runId])
 }
 
 // ===== 系统配置 =====
@@ -366,6 +374,7 @@ model Project {
   conversations Conversation[]
   memories      Memory[]
   artifacts     Artifact[]
+  agentRuns     AgentRun[]
   @@index([userId, updatedAt])
 }
 
@@ -428,4 +437,90 @@ model Artifact {
   @@index([userId, createdAt])
   @@index([projectId])
   @@index([conversationId])
+}
+
+// ===== M4: Agent 执行 =====
+enum AgentRunStatus {
+  queued
+  running
+  completed
+  failed
+  cancelled
+  timeout
+}
+enum AgentRunStepType {
+  reasoning
+  tool_call
+  tool_result
+  final
+}
+enum AgentRunStepStatus {
+  running
+  completed
+  failed
+  cancelled
+}
+enum ToolCallStatus {
+  running
+  completed
+  failed
+}
+
+model AgentRun {
+  id             String         @id @default(uuid())
+  userId         String
+  user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agentId        String
+  agent          Agent          @relation(fields: [agentId], references: [id], onDelete: Restrict)
+  projectId      String?
+  project        Project?       @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  conversationId String?
+  conversation   Conversation?  @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  status         AgentRunStatus @default(running)
+  currentStep    Int            @default(0)
+  maxSteps       Int            @default(8)
+  errorCode      String?
+  errorMessage   String?
+  metadata       Json?
+  createdAt      DateTime       @default(now())
+  startedAt      DateTime       @default(now())
+  completedAt    DateTime?
+  steps          AgentRunStep[]
+  @@index([userId, createdAt])
+  @@index([conversationId])
+}
+
+model AgentRunStep {
+  id           String            @id @default(uuid())
+  runId        String
+  run          AgentRun          @relation(fields: [runId], references: [id], onDelete: Cascade)
+  stepIndex    Int
+  type         AgentRunStepType
+  status       AgentRunStepStatus @default(running)
+  input        Json?
+  output       Json?
+  errorCode    String?
+  errorMessage String?
+  startedAt    DateTime          @default(now())
+  completedAt  DateTime?
+  toolCalls    ToolCall[]
+  @@unique([runId, stepIndex])
+}
+
+model ToolCall {
+  id             String         @id @default(uuid())
+  runStepId      String
+  runStep        AgentRunStep    @relation(fields: [runStepId], references: [id], onDelete: Cascade)
+  toolName       String
+  idempotencyKey String
+  input          Json
+  output         Json?
+  status         ToolCallStatus @default(running)
+  errorCode      String?
+  errorMessage   String?
+  durationMs     Int?
+  startedAt      DateTime       @default(now())
+  completedAt    DateTime?
+  @@unique([runStepId, idempotencyKey])
+  @@index([toolName, startedAt])
 }
