@@ -4,8 +4,10 @@ import { ChatController } from './chat.controller';
 import { LLMManagerService } from '../../providers/llm/llm-manager.service';
 import { ResolvedLLM } from '../../providers/llm/llm-manager.service';
 import { ChatAgent } from '../../agents/chat/chat.agent';
+import { ContextModule } from '../../core/context/context.module';
 
 @Module({
+  imports: [ContextModule],
   controllers: [ChatController],
   providers: [
     ChatService,

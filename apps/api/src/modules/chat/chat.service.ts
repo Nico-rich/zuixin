@@ -3,6 +3,7 @@ import { AppError, ErrorCode, TaskIntent } from '@ai-agent/shared';
 import { PrismaService } from '../prisma/prisma.service';
 import { RedisKVService } from '../../core/circuit-breaker/redis-kv.service';
 import { RouterService } from '../../core/router/router.service';
+import { ContextAssembler } from '../../core/context/context-assembler';
 import { ModelResolverService } from '../../providers/llm/model-resolver.service';
 import { ResolvedLLM } from '../../providers/llm/llm-manager.service';
 import { ChatMessage } from '../../providers/llm/llm.types';
@@ -29,6 +30,7 @@ export class ChatService {
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(RedisKVService) private readonly kv: RedisKVService,
     @Inject(RouterService) private readonly router: RouterService,
+    @Inject(ContextAssembler) private readonly context: ContextAssembler,
     @Inject(ModelResolverService) private readonly modelResolver: ModelResolverService,
     @Inject(UsageService) private readonly usage: UsageService,
     @Inject('CHAT_AGENT_FACTORY') private readonly agentFactory: AgentFactory,
@@ -55,7 +57,10 @@ export class ChatService {
       const assistantMessage = await this.prisma.message.create({
         data: { conversationId: conversation.id, userId, role: 'assistant', content: '', status: 'streaming' },
       });
-      const history = await this.buildHistory(conversation.id, userMessage.id);
+      // 上下文组装统一走 ContextAssembler（M1 仅最近消息源；未来 Memory/RAG 在此扩展）
+      const { messages: history } = await this.context.assemble({
+        userId, conversationId: conversation.id, excludeMessageId: userMessage.id,
+      });
       const intent = await this.router.classify({ userMessage: dto.message, attachments: [], history: history.slice(-2) });
       const resolved = await this.modelResolver.resolveDefaultLLM();
       // 意图落库可观测（M4 后台看分类命中率）
@@ -143,15 +148,5 @@ export class ChatService {
     const c = await this.prisma.conversation.findFirst({ where: { id, userId, deletedAt: null } });
     if (!c) throw new AppError(ErrorCode.NOT_FOUND, '对话不存在');
     return c;
-  }
-
-  /** 最近 8 条历史（不含本次 user 消息，按时间正序） */
-  private async buildHistory(conversationId: string, currentUserMessageId: string): Promise<ChatMessage[]> {
-    const rows = await this.prisma.message.findMany({
-      where: { conversationId, id: { not: currentUserMessageId } },
-      orderBy: { createdAt: 'desc' }, take: 8,
-      select: { role: true, content: true, id: true },
-    });
-    return rows.reverse().map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
   }
 }

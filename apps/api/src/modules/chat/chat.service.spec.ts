@@ -12,7 +12,6 @@ function makeChat(agentEvents?: () => AsyncIterable<AgentEvent>) {
     },
     message: {
       create: vi.fn().mockImplementation(({ data }) => Promise.resolve({ id: 'm-' + data.role, ...data })),
-      findMany: vi.fn().mockResolvedValue([]),
       update: vi.fn().mockResolvedValue({}),
     },
   };
@@ -21,6 +20,7 @@ function makeChat(agentEvents?: () => AsyncIterable<AgentEvent>) {
     setNX: vi.fn().mockResolvedValue(true), del: vi.fn().mockResolvedValue(undefined),
   };
   const router = { classify: vi.fn().mockResolvedValue({ type: 'chat', confidence: 1, parameters: { prompt: 'x' } }) };
+  const context = { assemble: vi.fn().mockResolvedValue({ messages: [], blocks: [] }) };
   const resolved = { providerId: 'p1', providerName: 'Mock', modelId: 'm1', apiModelId: 'mock-echo', timeoutMs: 1000, adapter: {} as never };
   const modelResolver = { resolveDefaultLLM: vi.fn().mockResolvedValue(resolved) };
   const usage = { recordChatUsage: vi.fn().mockResolvedValue(undefined) };
@@ -30,8 +30,8 @@ function makeChat(agentEvents?: () => AsyncIterable<AgentEvent>) {
     yield { type: 'done', messageId: 'm-assistant' };
   });
   const agentFactory = { create: vi.fn(() => ({ id: 'chat', execute: () => events() })) };
-  const svc = new ChatService(prisma as never, kv as never, router as never, modelResolver as never, usage as never, agentFactory as never);
-  return { svc, prisma, kv, usage };
+  const svc = new ChatService(prisma as never, kv as never, router as never, context as never, modelResolver as never, usage as never, agentFactory as never);
+  return { svc, prisma, kv, usage, context };
 }
 
 /** 收集 SSE 帧的 fake sink（缓冲式按 \n\n 分帧解析） */
@@ -76,6 +76,14 @@ describe('ChatService.prepareChat', () => {
     await svc.prepareChat('u1', { conversationId: null, message: '你好' }, 'req1');
     expect(prisma.conversation.create).toHaveBeenCalled();
     expect(prisma.message.create).toHaveBeenCalledTimes(2); // user + assistant
+  });
+
+  it('上下文组装走 ContextAssembler（排除当前用户消息）', async () => {
+    const { svc, context } = makeChat();
+    await svc.prepareChat('u1', { conversationId: null, message: '你好' }, 'req1');
+    expect(context.assemble).toHaveBeenCalledWith({
+      userId: 'u1', conversationId: 'c-new', excludeMessageId: 'm-user',
+    });
   });
 
   it('锁被占用 → CONCURRENT_CHAT', async () => {
