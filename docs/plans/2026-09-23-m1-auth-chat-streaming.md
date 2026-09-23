@@ -2191,3 +2191,36 @@ M2 方案文档：`docs/architecture/m2-database-module-design.md`（用户确�
 - **Image 回归**：image e2e 全链路继续全绿（统一服务迁移零回归）
 - **可靠性验收**：孤儿清扫 e2e（人为 processing 超时 → sweep → failed MEDIA_TASK_TIMEOUT，幂等）；重复执行已完成任务 → 附件数仍为 1
 - 隔离：任务/附件/项目/记忆的 userId 归属校验沿用 M2 审计结论，M3 未新增暴露面
+
+---
+
+# M4 执行记录（2026-09-23 追加）
+
+M4 设计：`docs/architecture/m4-agent-tool-design.md`（用户确认 + 6 项约束修订）。
+
+## 阶段与提交
+
+| 阶段 | 内容 | commit |
+|---|---|---|
+| P1 基础模型 | AgentRun/Step/ToolCall 表 + 状态机枚举 + agents.kind/version + usage.runId + task.idempotencyKey(UNIQUE) + seed 三 Agent/agentMapping；迁移经 migrate diff + deploy（dev 交互提示绕过） | 060e9b1, 7fd4941 |
+| P2 LLM Tool Calling | 内部协议（LLMTurn/ToolCallRequest/tool 消息/流式 delta 聚合）+ openai-compatible 映射 + mock function-calling 替身 | f21dffe |
+| P3/4 Tool 层 | ToolRegistry + 4 Tool（strictObject 防身份注入）+ ArtifactService 最小实现 + idempotencyKey 透传 | 9edf09b |
+| P5 Agent Loop | 决策循环（权限边界/幂等复用/循环检测/终态状态机/不存 CoT/用量记录 runId 关联/task.created 转发） | 4d9eb9d |
+| P6 注册表接线 | AgentRegistryService（DB 驱动）替代 ChatService 硬编码 switch + GeneralAssistantAgent + agent-runs 只读 API + agent.end→message_end 映射 | 09c09c5 |
+| P7/8 SSE+前端 | agent.*/tool.*/run.* schema + 事件透传 + 前端当前工具徽标 | 0ff2670 |
+
+## 关键执行发现
+
+1. **zod 无 z.toJSONSchema**（3.25 实测）→ 采用 zod-to-json-schema + 非泛型边界切断类型实例化。
+2. **Prisma migrate dev 非交互环境**对 UNIQUE 警告触发交互 → migrate diff（--from-url）+ 手工迁移目录 + deploy；shadow DB 需先建库。
+3. **strictObject 而非 object**：zod 默认剥离未知键——防身份注入必须 strict。
+4. **意图→Agent 映射语义**：image/video 意图直接映射 Image/Video Agent（设计如此）；Loop 经 chat 意图 + 非媒体工具（artifact/memory）验证——e2e 用"营销方案"/"记住"关键词避开媒体路由。
+5. **Loop 流式兼容**：纯回答走实时 text.delta（M1 流式体验保持）；工具回合文本先输出后调用工具为可接受边缘。
+6. 终态迁移全条件更新（where status='running'），数据库层杜绝终态复活。
+
+## 最终验证
+
+- `pnpm test`：shared 11 + api 194 = **205 全绿**（35+ 测试文件）；build 3 包；typecheck 零错误
+- 冒烟（真实三进程）：登录 → "帮我做一个营销方案" → **run.created → agent.start → status → tool.start(artifact.create) → tool.end → message_delta×126 → agent.end(completed) → run.completed** → 制品落库 → agent-runs API 返回 completed run（general-assistant）
+- **M1/M2/M3 全量回归**：chat/image/video/context-memory/projects/attachments/auth 全部 e2e 继续全绿
+- 验收矩阵：Idempotency（ToolCall UNIQUE(runId,key) + task.idempotencyKey e2e 断言）/ Security（agent-runs 越权 404）/ Loop（AGENT_LOOP_DETECTED 单测 + 连续同参同工具只执行 1 次）/ Terminal State（updateMany 条件终态 + 7 种失败路径）
