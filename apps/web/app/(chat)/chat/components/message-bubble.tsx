@@ -45,7 +45,14 @@ export function MessageBubble({ message, streaming, onRetry }: { message: ChatMe
                   <img src={`${API_BASE}/api/v1/attachments/${a.id}`} alt={a.originalName ?? '图片'} className="max-h-64 w-full rounded-lg border border-zinc-800 object-cover" />
                 </a>
               ))}
-              {message.attachments.filter((a) => a.type !== 'image').map((a) => (
+              {message.attachments.filter((a) => a.type === 'video').map((a) => (
+                <div key={a.id} className="col-span-2 rounded-lg border border-zinc-800 bg-zinc-900 sm:col-span-3">
+                  <video src={`${API_BASE}/api/v1/attachments/${a.id}`} controls className="max-h-80 w-full" preload="metadata">
+                    视频无法播放，<a href={`${API_BASE}/api/v1/attachments/${a.id}`} className="text-blue-400 underline">下载查看</a>
+                  </video>
+                </div>
+              ))}
+              {message.attachments.filter((a) => a.type === 'file').map((a) => (
                 <a key={a.id} href={`${API_BASE}/api/v1/attachments/${a.id}`} target="_blank" rel="noreferrer"
                   className="flex items-center gap-2 rounded-lg border border-zinc-800 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800">
                   📎 {a.originalName ?? '文件'}
