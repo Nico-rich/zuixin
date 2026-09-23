@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { CryptoService } from './crypto.service';
 
-const KEY = 'dGVzdC1rZXktMzItYnl0ZXMtbG9uZy1hYmNkZWY='; // base64 32 字节
+const KEY = 'dGVzdC1rZXktMzItYnl0ZXMtbG9uZy1hYmNkZWZnaGk='; // base64 32 字节（test-key-32-bytes-long-abcdefghi）
 
 describe('CryptoService', () => {
   let svc: CryptoService;
