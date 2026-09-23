@@ -2164,3 +2164,30 @@ M2 方案文档：`docs/architecture/m2-database-module-design.md`（用户确�
 - `pnpm test`：shared 11 + api 148 = **159 全绿**；`pnpm build` 3 包；`pnpm typecheck` 零错误
 - 冒烟（真实三进程）：登录 → 建项目 → 项目内对话 → 中文"帮我做一张海报图" → mock-router 分类 image_generation → SSE task.created → Worker 消费 → 任务 completed(100) → generated_image 附件挂到 assistant 消息 → 项目过滤查询正确
 - M1 能力零回归（chat SSE/多轮/停止/重试/上传/记忆注入均测试覆盖）
+
+---
+
+# M3 执行记录（2026-09-23 追加）
+
+## 阶段与提交
+
+| 阶段 | 内容 | commit |
+|---|---|---|
+| M3-1/2 | 任务可靠性（原子 claim/条件终态/MEDIA_TASK_TIMEOUT/孤儿清扫 repeatable job/usage 失败归因修复）+ 统一 Media 抽象（ImageGenerationService → MediaGenerationService + MediaExecutor 策略，Image 零回归迁移） | cc23677 |
+| M3-3/4 | VideoProvider 独立接口 + mock-video/dashscope-video + VideoManager + VideoExecutor（capability 校验 UNSUPPORTED_PARAMETER）+ VideoAgent + video 队列处理器 + seed 视频模型/限额 | be1cbae |
+| M3-5 | 前端视频附件渲染（<video controls> + 下载回退） | 94a1918 |
+
+## 关键执行发现
+
+1. **Worker 模块缺 QueueModule**：BullQueue_media-cleanup 注入失败导致 worker 启动崩溃（队列 provider 非全局，MediaCleanupWorkerModule 需显式 import QueueModule）——修复。
+2. **接口能力校验落位**：capability 复用 models.capabilities（未扩展 provider 接口），UNSUPPORTED_PARAMETER 不可重试 → ModelRouter 不回退、不静默改写参数。
+3. **单任务单结果**：claim 与终态全部 updateMany 条件更新；清扫竞态（慢 worker 完成 vs 已标 failed）→ 放弃完成写入并回收已创建附件（e2e 验证附件数=1）。
+4. mock-video 结果为占位 MP4 容器（ftyp+mdat，39B）——真实 Provider 接入后为可播放视频（前端有下载回退）。
+
+## 最终验证
+
+- `pnpm test`：shared 11 + api 173 = **184 全绿**；build 3 包；typecheck 零错误
+- 冒烟（真实三进程）：登录 → 中文"帮我做一个产品视频" → mock-router 分类 video_generation → SSE task.created(kind=video) → 独立 video 队列 → Worker 消费 → completed(100) → generated_video 附件(video/mp4) → 下载 200
+- **Image 回归**：image e2e 全链路继续全绿（统一服务迁移零回归）
+- **可靠性验收**：孤儿清扫 e2e（人为 processing 超时 → sweep → failed MEDIA_TASK_TIMEOUT，幂等）；重复执行已完成任务 → 附件数仍为 1
+- 隔离：任务/附件/项目/记忆的 userId 归属校验沿用 M2 审计结论，M3 未新增暴露面
