@@ -2806,3 +2806,20 @@ git add -A && git commit -m "feat(web): Next.js 骨架 + 全仓构建/测试通�
 **类型一致性**：`TaskIntent` 来自 `@ai-agent/shared`（zod 推断），与架构文档 §8.2 一致；`AgentEvent` 与 §12.2 SSE 协议一致；`ChatParams/LLMChunk` 与 §6.1 一致；`StorageAdapter` 与 §13 一致；任务状态枚举与 §9 状态机一致（pending/processing/completed/failed/cancelled）。✓
 
 **已知边界（后续里程碑处理）**：ChatAgent 的默认模型解析（M4）、SSE HTTP 接线（M1）、Image/Video Provider 接口与队列处理器（M2/M3）、任务进度事件与 SSE 任务通道（M5）、限流与配额（M1/M2）。
+
+---
+
+## 执行偏差记录（2026-09-23 实际执行）
+
+| # | 计划 | 实际 | 原因 |
+|---|---|---|---|
+| 1 | MinIO 镜像 `minio/minio` | `quay.io/minio/minio` | MinIO 官方已迁出 Docker Hub |
+| 2 | PG 端口 5432 | 5433 | 本机 5432 已被占用 |
+| 3 | Prisma 用 `package.json#prisma` 配置 | `prisma.config.ts` | Prisma 6.19 已废弃旧配置；同时解决 monorepo 根 .env 加载 |
+| 4 | 依赖注入靠装饰器元数据 | 全部核心服务显式 `@Inject` | vitest/esbuild 下元数据不可靠 |
+| 5 | 错误映射位于 `providers/llm/errors` | 上移至 `common/errors/provider-error` | core/model-router 不得反向依赖 providers 层 |
+| 6 | 事件总线直接持 ioredis 类型 | `RedisPubSubLike` 最小接口 + wrapRedis 适配 | ioredis v5 回调签名与测试 fake 不兼容 |
+| 7 | web `output:'standalone'` | 移除 | Windows 下构建追踪 symlink EPERM；容器化时在 Linux 内构建再启用 |
+| 8 | enum 单行写法 | 多行 | Prisma 要求 enum 值独占一行 |
+
+**最终验证**：`pnpm test`（shared 7 + api 48 全绿）、`pnpm build`（3 包成功）、`pnpm typecheck` 零错误、API/Worker/Web 三进程冒烟通过（health 200、web 200、worker 加载 mock provider）。
