@@ -116,7 +116,7 @@ flowchart TB
 | 前端 | **Next.js 15 (App Router) + React 19 + TypeScript** | 你的既定方向；App Router 的 Route Handler 代理与流式渲染成熟 |
 | 样式/组件 | **Tailwind CSS v4 + shadcn/ui** | 现代 AI 产品质感（类 ChatGPT/Linear）；shadcn 源码可改，不被组件库锁死；暗色模式内建 |
 | 前端状态 | **TanStack Query（服务端状态）+ Zustand（UI 状态）** | 对话列表/任务列表用 Query 自动缓存与失效；聊天流用自定义 `useChatStream` hook |
-| Markdown/代码高亮 | react-markdown + remark-gfm + **shiki** | shiki 主题一致性最好（highlight.js 已过时） |
+| Markdown/代码高亮 | react-markdown + remark-gfm + **rehype-highlight** | M1 实测：shiki 客户端需 async 初始化高亮器，复杂度高收益低；rehype-highlight 零初始化、够用（如未来需更精确主题再切 shiki） |
 | 后端 | **NestJS 11 + Express 适配器** | 见 3.2 |
 | 校验 | **zod（全项目唯一校验源）** | DTO、事件负载、Router JSON 输出，前后端共享 `packages/shared` 中的 schema；不引入 class-validator 双体系 |
 | ORM | **Prisma** | 你的既定方向；迁移工具链成熟、类型安全 |
@@ -699,7 +699,7 @@ Base URL：`/api/v1`。除 auth 外均需 JWT（httpOnly Cookie 自动携带）�
 | GET/POST | /conversations | 列表（游标）/ 新建 |
 | GET/PATCH/DELETE | /conversations/:id | 详情 / 重命名 / 删除 |
 | GET | /conversations/:id/messages?cursor= | 历史消息（含附件） |
-| **POST** | **/conversations/:id/chat** | **SSE 主入口**：`{message, attachmentIds[], mode: 'normal'}` |
+| **POST** | **/chat** | **SSE 主入口**：`{conversationId?(空则自动建会话), message, mode}`（M1 已实现；attachmentIds M2 起） |
 | POST | /attachments | multipart 上传（图/视频/PDF/Word/Excel/TXT） |
 | GET | /attachments/:id | 302 到预签名 URL 或流式返回 |
 | GET | /tasks/:id | 任务状态（轮询） |
@@ -743,17 +743,21 @@ Base URL：`/api/v1`。除 auth 外均需 JWT（httpOnly Cookie 自动携带）�
 
 ### 12.2 事件协议（`Content-Type: text/event-stream`）
 
+M1 定稿的线上协议（内部 AgentEvent 层经 chat 模块映射；M2+ 扩展 task.*/tool.*）：
+
 ```text
-event: status          data: {"stage":"routing","message":"正在分析需求…"}
-event: status          data: {"stage":"image_generation","message":"正在调用图片生成模型…"}
-event: text.delta      data: {"text":"React 的 useEffect…"}
-event: task.created    data: {"taskId":"…","kind":"image"}
-event: task.completed  data: {"taskId":"…","artifact":{"type":"image","attachmentId":"…","url":"/attachments/…"}}
-event: text.done       data: {}
-event: done            data: {"messageId":"…"}
-event: error           data: {"code":"PROVIDER_TIMEOUT","message":"模型响应超时，请重试","requestId":"…"}
+event: message_start   data: {"type":"message_start","messageId":"…","conversationId":"…","role":"assistant","createdAt":"…"}
+event: status          data: {"type":"status","stage":"llm","message":"正在生成回答…"}     ← 思考/阶段状态
+event: message_delta   data: {"type":"message_delta","delta":"React 的 useEffect…"}
+event: message_end     data: {"type":"message_end","messageId":"…","status":"completed"}  ← completed|stopped|failed
+event: task.created    data: {"type":"task.created","taskId":"…","kind":"image"}           ← M2+
+event: task.progress   data: {"type":"task.progress","taskId":"…","progress":50}
+event: task.completed  data: {"type":"task.completed","taskId":"…","artifact":{…}}
+event: error           data: {"type":"error","code":"PROVIDER_TIMEOUT","message":"模型响应超时，请重试","requestId":"…"}
 : ping                                  ← 15s 心跳注释行，防代理断连
 ```
+
+对应 zod schema 位于 `packages/shared/src/events.ts`（ChatStreamEventSchema），前后端共用。
 
 > 说明：`task.progress` / `task.completed` 事件在聊天流中仅在任务极快完成（Agent 仍在流内）时出现；常规路径（尤其视频）下，MVP 由前端轮询 `GET /tasks/:id` 呈现任务终态。这两个事件是 Phase 5 任务 SSE 通道（`/tasks/stream`）的正式协议。
 
@@ -922,7 +926,7 @@ agent-platform/
 | 里程碑 | 内容 | 对应需求 Phase | 验收标准 |
 |---|---|---|---|
 | **M0 基础设施** | monorepo 初始化、docker compose（PG/Redis/MinIO）、Prisma schema + migrate、环境变量、pino 日志、health 端点、vitest 骨架 | Phase 3 | compose up 后 API/Web 可跑通，`/api/v1/health` 200 |
-| **M1 认证 + 对话 + LLM 流式** | 管理员创建用户/登录/JWT/改密、conversations/messages、`POST /chat` SSE、ChatAgent、LLM registry + `openai-compatible` adapter（覆盖六大厂商，后台配 baseUrl/key/model）、前端聊天界面（流式 Markdown、代码高亮、停止/重试） | Phase 4（前半） | 登录后多轮流式对话可用；断开/停止不崩 |
+| **M1 认证 + 对话 + LLM 流式** ✅ 已完成 | 管理员创建用户/登录/JWT/改密、conversations/messages、`POST /chat` SSE、ChatAgent、LLM registry + `openai-compatible` adapter（覆盖六大厂商，后台配 baseUrl/key/model）、前端聊天界面（流式 Markdown、代码高亮、停止/重试） | Phase 4（前半） | 登录后多轮流式对话可用；断开/停止不崩 |
 | **M2 附件 + 图片生成** | 上传（拖拽）+ storage adapter（local/MinIO）、image 队列 + Worker、ImageAgent、生图 adapter：`openai-image`（同步）+ `dashscope-image`（万相，异步）+ `zhipu-image`（CogView）、TaskCard 轮询进度、"换风格"追问 | Phase 4（中） | 上传图片、文字生图、进度展示、结果持久化入对话 |
 | **M3 视频生成** | video 队列 + submit/轮询器、VideoAgent、`dashscope-video`（万相 wanx2.x）+ `volcano-video`（即梦 Ark，可选），fallback 链万相→即梦、取消任务、TaskCard 扩展 | Phase 4（后） | 图/文生视频全流程 + 进度 + 取消可用 |
 | **M4 AI Router + Agent 注册中心** | 意图分类（可配 router 模型）、agent 注册表（DB 配置）、Thinking 状态流、**图片理解（已纳入：vision 模型经 openai-compatible 多模态消息，qwen-vl / glm-4v / doubao-vision / gpt-4o 任配）** | Phase 4 收尾 | 同一对话中聊天/生图/生视频/分析自动分流，`intentType` 可观测 |
