@@ -22,6 +22,7 @@ function makeChat(agentEvents?: () => AsyncIterable<AgentEvent>) {
   };
   const router = { classify: vi.fn().mockResolvedValue({ type: 'chat', confidence: 1, parameters: { prompt: 'x' } }) };
   const context = { assemble: vi.fn().mockResolvedValue({ messages: [], blocks: [] }) };
+  const memoryExtractor = { extractCandidates: vi.fn().mockResolvedValue(0) };
   const resolved = { providerId: 'p1', providerName: 'Mock', modelId: 'm1', apiModelId: 'mock-echo', timeoutMs: 1000, adapter: {} as never };
   const modelResolver = { resolveDefaultLLM: vi.fn().mockResolvedValue(resolved) };
   const usage = { recordChatUsage: vi.fn().mockResolvedValue(undefined) };
@@ -31,8 +32,8 @@ function makeChat(agentEvents?: () => AsyncIterable<AgentEvent>) {
     yield { type: 'done', messageId: 'm-assistant' };
   });
   const agentFactory = { create: vi.fn(() => ({ id: 'chat', execute: () => events() })) };
-  const svc = new ChatService(prisma as never, kv as never, router as never, context as never, modelResolver as never, usage as never, agentFactory as never);
-  return { svc, prisma, kv, usage, context };
+  const svc = new ChatService(prisma as never, kv as never, router as never, context as never, memoryExtractor as never, modelResolver as never, usage as never, agentFactory as never);
+  return { svc, prisma, kv, usage, context, memoryExtractor };
 }
 
 /** 收集 SSE 帧的 fake sink（缓冲式按 \n\n 分帧解析） */

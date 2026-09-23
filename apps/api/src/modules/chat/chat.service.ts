@@ -4,6 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { RedisKVService } from '../../core/circuit-breaker/redis-kv.service';
 import { RouterService } from '../../core/router/router.service';
 import { ContextAssembler } from '../../core/context/context-assembler';
+import { MemoryExtractor, MEMORY_EXTRACTOR } from '../../core/memory/memory-extractor';
 import { ModelResolverService } from '../../providers/llm/model-resolver.service';
 import { ResolvedLLM } from '../../providers/llm/llm-manager.service';
 import { ChatMessage } from '../../providers/llm/llm.types';
@@ -16,6 +17,7 @@ export interface ChatRunContext {
   conversationId: string; userMessageId: string; assistantMessageId: string;
   userMessage: string; history: ChatMessage[]; intent: TaskIntent;
   resolved: ResolvedLLM; lockKey: string; startedAt: number; userId: string;
+  projectId?: string | null;
 }
 
 export interface AgentFactory {
@@ -31,6 +33,7 @@ export class ChatService {
     @Inject(RedisKVService) private readonly kv: RedisKVService,
     @Inject(RouterService) private readonly router: RouterService,
     @Inject(ContextAssembler) private readonly context: ContextAssembler,
+    @Inject(MEMORY_EXTRACTOR) private readonly memoryExtractor: MemoryExtractor,
     @Inject(ModelResolverService) private readonly modelResolver: ModelResolverService,
     @Inject(UsageService) private readonly usage: UsageService,
     @Inject('CHAT_AGENT_FACTORY') private readonly agentFactory: AgentFactory,
@@ -68,6 +71,7 @@ export class ChatService {
       return {
         conversationId: conversation.id, userMessageId: userMessage.id, assistantMessageId: assistantMessage.id,
         userMessage: dto.message, history, intent, resolved, lockKey, startedAt, userId,
+        projectId: conversation.projectId,
       };
     } catch (err) {
       await this.kv.del(lockKey).catch(() => undefined);
@@ -136,6 +140,13 @@ export class ChatService {
       inputTokens: usage?.inputTokens ?? 0, outputTokens: usage?.outputTokens ?? 0,
       latencyMs, status: status === 'completed' ? 'success' : 'failed', errorCode,
     }).catch((err) => this.logger.error(`用量记录失败: ${(err as Error).message}`));
+    // 记忆提取：fire-and-forget，不阻塞 SSE 收尾；失败/无候选静默（提取器内部兜底）
+    if (status === 'completed' && content) {
+      void this.memoryExtractor.extractCandidates({
+        userId: ctx.userId, conversationId: ctx.conversationId, projectId: ctx.projectId ?? undefined,
+        userMessage: ctx.userMessage, assistantReply: content, sourceMessageId: ctx.assistantMessageId,
+      }).catch(() => undefined);
+    }
     // 结构化日志（M5 统计：成本/成功率/latency/provider 健康度）
     this.logger.log({
       requestId, userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.assistantMessageId,
