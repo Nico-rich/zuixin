@@ -13,6 +13,7 @@ const XRW = { 'X-Requested-With': 'XMLHttpRequest' };
 describe('Chat (e2e, Mock Provider 全链路)', () => {
   let app: INestApplication;
   let cookie: string;
+  let convId = ''; // 从本套件自己的 SSE 流捕获，避免与其他并行 e2e 套件共享 DB 时取错会话
   const email = process.env.SEED_ADMIN_EMAIL ?? 'admin@example.com';
   const password = process.env.SEED_ADMIN_PASSWORD ?? 'admin123456';
 
@@ -47,6 +48,9 @@ describe('Chat (e2e, Mock Provider 全链路)', () => {
     expect(text).toContain('event: message_delta');
     expect(text).toContain('event: message_end');
     expect(text).toContain('"status":"completed"');
+    const convMatch = text.match(/"conversationId":"([0-9a-f-]+)"/);
+    expect(convMatch).toBeTruthy();
+    convId = convMatch![1];
     // mock 逐字符流式，原始文本中不存在连续子串——解析 delta 帧拼接后校验内容
     const deltas: string[] = [];
     for (const frame of text.split('\n\n')) {
@@ -62,9 +66,6 @@ describe('Chat (e2e, Mock Provider 全链路)', () => {
   });
 
   it('消息完整持久化：conversations + messages 落库（含 intentType）', async () => {
-    const list = await request(app.getHttpServer()).get('/api/v1/conversations').set('Cookie', cookie).expect(200);
-    expect(list.body.data.length).toBeGreaterThanOrEqual(1);
-    const convId = list.body.data[0].id;
     const msgs = await request(app.getHttpServer()).get(`/api/v1/conversations/${convId}/messages`).set('Cookie', cookie).expect(200);
     const roles = msgs.body.data.map((m: { role: string }) => m.role);
     expect(roles[0]).toBe('user');
@@ -75,8 +76,6 @@ describe('Chat (e2e, Mock Provider 全链路)', () => {
   });
 
   it('指定 conversationId 追问：历史消息累计 4 条', async () => {
-    const list = await request(app.getHttpServer()).get('/api/v1/conversations').set('Cookie', cookie).expect(200);
-    const convId = list.body.data[0].id;
     await request(app.getHttpServer()).post('/api/v1/chat').set(XRW).set('Cookie', cookie)
       .send({ conversationId: convId, message: '继续' })
       .buffer(true).parse((r, cb) => { r.on('data', () => undefined); r.on('end', () => cb(null, '')); })

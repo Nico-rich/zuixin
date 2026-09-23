@@ -68,10 +68,15 @@ export class ChatService {
       });
       const attachments = await this.resolveAttachments(userId, dto.attachmentIds);
       // 上下文组装统一走 ContextAssembler（最近消息 + 项目/用户记忆；未来 Summary/RAG 在此扩展）
-      const { messages: history } = await this.context.assemble({
+      const { messages: history, blocks } = await this.context.assemble({
         userId, conversationId: conversation.id, projectId: conversation.projectId ?? undefined, excludeMessageId: userMessage.id,
       });
-      const intent = await this.router.classify({ userMessage: dto.message, attachments: [], history: history.slice(-2) });
+      // 意图分类只看真实对话（记忆块不进 Router——"用户偏好主图尺寸"不应触发生图意图）
+      const conversationOnly = blocks
+        .map((b, i) => ({ scope: b.scope, message: history[i] }))
+        .filter((x) => x.scope === 'conversation')
+        .map((x) => x.message);
+      const intent = await this.router.classify({ userMessage: dto.message, attachments: [], history: conversationOnly.slice(-2) });
       // 仅 LLM 类意图解析 LLM（生图等直接走各自 Agent，不浪费一次模型解析）
       const resolved = intent.type === 'chat' ? await this.modelResolver.resolveDefaultLLM() : null;
       // 意图落库可观测（M4 后台看分类命中率）
@@ -145,12 +150,14 @@ export class ChatService {
       where: { id: ctx.assistantMessageId },
       data: { content, status, errorCode, tokenUsage: usage ?? undefined },
     }).catch((err) => this.logger.error(`消息落库失败: ${(err as Error).message}`));
-    await this.usage.recordChatUsage({
-      userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.assistantMessageId,
-      providerId: ctx.resolved.providerId, modelId: ctx.resolved.modelId,
-      inputTokens: usage?.inputTokens ?? 0, outputTokens: usage?.outputTokens ?? 0,
-      latencyMs, status: status === 'completed' ? 'success' : 'failed', errorCode,
-    }).catch((err) => this.logger.error(`用量记录失败: ${(err as Error).message}`));
+    if (ctx.resolved) {
+      await this.usage.recordChatUsage({
+        userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.assistantMessageId,
+        providerId: ctx.resolved.providerId, modelId: ctx.resolved.modelId,
+        inputTokens: usage?.inputTokens ?? 0, outputTokens: usage?.outputTokens ?? 0,
+        latencyMs, status: status === 'completed' ? 'success' : 'failed', errorCode,
+      }).catch((err) => this.logger.error(`用量记录失败: ${(err as Error).message}`));
+    }
     // 记忆提取：fire-and-forget，不阻塞 SSE 收尾；失败/无候选静默（提取器内部兜底）
     if (status === 'completed' && content) {
       void this.memoryExtractor.extractCandidates({
@@ -161,7 +168,7 @@ export class ChatService {
     // 结构化日志（M5 统计：成本/成功率/latency/provider 健康度）
     this.logger.log({
       requestId, userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.assistantMessageId,
-      provider: ctx.resolved.providerName, model: ctx.resolved.apiModelId, intentType: ctx.intent.type,
+      provider: ctx.resolved?.providerName ?? 'none', model: ctx.resolved?.apiModelId ?? 'none', intentType: ctx.intent.type,
       latencyMs, status, errorCode, tokens: usage,
     }, 'chat 完成');
   }
