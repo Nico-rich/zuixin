@@ -2224,3 +2224,31 @@ M4 设计：`docs/architecture/m4-agent-tool-design.md`（用户确认 + 6 项�
 - 冒烟（真实三进程）：登录 → "帮我做一个营销方案" → **run.created → agent.start → status → tool.start(artifact.create) → tool.end → message_delta×126 → agent.end(completed) → run.completed** → 制品落库 → agent-runs API 返回 completed run（general-assistant）
 - **M1/M2/M3 全量回归**：chat/image/video/context-memory/projects/attachments/auth 全部 e2e 继续全绿
 - 验收矩阵：Idempotency（ToolCall UNIQUE(runId,key) + task.idempotencyKey e2e 断言）/ Security（agent-runs 越权 404）/ Loop（AGENT_LOOP_DETECTED 单测 + 连续同参同工具只执行 1 次）/ Terminal State（updateMany 条件终态 + 7 种失败路径）
+
+---
+
+# M5 实施记录（2026-09-23 进行中，明日继续）
+
+M5 设计：`docs/architecture/m5-architecture-design.md`（已确认 + 10 条硬约束）。
+
+## 已完成
+
+| Phase | 内容 | commit |
+|---|---|---|
+| P1 | pgvector 镜像切换（pgvector/pgvector:pg16，数据卷兼容，CREATE EXTENSION vector 手动安装）+ AgentVersion/KB/Document/Chunk 表 + 5 枚举 + Agent.scope/activeVersionId(unique) + AgentRun.agentVersionId(Restrict) + tasks/artifacts runId/toolCallId + 迁移（diff+deploy）+ seed 一致性修复 | 491ff31 |
+
+## 明日继续（按序）
+
+- P2 Agent Version：registry 读 activeVersion、run 锁 versionId、publish/rollback/draft 生命周期 API、immutable published 服务层守卫、agents 旧定义字段退役迁移（快照 v1 后移除）
+- P3 linkage：ToolContext.toolCallId + tools 透传 runId/toolCallId + 非 Agent 场景兼容
+- P4 Usage：loop 失败回合 try/finally + 媒体 runId 归因 + 聚合 API
+- P5 Knowledge：EmbeddingProvider 族（mock 1536 维/dashscope/openai）+ KnowledgeRepository（封装 $queryRaw/$executeRaw）+ KnowledgeService + document 队列/Worker（txt/md 原生 + pdf-parse/mammoth）+ 去重/生命周期 + knowledge.search Tool
+- P6/7：KnowledgeSource 注册 + BudgetApplier（8k/优先级/截断）
+- P8 Timeline 投影 API
+- P9/10 专项测试 + M1~M4 回归
+
+## 关键状态
+
+- 全量测试 196 全绿、typecheck clean、build 通过
+- pgvector 扩展已在 PG 容器安装（extension "vector" 存在）
+- 每个 Phase 完成必须 typecheck+test 通过再进入下一阶段（用户硬约束）
