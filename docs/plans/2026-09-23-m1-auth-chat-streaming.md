@@ -2129,3 +2129,38 @@ git add -A && git commit -m "docs: M1 完成——架构文档同步 + 执行偏
 **最终验证**：`pnpm test`（89 全绿）、`pnpm build`（3 包）、`pnpm typecheck` 零错误；全栈冒烟通过——登录/SSE 流式（message_start→status→逐字符 delta→message_end）/消息持久化/并发锁/越权校验/CSRF/限流。
 
 **M1 交付能力**：Mock Provider 零 Key 完整链路（浏览器登录 admin@example.com / admin123456 → /chat 对话流式）；填入真实 Key 后（M5 后台或 seed）自动切真实模型，前端零改动。
+
+---
+
+# M2 执行记录（2026-09-23 追加）
+
+M2 方案文档：`docs/architecture/m2-database-module-design.md`（用户确认 6 决策点 + 3 追加架构要求）。
+
+## 阶段与提交
+
+| 阶段 | 内容 | commit |
+|---|---|---|
+| M2-1 | 数据模型（Project/Memory 含 lastUsedAt/Summary/Artifact + projectId + generated_file）+ seed（mock-router/生图 Provider/路由与限额） | 5041756 |
+| M2-2 | Project CRUD/软删除/归属校验 + @UsePipes→@Body(pipe) 修复 | 9e04bcd, b8cfd4e |
+| M2-3 | Conversation↔Project（挂载/移动/过滤/校验，ChatDto.projectId） | 24839bc |
+| M2-4 | Memory（core/memory 单表 + ILIKE + confidence≠importance + markUsed） | 729f240 |
+| M2-5 | ContextAssembler 接入（两个 MemorySource + CONTEXT_ORDER + 集成 e2e） | 6d61115 |
+| M2-6 | MemoryExtractor（阈值 0.7 + 每日上限 + fire-and-forget + Symbol DI token） | 8fad992 |
+| M2-7 | Attachment 上传/下载（multer/校验/getStream/attachmentIds→图片上下文） | 47cf4c8 |
+| M2-8 | Image Generation 独立能力（四 adapter/ImageManager/GenerationService/Worker/ImageAgent/tasks API/mock-router） | 6e9652a, ecd1727 |
+| M2-9 | 前端（上传/TaskCard/附件渲染/Project 选择器/同源代理） | fa6cd68 |
+
+## 关键执行发现（架构级）
+
+1. **Router 污染**：记忆块进意图分类会把"用户偏好主图尺寸"误判为生图意图 → 修复：Router 只接收 conversation scope 的块（prepareChat 过滤），Agent 上下文仍含全部记忆。这是 M2 接入记忆后暴露的真实设计问题。
+2. **接口 DI token**：`MemoryExtractor` 接口不能作 Nest token（类型擦除）→ Symbol token 约定固化。
+3. **@Optional 缺失**：EventBusService 可选构造参数未标 @Optional 导致 dev server 启动崩溃（单测直构未暴露）→ 修复。教训：可选构造注入必须 @Optional 或走工厂。
+4. **e2e 共享 DB 隔离**：chat e2e 取"列表第一条"会被并行套件的会话污染 → 改为从自身 SSE 流捕获 conversationId。
+5. **前端媒体鉴权**：`<img>` 跨域不带 cookie → Next rewrites 同源代理 `/api/*`（生产由 nginx 同域反代）。
+6. **Prisma Json 更新**：显式 null 需 `Prisma.JsonNull`；zod 字面量 vs Prisma 字符串枚举名义不兼容需显式收窄。
+
+## 最终验证
+
+- `pnpm test`：shared 11 + api 148 = **159 全绿**；`pnpm build` 3 包；`pnpm typecheck` 零错误
+- 冒烟（真实三进程）：登录 → 建项目 → 项目内对话 → 中文"帮我做一张海报图" → mock-router 分类 image_generation → SSE task.created → Worker 消费 → 任务 completed(100) → generated_image 附件挂到 assistant 消息 → 项目过滤查询正确
+- M1 能力零回归（chat SSE/多轮/停止/重试/上传/记忆注入均测试覆盖）

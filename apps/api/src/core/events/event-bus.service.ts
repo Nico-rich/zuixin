@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, Optional } from '@nestjs/common';
 import Redis from 'ioredis';
 
 const CHANNEL_PREFIX = 'agent:events:';
@@ -28,7 +28,7 @@ export class EventBusService implements OnModuleDestroy {
   private readonly pub: RedisPubSubLike;
   private readonly sub: RedisPubSubLike;
 
-  constructor(injected?: RedisPubSubLike) {
+  constructor(@Optional() injected?: RedisPubSubLike) {
     if (injected) {
       this.pub = injected; this.sub = injected;
       return;
