@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../../modules/prisma/prisma.service';
 import { CryptoService } from '../../core/crypto/crypto.service';
 import { LLMProvider } from './llm.types';
@@ -16,7 +16,11 @@ export class LLMManagerService implements OnModuleInit {
   private readonly logger = new Logger('LLMManager');
   private providers = new Map<string, LLMProvider>();
 
-  constructor(private readonly prisma: PrismaService, private readonly crypto: CryptoService) {}
+  // 显式 @Inject：vitest/esbuild 场景下装饰器元数据不可靠，显式注入最稳
+  constructor(
+    @Inject(PrismaService) private readonly prisma: PrismaService,
+    @Inject(CryptoService) private readonly crypto: CryptoService,
+  ) {}
 
   async onModuleInit() { await this.refresh(); }
 

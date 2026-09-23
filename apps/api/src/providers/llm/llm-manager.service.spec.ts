@@ -7,7 +7,7 @@ function makeManager() {
       { id: 'p1', name: 'Test', type: 'llm', adapter: 'mock', baseUrl: '', apiKeyEncrypted: '', timeoutMs: 1000, enabled: true },
     ]) },
     model: { findUnique: vi.fn().mockResolvedValue({
-      id: 'm1', apiModelId: 'mock-echo', enabled: true,
+      id: 'm1', providerId: 'p1', apiModelId: 'mock-echo', enabled: true,
       provider: { id: 'p1', name: 'Test', enabled: true },
     }) },
   };
@@ -37,12 +37,10 @@ describe('LLMManagerService', () => {
     await expect(svc.resolve('nope')).rejects.toThrow('模型不可用');
   });
 
-  it('禁用的 provider 不会被加载', async () => {
+  it('refresh 只查询启用中的 LLM provider（过滤下推到 DB）', async () => {
     const { svc, prisma } = makeManager();
-    (prisma.provider.findMany as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
-      { id: 'p2', name: 'Disabled', type: 'llm', adapter: 'mock', baseUrl: '', apiKeyEncrypted: '', timeoutMs: 1000, enabled: false },
-    ]);
     await svc.refresh();
-    expect(svc.getProvider('p2')).toBeUndefined();
+    const where = (prisma.provider.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
+    expect(where).toEqual({ type: 'llm', enabled: true });
   });
 });
