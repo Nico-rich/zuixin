@@ -34,8 +34,8 @@ export class AuthController {
 
   @Get('me')
   @UseGuards(JwtAuthGuard)
-  async me(@Req() req: Request & { user: AuthedUser }) {
-    return { data: await this.auth.me(req.user.userId) };
+  me(@Req() req: Request & { user: AuthedUser }) {
+    return this.auth.me(req.user.userId); // 全局 TransformInterceptor 统一包 {data}
   }
 
   private setAuthCookies(res: Response, access: string, refresh: string) {

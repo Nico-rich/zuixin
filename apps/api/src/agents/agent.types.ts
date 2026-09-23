@@ -12,6 +12,7 @@ export interface AgentContext {
   history: ChatMessage[];
   intent: TaskIntent;
   mode: 'normal' | 'thinking';
+  signal?: AbortSignal; // 用户停止生成 → 传播到 Provider 流
 }
 
 export interface Agent {

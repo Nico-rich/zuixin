@@ -23,11 +23,13 @@ export class ChatAgent implements Agent {
         ? await this.options.resolveLLM(ctx)
         : await this.resolveDefault(ctx);
       const messages = this.buildMessages(ctx);
-      const stream = adapter.stream({ model: apiModelId, messages, temperature: 0.7 });
+      const stream = adapter.stream({ model: apiModelId, messages, temperature: 0.7, signal: ctx.signal });
+      let usage: { inputTokens: number; outputTokens: number } | undefined;
       for await (const chunk of stream) {
         if (chunk.type === 'text') yield { type: 'text.delta', text: chunk.text };
+        else if (chunk.type === 'usage') usage = chunk.usage;
       }
-      yield { type: 'done', messageId: ctx.messageId };
+      yield { type: 'done', messageId: ctx.messageId, usage };
     } catch (err) {
       const e = err as { code?: string; message?: string };
       yield { type: 'error', code: e.code ?? 'PROVIDER_UNKNOWN', message: e.message ?? '生成失败' };

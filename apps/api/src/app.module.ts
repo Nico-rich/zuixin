@@ -8,9 +8,12 @@ import { CryptoModule } from './core/crypto/crypto.module';
 import { StorageModule } from './core/storage/storage.module';
 import { QueueModule } from './core/queue/queue.module';
 import { CircuitBreakerModule } from './core/circuit-breaker/circuit-breaker.module';
+import { RouterModule } from './core/router/router.module';
 import { ProvidersModule } from './providers/providers.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { ConversationsModule } from './modules/conversations/conversations.module';
+import { ChatModule } from './modules/chat/chat.module';
+import { UsageModule } from './modules/usage/usage.module';
 import { GlobalExceptionFilter } from './common/filters/global-exception.filter';
 
 @Module({
@@ -34,9 +37,12 @@ import { GlobalExceptionFilter } from './common/filters/global-exception.filter'
     StorageModule,
     QueueModule,
     CircuitBreakerModule,
+    RouterModule,
     ProvidersModule,
     AuthModule,
     ConversationsModule,
+    ChatModule,
+    UsageModule,
     HealthModule,
   ],
   providers: [GlobalExceptionFilter],

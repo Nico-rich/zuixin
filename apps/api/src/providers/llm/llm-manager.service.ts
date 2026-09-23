@@ -58,7 +58,7 @@ export class LLMManagerService implements OnModuleInit {
   private buildAdapter(name: string, cfg: { baseUrl: string; apiKey: string; timeoutMs: number }): LLMProvider {
     switch (name) {
       case 'openai-compatible': return new OpenAICompatibleAdapter(cfg);
-      case 'mock': return new MockLLMAdapter();
+      case 'mock': return new MockLLMAdapter(Number(process.env.MOCK_DELAY_MS ?? 20));
       default: throw new Error(`未知 LLM adapter: ${name}`);
     }
   }

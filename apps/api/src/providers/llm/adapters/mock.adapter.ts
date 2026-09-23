@@ -1,8 +1,9 @@
 import { ChatParams, ChatResponse, LLMChunk, LLMProvider } from '../llm.types';
 
-/** 开发/测试用 echo 适配器（无真实 API Key 时跑通全链路） */
+/** 开发/测试用 echo 适配器（无真实 API Key 时跑通全链路）；分块延迟模拟真实流式 */
 export class MockLLMAdapter implements LLMProvider {
   readonly kind = 'llm' as const;
+  constructor(private readonly chunkDelayMs = 20) {}
 
   async chat(params: ChatParams): Promise<ChatResponse> {
     return { content: this.reply(params), usage: { inputTokens: 1, outputTokens: 1 } };
@@ -10,7 +11,11 @@ export class MockLLMAdapter implements LLMProvider {
 
   async *stream(params: ChatParams): AsyncIterable<LLMChunk> {
     const text = this.reply(params);
-    for (const ch of text) yield { type: 'text', text: ch };
+    for (const ch of text) {
+      if (params.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+      yield { type: 'text', text: ch };
+      if (this.chunkDelayMs > 0) await new Promise((r) => setTimeout(r, this.chunkDelayMs));
+    }
   }
 
   private reply(params: ChatParams): string {

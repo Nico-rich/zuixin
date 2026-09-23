@@ -6,6 +6,7 @@ import Redis from 'ioredis';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { AppModule } from '../src/app.module';
 import { GlobalExceptionFilter } from '../src/common/filters/global-exception.filter';
+import { TransformInterceptor } from '../src/common/interceptors/transform.interceptor';
 import { csrfProtection } from '../src/modules/auth/csrf.middleware';
 
 const XRW = { 'X-Requested-With': 'XMLHttpRequest' };
@@ -34,6 +35,7 @@ describe('Auth (e2e)', () => {
     app.use('/api/v1', csrfProtection);
     app.setGlobalPrefix('api/v1');
     app.useGlobalFilters(moduleRef.get(GlobalExceptionFilter));
+    app.useGlobalInterceptors(new TransformInterceptor());
     await app.init();
   });
 
