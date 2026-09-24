@@ -16,13 +16,13 @@ import { ProjectsModule } from './modules/projects/projects.module';
 import { MemoriesModule } from './modules/memories/memories.module';
 import { AttachmentsModule } from './modules/attachments/attachments.module';
 import { AgentsModule } from './agents/agents.module';
-import { AgentRunsModule } from './modules/agent-runs/agent-runs.module';
+import { AgentRunsApiModule } from './modules/agent-runs/agent-runs-api.module';
 import { AgentsAdminModule } from './modules/agents-admin/agents-admin.module';
 import { KnowledgeApiModule } from './modules/knowledge/knowledge.module';
 import { GenerationsModule } from './modules/generations/generations.module';
 import { TasksModule } from './modules/tasks/tasks.module';
 import { ChatModule } from './modules/chat/chat.module';
-import { UsageModule } from './modules/usage/usage.module';
+import { UsageApiModule } from './modules/usage/usage-api.module';
 import { GlobalExceptionFilter } from './common/filters/global-exception.filter';
 
 @Module({
@@ -54,13 +54,13 @@ import { GlobalExceptionFilter } from './common/filters/global-exception.filter'
     MemoriesModule,
     AttachmentsModule,
     AgentsModule,
-    AgentRunsModule,
+    AgentRunsApiModule,
     AgentsAdminModule,
     KnowledgeApiModule,
     GenerationsModule,
     TasksModule,
     ChatModule,
-    UsageModule,
+    UsageApiModule,
     HealthModule,
   ],
   providers: [GlobalExceptionFilter],

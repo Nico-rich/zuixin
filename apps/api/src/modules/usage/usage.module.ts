@@ -1,7 +1,7 @@
 import { Global, Module } from '@nestjs/common';
 import { UsageService } from './usage.service';
-import { UsageController } from './usage.controller';
 
+/** 服务层（@Global：API 与 Worker 共用）；HTTP 面在 UsageApiModule（Worker 不引入 JWT 守卫） */
 @Global()
-@Module({ controllers: [UsageController], providers: [UsageService], exports: [UsageService] })
+@Module({ providers: [UsageService], exports: [UsageService] })
 export class UsageModule {}

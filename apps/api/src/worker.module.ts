@@ -11,6 +11,7 @@ import { QueueModule } from './core/queue/queue.module';
 import { ImageWorkerModule } from './worker/image/image-worker.module';
 import { MediaCleanupWorkerModule } from './worker/media-cleanup/media-cleanup-worker.module';
 import { VideoWorkerModule } from './worker/video/video-worker.module';
+import { AgentRunWorkerModule } from './worker/agent-run/agent-run-worker.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { VideoWorkerModule } from './worker/video/video-worker.module';
     ImageWorkerModule,
     VideoWorkerModule,
     MediaCleanupWorkerModule,
+    AgentRunWorkerModule,
   ],
 })
 export class WorkerModule {}

@@ -33,6 +33,7 @@ function makePersistence() {
     recordChatUsage: vi.fn(async (i) => { state.usage.push({ ...i }); }),
     finalizeRun: vi.fn(async (_id, data) => { state.finalize.push({ ...data }); return { count: 1 }; }),
     updateCurrentStep: vi.fn(async () => undefined),
+    findStep: vi.fn(async () => null),
   };
   return { persistence, state };
 }
@@ -389,6 +390,51 @@ describe('AgentRuntimeEngine（M6-P2 抽取后行为冻结 + transcript checkpoi
     await run(engine, makeEngine({ tools: [imageTool, multiTool] }).input);
     const assistantWithToolCalls = capturedRound2.filter((m) => m.role === 'assistant' && m.tool_calls?.length);
     expect(assistantWithToolCalls).toHaveLength(1); // 恰好一条（修复前为 N 条重复）
+  });
+
+  it('M6-P3 异步模式：runId 提供时跳过 createRun，且 seed 不含用户消息（API 已持久化）', async () => {
+    const { engine, persistence, state } = makeEngine({ streamFn: async function* () { yield { type: 'text', text: '异步回答' }; } });
+    const input = { ...makeEngine().input, runId: 'run-existing', workerId: 'worker-A' };
+    const { events } = await run(engine, input);
+    expect(persistence.createRun).not.toHaveBeenCalled();
+    expect(events[0]).toMatchObject({ type: 'run.created', runId: 'run-existing' });
+    // seed = system（末尾用户消息被跳过——已由 API 持久化为 seq 0）；随后只有 final assistant 追加
+    expect(state.messages.map((m) => m.role)).toEqual(['system', 'assistant']);
+    expect(state.messages.some((m) => m.role === 'user')).toBe(false);
+    // fencing：终态与 currentStep 携带 workerId
+    expect(state.finalize[0]).toMatchObject({ status: 'completed', workerId: 'worker-A' });
+  });
+
+  it('M6-P3 最小续跑：startStep 起点 + 崩溃残留 step 行 P2002 → 复用原行 id（幂等键稳定）', async () => {
+    const { engine, persistence, state } = makeEngine({
+      tools: [imageTool],
+      streamFn: async function* () {
+        yield { type: 'tool_calls', toolCalls: [{ id: 'c1', name: 'image.generate', arguments: '{"prompt":"x"}' }] };
+      },
+    });
+    (persistence.createStep as ReturnType<typeof vi.fn>).mockRejectedValueOnce(Object.assign(new Error('dup'), { code: 'P2002' }));
+    (persistence.findStep as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'step-existing' });
+    const input = { ...makeEngine({ tools: [imageTool] }).input, runId: 'run-existing', startStep: 2, seedTranscript: false };
+    await run(engine, input);
+    expect(persistence.createStep).toHaveBeenCalledWith(expect.objectContaining({ stepIndex: 2 }));
+    // ToolCall 行挂在复用的 step 行上（runStepId=step-existing）
+    expect(state.toolCallCreates[0]).toMatchObject({ runStepId: 'step-existing' });
+  });
+
+  it('M6-P3 shutdown：controls.active=false → Engine 跳过终态写入与 agent.end/run.completed（不伪造终态）', async () => {
+    const { engine, state } = makeEngine();
+    const controls = { active: false };
+    const input = { ...makeEngine().input, controls };
+    const it = engine.run(input);
+    const events: Array<{ type: string }> = [];
+    while (true) {
+      const { done, value } = await it.next();
+      if (done) break;
+      events.push(value as { type: string });
+    }
+    expect(events.map((e) => e.type)).not.toContain('agent.end');
+    expect(events.map((e) => e.type)).not.toContain('run.completed');
+    expect(state.finalize).toHaveLength(0);
   });
 
   it('result mapping：outcome 携带 runId/content/status/taskRefs（生成任务引用）', async () => {

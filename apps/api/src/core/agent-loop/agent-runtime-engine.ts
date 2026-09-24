@@ -30,7 +30,7 @@ export interface AgentLoopAgentConfig {
   contextBudgetTokens?: number;
 }
 
-/** Engine 输入上下文：身份全部由服务端（Sync Driver）构建，用户输入不可指定 */
+/** Engine 输入上下文：身份全部由服务端（Sync/Async Driver）构建，用户输入不可指定 */
 export interface AgentRuntimeContext {
   userId: string;
   projectId?: string;
@@ -42,6 +42,16 @@ export interface AgentRuntimeContext {
   /** 相对 deadline（ms）；缺省取 limits.agentRunTimeoutMs，再缺省 120s。P3 分层超时不动本字段 */
   deadlineMs?: number;
   signal: AbortSignal;
+  /** M6-P3 异步模式：已有 run（跳过 createRun；transcript 用户消息已由 API 持久化） */
+  runId?: string;
+  /** M6-P3 续跑起点（= run.currentStep；sync 默认 0） */
+  startStep?: number;
+  /** 是否 seed transcript（async 续跑时由 Driver 置 false——已持久化） */
+  seedTranscript?: boolean;
+  /** M6-P3 fencing：终态/currentStep 条件写携带 workerId（sync 无） */
+  workerId?: string;
+  /** 运行时控制位（shutdown 时 Driver 置 active=false → Engine 跳过终态写入） */
+  controls?: { active: boolean };
 }
 
 /** Engine 结构化结果（不携带 Prisma model，不含内部敏感信息） */
@@ -92,12 +102,15 @@ export class AgentRuntimeEngine {
     const limits = await this.persistence.getSystemSetting('limits');
     const configuredTimeout = (limits as { agentRunTimeoutMs?: number } | null)?.agentRunTimeoutMs;
     const deadline = Date.now() + (ctx.deadlineMs ?? configuredTimeout ?? DEFAULT_DEADLINE_MS);
-    const run = await this.persistence.createRun({
-      userId: ctx.userId, agentId: ctx.agent.id,
-      agentVersionId: ctx.agent.versionId, // 锁定版本快照，永不改变
-      projectId: ctx.projectId, conversationId: ctx.conversationId,
-      maxSteps, metadata: { agentTools: ctx.agent.tools },
-    });
+    // P3 异步模式：run 已由 API 创建（queued→claim→running）；sync 模式仍由 Engine 创建
+    const run = ctx.runId
+      ? { id: ctx.runId }
+      : await this.persistence.createRun({
+          userId: ctx.userId, agentId: ctx.agent.id,
+          agentVersionId: ctx.agent.versionId, // 锁定版本快照，永不改变
+          projectId: ctx.projectId, conversationId: ctx.conversationId,
+          maxSteps, metadata: { agentTools: ctx.agent.tools },
+        });
     const runId = run.id;
     yield { type: 'run.created', runId, agentId: ctx.agent.id };
     yield { type: 'agent.start', agentId: ctx.agent.id, runId };
@@ -108,12 +121,16 @@ export class AgentRuntimeEngine {
       ...ctx.history,
       { role: 'user' as const, content: ctx.userMessage },
     ];
-    // transcript seed：初始上下文（system + history + user）——durable 重放基座（CP0）
-    for (const m of messages) {
-      await this.persistence.appendMessage(ctx.userId, runId, {
-        role: m.role as never,
-        content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
-      }).catch((err) => this.logger.warn(`transcript seed 失败: ${(err as Error).message}`));
+    // transcript seed：初始上下文（system + history + user）——durable 重放基座（CP0）。
+    // async 模式：用户消息已由 API 持久化（seq 0），只 seed system+history；续跑（seedTranscript=false）不重复 seed。
+    if (ctx.seedTranscript !== false) {
+      const seedMessages = ctx.runId ? messages.slice(0, -1) : messages; // messages 末尾恒为当前用户消息
+      for (const m of seedMessages) {
+        await this.persistence.appendMessage(ctx.userId, runId, {
+          role: m.role as never,
+          content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+        }).catch((err) => this.logger.warn(`transcript seed 失败: ${(err as Error).message}`));
+      }
     }
 
     const toolDefs = this.toolDefinitions(ctx.agent.tools);
@@ -126,7 +143,8 @@ export class AgentRuntimeEngine {
     const taskRefs: string[] = [];
 
     try {
-      for (let step = 0; step < maxSteps; step++) {
+      // P3 最小续跑：从 run.currentStep 继续（已完成 step 的 tool 结果在 transcript 里随 history 重放）
+      for (let step = ctx.startStep ?? 0; step < maxSteps; step++) {
         if (ctx.signal.aborted) { finalStatus = 'cancelled'; break; }
         if (Date.now() >= deadline) { finalStatus = 'timeout'; errorCode = ErrorCode.AGENT_RUN_TIMEOUT; break; }
 
@@ -200,8 +218,9 @@ export class AgentRuntimeEngine {
         }
         lastToolSignature = signature;
 
-        // CP2：step 行先建（UNIQUE(runId, stepIndex) 幂等锚点）
-        const stepRow = await this.persistence.createStep({ runId, stepIndex: step, type: 'tool_call', status: 'running' });
+        // CP2：step 行先建（UNIQUE(runId, stepIndex) 幂等锚点）。
+        // P3 最小续跑：崩溃残留 step 行（P2002）→ 复用原行 id——ToolCall 幂等键含 stepId，键稳定 = 已完成工具不重复执行。
+        const stepRow = await this.createOrReuseStep(runId, step, { type: 'tool_call', status: 'running' });
         yield { type: 'run.progress', runId, currentStep: step + 1, maxSteps };
 
         // B1 修复：assistant tool_calls 消息每回合 push 一次（非逐工具重复）
@@ -229,7 +248,7 @@ export class AgentRuntimeEngine {
           yield { type: 'tool.end', toolName: call.name, runId, status: result.status, outputSummary: result.outputSummary };
         }
         await this.persistence.updateStep(stepRow.id, { status: 'completed', completedAt: new Date(), output: { toolCount: toolCalls.length } });
-        await this.persistence.updateCurrentStep(runId, step + 1);
+        await this.persistence.updateCurrentStep(runId, step + 1, ctx.workerId);
       }
       if (finalStatus === 'completed' && ctx.signal.aborted) finalStatus = 'cancelled';
       // MUST-2：maxSteps 耗尽且最后一轮仍是工具调用 → 硬失败，不得伪装 completed
@@ -239,8 +258,8 @@ export class AgentRuntimeEngine {
         yield { type: 'status', stage: 'agent', message: '任务过于复杂，已达到最大步骤数' };
       }
 
-      await this.persistence.createStep({
-        runId, stepIndex: FINAL_STEP_INDEX, type: 'final',
+      await this.createOrReuseStep(runId, FINAL_STEP_INDEX, {
+        type: 'final',
         status: finalStatus === 'completed' ? 'completed' : 'failed',
         output: { finalStatus },
       });
@@ -256,13 +275,15 @@ export class AgentRuntimeEngine {
         yield { type: 'error', code: appErr.code, message: appErr.message };
       }
     } finally {
-      // 条件更新：终态不可复活（状态机锁定）
-      await this.persistence.finalizeRun(runId, {
-        status: finalStatus, errorCode: errorCode ?? null, errorMessage: errorCode ? this.messageFor(errorCode) : null,
-        completedAt: new Date(),
-      });
-      yield { type: 'agent.end', agentId: ctx.agent.id, runId, status: finalStatus };
-      yield { type: 'run.completed', runId, status: finalStatus };
+      if (!ctx.controls || ctx.controls.active) {
+        // 条件更新：终态不可复活（状态机锁定）+ workerId fencing（async：旧 worker 不得写终态）
+        await this.persistence.finalizeRun(runId, {
+          status: finalStatus, errorCode: errorCode ?? null, errorMessage: errorCode ? this.messageFor(errorCode) : null,
+          completedAt: new Date(), workerId: ctx.workerId,
+        });
+        yield { type: 'agent.end', agentId: ctx.agent.id, runId, status: finalStatus };
+        yield { type: 'run.completed', runId, status: finalStatus };
+      }
     }
 
     return {
@@ -354,6 +375,22 @@ export class AgentRuntimeEngine {
         status: 'failed', errorCode: appErr.code, errorMessage: appErr.message, completedAt: new Date(), durationMs: Date.now() - startedAt,
       }).catch((e) => this.logger.warn(`ToolCall 失败更新异常: ${(e as Error).message}`));
       return { status: 'failed', error: appErr.message, outputSummary: `${call.name}：执行失败` };
+    }
+  }
+
+  /** step 行创建（P3 崩溃残留复用：UNIQUE(runId, stepIndex) 冲突时复用原行 id——幂等键稳定） */
+  private async createOrReuseStep(runId: string, stepIndex: number, data: { type: string; status?: string; output?: unknown }): Promise<{ id: string }> {
+    try {
+      return await this.persistence.createStep({ runId, stepIndex, ...data });
+    } catch (err) {
+      if ((err as { code?: string }).code === 'P2002') {
+        const existing = await this.persistence.findStep(runId, stepIndex);
+        if (existing) {
+          this.logger.warn({ runId, stepIndex }, 'step 行已存在（崩溃残留）→ 复用原行继续执行');
+          return existing;
+        }
+      }
+      throw err;
     }
   }
 

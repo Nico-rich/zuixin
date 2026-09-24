@@ -48,8 +48,10 @@ export interface AgentRuntimePersistence {
     providerId: string; modelId: string; inputTokens: number; outputTokens: number;
     latencyMs: number; status: 'success' | 'failed'; errorCode?: string;
   }): Promise<void>;
-  /** run 终态条件更新（where status=running，禁止终态复活） */
-  finalizeRun(runId: string, data: { status: string; errorCode?: string | null; errorMessage?: string | null; completedAt: Date }): Promise<{ count: number }>;
-  /** currentStep 推进 */
-  updateCurrentStep(runId: string, step: number): Promise<void>;
+  /** run 终态条件更新（where status=running，禁止终态复活；workerId 传入时追加 fencing 条件） */
+  finalizeRun(runId: string, data: { status: string; errorCode?: string | null; errorMessage?: string | null; completedAt: Date; workerId?: string }): Promise<{ count: number }>;
+  /** currentStep 推进（workerId 传入时追加 fencing 条件） */
+  updateCurrentStep(runId: string, step: number, workerId?: string): Promise<void>;
+  /** 已存在 step 行查询（P3 最小续跑：createStep P2002 冲突时复用原行 id，幂等键稳定） */
+  findStep(runId: string, stepIndex: number): Promise<{ id: string } | null>;
 }

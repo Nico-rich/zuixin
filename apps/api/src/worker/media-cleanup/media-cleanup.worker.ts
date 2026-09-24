@@ -3,20 +3,25 @@ import { InjectQueue, Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job, Queue } from 'bullmq';
 import { MEDIA_CLEANUP_QUEUE } from '../../core/queue/queue.module';
 import { MediaCleanupService } from '../../modules/generations/media-cleanup.service';
+import { AgentRunLeaseService } from '../../core/agent-run-lease/agent-run-lease.service';
 
 const SWEEP_INTERVAL_MS = 5 * 60_000;
 
-/** 清扫处理器：执行一次孤儿任务扫描（幂等，多 Worker 安全） */
+/** 清扫处理器：孤儿任务扫描 + 同步 run 清扫 + async run stale recovery（全幂等，多 Worker 安全） */
 @Processor(MEDIA_CLEANUP_QUEUE)
 export class MediaCleanupProcessor extends WorkerHost {
-  constructor(@Inject(MediaCleanupService) private readonly cleanup: MediaCleanupService) {
+  constructor(
+    @Inject(MediaCleanupService) private readonly cleanup: MediaCleanupService,
+    @Inject(AgentRunLeaseService) private readonly lease: AgentRunLeaseService,
+  ) {
     super();
   }
 
-  async process(_job: Job): Promise<{ tasks: number; runs: number }> {
+  async process(_job: Job): Promise<{ tasks: number; runs: number; recovered: { reEnqueued: number; timedOut: number } }> {
     const tasks = await this.cleanup.sweep();
     const runs = await this.cleanup.sweepAgentRuns();
-    return { tasks, runs };
+    const recovered = await this.lease.recoverStale(); // M6-P3：lease 过期重入队 / run deadline 超期 timeout
+    return { tasks, runs, recovered };
   }
 }
 

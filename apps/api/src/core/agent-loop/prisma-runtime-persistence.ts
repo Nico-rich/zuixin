@@ -74,7 +74,10 @@ export class PrismaRuntimePersistence implements AgentRuntimePersistence {
 
   finalizeRun(runId: string, data: Parameters<AgentRuntimePersistence['finalizeRun']>[1]) {
     return this.prisma.agentRun.updateMany({
-      where: { id: runId, status: 'running' },
+      where: {
+        id: runId, status: 'running',
+        ...(data.workerId ? { workerId: data.workerId } : {}), // M6 fencing：旧 worker 不得写终态
+      },
       data: {
         status: data.status as never, errorCode: data.errorCode ?? undefined, errorMessage: data.errorMessage ?? undefined,
         completedAt: data.completedAt,
@@ -82,7 +85,15 @@ export class PrismaRuntimePersistence implements AgentRuntimePersistence {
     });
   }
 
-  async updateCurrentStep(runId: string, step: number): Promise<void> {
-    await this.prisma.agentRun.update({ where: { id: runId }, data: { currentStep: step } });
+  async updateCurrentStep(runId: string, step: number, workerId?: string): Promise<void> {
+    await this.prisma.agentRun.update({
+      where: { id: runId, ...(workerId ? { workerId } : {}) },
+      data: { currentStep: step },
+    });
+  }
+
+  async findStep(runId: string, stepIndex: number): Promise<{ id: string } | null> {
+    const row = await this.prisma.agentRunStep.findUnique({ where: { runId_stepIndex: { runId, stepIndex } } });
+    return row ? { id: row.id } : null;
   }
 }
