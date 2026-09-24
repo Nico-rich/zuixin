@@ -11,6 +11,9 @@ import { ToolRegistry } from '../tools/tool-registry.service';
 import { ToolContext } from '../tools/tool.types';
 import { mapProviderError, ProviderLikeError } from '../../common/errors/provider-error';
 import { AGENT_RUNTIME_PERSISTENCE, AgentRuntimePersistence } from './runtime-persistence';
+import { ResumePlan } from './resume-planner';
+
+const GENERATION_TOOLS = ['image.generate', 'video.generate'];
 
 export interface AgentLoopAgentConfig {
   id: string;
@@ -35,7 +38,8 @@ export interface AgentRuntimeContext {
   userId: string;
   projectId?: string;
   conversationId?: string;
-  messageId: string;
+  /** 展示锚点 Message id（usage 归因 + ToolContext.messageId FK——必须真实 Message 行或 undefined，绝不传 runId 冒充） */
+  messageId?: string;
   userMessage: string;
   history: ChatMessage[];
   agent: AgentLoopAgentConfig;
@@ -52,12 +56,14 @@ export interface AgentRuntimeContext {
   workerId?: string;
   /** 运行时控制位（shutdown 时 Driver 置 active=false → Engine 跳过终态写入） */
   controls?: { active: boolean };
+  /** M6-P4 resume 计划（async 续跑时由 Driver 经 ResumePlanner 计算；sync 不传 = 全新执行） */
+  resume?: ResumePlan;
 }
 
 /** Engine 结构化结果（不携带 Prisma model，不含内部敏感信息） */
 export interface AgentRunOutcome {
   runId: string;
-  status: 'completed' | 'failed' | 'cancelled' | 'timeout';
+  status: 'completed' | 'failed' | 'cancelled' | 'timeout' | 'waiting';
   /** 最终回答全文（text.delta 累积；Sync Driver/Chat 仍自持 buffer，行为冻结） */
   content: string;
   errorCode?: string;
@@ -134,17 +140,51 @@ export class AgentRuntimeEngine {
     }
 
     const toolDefs = this.toolDefinitions(ctx.agent.tools);
-    let finalStatus: 'completed' | 'failed' | 'cancelled' | 'timeout' = 'completed';
+    let finalStatus: 'completed' | 'failed' | 'cancelled' | 'timeout' | 'waiting' = 'completed';
     let errorCode: string | undefined;
     let errorMessage: string | undefined;
     let lastToolSignature: string | null = null;
     let lastTurnHadToolCalls = false;
-    let content = '';
+    // P4 'final' resume：已流式产出但未落终态的回答（不重打 LLM）
+    let content = ctx.resume?.finalContent ?? '';
     const taskRefs: string[] = [];
+    const isAsync = !!ctx.runId && !!ctx.workerId;
+    /** 外部终态竞争（cancel/timeout 先落库）→ Engine 以 DB 为事实停止，不覆盖外部结果 */
+    let externalTerminal: string | undefined;
 
     try {
-      // P3 最小续跑：从 run.currentStep 继续（已完成 step 的 tool 结果在 transcript 里随 history 重放）
-      for (let step = ctx.startStep ?? 0; step < maxSteps; step++) {
+      let loopStart = ctx.startStep ?? 0;
+      if (ctx.resume?.mode === 'tools') {
+        // P4-3 resume 核心：继续执行已持久化的 tool decision（assistant.tool_calls 已落库）——
+        // 绝不重新调用 LLM；ToolCall 行 completed 复用输出 / running 同行重试 / 缺失新建（幂等键稳定）。
+        lastTurnHadToolCalls = true;
+        const stepRow = await this.createOrReuseStep(runId, ctx.resume.startStep, { type: 'tool_call', status: 'running' });
+        const resumeResult = yield* this.executeToolList(
+          ctx, runId, stepRow.id,
+          ctx.resume.pendingCalls.map((c) => ({ id: c.llmCallId, name: c.name, arguments: c.arguments, toolIndex: c.toolIndex })),
+          isAsync, deadline, taskRefs, messages,
+        );
+        if (resumeResult.waiting) {
+          finalStatus = 'waiting';
+        } else if (resumeResult.external) {
+          externalTerminal = resumeResult.external;
+          finalStatus = this.mapExternalTerminal(resumeResult.external);
+        } else if (resumeResult.stop) {
+          if (ctx.signal.aborted) finalStatus = 'cancelled';
+          else if (Date.now() >= deadline) { finalStatus = 'timeout'; errorCode = ErrorCode.AGENT_RUN_TIMEOUT; }
+        } else {
+          await this.persistence.updateStep(stepRow.id, { status: 'completed', completedAt: new Date(), output: { toolCount: ctx.resume.pendingCalls.length } });
+          await this.persistence.updateCurrentStep(runId, ctx.resume.startStep + 1, ctx.workerId);
+        }
+        loopStart = ctx.resume.startStep + 1; // waiting/external/cancel 也置 loopStart：主循环步首会再次检查
+      } else if (ctx.resume?.mode === 'final') {
+        // 最终回答已持久化（crash 于 [I]/[J] 前）→ 跳过 LLM，直接补 final
+        loopStart = maxSteps;
+      }
+      if (ctx.resume?.lastToolSignature) lastToolSignature = ctx.resume.lastToolSignature;
+
+      for (let step = loopStart; step < maxSteps; step++) {
+        if (finalStatus === 'waiting' || externalTerminal) break; // resume-tools 已停止（waiting 落库/外部终态）
         if (ctx.signal.aborted) { finalStatus = 'cancelled'; break; }
         if (Date.now() >= deadline) { finalStatus = 'timeout'; errorCode = ErrorCode.AGENT_RUN_TIMEOUT; break; }
 
@@ -179,7 +219,7 @@ export class AgentRuntimeEngine {
           if (ctx.signal.aborted) {
             finalStatus = 'cancelled';
             await this.persistence.recordChatUsage({
-              userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.messageId,
+              userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.messageId ?? '',
               providerId: resolved.providerId, modelId: resolved.modelId, runId,
               inputTokens: 0, outputTokens: 0, latencyMs: Date.now() - turnStarted,
               status: 'failed', errorCode: ErrorCode.AGENT_CANCELLED,
@@ -188,7 +228,7 @@ export class AgentRuntimeEngine {
           }
           const appErr = err instanceof AppError ? err : mapProviderError(err as ProviderLikeError);
           await this.persistence.recordChatUsage({
-            userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.messageId,
+            userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.messageId ?? '',
             providerId: resolved.providerId, modelId: resolved.modelId, runId,
             inputTokens: 0, outputTokens: 0, latencyMs: Date.now() - turnStarted,
             status: 'failed', errorCode: appErr.code,
@@ -196,7 +236,7 @@ export class AgentRuntimeEngine {
           throw err;
         }
         await this.persistence.recordChatUsage({
-          userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.messageId,
+          userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.messageId ?? '',
           providerId: resolved.providerId, modelId: resolved.modelId, runId,
           inputTokens: 0, outputTokens: 0, latencyMs: Date.now() - turnStarted, status: 'success',
         });
@@ -226,26 +266,19 @@ export class AgentRuntimeEngine {
         // B1 修复：assistant tool_calls 消息每回合 push 一次（非逐工具重复）
         messages.push({ role: 'assistant', content: '', tool_calls: toolCalls });
 
-        for (const [toolIndex, call] of toolCalls.entries()) {
-          yield { type: 'status', stage: 'tool', message: `正在调用 ${call.name}…` };
-          yield { type: 'tool.start', toolName: call.name, runId };
-          const result = await this.executeToolCall(ctx, runId, stepRow.id, toolIndex, call, ctx.signal);
-          // 生成类工具 → 转发 task.created（前端 TaskCard 依赖，与 Image/Video Agent 行为一致）
-          const taskId = (result.output as { taskId?: string } | undefined)?.taskId;
-          if (result.status === 'completed' && taskId && (call.name === 'image.generate' || call.name === 'video.generate')) {
-            taskRefs.push(taskId);
-            yield { type: 'task.created', taskId, kind: call.name === 'image.generate' ? 'image' : 'video' };
+        const toolListResult = yield* this.executeToolList(ctx, runId, stepRow.id, toolCalls, isAsync, deadline, taskRefs, messages);
+        if (toolListResult.stop) {
+          if (toolListResult.waiting) {
+            finalStatus = 'waiting'; // enterWaiting 已落库（waiting 不占用 Worker）
+          } else if (toolListResult.external) {
+            externalTerminal = toolListResult.external;
+            finalStatus = this.mapExternalTerminal(toolListResult.external);
+          } else if (ctx.signal.aborted) {
+            finalStatus = 'cancelled';
+          } else if (Date.now() >= deadline) {
+            finalStatus = 'timeout'; errorCode = ErrorCode.AGENT_RUN_TIMEOUT;
           }
-          // 回喂模型（无论成败——失败让模型看到错误并修正）
-          // P6 Tool Result Budget：内容纳入确定性截断（不破坏 assistant tool_call / tool result 消息配对）
-          const toolContent = this.truncateToolResult(JSON.stringify(result.output ?? result.error ?? {}));
-          messages.push({ role: 'tool', content: toolContent, tool_call_id: call.id });
-          // transcript checkpoint（CP4）：tool 结果（截断后内容与喂给 LLM 的一致）
-          await this.persistence.appendMessage(ctx.userId, runId, {
-            role: 'tool', content: toolContent, toolCallId: call.id,
-          }).catch((err) => this.logger.warn(`transcript tool 落库失败: ${(err as Error).message}`));
-          this.compactToolResults(messages);
-          yield { type: 'tool.end', toolName: call.name, runId, status: result.status, outputSummary: result.outputSummary };
+          break;
         }
         await this.persistence.updateStep(stepRow.id, { status: 'completed', completedAt: new Date(), output: { toolCount: toolCalls.length } });
         await this.persistence.updateCurrentStep(runId, step + 1, ctx.workerId);
@@ -258,11 +291,14 @@ export class AgentRuntimeEngine {
         yield { type: 'status', stage: 'agent', message: '任务过于复杂，已达到最大步骤数' };
       }
 
-      await this.createOrReuseStep(runId, FINAL_STEP_INDEX, {
-        type: 'final',
-        status: finalStatus === 'completed' ? 'completed' : 'failed',
-        output: { finalStatus },
-      });
+      // waiting（已落库）与外部终态竞争输家不写 final step——取消语义下停止写业务态
+      if (finalStatus !== 'waiting' && !externalTerminal) {
+        await this.createOrReuseStep(runId, FINAL_STEP_INDEX, {
+          type: 'final',
+          status: finalStatus === 'completed' ? 'completed' : 'failed',
+          output: { finalStatus },
+        });
+      }
     } catch (err) {
       // 取消在回合内已被识别；此处仅为兜底（例如 createStep 阶段 signal 已 abort）
       if (ctx.signal.aborted) {
@@ -275,12 +311,21 @@ export class AgentRuntimeEngine {
         yield { type: 'error', code: appErr.code, message: appErr.message };
       }
     } finally {
-      if (!ctx.controls || ctx.controls.active) {
+      // waiting：状态已由 enterWaiting 落库（running→waiting），无终态写、无 final step、无结束事件
+      if (finalStatus !== 'waiting' && (!ctx.controls || ctx.controls.active)) {
         // 条件更新：终态不可复活（状态机锁定）+ workerId fencing（async：旧 worker 不得写终态）
-        await this.persistence.finalizeRun(runId, {
+        const done = await this.persistence.finalizeRun(runId, {
           status: finalStatus, errorCode: errorCode ?? null, errorMessage: errorCode ? this.messageFor(errorCode) : null,
           completedAt: new Date(), workerId: ctx.workerId,
         });
+        if (done.count === 0) {
+          // 竞态输家：外部（cancel/timeout）已终态 → 以 DB 为事实修正 outcome（P4/P5 竞争语义）
+          const actual = await this.persistence.getRunStatus(runId);
+          if (actual && ['completed', 'failed', 'cancelled', 'timeout'].includes(actual.status)) {
+            finalStatus = actual.status as 'completed' | 'failed' | 'cancelled' | 'timeout';
+            if (actual.status === 'timeout') errorCode = ErrorCode.AGENT_RUN_TIMEOUT;
+          }
+        }
         yield { type: 'agent.end', agentId: ctx.agent.id, runId, status: finalStatus };
         yield { type: 'run.completed', runId, status: finalStatus };
       }
@@ -318,9 +363,14 @@ export class AgentRuntimeEngine {
       return { status: 'failed', error: '该工具需要审批，当前不可用', outputSummary: `${call.name}：需要审批` };
     }
 
-    // 幂等查重：同一 (runStepId, idempotencyKey) 已完成 → 复用输出，不重复执行
+    // 幂等查重：同一 (runStepId, idempotencyKey) 已完成 → 复用输出，不重复执行。
+    // P4-4 resume：生成类工具的 completed 行刷新任务终态结果（任务结果 = 工具事实，行内 output 保持真实）。
     const existing = await this.persistence.findToolCall(stepId, idempotencyKey);
     if (existing?.status === 'completed' && existing.output != null) {
+      const refreshed = await this.refreshGenerationOutput(call.name, existing.output, existing.id);
+      if (refreshed) {
+        return { status: 'completed', output: refreshed, outputSummary: this.summarize(call.name, refreshed) };
+      }
       return { status: 'completed', output: existing.output, outputSummary: '（复用已执行结果）' };
     }
 
@@ -340,6 +390,7 @@ export class AgentRuntimeEngine {
     // 执行前先落 ToolCall 行（running）——行 id 作为 toolCallId 注入执行上下文（FK 追溯真实行）；
     // 执行后更新该行终态。并发重试撞唯一约束 → 查重复用。
     let toolCallId: string;
+    let retryingExistingRow = false; // P4-4：running 残留行（崩溃于执行中）→ 同一行重试，attempts+1
     try {
       const row = await this.persistence.createToolCall({
         runStepId: stepId, toolName: call.name, idempotencyKey, input: parsedInput, status: 'running',
@@ -349,10 +400,22 @@ export class AgentRuntimeEngine {
       if ((err as { code?: string }).code === 'P2002') {
         const existingRow = await this.persistence.findToolCall(stepId, idempotencyKey);
         if (existingRow?.status === 'completed' && existingRow.output != null) {
+          const refreshed = await this.refreshGenerationOutput(call.name, existingRow.output, existingRow.id);
+          if (refreshed) {
+            return { status: 'completed', output: refreshed, outputSummary: this.summarize(call.name, refreshed) };
+          }
           return { status: 'completed', output: existingRow.output, outputSummary: '（复用已执行结果）' };
         }
+        if (existingRow) {
+          // 崩溃残留 running 行：副作用是否安全重试由工具幂等键收敛（GenerationTask 全局幂等键/Artifact 幂等键/只读工具）
+          toolCallId = existingRow.id;
+          retryingExistingRow = true;
+        } else {
+          throw err;
+        }
+      } else {
+        throw err;
       }
-      throw err;
     }
 
     const toolCtx: ToolContext = {
@@ -366,6 +429,7 @@ export class AgentRuntimeEngine {
       const output = await tool.execute(parsedInput, { ...toolCtx, signal: combinedSignal });
       await this.persistence.updateToolCall(toolCallId, {
         output, status: 'completed', completedAt: new Date(), durationMs: Date.now() - startedAt,
+        incrementAttempts: retryingExistingRow, // 同一行重试可观测
       }).catch((err) => this.logger.warn(`ToolCall 完成更新失败（幂等兜底）: ${(err as Error).message}`));
       return { status: 'completed', output, outputSummary: this.summarize(call.name, output) };
     } catch (err) {
@@ -376,6 +440,103 @@ export class AgentRuntimeEngine {
       }).catch((e) => this.logger.warn(`ToolCall 失败更新异常: ${(e as Error).message}`));
       return { status: 'failed', error: appErr.message, outputSummary: `${call.name}：执行失败` };
     }
+  }
+
+  /**
+   * 单回合工具列表执行（正常回合 + resume 'tools' 模式共用）：
+   * 逐工具 execute → waiting 判定（P4-5）→ task.created 转发 → tool 结果回喂 + transcript 落库。
+   * 返回停止原因：waiting（已落库）/ external（外部终态竞争获胜）/ abort / 正常完成。
+   * toolIndex 缺省用列表下标；resume 传入原始下标保持 idempotency key 稳定。
+   */
+  private async *executeToolList(
+    ctx: AgentRuntimeContext, runId: string, stepRowId: string,
+    calls: Array<{ id: string; name: string; arguments: string; toolIndex?: number }>,
+    isAsync: boolean, deadline: number, taskRefs: string[], messages: ChatMessage[],
+  ): AsyncGenerator<AgentEvent, { stop: boolean; waiting?: boolean; external?: string }, void> {
+    for (const [index, call] of calls.entries()) {
+      if (ctx.signal.aborted) return { stop: true };
+      if (Date.now() >= deadline) return { stop: true };
+      yield { type: 'status', stage: 'tool', message: `正在调用 ${call.name}…` };
+      yield { type: 'tool.start', toolName: call.name, runId };
+      const result = await this.executeToolCall(
+        ctx, runId, stepRowId, call.toolIndex ?? index, call, ctx.signal,
+      );
+      // P4-5 waiting：异步 run + 生成任务未终态 → running→waiting + waitingOnTaskId + 释放 worker
+      const decision = await this.resolveGenerationTask(ctx, runId, call.name, result, isAsync);
+      if (decision.action === 'waiting') {
+        yield { type: 'task.created', taskId: decision.waitingTaskId!, kind: call.name === 'image.generate' ? 'image' : 'video' };
+        return { stop: true, waiting: true };
+      }
+      if (decision.action === 'terminated') return { stop: true, external: decision.status };
+      if (decision.output) result.output = decision.output; // 首查即终态 → 用真实任务结果回喂模型
+      // 生成类工具 → 转发 task.created（前端 TaskCard 依赖，与 Image/Video Agent 行为一致）
+      const taskId = (result.output as { taskId?: string } | undefined)?.taskId;
+      if (result.status === 'completed' && taskId && GENERATION_TOOLS.includes(call.name)) {
+        taskRefs.push(taskId);
+        yield { type: 'task.created', taskId, kind: call.name === 'image.generate' ? 'image' : 'video' };
+      }
+      // 回喂模型（无论成败——失败让模型看到错误并修正）
+      // P6 Tool Result Budget：内容纳入确定性截断（不破坏 assistant tool_call / tool result 消息配对）
+      const toolContent = this.truncateToolResult(JSON.stringify(result.output ?? result.error ?? {}));
+      messages.push({ role: 'tool', content: toolContent, tool_call_id: call.id });
+      // transcript checkpoint（CP4）：tool 结果（截断后内容与喂给 LLM 的一致）
+      await this.persistence.appendMessage(ctx.userId, runId, {
+        role: 'tool', content: toolContent, toolCallId: call.id,
+      }).catch((err) => this.logger.warn(`transcript tool 落库失败: ${(err as Error).message}`));
+      this.compactToolResults(messages);
+      yield { type: 'tool.end', toolName: call.name, runId, status: result.status, outputSummary: result.outputSummary };
+    }
+    return { stop: false };
+  }
+
+  /**
+   * P4-5/P4-9 生成任务裁决（仅异步 run + 生成工具）：
+   * - 任务未终态 → 原子进入 waiting（条件更新 running+workerId；waiting 不占用 Worker）；
+   * - 首查即终态 → 返回真实任务结果（成功=任务输出/失败=错误文案，回喂模型由 LLM 决定重试或失败）；
+   * - enterWaiting count=0 → 外部已终态（cancel/timeout）→ Engine 以 DB 为事实停止。
+   */
+  private async resolveGenerationTask(
+    ctx: AgentRuntimeContext, runId: string, toolName: string,
+    result: { status: string; output?: unknown },
+    isAsync: boolean,
+  ): Promise<{ action: 'none'; output?: unknown } | { action: 'waiting'; waitingTaskId: string } | { action: 'terminated'; status?: string }> {
+    if (!isAsync || result.status !== 'completed' || !GENERATION_TOOLS.includes(toolName)) return { action: 'none' };
+    const taskId = (result.output as { taskId?: string } | undefined)?.taskId;
+    if (!taskId) return { action: 'none' };
+    // resume 复用行已刷新 / 幂等命中已带终态 → 直接继续
+    const known = (result.output as { status?: string } | undefined)?.status;
+    if (['completed', 'failed', 'cancelled'].includes(known ?? '')) return { action: 'none' };
+    const task = await this.persistence.getGenerationTask(taskId);
+    if (!task) return { action: 'none' }; // 任务行异常缺失：保持原输出回喂模型
+    if (['completed', 'failed', 'cancelled'].includes(task.status)) {
+      return {
+        action: 'none',
+        output: { taskId, status: task.status, output: task.output, errorMessage: task.errorMessage ?? undefined },
+      };
+    }
+    const entered = await this.persistence.enterWaiting(runId, taskId, ctx.workerId);
+    if (entered.count > 0) return { action: 'waiting', waitingTaskId: taskId };
+    const run = await this.persistence.getRunStatus(runId);
+    return { action: 'terminated', status: run?.status };
+  }
+
+  /** 生成工具 completed 行的输出刷新（P4-4：resume 时任务结果 = 工具事实；同步更新行内 output）。无刷新 → null */
+  private async refreshGenerationOutput(toolName: string, output: unknown, toolCallRowId: string): Promise<unknown | null> {
+    if (!GENERATION_TOOLS.includes(toolName)) return null;
+    const taskId = (output as { taskId?: string } | undefined)?.taskId;
+    if (!taskId) return null;
+    const known = (output as { status?: string } | undefined)?.status;
+    if (['completed', 'failed', 'cancelled'].includes(known ?? '')) return null; // 已刷新过
+    const task = await this.persistence.getGenerationTask(taskId);
+    if (!task || !['completed', 'failed', 'cancelled'].includes(task.status)) return null;
+    const refreshed = { taskId, status: task.status, output: task.output, errorMessage: task.errorMessage ?? undefined };
+    await this.persistence.updateToolCall(toolCallRowId, { output: refreshed }).catch(() => undefined);
+    return refreshed;
+  }
+
+  /** 外部终态 → Engine 终态映射（DB 事实；异常状态保守为 failed，绝不复活动行） */
+  private mapExternalTerminal(status: string | undefined): 'cancelled' | 'timeout' | 'failed' {
+    return status === 'cancelled' || status === 'timeout' ? status : 'failed';
   }
 
   /** step 行创建（P3 崩溃残留复用：UNIQUE(runId, stepIndex) 冲突时复用原行 id——幂等键稳定） */

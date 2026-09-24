@@ -107,16 +107,17 @@ export class AgentRunLeaseService {
 
   /**
    * Stale recovery（清理调度器兜底；lease 过期 ≠ run 超时）：
-   * ① run deadline（startedAt + limits.agentRunDeadlineMs）已过 → timeout 终态（条件更新，绝不复活终态）；
-   * ② 未超期但 async run lease 已过期/已释放 → 重新入队（claim 条件更新是最终防线，重复入队幂等）。
+   * ① run deadline（startedAt + limits.agentRunDeadlineMs，含 waiting 时间）已过 → timeout 终态（条件更新，绝不复活终态）；
+   * ② 未超期但 async run lease 已过期/已释放 → 重新入队（claim 条件更新是最终防线，重复入队幂等）；
+   * ③ P4-6 兜底：waiting 且任务已终态（hook 丢失）→ 唤醒（waiting→queued + 入队）；任务仍在执行 → 不动。
    * 同步 run（workerId null）不在此恢复域（sweepAgentRuns 120s 语义负责）。
    */
   async recoverStale(): Promise<{ reEnqueued: number; timedOut: number }> {
     const now = new Date();
     const deadlineMs = await this.runDeadlineMs();
     const rows = await this.prisma.agentRun.findMany({
-      where: { status: { in: ['queued', 'running'] } },
-      select: { id: true, status: true, startedAt: true, workerId: true, leaseUntil: true },
+      where: { status: { in: ['queued', 'running', 'waiting'] } },
+      select: { id: true, status: true, startedAt: true, workerId: true, leaseUntil: true, waitingOnTaskId: true },
     });
     let reEnqueued = 0;
     let timedOut = 0;
@@ -124,12 +125,41 @@ export class AgentRunLeaseService {
       const pastDeadline = now.getTime() - row.startedAt.getTime() > deadlineMs;
       if (pastDeadline) {
         const done = await this.prisma.agentRun.updateMany({
-          where: { id: row.id, status: { in: ['queued', 'running'] } },
-          data: { status: 'timeout', errorCode: 'AGENT_RUN_TIMEOUT', errorMessage: '执行超时', completedAt: now },
+          where: { id: row.id, status: { in: ['queued', 'running', 'waiting'] } },
+          data: {
+            status: 'timeout', errorCode: 'AGENT_RUN_TIMEOUT', errorMessage: '执行超时', completedAt: now,
+            waitingOnTaskId: null, workerId: null, leaseUntil: null, heartbeatAt: null,
+          },
         });
         if (done.count > 0) {
           timedOut++;
           this.logger.warn({ runId: row.id, status: row.status }, 'run 超过 deadline → timeout');
+        }
+        continue;
+      }
+      if (row.status === 'waiting' && row.waitingOnTaskId) {
+        // hook 丢失兜底：任务已终态但 run 仍 waiting → 唤醒（hook 与 sweep 双通道，至少一次语义 + 幂等）
+        const task = await this.prisma.generationTask.findUnique({
+          where: { id: row.waitingOnTaskId }, select: { status: true },
+        });
+        if (task && ['completed', 'failed', 'cancelled'].includes(task.status)) {
+          const woken = await this.prisma.agentRun.updateMany({
+            where: { id: row.id, status: 'waiting', waitingOnTaskId: row.waitingOnTaskId },
+            data: { status: 'queued', waitingOnTaskId: null, workerId: null, leaseUntil: null, heartbeatAt: null },
+          });
+          if (woken.count > 0) {
+            await this.agentRunQueue.add(
+              'execute',
+              { runId: row.id },
+              {
+                jobId: `run-${row.id}-recover-${now.getTime()}`,
+                attempts: 2, backoff: { type: 'exponential', delay: 2000 },
+                removeOnComplete: true, removeOnFail: { count: 500 },
+              },
+            );
+            reEnqueued++;
+            this.logger.warn({ runId: row.id, taskId: row.waitingOnTaskId }, 'waiting 且任务已终态（hook 丢失）→ 兜底唤醒');
+          }
         }
         continue;
       }

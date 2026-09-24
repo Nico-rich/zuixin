@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { LIMITS, ErrorCode } from '@ai-agent/shared';
 import { PrismaService } from '../prisma/prisma.service';
 import { UsageService } from '../usage/usage.service';
+import { AgentRunResumeTrigger } from '../../core/agent-run-resume/agent-run-resume-trigger.service';
 
 const DEFAULT_AGENT_RUN_TIMEOUT_MS = 120_000;
 
@@ -20,6 +21,7 @@ export class MediaCleanupService {
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(UsageService) private readonly usage: UsageService,
+    @Inject(AgentRunResumeTrigger) private readonly resume: AgentRunResumeTrigger,
   ) {}
 
   /** 清扫 GenerationTask（返回失败任务数） */
@@ -47,6 +49,8 @@ export class MediaCleanupService {
         imageCount: 0, videoSeconds: 0, latencyMs: now - (row.startedAt?.getTime() ?? now),
         status: 'failed', errorCode: ErrorCode.MEDIA_TASK_TIMEOUT, runId: row.runId ?? undefined,
       }).catch(() => undefined);
+      // M6-P4：任务超时也是终态 → 唤醒 run（任务超时 ≠ run 超时；失败回喂模型由 LLM 决策）
+      await this.resume.onTaskTerminal(row.id).catch(() => undefined);
       swept++;
       this.logger.warn({ taskId: row.id, type: row.type, provider: row.providerId ?? 'unknown' }, '孤儿任务已清扫为失败（超时）');
     }

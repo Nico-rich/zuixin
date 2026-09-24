@@ -39,9 +39,15 @@ export interface AgentRuntimePersistence {
   }): Promise<{ id: string }>;
   /** 幂等查重：同一 (runStepId, idempotencyKey) 已完成 → 复用输出 */
   findToolCall(runStepId: string, idempotencyKey: string): Promise<ToolCallRecord | null>;
-  updateToolCall(id: string, data: { output?: unknown; status?: string; errorCode?: string; errorMessage?: string; completedAt?: Date; durationMs?: number }): Promise<void>;
+  updateToolCall(id: string, data: { output?: unknown; status?: string; errorCode?: string; errorMessage?: string; completedAt?: Date; durationMs?: number; incrementAttempts?: boolean }): Promise<void>;
   /** transcript 追加（UNIQUE(runId, sequence)，userId 首条件） */
   appendMessage(userId: string, runId: string, message: { role: TranscriptRole; content: string; toolCallId?: string; toolCalls?: unknown }): Promise<unknown>;
+  /** 读 GenerationTask（waiting 判定 + resume 结果刷新；非 Agent 场景 null） */
+  getGenerationTask(taskId: string): Promise<{ id: string; status: string; output: unknown; errorMessage?: string | null } | null>;
+  /** P4：进入 waiting（条件更新 running+workerId → waiting+waitingOnTaskId，释放 lease/workerId；count=0 = 已被外部终态） */
+  enterWaiting(runId: string, taskId: string, workerId?: string): Promise<{ count: number }>;
+  /** 读 run 当前状态（外部终态竞争时以 DB 为事实） */
+  getRunStatus(runId: string): Promise<{ status: string } | null>;
   /** LLM 回合用量（成功/失败每轮必记） */
   recordChatUsage(input: {
     userId: string; conversationId?: string; messageId: string; runId: string;

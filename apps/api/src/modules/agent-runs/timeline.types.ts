@@ -5,7 +5,7 @@ import { RunUsageAggregate } from '../usage/usage.service';
  * 不新建任何 Event 表）。type 复用 SSE 事件命名语义，但这是持久化投影，不是实时事件。
  */
 export type TimelineItemType =
-  | 'run.started' | 'run.completed' | 'run.failed' | 'run.cancelled' | 'run.timeout'
+  | 'run.started' | 'run.waiting' | 'run.completed' | 'run.failed' | 'run.cancelled' | 'run.timeout'
   | 'step.tool_call' | 'step.final'
   | 'tool.started' | 'tool.completed' | 'tool.failed'
   | 'task.created' | 'task.completed' | 'task.failed'

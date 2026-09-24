@@ -30,11 +30,12 @@ function makeService() {
     execute: vi.fn().mockRejectedValue(new AppError(ErrorCode.PROVIDER_OVERLOADED, 'provider down')),
   };
   const executors = new Map([['image', failingExecutor]]);
+  const resume = { onTaskTerminal: vi.fn().mockResolvedValue(undefined) };
   const svc = new MediaGenerationService(
     prisma as never, storage as never, events as never, usage as never,
-    queue as never, queue as never, executors as never,
+    queue as never, queue as never, executors as never, resume as never,
   );
-  return { svc, prisma, usage };
+  return { svc, prisma, usage, resume };
 }
 
 describe('MediaGenerationService 失败归因（M6-A9）', () => {

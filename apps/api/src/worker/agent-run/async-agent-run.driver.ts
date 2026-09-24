@@ -4,12 +4,14 @@ import { AgentRuntimeEngine, AgentRuntimeContext, AgentRunOutcome } from '../../
 import { ContextAssembler } from '../../core/context/context-assembler';
 import { ChatMessage } from '../../providers/llm/llm.types';
 import { AgentRunLeaseService } from '../../core/agent-run-lease/agent-run-lease.service';
+import { planResume } from '../../core/agent-loop/resume-planner';
 
 /**
- * M6-P3 Async Driver（Worker 侧）：
+ * M6-P4 Async Driver（Worker 侧）：
  * 从 DB 加载 run/version/transcript（身份与配置的最终事实来源——不信任 job payload）→
- * 构建 RuntimeContext → 驱动 AgentRuntimeEngine → 按 run 终态落 assistant Message → 释放 lease。
- * P3 续跑语义 = 最小续跑（startStep=currentStep + step 行复用 + transcript 重放），完整 resume 协议在 P4。
+ * ResumePlanner 计算续跑计划（llm/tools/final）→ 构建 RuntimeContext → 驱动 AgentRuntimeEngine →
+ * 按 run 终态落 assistant Message → 释放 lease。
+ * P4 durable resume：transcript 为唯一重放输入；waiting 由 Engine 落库，本 Driver 只透传 outcome。
  */
 @Injectable()
 export class AsyncAgentRunDriver {
@@ -35,6 +37,8 @@ export class AsyncAgentRunDriver {
     const userMessage = userRow.content;
     const metadata = (run.metadata ?? {}) as { assistantMessageId?: string };
     const continuation = transcript.length > 1; // 除 seq0 用户消息外已有内容 = 崩溃续跑
+    // P4 durable resume：transcript + currentStep → 续跑计划（已持久化 tool decision 绝不重打 LLM）
+    const resumePlan = planResume(transcript, run.currentStep);
 
     const cfg = (version.config ?? {}) as {
       maxSteps?: number; requiresTools?: boolean; knowledge?: { enabled?: boolean }; contextBudgetTokens?: number;
@@ -58,7 +62,7 @@ export class AsyncAgentRunDriver {
       userId: run.userId,
       projectId: run.projectId ?? undefined,
       conversationId: run.conversationId ?? undefined,
-      messageId: metadata.assistantMessageId ?? runId,
+      messageId: metadata.assistantMessageId, // 真实 Message 行或 undefined——绝不传 runId 冒充（GenerationTask.messageId FK）
       userMessage,
       history,
       agent: {
@@ -73,10 +77,11 @@ export class AsyncAgentRunDriver {
       deadlineMs: await this.remainingDeadlineMs(run.startedAt),
       signal,
       runId,
-      startStep: run.currentStep,
+      startStep: resumePlan.startStep,
       seedTranscript: !continuation,
       workerId: run.workerId ?? undefined,
       controls,
+      resume: resumePlan,
     };
 
     const generator = this.engine.run(ctx);
@@ -87,7 +92,10 @@ export class AsyncAgentRunDriver {
       // P3：无 SSE 订阅，事件不消费（P6 接 EventBus 观察层）
     }
 
-    await this.finalizeAssistantMessage(run, metadata.assistantMessageId, outcome);
+    // waiting：run 仍存活（已落库 waiting+waitingOnTaskId），assistant Message 保持 streaming，无终态写
+    if (outcome.status !== 'waiting') {
+      await this.finalizeAssistantMessage(run, metadata.assistantMessageId, outcome);
+    }
     return outcome;
   }
 

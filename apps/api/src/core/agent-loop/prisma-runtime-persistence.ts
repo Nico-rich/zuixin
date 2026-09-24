@@ -56,7 +56,15 @@ export class PrismaRuntimePersistence implements AgentRuntimePersistence {
   }
 
   async updateToolCall(id: string, data: Parameters<AgentRuntimePersistence['updateToolCall']>[1]): Promise<void> {
-    await this.prisma.toolCall.update({ where: { id }, data: data as never });
+    await this.prisma.toolCall.update({
+      where: { id },
+      data: {
+        output: data.output as never, status: data.status as never,
+        errorCode: data.errorCode, errorMessage: data.errorMessage,
+        completedAt: data.completedAt, durationMs: data.durationMs,
+        ...(data.incrementAttempts ? { attempts: { increment: 1 } } : {}),
+      } as never,
+    });
   }
 
   appendMessage(userId: string, runId: string, message: Parameters<AgentRuntimePersistence['appendMessage']>[2]) {
@@ -95,5 +103,26 @@ export class PrismaRuntimePersistence implements AgentRuntimePersistence {
   async findStep(runId: string, stepIndex: number): Promise<{ id: string } | null> {
     const row = await this.prisma.agentRunStep.findUnique({ where: { runId_stepIndex: { runId, stepIndex } } });
     return row ? { id: row.id } : null;
+  }
+
+  async getGenerationTask(taskId: string): Promise<{ id: string; status: string; output: unknown; errorMessage?: string | null } | null> {
+    const task = await this.prisma.generationTask.findUnique({
+      where: { id: taskId },
+      select: { id: true, status: true, output: true, errorMessage: true },
+    });
+    return task ? { id: task.id, status: task.status, output: task.output, errorMessage: task.errorMessage } : null;
+  }
+
+  async enterWaiting(runId: string, taskId: string, workerId?: string): Promise<{ count: number }> {
+    // P4-5：waiting 不占用 worker——workerId/leaseUntil/heartbeatAt 全释放（条件更新防外部终态竞争）
+    return this.prisma.agentRun.updateMany({
+      where: { id: runId, status: 'running', ...(workerId ? { workerId } : {}) },
+      data: { status: 'waiting', waitingOnTaskId: taskId, workerId: null, leaseUntil: null, heartbeatAt: null },
+    });
+  }
+
+  async getRunStatus(runId: string): Promise<{ status: string } | null> {
+    const row = await this.prisma.agentRun.findUnique({ where: { id: runId }, select: { status: true } });
+    return row ? { status: row.status } : null;
   }
 }

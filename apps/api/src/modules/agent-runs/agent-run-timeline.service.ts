@@ -6,7 +6,7 @@ import { RunTimeline, TimelineItem, TimelineItemType } from './timeline.types';
 
 /** 同 timestamp 时的确定性排序权重（run → step → tool → task → artifact → usage） */
 const TYPE_ORDER: Record<TimelineItemType, number> = {
-  'run.started': 0, 'run.completed': 0, 'run.failed': 0, 'run.cancelled': 0, 'run.timeout': 0,
+  'run.started': 0, 'run.waiting': 0, 'run.completed': 0, 'run.failed': 0, 'run.cancelled': 0, 'run.timeout': 0,
   'step.tool_call': 1, 'step.final': 1,
   'tool.started': 2, 'tool.completed': 2, 'tool.failed': 2,
   'task.created': 3, 'task.completed': 3, 'task.failed': 3,
@@ -54,6 +54,17 @@ export class AgentRunTimelineService {
       id: `run-${run.id}`, type: 'run.started', status: 'info',
       timestamp: run.startedAt.toISOString(), title: 'Agent 开始执行',
     });
+    // M6-P4 waiting：run 存活但无 worker，等待 GenerationTask（快照时刻状态；恢复执行后该瞬态项消失，
+    // 任务事实由 task.created/task.completed 项呈现——投影只反映当前 DB 状态）
+    if (run.status === 'waiting') {
+      const waitingTask = run.waitingOnTaskId ? run.tasks.find((t) => t.id === run.waitingOnTaskId) : undefined;
+      items.push({
+        id: `run-waiting-${run.id}`, type: 'run.waiting', status: 'running',
+        timestamp: (waitingTask?.createdAt ?? run.heartbeatAt ?? run.startedAt).toISOString(),
+        title: '⏳ 等待生成任务完成',
+        metadata: waitingTask ? { taskId: waitingTask.id, type: waitingTask.type } : undefined,
+      });
+    }
 
     // 2. steps + toolCalls
     for (const step of run.steps) {

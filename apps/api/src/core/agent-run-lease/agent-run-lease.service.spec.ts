@@ -86,7 +86,7 @@ describe('AgentRunLeaseService（claim/renew/release + stale recovery）', () =>
     const res = await svc.recoverStale();
     expect(res.timedOut).toBe(1);
     expect(prisma.agentRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: 'run-old', status: { in: ['queued', 'running'] } },
+      where: { id: 'run-old', status: { in: ['queued', 'running', 'waiting'] } }, // M6-P4：waiting 同样受 deadline 约束
       data: expect.objectContaining({ status: 'timeout', errorCode: 'AGENT_RUN_TIMEOUT' }),
     }));
   });

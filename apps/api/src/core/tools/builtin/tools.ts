@@ -72,6 +72,7 @@ export function createArtifactTool(artifacts: ArtifactService): Tool {
         type: input.type, title: input.title, summary: input.summary, content: input.content,
         projectId: ctx.projectId, conversationId: ctx.conversationId, messageId: ctx.messageId,
         runId: ctx.agentRunId, toolCallId: ctx.toolCallId,
+        idempotencyKey: ctx.idempotencyKey, // M6-P4：resume 重放去重（同一 ToolCall 绝不产生第二个制品）
       });
       return { artifactId: artifact.id, status: artifact.status };
     },
@@ -92,6 +93,9 @@ export function createMemoryCandidateTool(memories: MemoryService): Tool {
     }),
     execute: async (raw, ctx) => {
       const input = raw as { content: string; category: 'preference' | 'profile' | 'instruction' | 'project_context' | 'workflow' | 'other'; importance?: number; confidence?: number };
+      // M6-P4 副作用收敛：同一 (用户, 内容, 来源消息) 的 candidate 已存在 → 复用，不重复创建（Memory 无幂等键列）
+      const existing = await memories.findCandidate(ctx.userId, input.content, ctx.messageId);
+      if (existing) return { memoryId: existing.id, status: existing.status };
       const memory = await memories.create(ctx.userId, {
         scope: ctx.projectId ? 'project' : 'user',
         projectId: ctx.projectId,

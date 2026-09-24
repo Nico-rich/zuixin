@@ -11,6 +11,7 @@ import { EventBusService } from '../../core/events/event-bus.service';
 import { UsageService } from '../usage/usage.service';
 import { IMAGE_QUEUE, VIDEO_QUEUE } from '../../core/queue/queue.module';
 import { MediaExecutor, MediaExecResult } from './media-types';
+import { AgentRunResumeTrigger } from '../../core/agent-run-resume/agent-run-resume-trigger.service';
 
 export interface PrepareMediaInput {
   userId: string;
@@ -51,6 +52,7 @@ export class MediaGenerationService {
     @InjectQueue(IMAGE_QUEUE) private readonly imageQueue: Queue,
     @InjectQueue(VIDEO_QUEUE) private readonly videoQueue: Queue,
     @Inject('MEDIA_EXECUTORS') private readonly executors: Map<string, MediaExecutor>,
+    @Inject(AgentRunResumeTrigger) private readonly resume: AgentRunResumeTrigger,
   ) {}
 
   /** 便捷入口：图片任务（M2 API 兼容） */
@@ -167,6 +169,8 @@ export class MediaGenerationService {
         latencyMs: Date.now() - startedAt, status: 'success', runId: task.runId ?? undefined,
       });
       await this.events.publish('task', { type: 'task.completed', taskId, progress: 100 });
+      // M6-P4：任务终态单点 hook → 唤醒 waiting 的 AgentRun（waiting→queued→resume）
+      await this.resume.onTaskTerminal(taskId).catch(() => undefined);
       this.logger.log({ taskId, userId: task.userId, type: task.type, provider: result.providerId, latencyMs: Date.now() - startedAt }, '媒体任务完成');
     } catch (err) {
       const appErr = err instanceof AppError ? err : mapProviderError(err as ProviderLikeError);
@@ -189,6 +193,8 @@ export class MediaGenerationService {
       runId: current!.runId ?? undefined, // M6-A9：失败归因补齐 runId（与成功/清扫路径一致）
     }).catch(() => undefined);
     await this.events.publish('task', { type: 'task.progress', taskId, progress: 100, message: '失败' });
+    // M6-P4：任务失败也是终态 → 唤醒 run（P4-9：失败回喂模型，由 LLM 决定重试/降级/终态）
+    await this.resume.onTaskTerminal(taskId).catch(() => undefined);
     this.logger.warn({ taskId, code, provider: current!.providerId ?? 'unknown' }, `媒体任务失败: ${message}`);
   }
 

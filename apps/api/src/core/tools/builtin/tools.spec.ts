@@ -64,6 +64,7 @@ describe('artifact.create Tool', () => {
 describe('memory.create_candidate Tool（只产候选，不绕过状态机）', () => {
   it('有 projectId → 项目级候选；source=agent', async () => {
     const memories = {
+      findCandidate: vi.fn().mockResolvedValue(null), // M6-P4 副作用收敛查重
       create: vi.fn().mockResolvedValue({ id: 'mem-1', status: 'candidate' }),
     };
     const tool = createMemoryCandidateTool(memories as never);
@@ -75,7 +76,7 @@ describe('memory.create_candidate Tool（只产候选，不绕过状态机）', 
   });
 
   it('无 projectId → 用户级候选', async () => {
-    const memories = { create: vi.fn().mockResolvedValue({ id: 'mem-2', status: 'candidate' }) };
+    const memories = { findCandidate: vi.fn().mockResolvedValue(null), create: vi.fn().mockResolvedValue({ id: 'mem-2', status: 'candidate' }) };
     const tool = createMemoryCandidateTool(memories as never);
     await tool.execute({ content: '偏好', category: 'preference' }, makeCtx({ projectId: undefined }));
     expect(memories.create).toHaveBeenCalledWith('u1', expect.objectContaining({ scope: 'user', projectId: undefined }));

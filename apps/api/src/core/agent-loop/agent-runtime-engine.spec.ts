@@ -34,6 +34,9 @@ function makePersistence() {
     finalizeRun: vi.fn(async (_id, data) => { state.finalize.push({ ...data }); return { count: 1 }; }),
     updateCurrentStep: vi.fn(async () => undefined),
     findStep: vi.fn(async () => null),
+    getGenerationTask: vi.fn(async () => null),
+    enterWaiting: vi.fn(async () => ({ count: 1 })),
+    getRunStatus: vi.fn(async () => null),
   };
   return { persistence, state };
 }
@@ -452,5 +455,135 @@ describe('AgentRuntimeEngine（M6-P2 抽取后行为冻结 + transcript checkpoi
       runId: 'run-1', status: 'completed', content: '已提交生成任务', taskRefs: ['task-1'],
     });
     expect(events.find((e) => e.type === 'task.created')).toMatchObject({ taskId: 'task-1', kind: 'image' });
+  });
+});
+
+describe('AgentRuntimeEngine（M6-P4 durable resume + waiting）', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  /** 异步模式输入（runId + workerId + resume 计划；tools 需与被测 engine 一致） */
+  function asyncInput(overrides: Partial<AgentRuntimeContext> = {}, tools: Tool[] = []): AgentRuntimeContext {
+    return { ...makeEngine({ tools }).input, runId: 'run-existing', workerId: 'worker-A', seedTranscript: false, ...overrides };
+  }
+
+  it('P4-3 resume tools：已持久化 tool decision 继续执行——绝不重新调用 LLM（本回合 0 次 LLM）', async () => {
+    const streamFn = vi.fn(async function* () { yield { type: 'text', text: '续跑完成' }; });
+    const { engine, persistence, state } = makeEngine({ tools: [imageTool], streamFn });
+    const plan = {
+      mode: 'tools' as const, startStep: 0,
+      pendingCalls: [{ llmCallId: 'call_1', name: 'image.generate', arguments: '{"prompt":"x"}', toolIndex: 0 }],
+      lastToolSignature: 'sig',
+    };
+    // 任务已终态：resume 时以任务结果为工具事实（不进入 waiting）
+    (persistence.getGenerationTask as ReturnType<typeof vi.fn>).mockResolvedValue({ status: 'completed', output: { attachments: ['a1'] } });
+    const { outcome } = await run(engine, asyncInput({ resume: plan }, [imageTool]));
+    expect(streamFn).toHaveBeenCalledTimes(1); // 仅 resume 之后的下一回合（不含被恢复的决策回合）
+    expect(outcome.status).toBe('completed');
+    // 工具结果回喂：真实任务结果（而非 stale pending）
+    const toolMsg = state.messages.find((m) => m.role === 'tool');
+    expect(toolMsg?.content).toContain('"status":"completed"');
+    expect(toolMsg?.toolCallId).toBe('call_1'); // 与 assistant.tool_calls 配对
+    expect(imageTool.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('P4-5 waiting：任务未终态 → enterWaiting（running→waiting+waitingOnTaskId），不写终态/不写 final step/不写 tool 结果', async () => {
+    const streamFn = vi.fn(async function* () {
+      yield { type: 'tool_calls', toolCalls: [{ id: 'c1', name: 'image.generate', arguments: '{"prompt":"x"}' }] };
+    });
+    const { engine, persistence, state } = makeEngine({ tools: [imageTool], streamFn });
+    (persistence.getGenerationTask as ReturnType<typeof vi.fn>).mockResolvedValue({ status: 'pending', output: null });
+    const { outcome } = await run(engine, asyncInput({}, [imageTool]));
+    expect(outcome.status).toBe('waiting');
+    expect(persistence.enterWaiting).toHaveBeenCalledWith('run-existing', 'task-1', 'worker-A');
+    expect(state.finalize).toHaveLength(0);            // waiting 非终态
+    expect(state.messages.some((m) => m.role === 'tool')).toBe(false); // 任务结果由 resume 时写入
+    expect(state.steps.some((s) => s.type === 'final')).toBe(false);
+  });
+
+  it('P4-5 waiting 竞争：enterWaiting count=0（外部已 cancel）→ 以 DB 为事实 stopped，不写 tool 结果', async () => {
+    const streamFn = vi.fn(async function* () {
+      yield { type: 'tool_calls', toolCalls: [{ id: 'c1', name: 'image.generate', arguments: '{"prompt":"x"}' }] };
+    });
+    const { engine, persistence, state } = makeEngine({ tools: [imageTool], streamFn });
+    (persistence.getGenerationTask as ReturnType<typeof vi.fn>).mockResolvedValue({ status: 'pending', output: null });
+    (persistence.enterWaiting as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+    (persistence.getRunStatus as ReturnType<typeof vi.fn>).mockResolvedValue({ status: 'cancelled' });
+    const { outcome } = await run(engine, asyncInput({}, [imageTool]));
+    expect(outcome.status).toBe('cancelled'); // 外部终态为事实
+    expect(state.messages.some((m) => m.role === 'tool')).toBe(false);
+  });
+
+  it('P4-4 running 残留行：createToolCall P2002 → 复用原行 id 重试（attempts+1），不新建行', async () => {
+    const streamFn = vi.fn(async function* () { yield { type: 'text', text: '续跑完成' }; });
+    const { engine, persistence, state } = makeEngine({ tools: [imageTool], streamFn });
+    (persistence.createToolCall as ReturnType<typeof vi.fn>).mockRejectedValueOnce(Object.assign(new Error('dup'), { code: 'P2002' }));
+    (persistence.findToolCall as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'tc-existing', status: 'running', output: null });
+    const plan = {
+      mode: 'tools' as const, startStep: 0,
+      pendingCalls: [{ llmCallId: 'c1', name: 'image.generate', arguments: '{"prompt":"x"}', toolIndex: 0 }],
+      lastToolSignature: 'sig',
+    };
+    const { outcome } = await run(engine, asyncInput({ resume: plan }, [imageTool]));
+    expect(outcome.status).toBe('completed'); // 重试后下一回合正常收尾
+    // 同一行更新终态 + attempts 递增（副作用由 GenerationTask 幂等键收敛）
+    expect(state.toolCallUpdates[0]).toMatchObject({ id: 'tc-existing', data: { status: 'completed', incrementAttempts: true } });
+    expect(imageTool.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('P4-4 completed 行 + tool 结果缺失：复用输出补写 tool 消息（零重复执行）', async () => {
+    const streamFn = vi.fn(async function* () { yield { type: 'text', text: '补写完成' }; });
+    const { engine, persistence, state } = makeEngine({ tools: [imageTool], streamFn });
+    (persistence.findToolCall as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'tc-done', status: 'completed', output: { taskId: 'task-9', status: 'pending' },
+    });
+    const plan = {
+      mode: 'tools' as const, startStep: 0,
+      pendingCalls: [{ llmCallId: 'c1', name: 'image.generate', arguments: '{"prompt":"x"}', toolIndex: 0 }],
+      lastToolSignature: 'sig',
+    };
+    const { outcome } = await run(engine, asyncInput({ resume: plan }, [imageTool]));
+    expect(outcome.status).toBe('completed');
+    expect(imageTool.execute).not.toHaveBeenCalled(); // 零重复执行
+    expect(state.messages.find((m) => m.role === 'tool')?.toolCallId).toBe('c1');
+    expect(state.toolCallCreates).toHaveLength(0);
+  });
+
+  it('P4 final resume：最终回答已持久化 → 跳过 LLM 直接补 final（content 继承 transcript）', async () => {
+    const streamFn = vi.fn(async function* () { yield { type: 'text', text: '不应被调用' }; });
+    const { engine, state } = makeEngine({ streamFn });
+    const plan = { mode: 'final' as const, startStep: 0, finalContent: '已流式产出的回答', pendingCalls: [], lastToolSignature: null };
+    const { outcome } = await run(engine, asyncInput({ resume: plan }, [imageTool]));
+    expect(outcome).toMatchObject({ status: 'completed', content: '已流式产出的回答' });
+    expect(streamFn).not.toHaveBeenCalled();
+    expect(state.finalize[0]).toMatchObject({ status: 'completed', workerId: 'worker-A' });
+    expect(state.steps.some((s) => s.type === 'final')).toBe(true);
+  });
+
+  it('P4-12：resume 不重复计费——被恢复回合不重记 usage，新回合才记', async () => {
+    const streamFn = vi.fn(async function* () { yield { type: 'text', text: 'x' }; });
+    const { engine, persistence, state } = makeEngine({ tools: [imageTool], streamFn });
+    (persistence.getGenerationTask as ReturnType<typeof vi.fn>).mockResolvedValue({ status: 'completed', output: null });
+    const plan = {
+      mode: 'tools' as const, startStep: 0,
+      pendingCalls: [{ llmCallId: 'c1', name: 'image.generate', arguments: '{"prompt":"x"}', toolIndex: 0 }],
+      lastToolSignature: 'sig',
+    };
+    await run(engine, asyncInput({ resume: plan }, [imageTool]));
+    expect(streamFn).toHaveBeenCalledTimes(1); // 新回合 = 1 条 usage（被恢复回合不重记）
+    expect(state.usage).toHaveLength(1);
+  });
+
+  it('P4-10 deadline while waiting resume：deadline 已过 → resume tools 步首即 timeout，绝不 waiting→running', async () => {
+    const streamFn = vi.fn(async function* () { yield { type: 'text', text: 'x' }; });
+    const { engine } = makeEngine({ tools: [imageTool], streamFn });
+    const plan = {
+      mode: 'tools' as const, startStep: 0,
+      pendingCalls: [{ llmCallId: 'c1', name: 'image.generate', arguments: '{"prompt":"x"}', toolIndex: 0 }],
+      lastToolSignature: 'sig',
+    };
+    const { outcome } = await run(engine, asyncInput({ resume: plan, deadlineMs: -1000 }, [imageTool])); // 已过期
+    expect(outcome.status).toBe('timeout');
+    expect(imageTool.execute).not.toHaveBeenCalled();
+    expect(streamFn).not.toHaveBeenCalled();
   });
 });

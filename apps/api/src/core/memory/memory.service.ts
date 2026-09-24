@@ -82,6 +82,13 @@ export class MemoryService {
     });
   }
 
+  /** M6-P4 副作用收敛：同一 (用户, 内容, 来源消息) 的 candidate 已存在 → 复用（resume 重放不重复创建） */
+  async findCandidate(userId: string, content: string, sourceMessageId?: string) {
+    return this.prisma.memory.findFirst({
+      where: { userId, content, status: 'candidate', sourceMessageId: sourceMessageId ?? null },
+    });
+  }
+
   /** 更新（scope/projectId 不可变）；candidate→active/rejected 即"确认/拒绝" */
   async update(userId: string, id: string, input: UpdateMemoryInput) {
     await this.requireOwned(userId, id);

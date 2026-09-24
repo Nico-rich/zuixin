@@ -7,9 +7,10 @@ import { VideoExecutor } from './executors/video.executor';
 import { QueueModule } from '../../core/queue/queue.module';
 import { EventsModule } from '../../core/events/events.module';
 import { ModelRouterModule } from '../../core/model-router/model-router.module';
+import { AgentRunResumeModule } from '../../core/agent-run-resume/agent-run-resume.module';
 
 @Module({
-  imports: [QueueModule, EventsModule, ModelRouterModule],
+  imports: [QueueModule, EventsModule, ModelRouterModule, AgentRunResumeModule],
   providers: [
     MediaGenerationService,
     MediaCleanupService,
