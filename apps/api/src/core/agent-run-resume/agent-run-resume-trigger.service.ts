@@ -91,4 +91,47 @@ export class AgentRunResumeTrigger {
     const n = Number((row?.value as { agentRunDeadlineMs?: number } | null)?.agentRunDeadlineMs);
     return Number.isFinite(n) && n > 0 ? n : DEFAULT_RUN_DEADLINE_MS;
   }
+
+  /**
+   * M7-P1 Approval 终态 → AgentRun 唤醒（与 onTaskTerminal 同构的 waiting 唤醒原语）：
+   * 条件更新 waiting + waitingOnApprovalId 精确匹配 → queued（deadline 已过 → timeout，绝不复活）；
+   * jobId 唯一键 `run-{id}-wake-{ts}`（BullMQ 同键去重陷阱，M6 教训）；重复唤醒由条件更新 + claim 去重。
+   */
+  async wakeWaitingRunByApproval(runId: string, approvalId: string): Promise<{ woken: boolean }> {
+    const run = await this.prisma.agentRun.findUnique({
+      where: { id: runId },
+      select: { id: true, status: true, startedAt: true, waitingOnApprovalId: true },
+    });
+    if (!run || run.status !== 'waiting' || run.waitingOnApprovalId !== approvalId) return { woken: false };
+
+    const deadlineMs = await this.runDeadlineMs();
+    const pastDeadline = Date.now() - run.startedAt.getTime() > deadlineMs;
+    const done = await this.prisma.agentRun.updateMany({
+      where: { id: runId, status: 'waiting', waitingOnApprovalId: approvalId },
+      data: pastDeadline
+        ? {
+            status: 'timeout', errorCode: 'AGENT_RUN_TIMEOUT', errorMessage: '执行超时',
+            completedAt: new Date(), waitingOnApprovalId: null, workerId: null, leaseUntil: null, heartbeatAt: null,
+          }
+        : {
+            status: 'queued', waitingOnApprovalId: null, workerId: null, leaseUntil: null, heartbeatAt: null,
+          },
+    });
+    if (done.count === 0) return { woken: false }; // 竞态：已唤醒/已终态
+    if (pastDeadline) {
+      this.logger.warn({ runId, approvalId }, '审批终态到达但 run deadline 已过 → timeout');
+      return { woken: false };
+    }
+    await this.agentRunQueue.add(
+      'execute',
+      { runId },
+      {
+        jobId: `run-${runId}-wake-${Date.now()}`,
+        attempts: 2, backoff: { type: 'exponential', delay: 2000 },
+        removeOnComplete: true, removeOnFail: { count: 500 },
+      },
+    );
+    this.logger.log({ runId, approvalId }, 'Approval 终态 → 唤醒 AgentRun（waiting→queued）');
+    return { woken: true };
+  }
 }

@@ -10,6 +10,8 @@ export type TimelineItemType =
   | 'tool.started' | 'tool.completed' | 'tool.failed'
   | 'task.created' | 'task.completed' | 'task.failed'
   | 'artifact.created'
+  // M7-P1：Approval 项（id 幂等演进：requested → approved/rejected/expired/cancelled）
+  | 'approval.requested' | 'approval.approved' | 'approval.rejected' | 'approval.expired' | 'approval.cancelled'
   | 'usage.summary';
 
 export interface TimelineItem {

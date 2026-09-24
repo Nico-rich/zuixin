@@ -12,6 +12,10 @@ function makeService(rows: Array<Record<string, unknown>> = []) {
       findUnique: vi.fn().mockResolvedValue(null),
       findMany: vi.fn().mockResolvedValue(rows),
     },
+    approval: {
+      findUnique: vi.fn().mockResolvedValue(null),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+    },
   };
   const events = { publish: vi.fn().mockResolvedValue(undefined) };
   return { svc: new AgentRunLeaseService(prisma as never, queue as never, events as never), prisma, queue, events };
@@ -114,6 +118,40 @@ describe('AgentRunLeaseService（claim/renew/release + stale recovery）', () =>
     const { svc, queue } = makeService([
       { id: 'run-live', status: 'running', workerId: 'w1', startedAt: new Date(Date.now() - 60_000), leaseUntil: new Date(Date.now() + 30_000) },
     ]);
+    const res = await svc.recoverStale();
+    expect(res).toMatchObject({ reEnqueued: 0, timedOut: 0 });
+    expect(queue.add).not.toHaveBeenCalled();
+  });
+
+  it('M7-P1 recoverStale：waiting 且审批已终态（hook 丢失）→ 兜底唤醒', async () => {
+    const { svc, queue, prisma } = makeService([
+      { id: 'run-approve', status: 'waiting', workerId: null, startedAt: new Date(Date.now() - 60_000), leaseUntil: null, waitingOnTaskId: null, waitingOnApprovalId: 'a1' },
+    ]);
+    prisma.approval.findUnique.mockResolvedValue({ status: 'approved', expiresAt: null });
+    const res = await svc.recoverStale();
+    expect(res.reEnqueued).toBe(1);
+    expect(prisma.agentRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'run-approve', status: 'waiting', waitingOnApprovalId: 'a1' },
+      data: expect.objectContaining({ status: 'queued', waitingOnApprovalId: null }),
+    }));
+    expect(queue.add).toHaveBeenCalledWith('execute', { runId: 'run-approve' }, expect.objectContaining({ attempts: 2 }));
+  });
+
+  it('M7-P1 recoverStale：waiting 且审批 requested 但已过期 → 先 expire 再唤醒', async () => {
+    const { svc, queue, prisma } = makeService([
+      { id: 'run-expire', status: 'waiting', workerId: null, startedAt: new Date(Date.now() - 60_000), leaseUntil: null, waitingOnTaskId: null, waitingOnApprovalId: 'a2' },
+    ]);
+    prisma.approval.findUnique.mockResolvedValue({ status: 'requested', expiresAt: new Date(Date.now() - 1000) });
+    await svc.recoverStale();
+    expect(prisma.approval.updateMany).toHaveBeenCalledWith({ where: { id: 'a2', status: 'requested' }, data: { status: 'expired' } });
+    expect(queue.add).toHaveBeenCalled();
+  });
+
+  it('M7-P1 recoverStale：waiting 且审批仍未决未过期 → 不动（正常等待审批中）', async () => {
+    const { svc, queue, prisma } = makeService([
+      { id: 'run-wait', status: 'waiting', workerId: null, startedAt: new Date(Date.now() - 60_000), leaseUntil: null, waitingOnTaskId: null, waitingOnApprovalId: 'a3' },
+    ]);
+    prisma.approval.findUnique.mockResolvedValue({ status: 'requested', expiresAt: new Date(Date.now() + 60_000) });
     const res = await svc.recoverStale();
     expect(res).toMatchObject({ reEnqueued: 0, timedOut: 0 });
     expect(queue.add).not.toHaveBeenCalled();

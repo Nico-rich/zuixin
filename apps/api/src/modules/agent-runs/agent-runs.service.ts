@@ -134,7 +134,7 @@ export class AgentRunsService {
    * - Redis 提示通道（快速取消，非事实来源）——worker 心跳 15s 兜底检测 DB 状态。
    */
   async cancel(userId: string, runId: string) {
-    const run = await this.prisma.agentRun.findFirst({ where: { id: runId, userId }, select: { id: true, status: true, waitingOnTaskId: true } });
+    const run = await this.prisma.agentRun.findFirst({ where: { id: runId, userId }, select: { id: true, status: true, waitingOnTaskId: true, waitingOnApprovalId: true } });
     if (!run) throw new AppError(ErrorCode.NOT_FOUND, '运行不存在');
     const done = await this.prisma.agentRun.updateMany({
       where: { id: runId, userId, status: { in: ACTIVE_STATUSES as unknown as AgentRunStatus[] } },
@@ -147,6 +147,13 @@ export class AgentRunsService {
       await this.prisma.generationTask.updateMany({
         where: { id: run.waitingOnTaskId, status: 'pending' },
         data: { status: 'cancelled', statusMessage: 'Agent 运行已取消', completedAt: new Date() },
+      }).catch(() => undefined);
+    }
+    // M7-P1：等待中的审批 → cancelled（best-effort；不唤醒——run 已 cancelled）
+    if (run.status === 'waiting' && run.waitingOnApprovalId) {
+      await this.prisma.approval.updateMany({
+        where: { id: run.waitingOnApprovalId, status: 'requested' },
+        data: { status: 'cancelled', cancelledAt: new Date() },
       }).catch(() => undefined);
     }
     // 快速通道：worker 收到提示立即 abort（heartbeat 15s 仍是 DB 事实兜底）

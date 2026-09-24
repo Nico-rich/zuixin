@@ -147,6 +147,7 @@ model User {
   memories      Memory[]
   artifacts     Artifact[]
   agentRuns     AgentRun[]
+  approvals     Approval[]
   knowledgeBases KnowledgeBase[]
   documents      Document[]
 }
@@ -382,6 +383,7 @@ model Project {
   memories      Memory[]
   artifacts     Artifact[]
   agentRuns     AgentRun[]
+  approvals     Approval[]
   knowledgeBases KnowledgeBase[]
   documents       Document[]
   @@index([userId, updatedAt])
@@ -481,6 +483,7 @@ enum ToolCallStatus {
   running
   completed
   failed
+  waiting_approval // M7-P1: 等待人工审批（Approval 决定后 resume 继续执行或失败回喂）
 }
 
 model AgentRun {
@@ -508,7 +511,10 @@ model AgentRun {
   workerId        String?      // lease 持有者（worker 实例 id）；NULL = 同步 run（M5 语义，sweep 沿用 120s）
   leaseUntil      DateTime?    // 租约到期时刻（心跳续期）
   heartbeatAt     DateTime?    // 最近心跳（可观测）
-  waitingOnTaskId String?      // waiting 时等待的 GenerationTask
+  waitingOnTaskId     String?      // waiting 时等待的 GenerationTask
+  waitingOnApprovalId String?      // M7-P1: waiting 时等待的 Approval（与 waitingOnTaskId 互斥）
+  waitingOnApproval   Approval?    @relation("RunWaitingApproval", fields: [waitingOnApprovalId], references: [id], onDelete: SetNull)
+  approvals           Approval[]   // 本 run 产生的审批
   retryOfRunId    String?      // Retry = 新 Run 血缘（不重新打开 terminal run）
   retryOf         AgentRun?  @relation("RetryChain", fields: [retryOfRunId], references: [id], onDelete: SetNull)
   retries         AgentRun[] @relation("RetryChain")
@@ -522,6 +528,44 @@ model AgentRun {
   @@index([status])
   @@index([retryOfRunId])
   @@index([waitingOnTaskId])
+  @@index([waitingOnApprovalId])
+}
+
+// ===== M7-P1: Approval（Human-in-the-loop；M6 waiting 的第二种等待目标）=====
+enum ApprovalStatus {
+  requested
+  approved
+  rejected
+  expired
+  cancelled
+}
+
+model Approval {
+  id          String         @id @default(uuid())
+  userId      String
+  user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId   String?
+  project     Project?       @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  agentRunId  String?
+  agentRun    AgentRun?      @relation(fields: [agentRunId], references: [id], onDelete: Cascade)
+  toolCallId  String?
+  toolCall    ToolCall?      @relation(fields: [toolCallId], references: [id], onDelete: Cascade)
+  waitingRuns AgentRun[]     @relation("RunWaitingApproval")
+  status      ApprovalStatus @default(requested)
+  riskLevel   String         @default("medium") // low | medium | high
+  reason      String
+  payload     Json?
+  expiresAt   DateTime?
+  approvedAt  DateTime?
+  rejectedAt  DateTime?
+  cancelledAt DateTime?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  @@index([userId, createdAt])
+  @@index([projectId])
+  @@index([agentRunId])
+  @@index([toolCallId])
+  @@index([status, expiresAt])
 }
 
 model AgentRunStep {
@@ -558,6 +602,7 @@ model ToolCall {
   completedAt    DateTime?
   tasks          GenerationTask[]
   artifacts      Artifact[]
+  approvals      Approval[]
   @@unique([runStepId, idempotencyKey])
   @@index([toolName, startedAt])
 }

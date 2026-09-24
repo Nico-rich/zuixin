@@ -19,8 +19,11 @@ export interface CreateRunInput {
 
 export interface ToolCallRecord {
   id: string;
-  status: 'running' | 'completed' | 'failed';
+  status: 'running' | 'completed' | 'failed' | 'waiting_approval';
   output: unknown | null;
+  /** failed 终态时的原始错误（M7-P1 resume 幂等复用失败事实，不重复执行） */
+  errorCode?: string | null;
+  errorMessage?: string | null;
 }
 
 export interface AgentRuntimePersistence {
@@ -34,7 +37,7 @@ export interface AgentRuntimePersistence {
   /** ToolCall 先建行（running）→ 行 id 注入 ToolContext（P2 保持 M5 顺序，不实现 resume） */
   createToolCall(data: {
     runStepId: string; toolName: string; idempotencyKey: string;
-    input: unknown; status?: 'running' | 'completed' | 'failed';
+    input: unknown; status?: 'running' | 'completed' | 'failed' | 'waiting_approval';
     output?: unknown; errorCode?: string; errorMessage?: string; completedAt?: Date | null;
   }): Promise<{ id: string }>;
   /** 幂等查重：同一 (runStepId, idempotencyKey) 已完成 → 复用输出 */
@@ -46,6 +49,15 @@ export interface AgentRuntimePersistence {
   getGenerationTask(taskId: string): Promise<{ id: string; status: string; output: unknown; errorMessage?: string | null } | null>;
   /** P4：进入 waiting（条件更新 running+workerId → waiting+waitingOnTaskId，释放 lease/workerId；count=0 = 已被外部终态） */
   enterWaiting(runId: string, taskId: string, workerId?: string): Promise<{ count: number }>;
+  /** M7-P1：进入 approval waiting（running+workerId → waiting + waitingOnApprovalId，释放 lease；count=0 = 外部终态竞争） */
+  enterWaitingApproval(runId: string, approvalId: string, workerId?: string): Promise<{ count: number }>;
+  /** M7-P1：创建 Approval（requested；身份全部服务端注入） */
+  createApproval(data: {
+    userId: string; projectId?: string; agentRunId?: string; toolCallId?: string;
+    riskLevel: string; reason: string; payload?: Record<string, unknown>; expiresAt?: Date | null;
+  }): Promise<{ id: string }>;
+  /** M7-P1：按 ToolCall 行查关联 Approval（resume 决策事实） */
+  getApprovalForToolCall(toolCallId: string): Promise<{ id: string; status: string } | null>;
   /** 读 run 当前状态（外部终态竞争时以 DB 为事实） */
   getRunStatus(runId: string): Promise<{ status: string } | null>;
   /** LLM 回合用量（成功/失败每轮必记） */

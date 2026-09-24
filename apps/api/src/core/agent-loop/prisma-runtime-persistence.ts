@@ -44,15 +44,18 @@ export class PrismaRuntimePersistence implements AgentRuntimePersistence {
         input: data.input as never, output: data.output as never,
         status: data.status ?? 'running',
         errorCode: data.errorCode, errorMessage: data.errorMessage,
-        completedAt: data.completedAt ?? (data.status === 'running' ? null : new Date()),
+        completedAt: data.completedAt ?? (data.status === 'running' || data.status === 'waiting_approval' ? null : new Date()),
       },
     });
     return { id: row.id };
   }
 
   async findToolCall(runStepId: string, idempotencyKey: string): Promise<ToolCallRecord | null> {
-    const row = await this.prisma.toolCall.findUnique({ where: { runStepId_idempotencyKey: { runStepId, idempotencyKey } } });
-    return row ? { id: row.id, status: row.status, output: row.output } : null;
+    const row = await this.prisma.toolCall.findUnique({
+      where: { runStepId_idempotencyKey: { runStepId, idempotencyKey } },
+      select: { id: true, status: true, output: true, errorCode: true, errorMessage: true },
+    });
+    return row ? { id: row.id, status: row.status, output: row.output, errorCode: row.errorCode, errorMessage: row.errorMessage } : null;
   }
 
   async updateToolCall(id: string, data: Parameters<AgentRuntimePersistence['updateToolCall']>[1]): Promise<void> {
@@ -124,5 +127,33 @@ export class PrismaRuntimePersistence implements AgentRuntimePersistence {
   async getRunStatus(runId: string): Promise<{ status: string } | null> {
     const row = await this.prisma.agentRun.findUnique({ where: { id: runId }, select: { status: true } });
     return row ? { status: row.status } : null;
+  }
+
+  async enterWaitingApproval(runId: string, approvalId: string, workerId?: string): Promise<{ count: number }> {
+    // M7-P1：与 enterWaiting(task) 同构——条件更新 + 释放 lease/worker；waitingOnApprovalId 与 waitingOnTaskId 互斥
+    return this.prisma.agentRun.updateMany({
+      where: { id: runId, status: 'running', ...(workerId ? { workerId } : {}) },
+      data: { status: 'waiting', waitingOnApprovalId: approvalId, workerId: null, leaseUntil: null, heartbeatAt: null },
+    });
+  }
+
+  async createApproval(data: Parameters<AgentRuntimePersistence['createApproval']>[0]) {
+    const row = await this.prisma.approval.create({
+      data: {
+        userId: data.userId, projectId: data.projectId ?? null, agentRunId: data.agentRunId ?? null,
+        toolCallId: data.toolCallId ?? null, status: 'requested', riskLevel: data.riskLevel,
+        reason: data.reason, payload: (data.payload ?? {}) as never, expiresAt: data.expiresAt ?? null,
+      },
+    });
+    return { id: row.id };
+  }
+
+  async getApprovalForToolCall(toolCallId: string): Promise<{ id: string; status: string } | null> {
+    const row = await this.prisma.approval.findFirst({
+      where: { toolCallId },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, status: true },
+    });
+    return row ? { id: row.id, status: row.status } : null;
   }
 }

@@ -38,6 +38,9 @@ function makePersistence() {
     getGenerationTask: vi.fn(async () => null),
     enterWaiting: vi.fn(async () => ({ count: 1 })),
     getRunStatus: vi.fn(async () => null),
+    enterWaitingApproval: vi.fn(async () => ({ count: 1 })),
+    createApproval: vi.fn(async () => ({ id: 'approval-1' })),
+    getApprovalForToolCall: vi.fn(async () => null),
   };
   return { persistence, state };
 }
@@ -730,5 +733,123 @@ describe('AgentRuntimeEngine（M6-P7 lease fencing：旧 worker 迟写被拒，D
     (persistence.getRunStatus as ReturnType<typeof vi.fn>).mockResolvedValue({ status: 'timeout' });
     const { outcome } = await run(engine, asyncInput({}, [imageTool]));
     expect(outcome.status).toBe('timeout'); // DB 事实；绝不 waiting→running 复活
+  });
+});
+
+describe('AgentRuntimeEngine（M7-P1 Approval 审批门）', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  const approvalTool: Tool = {
+    name: 'external_action.demo', description: '外部操作', permission: 'external_action', requiresApproval: true,
+    inputSchema: z.strictObject({ title: z.string().min(1) }),
+    execute: vi.fn().mockResolvedValue({ artifactId: 'a1', executed: true }),
+  };
+  /** 第一回合 tool_calls → 审批门；后续回合纯文本（模拟 resume 后的 LLM 决策） */
+  const approvalStream = () => {
+    let calls = 0;
+    return vi.fn(async function* () {
+      calls++;
+      if (calls === 1) {
+        yield { type: 'tool_calls', toolCalls: [{ id: 'c1', name: 'external_action.demo', arguments: '{"title":"发布"}' }] };
+      } else {
+        yield { type: 'text', text: '完成' };
+      }
+    });
+  };
+  const planTools = (): AgentRuntimeContext['resume'] => ({
+    mode: 'tools', startStep: 0,
+    pendingCalls: [{ llmCallId: 'c1', name: 'external_action.demo', arguments: '{"title":"发布"}', toolIndex: 0 }],
+    lastToolSignature: null,
+  });
+
+  it('P1 async 审批门：waiting_approval 行 + Approval(requested) + enterWaitingApproval → outcome waiting（绝不执行 Tool、绝不 finalize）', async () => {
+    const { engine, persistence, state } = makeEngine({ tools: [approvalTool], streamFn: approvalStream() });
+    const { events, outcome } = await run(engine, asyncInput({}, [approvalTool]));
+    expect(outcome.status).toBe('waiting');
+    expect(outcome.approvalRefs).toEqual(['approval-1']);
+    expect(approvalTool.execute).not.toHaveBeenCalled();
+    expect(state.toolCallCreates[0]).toMatchObject({ toolName: 'external_action.demo', status: 'waiting_approval' });
+    expect(persistence.createApproval).toHaveBeenCalledWith(expect.objectContaining({
+      toolCallId: 'tc-1', agentRunId: 'run-existing', riskLevel: 'high', userId: 'u1',
+    }));
+    expect(persistence.enterWaitingApproval).toHaveBeenCalledWith('run-existing', 'approval-1', 'worker-A');
+    expect(state.finalize).toHaveLength(0); // waiting 无终态写
+    expect(events.some((e) => e.type === 'approval.requested')).toBe(true);
+    expect(state.messages.some((m) => m.role === 'tool')).toBe(false); // 未决前不写 tool 结果
+  });
+
+  it('P1 resume approved：waiting_approval 行 + Approval(approved) → 同一行继续执行 → completed + LLM final', async () => {
+    const { engine, persistence, state } = makeEngine({ tools: [approvalTool], streamFn: approvalStream() });
+    // 状态化行：首次查 waiting_approval（resume 执行），之后查 completed（后续回合幂等复用）
+    (persistence.findToolCall as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ id: 'tc-1', status: 'waiting_approval', output: null })
+      .mockResolvedValue({ id: 'tc-1', status: 'completed', output: { artifactId: 'a1', executed: true } });
+    (persistence.getApprovalForToolCall as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'approval-1', status: 'approved' });
+    const { outcome } = await run(engine, asyncInput({ resume: planTools() }, [approvalTool]));
+    expect(outcome.status).toBe('completed');
+    expect(approvalTool.execute).toHaveBeenCalledTimes(1); // 只执行一次（后续回合 completed 行复用）
+    expect(state.toolCallUpdates.some((u) => u.id === 'tc-1' && u.data.status === 'completed')).toBe(true);
+    expect(state.messages.some((m) => m.role === 'tool' && m.content.includes('executed'))).toBe(true); // 结果回喂
+  });
+
+  it('P1 resume rejected：行 failed(APPROVAL_REJECTED) + 失败回喂 LLM，绝不执行 Tool', async () => {
+    const { engine, persistence, state } = makeEngine({ tools: [approvalTool], streamFn: approvalStream() });
+    (persistence.findToolCall as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'tc-1', status: 'waiting_approval', output: null });
+    (persistence.getApprovalForToolCall as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'approval-1', status: 'rejected' });
+    const { outcome } = await run(engine, asyncInput({ resume: planTools() }, [approvalTool]));
+    expect(outcome.status).toBe('completed'); // 拒绝不直接失败 run——LLM 决定
+    expect(approvalTool.execute).not.toHaveBeenCalled();
+    expect(state.toolCallUpdates.some((u) => u.id === 'tc-1' && u.data.status === 'failed' && u.data.errorCode === 'APPROVAL_REJECTED')).toBe(true);
+    expect(state.messages.some((m) => m.role === 'tool' && m.content.includes('拒绝'))).toBe(true);
+  });
+
+  it('P1 resume expired/cancelled：对应错误码，绝不执行 Tool', async () => {
+    for (const status of ['expired', 'cancelled'] as const) {
+      const { engine, persistence, state } = makeEngine({ tools: [approvalTool], streamFn: approvalStream() });
+      (persistence.findToolCall as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'tc-1', status: 'waiting_approval', output: null });
+      (persistence.getApprovalForToolCall as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'approval-1', status });
+      const { outcome } = await run(engine, asyncInput({ resume: planTools() }, [approvalTool]));
+      expect(outcome.status).toBe('completed');
+      expect(approvalTool.execute).not.toHaveBeenCalled();
+      expect(state.toolCallUpdates.some((u) => u.id === 'tc-1' && u.data.status === 'failed' && u.data.errorCode === 'APPROVAL_' + status.toUpperCase())).toBe(true);
+    }
+  });
+
+  it('P1 resume requested（崩溃窗口残留）→ 重新 enterWaitingApproval → waiting（幂等收敛）', async () => {
+    const { engine, persistence } = makeEngine({ tools: [approvalTool], streamFn: approvalStream() });
+    (persistence.findToolCall as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'tc-1', status: 'waiting_approval', output: null });
+    (persistence.getApprovalForToolCall as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'approval-1', status: 'requested' });
+    const { outcome } = await run(engine, asyncInput({ resume: planTools() }, [approvalTool]));
+    expect(outcome.status).toBe('waiting');
+    expect(outcome.approvalRefs).toEqual(['approval-1']);
+    expect(persistence.enterWaitingApproval).toHaveBeenCalledWith('run-existing', 'approval-1', 'worker-A');
+  });
+
+  it('P1 重复 resume（行已 failed）→ 复用失败事实，绝不重复执行', async () => {
+    const { engine, persistence, state } = makeEngine({ tools: [approvalTool], streamFn: approvalStream() });
+    (persistence.findToolCall as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'tc-1', status: 'failed', output: null, errorCode: 'APPROVAL_REJECTED', errorMessage: '用户拒绝了该操作',
+    });
+    const { outcome } = await run(engine, asyncInput({ resume: planTools() }, [approvalTool]));
+    expect(outcome.status).toBe('completed');
+    expect(approvalTool.execute).not.toHaveBeenCalled();
+    expect(state.messages.some((m) => m.role === 'tool' && m.content.includes('拒绝'))).toBe(true); // 原失败事实回喂
+  });
+
+  it('P1 同步路径冻结：requiresApproval 工具在 sync（无 workerId）仍直接 TOOL_DENIED', async () => {
+    const { engine, state } = makeEngine({ tools: [approvalTool], streamFn: approvalStream() });
+    const { outcome } = await run(engine, makeEngine({ tools: [approvalTool] }).input);
+    expect(outcome.status).toBe('completed'); // 拒绝回喂后 LLM 正常收尾（M4 冻结行为）
+    expect(approvalTool.execute).not.toHaveBeenCalled();
+    expect(state.toolCallCreates.some((c) => c.status === 'failed' && c.errorCode === 'TOOL_DENIED')).toBe(true);
+  });
+
+  it('P1 审批异常（Approval 行缺失）→ 安全拒绝，绝不绕过审批执行', async () => {
+    const { engine, persistence } = makeEngine({ tools: [approvalTool], streamFn: approvalStream() });
+    (persistence.findToolCall as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'tc-1', status: 'waiting_approval', output: null });
+    (persistence.getApprovalForToolCall as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+    const { outcome } = await run(engine, asyncInput({ resume: planTools() }, [approvalTool]));
+    expect(outcome.status).toBe('completed');
+    expect(approvalTool.execute).not.toHaveBeenCalled();
   });
 });

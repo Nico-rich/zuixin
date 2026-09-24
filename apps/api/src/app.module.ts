@@ -18,6 +18,7 @@ import { AttachmentsModule } from './modules/attachments/attachments.module';
 import { AgentsModule } from './agents/agents.module';
 import { AgentRunsApiModule } from './modules/agent-runs/agent-runs-api.module';
 import { AgentsAdminModule } from './modules/agents-admin/agents-admin.module';
+import { ApprovalsApiModule } from './modules/approvals/approvals-api.module';
 import { KnowledgeApiModule } from './modules/knowledge/knowledge.module';
 import { GenerationsModule } from './modules/generations/generations.module';
 import { TasksModule } from './modules/tasks/tasks.module';
@@ -56,6 +57,7 @@ import { GlobalExceptionFilter } from './common/filters/global-exception.filter'
     AgentsModule,
     AgentRunsApiModule,
     AgentsAdminModule,
+    ApprovalsApiModule,
     KnowledgeApiModule,
     GenerationsModule,
     TasksModule,

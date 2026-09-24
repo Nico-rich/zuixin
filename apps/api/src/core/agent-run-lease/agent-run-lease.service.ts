@@ -119,7 +119,7 @@ export class AgentRunLeaseService {
     const deadlineMs = await this.runDeadlineMs();
     const rows = await this.prisma.agentRun.findMany({
       where: { status: { in: ['queued', 'running', 'waiting'] } },
-      select: { id: true, status: true, startedAt: true, workerId: true, leaseUntil: true, waitingOnTaskId: true },
+      select: { id: true, status: true, startedAt: true, workerId: true, leaseUntil: true, waitingOnTaskId: true, waitingOnApprovalId: true },
     });
     let reEnqueued = 0;
     let timedOut = 0;
@@ -182,6 +182,38 @@ export class AgentRunLeaseService {
             );
             reEnqueued++;
             this.logger.warn({ runId: row.id, taskId: row.waitingOnTaskId }, 'waiting 且任务已终态（hook 丢失）→ 兜底唤醒');
+          }
+        }
+        continue;
+      }
+      if (row.status === 'waiting' && row.waitingOnApprovalId) {
+        // M7-P1 审批等待兜底：审批已终态（hook 丢失）→ 唤醒；requested 且过期 → 先 expire 再唤醒（resume 失败回喂）
+        const approval = await this.prisma.approval.findUnique({
+          where: { id: row.waitingOnApprovalId }, select: { status: true, expiresAt: true },
+        });
+        const approvalId = row.waitingOnApprovalId;
+        const decided = approval && ['approved', 'rejected', 'cancelled', 'expired'].includes(approval.status);
+        const pastExpiry = approval?.status === 'requested' && approval.expiresAt != null && approval.expiresAt.getTime() < now.getTime();
+        if (decided || pastExpiry) {
+          if (pastExpiry) {
+            await this.prisma.approval.updateMany({ where: { id: approvalId, status: 'requested' }, data: { status: 'expired' } });
+          }
+          const woken = await this.prisma.agentRun.updateMany({
+            where: { id: row.id, status: 'waiting', waitingOnApprovalId: approvalId },
+            data: { status: 'queued', waitingOnApprovalId: null, workerId: null, leaseUntil: null, heartbeatAt: null },
+          });
+          if (woken.count > 0) {
+            await this.agentRunQueue.add(
+              'execute',
+              { runId: row.id },
+              {
+                jobId: `run-${row.id}-recover-${now.getTime()}`,
+                attempts: 2, backoff: { type: 'exponential', delay: 2000 },
+                removeOnComplete: true, removeOnFail: { count: 500 },
+              },
+            );
+            reEnqueued++;
+            this.logger.warn({ runId: row.id, approvalId }, 'waiting 且审批已终态/过期（hook 丢失）→ 兜底唤醒');
           }
         }
         continue;

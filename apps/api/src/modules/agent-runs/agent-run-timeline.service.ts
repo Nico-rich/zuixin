@@ -4,12 +4,13 @@ import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { aggregateRunUsage } from '../usage/usage.service';
 import { RunTimeline, TimelineItem, TimelineItemType } from './timeline.types';
 
-/** 同 timestamp 时的确定性排序权重（run → step → tool → task → artifact → usage） */
+/** 同 timestamp 时的确定性排序权重（run → step → tool → task/approval → artifact → usage） */
 const TYPE_ORDER: Record<TimelineItemType, number> = {
   'run.started': 0, 'run.waiting': 0, 'run.completed': 0, 'run.failed': 0, 'run.cancelled': 0, 'run.timeout': 0,
   'step.tool_call': 1, 'step.final': 1,
   'tool.started': 2, 'tool.completed': 2, 'tool.failed': 2,
   'task.created': 3, 'task.completed': 3, 'task.failed': 3,
+  'approval.requested': 3, 'approval.approved': 3, 'approval.rejected': 3, 'approval.expired': 3, 'approval.cancelled': 3,
   'artifact.created': 4,
   'usage.summary': 5,
 };
@@ -43,6 +44,7 @@ export class AgentRunTimelineService {
         agentVersion: { select: { id: true, version: true, status: true } },
         tasks: { orderBy: { createdAt: 'asc' }, include: { model: { select: { name: true } } } },
         artifacts: { orderBy: { createdAt: 'asc' } },
+        approvals: { orderBy: { createdAt: 'asc' } },
       },
     });
     if (!run) throw new AppError(ErrorCode.NOT_FOUND, '运行不存在');
@@ -58,11 +60,14 @@ export class AgentRunTimelineService {
     // 任务事实由 task.created/task.completed 项呈现——投影只反映当前 DB 状态）
     if (run.status === 'waiting') {
       const waitingTask = run.waitingOnTaskId ? run.tasks.find((t) => t.id === run.waitingOnTaskId) : undefined;
+      // M7-P1：审批等待（与任务等待互斥）
+      const waitingApproval = run.waitingOnApprovalId ? run.approvals.find((a) => a.id === run.waitingOnApprovalId) : undefined;
       items.push({
         id: `run-waiting-${run.id}`, type: 'run.waiting', status: 'running',
-        timestamp: (waitingTask?.createdAt ?? run.heartbeatAt ?? run.startedAt).toISOString(),
-        title: '⏳ 等待生成任务完成',
-        metadata: waitingTask ? { taskId: waitingTask.id, type: waitingTask.type } : undefined,
+        timestamp: (waitingTask?.createdAt ?? waitingApproval?.createdAt ?? run.heartbeatAt ?? run.startedAt).toISOString(),
+        title: waitingApproval ? '⏳ 等待人工审批' : '⏳ 等待生成任务完成',
+        metadata: waitingTask ? { taskId: waitingTask.id, type: waitingTask.type }
+          : waitingApproval ? { approvalId: waitingApproval.id } : undefined,
       });
     }
 
@@ -83,6 +88,8 @@ export class AgentRunTimelineService {
             timestamp: call.startedAt.toISOString(),
             title: `🔧 ${call.toolName}`,
           });
+          // M7-P1：等待审批的行不产出 tool 终态项（审批事实由 approval.* 项呈现；resume 后同一 id 演进为终态）
+          if (call.status === 'waiting_approval') continue;
           const failed = call.status === 'failed';
           items.push({
             id: `tool-end-${call.id}`, type: failed ? 'tool.failed' : 'tool.completed',
@@ -117,6 +124,23 @@ export class AgentRunTimelineService {
         summary: task.statusMessage ?? task.status,
         durationMs: terminal && task.startedAt ? task.completedAt!.getTime() - task.startedAt.getTime() : undefined,
         metadata: { taskId: task.id, model: task.model?.name ?? undefined, progress: task.progress ?? undefined },
+      });
+    }
+
+    // 3.5 M7-P1 Approval（id 幂等项：requested 演进为终态；payload 只取 toolName，不放 input）
+    for (const approval of run.approvals) {
+      const type: TimelineItemType = ({
+        requested: 'approval.requested', approved: 'approval.approved', rejected: 'approval.rejected',
+        expired: 'approval.expired', cancelled: 'approval.cancelled',
+      } as Record<string, TimelineItemType>)[approval.status] ?? 'approval.requested';
+      const decidedAt = approval.approvedAt ?? approval.rejectedAt ?? approval.cancelledAt;
+      items.push({
+        id: `approval-${approval.id}`, type,
+        status: approval.status === 'approved' ? 'success' : approval.status === 'requested' ? 'running' : 'failed',
+        timestamp: (decidedAt ?? approval.createdAt).toISOString(),
+        title: `🔐 ${approval.reason}`,
+        summary: approval.status === 'requested' ? '等待人工审批' : undefined,
+        metadata: { approvalId: approval.id, riskLevel: approval.riskLevel, toolName: (approval.payload as { toolName?: string } | null)?.toolName ?? undefined },
       });
     }
 

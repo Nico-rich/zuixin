@@ -48,11 +48,15 @@ export const ToolEndEventSchema = z.object({ type: z.literal('tool.end'), toolNa
 export const RunCreatedEventSchema = z.object({ type: z.literal('run.created'), runId: z.string(), agentId: z.string() });
 export const RunProgressEventSchema = z.object({ type: z.literal('run.progress'), runId: z.string(), currentStep: z.number(), maxSteps: z.number() });
 export const RunCompletedEventSchema = z.object({ type: z.literal('run.completed'), runId: z.string(), status: z.enum(['completed', 'failed', 'cancelled', 'timeout']) });
+// M7-P1: Approval 事件（engine 产 requested；decided 由 ApprovalsService 经 EventBus 发布）
+export const ApprovalRequestedEventSchema = z.object({ type: z.literal('approval.requested'), approvalId: z.string(), runId: z.string(), toolName: z.string() });
+export const ApprovalDecidedEventSchema = z.object({ type: z.literal('approval.decided'), approvalId: z.string(), runId: z.string(), status: z.enum(['approved', 'rejected', 'expired', 'cancelled']) });
 
 export const AgentEventSchema = z.discriminatedUnion('type', [
   StatusEventSchema, TextDeltaEventSchema, TaskCreatedEventSchema, DoneEventSchema, ErrorEventSchema,
   AgentStartEventSchema, AgentEndEventSchema, ToolStartEventSchema, ToolEndEventSchema,
   RunCreatedEventSchema, RunProgressEventSchema, RunCompletedEventSchema,
+  ApprovalRequestedEventSchema, ApprovalDecidedEventSchema,
 ]);
 export type AgentEvent = z.infer<typeof AgentEventSchema>;
 

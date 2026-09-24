@@ -8,7 +8,7 @@ import { LLMManagerService } from '../../providers/llm/llm-manager.service';
 import { ResolvedLLM } from '../../providers/llm/llm-manager.service';
 import { ChatMessage, ToolDefinitionWire } from '../../providers/llm/llm.types';
 import { ToolRegistry } from '../tools/tool-registry.service';
-import { ToolContext } from '../tools/tool.types';
+import { Tool, ToolContext } from '../tools/tool.types';
 import { mapProviderError, ProviderLikeError } from '../../common/errors/provider-error';
 import { AGENT_RUNTIME_PERSISTENCE, AgentRuntimePersistence } from './runtime-persistence';
 import { ResumePlan } from './resume-planner';
@@ -71,11 +71,15 @@ export interface AgentRunOutcome {
   errorMessage?: string;
   /** 本次 run 创建的生成任务引用（task.created 转发过的 taskId） */
   taskRefs: string[];
+  /** M7-P1：本次 run 进入 waiting 的审批引用（driver 发 run.waiting 事件用） */
+  approvalRefs: string[];
 }
 
 const DEFAULT_MAX_STEPS = 8;
 const DEFAULT_DEADLINE_MS = 120_000;
 const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
+/** M7-P1：审批默认有效期（limits.approvalExpiresMs 可覆盖；0 = 不过期） */
+const DEFAULT_APPROVAL_TTL_MS = 24 * 3600_000;
 /** P5-10：LLM 瞬时故障回合内重试上限与退避（1s/4s + 调用侧全幅 jitter ±30%） */
 const LLM_MAX_RETRIES = 2;
 const LLM_RETRY_BACKOFF_MS = [1000, 4000];
@@ -151,6 +155,7 @@ export class AgentRuntimeEngine {
     // P4 'final' resume：已流式产出但未落终态的回答（不重打 LLM）
     let content = ctx.resume?.finalContent ?? '';
     const taskRefs: string[] = [];
+    const approvalRefs: string[] = []; // M7-P1：approval waiting 引用
     const isAsync = !!ctx.runId && !!ctx.workerId;
     /** 外部终态竞争（cancel/timeout 先落库）→ Engine 以 DB 为事实停止，不覆盖外部结果 */
     let externalTerminal: string | undefined;
@@ -165,7 +170,7 @@ export class AgentRuntimeEngine {
         const resumeResult = yield* this.executeToolList(
           ctx, runId, stepRow.id,
           ctx.resume.pendingCalls.map((c) => ({ id: c.llmCallId, name: c.name, arguments: c.arguments, toolIndex: c.toolIndex })),
-          isAsync, deadline, taskRefs, messages,
+          isAsync, deadline, taskRefs, approvalRefs, messages,
         );
         if (resumeResult.waiting) {
           finalStatus = 'waiting';
@@ -293,7 +298,7 @@ export class AgentRuntimeEngine {
         // B1 修复：assistant tool_calls 消息每回合 push 一次（非逐工具重复）
         messages.push({ role: 'assistant', content: '', tool_calls: toolCalls });
 
-        const toolListResult = yield* this.executeToolList(ctx, runId, stepRow.id, toolCalls, isAsync, deadline, taskRefs, messages);
+        const toolListResult = yield* this.executeToolList(ctx, runId, stepRow.id, toolCalls, isAsync, deadline, taskRefs, approvalRefs, messages);
         if (toolListResult.stop) {
           if (toolListResult.waiting) {
             finalStatus = 'waiting'; // enterWaiting 已落库（waiting 不占用 Worker）
@@ -362,16 +367,18 @@ export class AgentRuntimeEngine {
       runId, status: finalStatus, content, errorCode,
       errorMessage: errorCode ? this.messageFor(errorCode) : undefined,
       taskRefs,
+      approvalRefs,
     };
   }
 
-  /** 单个 Tool 执行：权限校验 → 幂等查重 → execute（超时包裹）→ ToolCall 落库（P2 保持 M5 顺序） */
+  /** 单个 Tool 执行：权限校验 → 审批门（M7-P1 async）→ 幂等查重 → execute（超时包裹）→ ToolCall 落库 */
   private async executeToolCall(
     ctx: AgentRuntimeContext, runId: string, stepId: string, toolIndex: number,
     call: { id: string; name: string; arguments: string }, signal: AbortSignal,
-  ): Promise<{ status: 'completed' | 'failed'; output?: unknown; error?: string; outputSummary?: string }> {
+  ): Promise<{ status: 'completed' | 'failed'; output?: unknown; error?: string; outputSummary?: string; approvalWaiting?: { approvalId: string } }> {
     const tool = this.registry.get(call.name);
     const idempotencyKey = createHash('sha256').update(`${runId}:${stepId}:${toolIndex}:${call.name}:${call.arguments}`).digest('hex');
+    const isAsync = !!ctx.runId && !!ctx.workerId;
 
     // 权限边界 1：Tool 必须在 Agent 允许清单内（LLM 输出不能扩大权限）
     if (!tool || !ctx.agent.tools.includes(call.name)) {
@@ -381,13 +388,15 @@ export class AgentRuntimeEngine {
       }).catch(() => undefined);
       return { status: 'failed', error: '无权限调用该工具', outputSummary: `${call.name}：无权限` };
     }
-    // 权限边界 2：审批/高权限工具在 M4 一律拒绝（M7 接审批状态机）
-    if (tool.requiresApproval || tool.permission === 'external_action') {
+    // 权限边界 2：审批/高权限工具——同步路径维持 M4 冻结拒绝（无 resume 通道，绝不悬置）；
+    // 异步路径走 M7-P1 审批状态机（waiting → 人工决定 → resume 执行或失败回喂）。
+    const approvalRequired = !!tool.requiresApproval || tool.permission === 'external_action';
+    if (approvalRequired && !isAsync) {
       await this.persistence.createToolCall({
         runStepId: stepId, toolName: call.name, idempotencyKey, input: JSON.parse(call.arguments || '{}'),
-        status: 'failed', errorCode: ErrorCode.TOOL_DENIED, errorMessage: '该工具需要审批（M7 上线）',
+        status: 'failed', errorCode: ErrorCode.TOOL_DENIED, errorMessage: '该工具需要人工审批，请通过异步 Agent 运行使用',
       }).catch(() => undefined);
-      return { status: 'failed', error: '该工具需要审批，当前不可用', outputSummary: `${call.name}：需要审批` };
+      return { status: 'failed', error: '该工具需要人工审批，当前不可用', outputSummary: `${call.name}：需要审批` };
     }
 
     // 幂等查重：同一 (runStepId, idempotencyKey) 已完成 → 复用输出，不重复执行。
@@ -412,6 +421,12 @@ export class AgentRuntimeEngine {
         status: 'failed', errorCode: ErrorCode.VALIDATION_ERROR, errorMessage: msg,
       }).catch(() => undefined);
       return { status: 'failed', error: msg, outputSummary: `${call.name}：参数非法` };
+    }
+
+    // M7-P1 审批门（仅异步 run）：waiting_approval 行 + Approval(requested) → enterWaitingApproval；
+    // resume 按 Approval 事实裁决：approved → 同行执行 / rejected·expired·cancelled → 失败回喂 / requested → 重新 waiting。
+    if (approvalRequired && isAsync) {
+      return this.executeApprovalGatedTool(ctx, runId, stepId, toolIndex, tool, call, parsedInput, idempotencyKey, existing, signal);
     }
 
     // 执行前先落 ToolCall 行（running）——行 id 作为 toolCallId 注入执行上下文（FK 追溯真实行）；
@@ -445,6 +460,99 @@ export class AgentRuntimeEngine {
       }
     }
 
+    return this.executeToolRow(ctx, runId, tool, parsedInput, stepId, toolCallId, idempotencyKey, retryingExistingRow, signal);
+  }
+
+  /**
+   * M7-P1 审批门（异步 run 专属；同步路径在权限边界 2 已拒绝）：
+   * - 无行：建 waiting_approval 行（幂等键防并发）→ Approval(requested, toolCallId) → enterWaitingApproval → waiting；
+   * - 已有行：按 ToolCall 行状态 + Approval 事实裁决（resume 幂等）——
+   *   approved → 同行继续执行；rejected/expired/cancelled → 行 failed（结果回喂 LLM）；
+   *   requested（崩溃窗口残留）→ 重新 enterWaitingApproval（条件更新幂等收敛）；
+   *   failed（重复 resume）→ 返回原失败事实，绝不重复执行。
+   */
+  private async executeApprovalGatedTool(
+    ctx: AgentRuntimeContext, runId: string, stepId: string, toolIndex: number,
+    tool: Tool, call: { id: string; name: string; arguments: string },
+    parsedInput: unknown, idempotencyKey: string, existing: Awaited<ReturnType<AgentRuntimePersistence['findToolCall']>>,
+    signal: AbortSignal,
+  ): Promise<{ status: 'completed' | 'failed'; output?: unknown; error?: string; outputSummary?: string; approvalWaiting?: { approvalId: string } }> {
+    if (existing) {
+      if (existing.status === 'failed') {
+        // 已终态失败（拒绝/过期/取消/执行失败但 transcript 未落）→ 复用原失败事实，绝不重复执行
+        return { status: 'failed', error: existing.errorMessage ?? '该操作未获批准', outputSummary: `${call.name}：未执行` };
+      }
+      const approval = await this.persistence.getApprovalForToolCall(existing.id);
+      if (approval?.status === 'approved') {
+        // 审批通过 → 同一行继续执行（waiting_approval/running 残留皆可；行内终态由 executeToolRow 落）
+        return this.executeToolRow(ctx, runId, tool, parsedInput, stepId, existing.id, idempotencyKey, existing.status === 'running', signal);
+      }
+      if (approval && ['rejected', 'expired', 'cancelled'].includes(approval.status)) {
+        const code = approval.status === 'rejected' ? ErrorCode.APPROVAL_REJECTED
+          : approval.status === 'expired' ? ErrorCode.APPROVAL_EXPIRED : ErrorCode.APPROVAL_CANCELLED;
+        const message = approval.status === 'rejected' ? '用户拒绝了该操作'
+          : approval.status === 'expired' ? '审批已过期，操作未执行' : '审批已取消，操作未执行';
+        await this.persistence.updateToolCall(existing.id, {
+          status: 'failed', errorCode: code, errorMessage: message, completedAt: new Date(),
+        });
+        return { status: 'failed', error: message, outputSummary: `${call.name}：审批未通过` };
+      }
+      if (approval?.status === 'requested') {
+        // 崩溃窗口：Approval 已建但 enterWaiting 前崩（或重复 resume）→ 重新进入 waiting（幂等收敛）
+        const entered = await this.persistence.enterWaitingApproval(runId, approval.id, ctx.workerId);
+        if (entered.count > 0) return { status: 'completed', approvalWaiting: { approvalId: approval.id }, outputSummary: `${call.name}：等待审批` };
+        return { status: 'failed', error: '运行已终止', outputSummary: `${call.name}：运行已终止` }; // count=0 = 外部终态竞争
+      }
+      // Approval 行缺失（异常数据）→ 安全拒绝，绝不绕过审批执行
+      await this.persistence.updateToolCall(existing.id, {
+        status: 'failed', errorCode: ErrorCode.TOOL_DENIED, errorMessage: '审批记录缺失，已拒绝执行', completedAt: new Date(),
+      });
+      return { status: 'failed', error: '审批记录缺失，已拒绝执行', outputSummary: `${call.name}：审批异常` };
+    }
+
+    // 无行：waiting_approval 行 → Approval → enterWaitingApproval
+    let rowId: string;
+    try {
+      const row = await this.persistence.createToolCall({
+        runStepId: stepId, toolName: call.name, idempotencyKey, input: parsedInput, status: 'waiting_approval',
+      });
+      rowId = row.id;
+    } catch (err) {
+      if ((err as { code?: string }).code === 'P2002') {
+        // 并发建行竞态输家 → 按已存在的行重新裁决（递归一次收敛）
+        const won = await this.persistence.findToolCall(stepId, idempotencyKey);
+        if (!won) throw err;
+        return this.executeApprovalGatedTool(ctx, runId, stepId, toolIndex, tool, call, parsedInput, idempotencyKey, won, signal);
+      }
+      throw err;
+    }
+    const ttl = await this.approvalTtlMs();
+    const approval = await this.persistence.createApproval({
+      userId: ctx.userId, projectId: ctx.projectId, agentRunId: runId, toolCallId: rowId,
+      riskLevel: tool.permission === 'external_action' ? 'high' : 'medium',
+      reason: `工具 ${call.name} 需要人工审批`,
+      payload: { toolName: call.name, input: parsedInput },
+      expiresAt: ttl > 0 ? new Date(Date.now() + ttl) : null,
+    });
+    const entered = await this.persistence.enterWaitingApproval(runId, approval.id, ctx.workerId);
+    if (entered.count > 0) {
+      return { status: 'completed', approvalWaiting: { approvalId: approval.id }, outputSummary: `${call.name}：等待审批` };
+    }
+    return { status: 'failed', error: '运行已终止', outputSummary: `${call.name}：运行已终止` }; // 外部终态竞争（count=0）
+  }
+
+  /** 审批有效期（limits.approvalExpiresMs；缺省 24h；0 = 不过期） */
+  private async approvalTtlMs(): Promise<number> {
+    const limits = await this.persistence.getSystemSetting('limits');
+    const n = Number((limits as { approvalExpiresMs?: number } | null)?.approvalExpiresMs);
+    return Number.isFinite(n) && n >= 0 ? n : DEFAULT_APPROVAL_TTL_MS;
+  }
+
+  /** 行级执行体（普通路径 + 审批通过后的 resume 路径共用）：retry policy → execute → 行终态落库 */
+  private async executeToolRow(
+    ctx: AgentRuntimeContext, runId: string, tool: Tool, parsedInput: unknown,
+    stepId: string, toolCallId: string, idempotencyKey: string, retryingExistingRow: boolean, signal: AbortSignal,
+  ): Promise<{ status: 'completed' | 'failed'; output?: unknown; error?: string; outputSummary?: string }> {
     const toolCtx: ToolContext = {
       userId: ctx.userId, projectId: ctx.projectId, conversationId: ctx.conversationId,
       messageId: ctx.messageId, agentRunId: runId, agentRunStepId: stepId,
@@ -483,14 +591,14 @@ export class AgentRuntimeEngine {
         output, status: 'completed', completedAt: new Date(), durationMs: Date.now() - startedAt,
         incrementAttempts: retryingExistingRow || attemptsUsed > 1, // 同一行重试可观测
       }).catch((err) => this.logger.warn(`ToolCall 完成更新失败（幂等兜底）: ${(err as Error).message}`));
-      return { status: 'completed', output, outputSummary: this.summarize(call.name, output) };
+      return { status: 'completed', output, outputSummary: this.summarize(tool.name, output) };
     }
     // M5 行为冻结：工具层失败一律回喂模型（含取消中断）——取消在下一步步首检查中被识别
     const appErr = lastErr instanceof AppError ? lastErr : new AppError(ErrorCode.PROVIDER_UNKNOWN, (lastErr as Error).message);
     await this.persistence.updateToolCall(toolCallId, {
       status: 'failed', errorCode: appErr.code, errorMessage: appErr.message, completedAt: new Date(), durationMs: Date.now() - startedAt,
     }).catch((e) => this.logger.warn(`ToolCall 失败更新异常: ${(e as Error).message}`));
-    return { status: 'failed', error: appErr.message, outputSummary: `${call.name}：执行失败` };
+    return { status: 'failed', error: appErr.message, outputSummary: `${tool.name}：执行失败` };
   }
 
   /** 可中断 sleep（cancel 期间退避立即可恢复，不拖延取消） */
@@ -511,7 +619,7 @@ export class AgentRuntimeEngine {
   private async *executeToolList(
     ctx: AgentRuntimeContext, runId: string, stepRowId: string,
     calls: Array<{ id: string; name: string; arguments: string; toolIndex?: number }>,
-    isAsync: boolean, deadline: number, taskRefs: string[], messages: ChatMessage[],
+    isAsync: boolean, deadline: number, taskRefs: string[], approvalRefs: string[], messages: ChatMessage[],
   ): AsyncGenerator<AgentEvent, { stop: boolean; waiting?: boolean; external?: string }, void> {
     for (const [index, call] of calls.entries()) {
       if (ctx.signal.aborted) return { stop: true };
@@ -521,6 +629,12 @@ export class AgentRuntimeEngine {
       const result = await this.executeToolCall(
         ctx, runId, stepRowId, call.toolIndex ?? index, call, ctx.signal,
       );
+      // M7-P1 approval waiting：异步 run + 审批未决 → waiting + waitingOnApprovalId + 释放 worker
+      if (result.approvalWaiting) {
+        approvalRefs.push(result.approvalWaiting.approvalId);
+        yield { type: 'approval.requested', approvalId: result.approvalWaiting.approvalId, runId, toolName: call.name };
+        return { stop: true, waiting: true };
+      }
       // P4-5 waiting：异步 run + 生成任务未终态 → running→waiting + waitingOnTaskId + 释放 worker
       const decision = await this.resolveGenerationTask(ctx, runId, call.name, result, isAsync);
       if (decision.action === 'waiting') {

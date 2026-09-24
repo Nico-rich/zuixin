@@ -64,6 +64,7 @@ function makeRunFixture(status: string) {
     artifacts: [
       { id: 'art-1', type: 'creative_brief', title: '营销方案', summary: '方案摘要', createdAt: t('2026-09-24T00:00:13Z') },
     ],
+    approvals: [],
   };
 }
 

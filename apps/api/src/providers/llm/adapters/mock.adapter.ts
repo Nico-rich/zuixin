@@ -38,6 +38,9 @@ export class MockLLMAdapter implements LLMProvider {
     if (/方案|简报|brief/i.test(text) && has('artifact.create')) {
       return { id: 'call_mock_artifact', name: 'artifact.create', arguments: JSON.stringify({ type: 'creative_brief', title: text.slice(0, 40), summary: text }) };
     }
+    if (/发布|外部操作|publish/i.test(text) && has('external_action.demo')) {
+      return { id: 'call_mock_external', name: 'external_action.demo', arguments: JSON.stringify({ title: text.slice(0, 40), content: text }) };
+    }
     if (/记住|记下/i.test(text) && has('memory.create_candidate')) {
       return { id: 'call_mock_memory', name: 'memory.create_candidate', arguments: JSON.stringify({ content: text, category: 'preference', importance: 70, confidence: 0.9 }) };
     }

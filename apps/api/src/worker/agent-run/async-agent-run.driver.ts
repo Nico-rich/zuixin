@@ -28,7 +28,7 @@ export class AsyncAgentRunDriver {
     const run = await this.prisma.agentRun.findUnique({ where: { id: runId }, include: { agentVersion: true } });
     if (!run || run.status !== 'running') {
       // 已被取消/终态/他人处理 → 幂等退出
-      return { runId, status: run?.status === 'cancelled' ? 'cancelled' : 'failed', content: '', taskRefs: [] };
+      return { runId, status: run?.status === 'cancelled' ? 'cancelled' : 'failed', content: '', taskRefs: [], approvalRefs: [] };
     }
     const version = run.agentVersion;
     if (!version) throw new Error(`run ${runId} 无 agentVersion 快照`);
@@ -98,7 +98,8 @@ export class AsyncAgentRunDriver {
     if (outcome.status === 'waiting') {
       // P4 waiting：run 仍存活（已落库 waiting+waitingOnTaskId），assistant Message 保持 streaming，无终态写
       const taskId = outcome.taskRefs[0];
-      await this.events.publish(agentRunChannel(runId), { type: 'run.waiting', runId, taskId }).catch(() => undefined);
+      const approvalId = outcome.approvalRefs[0]; // M7-P1：审批等待（与任务等待互斥）
+      await this.events.publish(agentRunChannel(runId), { type: 'run.waiting', runId, taskId, approvalId }).catch(() => undefined);
     } else {
       await this.finalizeAssistantMessage(run, metadata.assistantMessageId, outcome);
     }

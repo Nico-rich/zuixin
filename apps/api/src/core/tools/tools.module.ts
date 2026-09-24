@@ -10,6 +10,7 @@ import { MemoryService } from '../memory/memory.service';
 import { KnowledgeService } from '../knowledge/knowledge.service';
 import { createArtifactTool, createImageGenerateTool, createMemoryCandidateTool, createVideoGenerateTool } from './builtin/tools';
 import { createKnowledgeSearchTool } from './builtin/knowledge.tool';
+import { createExternalActionDemoTool } from './builtin/approval.tool';
 
 @Module({
   imports: [GenerationsModule, ArtifactsModule, MemoryModule, KnowledgeModule],
@@ -24,6 +25,7 @@ import { createKnowledgeSearchTool } from './builtin/knowledge.tool';
         registry.register(createArtifactTool(artifacts));
         registry.register(createMemoryCandidateTool(memories));
         registry.register(createKnowledgeSearchTool(knowledge));
+        registry.register(createExternalActionDemoTool(artifacts)); // M7-P1：审批链路入口工具
         return registry;
       },
     },
