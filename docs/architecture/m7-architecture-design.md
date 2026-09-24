@@ -228,3 +228,40 @@ commerce.analytics.summary / analytics.compare
 
 - 单测 8：时间窗校验/连接解析/facts-derived 分层/aov-roas-ctr 计算/两期变化率零基数不伪造/来源分布不重复计数。
 - e2e 7：6 个工具经真实 Agent 链路断言 facts/derived 数值；只读保证（数据零变更）；无连接失败回喂。
+
+## 5. M7-P5 Commerce Analysis + Creative Decision Loop
+
+### 5.1 数据模型
+
+- `CommerceAnalysis`：analysisType/timeRange/facts/derived/anomalies（服务端计算）+ possibleCauses/recommendations（LLM 提供，独立字段 + source 标注）；
+- `CreativeBrief`：problem/target/objective/creativeAngle/visualDirection/copyDirection/constraints/platform/product/evidence + artifactId（Artifact(creative_brief) 镜像，复用现有制品体系）。
+
+### 5.2 事实/推测严格分层（绝不把推测写成事实）
+
+```
+facts          → service-computed（CommerceService 聚合原始事实）
+derived        → service-computed（ctr/cvr/roas/aov 等派生指标）
+anomalies      → service-rule（当前窗 vs 前一期同长窗口，下降 ≥10% 阈值，base/compare/threshold 标注）
+possibleCauses → llm-interpretation（LLM 提供，独立存储）
+recommendations→ llm-recommendation
+```
+- 每个 API/工具响应携带 `layering` 标注表（消费者不得混淆）；
+- 异常检测覆盖 facts+derived 双源（roas/ctr/conversionRate 在 derived——实测修复：初版只查 facts 导致派生类异常漏检）。
+
+### 5.3 创意决策环（复用既有管线，零重造）
+
+```
+Commerce Data → commerce.analysis.generate（facts/derived/anomalies 服务端 + LLM 推测分离）
+→ creativeBrief.create（evidence 自动快照最新 ready 分析；LLM 创意方向标注 llm-suggestion；Artifact 镜像）
+→ 既有 Image Agent / GenerationTask / Artifact / Usage 管线（M3/M4/M6 全复用）
+```
+
+### 5.4 工具
+
+- `commerce.analysis.generate`（write；analysisType 8 类；possibleCauses/recommendations 可选输入，服务端分离存储）；
+- `creativeBrief.create`（write；problem/objective 必填；analysisId 缺省自动挂最新分析；idempotencyKey = ToolCall 级）。
+
+### 5.5 测试
+
+- 单测 4：规则异常（双源）/分层标注/证据快照/Artifact 镜像/非法类型。
+- e2e 3：分析（营收-14%/访问-25%/ROAS-37.5% 三异常 + DB 分层断言）→ 简报（自动关联证据 + 镜像制品）→ 闭环（简报方向进入既有 Image Agent 管线，waiting→resume 全复用）。

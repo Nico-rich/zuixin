@@ -251,6 +251,23 @@ export class CommerceService {
     }
     return { facts: deltas, derived: { note: 'changePct 为服务端计算的百分比变化；因果解读属于 LLM 推测，不得作为事实' }, meta: { provider: base.meta.provider, base: base.meta.timeRange, compare: compare.meta.timeRange, readOnly: true } };
   }
+
+  /** 库存汇总：facts 原始聚合 + derived 售罄率（read-only） */
+  async inventorySummary(userId: string, input: CommerceToolInput) {
+    const provider = this.provider(input.provider);
+    const connection = await this.resolveConnection(userId, provider.name, input.connectionId);
+    const timeRange = this.resolveTimeRange(input.timeRange);
+    const rows = await provider.inventory({ userId, connectionId: connection.id }, timeRange);
+    let stock = 0, reserved = 0, sold = 0;
+    for (const r of rows) {
+      stock += r.stock as number; reserved += r.reserved as number; sold += r.sold as number;
+    }
+    return {
+      facts: { stock, reserved, sold },
+      derived: { sellThrough: stock + sold > 0 ? round2(sold / (stock + sold)) : 0 },
+      meta: { provider: provider.name, timeRange, readOnly: true },
+    };
+  }
 }
 
 type MetricRowLike = Record<string, unknown>;

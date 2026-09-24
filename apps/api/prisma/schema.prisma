@@ -159,6 +159,8 @@ model User {
   commerceAdMetrics   CommerceAdMetric[]
   commerceInventory   CommerceInventoryMetric[]
   commerceRevenue     CommerceRevenueMetric[]
+  commerceAnalyses  CommerceAnalysis[]
+  creativeBriefs    CreativeBrief[]
   knowledgeBases KnowledgeBase[]
   documents      Document[]
 }
@@ -397,6 +399,8 @@ model Project {
   approvals     Approval[]
   connections   Connection[]
   externalActions ExternalAction[]
+  commerceAnalyses CommerceAnalysis[]
+  creativeBriefs   CreativeBrief[]
   knowledgeBases KnowledgeBase[]
   documents       Document[]
   @@index([userId, updatedAt])
@@ -529,6 +533,8 @@ model AgentRun {
   waitingOnApproval   Approval?    @relation("RunWaitingApproval", fields: [waitingOnApprovalId], references: [id], onDelete: SetNull)
   externalActions     ExternalAction[]
   approvals           Approval[]   // 本 run 产生的审批
+  commerceAnalyses    CommerceAnalysis[]
+  creativeBriefs      CreativeBrief[]
   retryOfRunId    String?      // Retry = 新 Run 血缘（不重新打开 terminal run）
   retryOf         AgentRun?  @relation("RetryChain", fields: [retryOfRunId], references: [id], onDelete: SetNull)
   retries         AgentRun[] @relation("RetryChain")
@@ -1035,4 +1041,59 @@ model CommerceRevenueMetric {
   refunds      Float    @default(0)
   netRevenue   Float    @default(0)
   @@index([userId, provider, periodStart])
+}
+
+// ===== M7-P5: Commerce Analysis + Creative Brief（事实/推测严格分层）=====
+// facts/derived/anomalies = 服务端计算；possibleCauses/recommendations = LLM 推测（独立字段，绝不混入事实）
+model CommerceAnalysis {
+  id             String    @id @default(uuid())
+  userId         String
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId      String?
+  project        Project?  @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  agentRunId     String?
+  agentRun       AgentRun? @relation(fields: [agentRunId], references: [id], onDelete: SetNull)
+  connectionId   String?
+  analysisType   String // sales | traffic | conversion | ads | roas | revenue | inventory | composite
+  timeRange      Json
+  facts          Json // 原始聚合事实（CommerceService 输出快照）
+  derived        Json // 服务端派生指标
+  anomalies      Json? // 服务端规则异常（阈值判定，非 LLM）
+  possibleCauses Json? // LLM 推测（明确标注 interpretation，绝不当作事实）
+  recommendations Json? // LLM 建议（明确标注 recommendation）
+  status         String    @default("ready") // draft | ready
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  briefs         CreativeBrief[]
+  @@index([userId, createdAt])
+  @@index([agentRunId])
+}
+
+model CreativeBrief {
+  id                 String            @id @default(uuid())
+  userId             String
+  user               User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId          String?
+  project            Project?          @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  agentRunId         String?
+  agentRun           AgentRun?         @relation(fields: [agentRunId], references: [id], onDelete: SetNull)
+  commerceAnalysisId String?
+  analysis           CommerceAnalysis? @relation(fields: [commerceAnalysisId], references: [id], onDelete: SetNull)
+  problem            String            @db.Text
+  target             String?
+  objective          String
+  creativeAngle      String?
+  visualDirection    String?
+  copyDirection      String?
+  constraints        Json?
+  platform           String?
+  product            Json? // 商品引用快照（LLM 提供，标注来源）
+  evidence           Json? // 数据证据（facts/derived/anomalies 引用快照）
+  status             String            @default("draft") // draft | ready | approved | rejected
+  artifactId         String? // Artifact(creative_brief) 镜像（与现有制品体系整合）
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+  @@index([userId, createdAt])
+  @@index([agentRunId])
+  @@index([commerceAnalysisId])
 }

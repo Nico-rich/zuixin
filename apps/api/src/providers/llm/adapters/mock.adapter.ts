@@ -38,6 +38,12 @@ export class MockLLMAdapter implements LLMProvider {
     if (/视频|短片|动画/i.test(text) && has('video.generate')) {
       return { id: 'call_mock_video', name: 'video.generate', arguments: JSON.stringify({ prompt: text, duration: 5 }) };
     }
+    if (/主图方案|创意方案|创意简报|三套|3套|brief/i.test(text) && has('creativeBrief.create')) {
+      return { id: 'call_mock_brief', name: 'creativeBrief.create', arguments: JSON.stringify({ problem: '转化率下降', objective: '提升点击率', creativeAngle: '黑金质感', visualDirection: '黑金配色+大字报排版', platform: '店铺主图' }) };
+    }
+    if (/转化率下降|转化下降|异常|诊断/i.test(text) && has('commerce.analysis.generate')) {
+      return { id: 'call_mock_analysis', name: 'commerce.analysis.generate', arguments: JSON.stringify({ analysisType: 'composite', timeRange: { days: 30 }, possibleCauses: ['流量质量下降（推测）'], recommendations: ['优化主图点击率'] }) };
+    }
     if (/方案|简报|brief/i.test(text) && has('artifact.create')) {
       return { id: 'call_mock_artifact', name: 'artifact.create', arguments: JSON.stringify({ type: 'creative_brief', title: text.slice(0, 40), summary: text }) };
     }
