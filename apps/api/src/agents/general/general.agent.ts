@@ -1,18 +1,19 @@
 import { AgentEvent } from '@ai-agent/shared';
 import { Agent, AgentContext } from '../agent.types';
-import { AgentLoopService, AgentLoopAgentConfig } from '../../core/agent-loop/agent-loop.service';
+import { AgentRuntimeEngine, AgentLoopAgentConfig } from '../../core/agent-loop/agent-runtime-engine';
 import { ContextAssembler } from '../../core/context/context-assembler';
 
 export interface GeneralAgentDeps {
-  loop: AgentLoopService;
+  engine: AgentRuntimeEngine;
   context: ContextAssembler;
   config: AgentLoopAgentConfig;
 }
 
 /**
- * 通用助手 Agent（Agent Loop 驱动）：
- * ContextAssembler 取上下文（最近消息 + 项目/用户记忆）→ AgentLoop 决策（回答或调用工具）。
- * 上下文组装唯一走 ContextAssembler，Agent 不直查 Memory。
+ * 通用助手 Agent = M6-P2 Sync Driver：
+ * 职责只保留——上下文组装（ContextAssembler，唯一入口）+ RuntimeContext 构建（身份来自服务端 ctx，
+ * 用户输入不可指定 userId/runId/agentVersionId）+ Engine 事件流透传。
+ * SSE 输出、消息落库、锁释放等 HTTP 侧职责全部留在 ChatService。
  */
 export class GeneralAssistantAgent implements Agent {
   readonly id: string;
@@ -33,7 +34,7 @@ export class GeneralAssistantAgent implements Agent {
       // 上下文预算（AgentVersion 配置；默认 limits.contextBudgetTokens=8000）
       budgetTokens: this.deps.config.contextBudgetTokens,
     });
-    yield* this.deps.loop.execute({
+    const run = this.deps.engine.run({
       userId: ctx.userId,
       projectId: ctx.projectId,
       conversationId: ctx.conversationId,
@@ -43,5 +44,10 @@ export class GeneralAssistantAgent implements Agent {
       agent: this.deps.config,
       signal: ctx.signal ?? new AbortController().signal,
     });
+    for await (const event of run) {
+      yield event;
+    }
+    // outcome 由引擎在 generator return 中产出（P3 Async Driver 直接消费；Sync 路径契约 = 事件流，冻结不变）
+    await run.next();
   }
 }

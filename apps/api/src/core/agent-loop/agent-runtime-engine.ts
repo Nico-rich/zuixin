@@ -3,8 +3,6 @@ import { createHash } from 'node:crypto';
 import { ZodSchema } from 'zod';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import { AgentEvent, AppError, ErrorCode } from '@ai-agent/shared';
-import { PrismaService } from '../../modules/prisma/prisma.service';
-import { UsageService } from '../../modules/usage/usage.service';
 import { ModelResolverService } from '../../providers/llm/model-resolver.service';
 import { LLMManagerService } from '../../providers/llm/llm-manager.service';
 import { ResolvedLLM } from '../../providers/llm/llm-manager.service';
@@ -12,6 +10,7 @@ import { ChatMessage, ToolDefinitionWire } from '../../providers/llm/llm.types';
 import { ToolRegistry } from '../tools/tool-registry.service';
 import { ToolContext } from '../tools/tool.types';
 import { mapProviderError, ProviderLikeError } from '../../common/errors/provider-error';
+import { AGENT_RUNTIME_PERSISTENCE, AgentRuntimePersistence } from './runtime-persistence';
 
 export interface AgentLoopAgentConfig {
   id: string;
@@ -31,7 +30,8 @@ export interface AgentLoopAgentConfig {
   contextBudgetTokens?: number;
 }
 
-export interface AgentLoopInput {
+/** Engine 输入上下文：身份全部由服务端（Sync Driver）构建，用户输入不可指定 */
+export interface AgentRuntimeContext {
   userId: string;
   projectId?: string;
   conversationId?: string;
@@ -39,8 +39,22 @@ export interface AgentLoopInput {
   userMessage: string;
   history: ChatMessage[];
   agent: AgentLoopAgentConfig;
-  deadlineMs?: number;             // 默认 120s
+  /** 相对 deadline（ms）；缺省取 limits.agentRunTimeoutMs，再缺省 120s。P3 分层超时不动本字段 */
+  deadlineMs?: number;
   signal: AbortSignal;
+}
+
+/** Engine 结构化结果（不携带 Prisma model，不含内部敏感信息） */
+export interface AgentRunOutcome {
+  runId: string;
+  status: 'completed' | 'failed' | 'cancelled' | 'timeout';
+  /** 最终回答全文（text.delta 累积；Sync Driver/Chat 仍自持 buffer，行为冻结） */
+  content: string;
+  errorCode?: string;
+  /** 安全错误摘要 */
+  errorMessage?: string;
+  /** 本次 run 创建的生成任务引用（task.created 转发过的 taskId） */
+  taskRefs: string[];
 }
 
 const DEFAULT_MAX_STEPS = 8;
@@ -53,64 +67,74 @@ const TOOL_RESULTS_TOTAL_MAX_CHARS = 8000;
 const FINAL_STEP_INDEX = 999;
 
 /**
- * 通用 Agent Loop（决策者）：
- * 上下文 → LLM（工具定义）→ tool_calls? → 校验/权限/执行/回喂 → 重复 → final。
- * - 不保存模型内部 chain-of-thought（step type=reasoning 不落 LLM 推理内容）；
+ * AgentRuntime Engine（M6-P2 抽取）：
+ * - 不依赖 HTTP/SSE/Chat/Controller/前端；事件经 AsyncGenerator 产出（SSE 写入留在 Driver 侧）；
+ * - 不直接操作 Provider（经 LLMManager/ModelResolver 抽象）与 DB（经 AgentRuntimePersistence 边界）；
+ * - transcript checkpoint：初始上下文 seed → 每回合 assistant 快照 → 每工具 tool 结果（[B]~[J] 边界）；
  * - 终态保证：completed/failed/cancelled/timeout，条件更新禁止终态复活；
- * - 循环检测：连续两次同 Tool 同参数 → AGENT_LOOP_DETECTED；
- * - 身份与权限：ToolContext 由本服务注入，Tool 输入不允许身份字段。
+ * - 取消：signal.aborted 识别为 cancellation（不伪装 provider failure）。
+ * P3 Async Driver 复用同一引擎；P2 不实现 resume/waiting/lease。
  */
 @Injectable()
-export class AgentLoopService {
-  private readonly logger = new Logger('AgentLoop');
+export class AgentRuntimeEngine {
+  private readonly logger = new Logger('AgentRuntime');
 
   constructor(
-    @Inject(PrismaService) private readonly prisma: PrismaService,
+    @Inject(AGENT_RUNTIME_PERSISTENCE) private readonly persistence: AgentRuntimePersistence,
     @Inject(ToolRegistry) private readonly registry: ToolRegistry,
     @Inject(ModelResolverService) private readonly modelResolver: ModelResolverService,
     @Inject(LLMManagerService) private readonly llmManager: LLMManagerService,
-    @Inject(UsageService) private readonly usage: UsageService,
   ) {}
 
-  async *execute(input: AgentLoopInput): AsyncIterable<AgentEvent> {
-    const maxSteps = input.agent.maxSteps ?? DEFAULT_MAX_STEPS;
-    // 超时配置来自 system_settings.limits.agentRunTimeoutMs（与清扫阈值同源，不写死）
-    const limits = await this.prisma.systemSetting.findUnique({ where: { key: 'limits' } });
-    const configuredTimeout = (limits?.value as { agentRunTimeoutMs?: number } | null)?.agentRunTimeoutMs;
-    const deadline = Date.now() + (input.deadlineMs ?? configuredTimeout ?? DEFAULT_DEADLINE_MS);
-    const run = await this.prisma.agentRun.create({
-      data: {
-        userId: input.userId, agentId: input.agent.id,
-        agentVersionId: input.agent.versionId, // 锁定版本快照，永不改变
-        projectId: input.projectId, conversationId: input.conversationId,
-        maxSteps, metadata: { agentTools: input.agent.tools },
-      },
+  async *run(ctx: AgentRuntimeContext): AsyncGenerator<AgentEvent, AgentRunOutcome, void> {
+    const maxSteps = ctx.agent.maxSteps ?? DEFAULT_MAX_STEPS;
+    // 超时配置来自 system_settings.limits.agentRunTimeoutMs（与清扫阈值同源，不写死；P2 只保留同步语义）
+    const limits = await this.persistence.getSystemSetting('limits');
+    const configuredTimeout = (limits as { agentRunTimeoutMs?: number } | null)?.agentRunTimeoutMs;
+    const deadline = Date.now() + (ctx.deadlineMs ?? configuredTimeout ?? DEFAULT_DEADLINE_MS);
+    const run = await this.persistence.createRun({
+      userId: ctx.userId, agentId: ctx.agent.id,
+      agentVersionId: ctx.agent.versionId, // 锁定版本快照，永不改变
+      projectId: ctx.projectId, conversationId: ctx.conversationId,
+      maxSteps, metadata: { agentTools: ctx.agent.tools },
     });
-    yield { type: 'run.created', runId: run.id, agentId: input.agent.id };
-    yield { type: 'agent.start', agentId: input.agent.id, runId: run.id };
+    const runId = run.id;
+    yield { type: 'run.created', runId, agentId: ctx.agent.id };
+    yield { type: 'agent.start', agentId: ctx.agent.id, runId };
     yield { type: 'status', stage: 'agent', message: '正在分析需求…' };
 
     const messages: ChatMessage[] = [
-      ...(input.agent.systemPrompt ? [{ role: 'system' as const, content: input.agent.systemPrompt }] : []),
-      ...input.history,
-      { role: 'user' as const, content: input.userMessage },
+      ...(ctx.agent.systemPrompt ? [{ role: 'system' as const, content: ctx.agent.systemPrompt }] : []),
+      ...ctx.history,
+      { role: 'user' as const, content: ctx.userMessage },
     ];
-    const toolDefs = this.toolDefinitions(input.agent.tools);
+    // transcript seed：初始上下文（system + history + user）——durable 重放基座（CP0）
+    for (const m of messages) {
+      await this.persistence.appendMessage(ctx.userId, runId, {
+        role: m.role as never,
+        content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+      }).catch((err) => this.logger.warn(`transcript seed 失败: ${(err as Error).message}`));
+    }
+
+    const toolDefs = this.toolDefinitions(ctx.agent.tools);
     let finalStatus: 'completed' | 'failed' | 'cancelled' | 'timeout' = 'completed';
     let errorCode: string | undefined;
+    let errorMessage: string | undefined;
     let lastToolSignature: string | null = null;
     let lastTurnHadToolCalls = false;
+    let content = '';
+    const taskRefs: string[] = [];
 
     try {
       for (let step = 0; step < maxSteps; step++) {
-        if (input.signal.aborted) { finalStatus = 'cancelled'; break; }
+        if (ctx.signal.aborted) { finalStatus = 'cancelled'; break; }
         if (Date.now() >= deadline) { finalStatus = 'timeout'; errorCode = ErrorCode.AGENT_RUN_TIMEOUT; break; }
 
-        const resolved = await this.resolveLLM(input.agent);
+        const resolved = await this.resolveLLM(ctx.agent);
         // Tool Calling 能力降级（MUST-3）：capabilities.functionCalling === false 时不发送 tools；
         // requiresTools 的 Agent 直接 NO_TOOL_CAPABILITY 终态——绝不伪装完成。
         const supportsTools = resolved.capabilities?.['functionCalling'] !== false;
-        if (toolDefs.length && !supportsTools && input.agent.requiresTools) {
+        if (toolDefs.length && !supportsTools && ctx.agent.requiresTools) {
           finalStatus = 'failed';
           errorCode = ErrorCode.NO_TOOL_CAPABILITY;
           yield { type: 'status', stage: 'agent', message: '当前模型不支持工具调用，无法完成该任务' };
@@ -120,31 +144,51 @@ export class AgentLoopService {
         const turnStarted = Date.now();
         // 每回合 LLM 用量落库（M5-P4：成功/失败均记录——失败回合可能已计费，必须可观测）
         let toolCalls: Array<{ id: string; name: string; arguments: string }> | undefined;
+        let turnText = '';
         try {
           const stream = resolved.adapter.stream({
-            model: resolved.apiModelId, messages, temperature: input.agent.temperature ?? 0.7,
-            maxTokens: input.agent.maxTokens, tools: toolsToSend, signal: input.signal,
+            model: resolved.apiModelId, messages, temperature: ctx.agent.temperature ?? 0.7,
+            maxTokens: ctx.agent.maxTokens, tools: toolsToSend, signal: ctx.signal,
           });
           for await (const chunk of stream) {
-            if (chunk.type === 'text') yield { type: 'text.delta', text: chunk.text };
-            else if (chunk.type === 'tool_calls') toolCalls = chunk.toolCalls;
+            if (chunk.type === 'text') {
+              content += chunk.text; turnText += chunk.text;
+              yield { type: 'text.delta', text: chunk.text };
+            } else if (chunk.type === 'tool_calls') toolCalls = chunk.toolCalls;
           }
         } catch (err) {
+          // M6-A8：用户取消 → cancelled（绝不伪装成 provider failure）；中断回合仍记 usage（可能已计费）
+          if (ctx.signal.aborted) {
+            finalStatus = 'cancelled';
+            await this.persistence.recordChatUsage({
+              userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.messageId,
+              providerId: resolved.providerId, modelId: resolved.modelId, runId,
+              inputTokens: 0, outputTokens: 0, latencyMs: Date.now() - turnStarted,
+              status: 'failed', errorCode: ErrorCode.AGENT_CANCELLED,
+            });
+            break;
+          }
           const appErr = err instanceof AppError ? err : mapProviderError(err as ProviderLikeError);
-          await this.usage.recordChatUsage({
-            userId: input.userId, conversationId: input.conversationId ?? '', messageId: input.messageId,
-            providerId: resolved.providerId, modelId: resolved.modelId, runId: run.id,
+          await this.persistence.recordChatUsage({
+            userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.messageId,
+            providerId: resolved.providerId, modelId: resolved.modelId, runId,
             inputTokens: 0, outputTokens: 0, latencyMs: Date.now() - turnStarted,
             status: 'failed', errorCode: appErr.code,
-          }).catch(() => undefined);
+          });
           throw err;
         }
-        await this.usage.recordChatUsage({
-          userId: input.userId, conversationId: input.conversationId ?? '', messageId: input.messageId,
-          providerId: resolved.providerId, modelId: resolved.modelId, runId: run.id,
+        await this.persistence.recordChatUsage({
+          userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.messageId,
+          providerId: resolved.providerId, modelId: resolved.modelId, runId,
           inputTokens: 0, outputTokens: 0, latencyMs: Date.now() - turnStarted, status: 'success',
-        }).catch(() => undefined);
+        });
         lastTurnHadToolCalls = !!toolCalls?.length;
+        // transcript checkpoint（CP1）：assistant 回合快照——含 tool_calls 决策事实，resume 不重打 LLM
+        await this.persistence.appendMessage(ctx.userId, runId, {
+          role: 'assistant', content: turnText,
+          toolCalls: toolCalls?.length ? toolCalls.map((t) => ({ id: t.id, name: t.name, arguments: t.arguments })) : undefined,
+        }).catch((err) => this.logger.warn(`transcript assistant 落库失败: ${(err as Error).message}`));
+
         if (!toolCalls?.length) break; // final 回答已流式输出
 
         // 循环检测：连续两次相同 Tool 同参数
@@ -156,37 +200,38 @@ export class AgentLoopService {
         }
         lastToolSignature = signature;
 
-        const stepRow = await this.prisma.agentRunStep.create({
-          data: { runId: run.id, stepIndex: step, type: 'tool_call', status: 'running' },
-        });
-        yield { type: 'run.progress', runId: run.id, currentStep: step + 1, maxSteps };
+        // CP2：step 行先建（UNIQUE(runId, stepIndex) 幂等锚点）
+        const stepRow = await this.persistence.createStep({ runId, stepIndex: step, type: 'tool_call', status: 'running' });
+        yield { type: 'run.progress', runId, currentStep: step + 1, maxSteps };
+
+        // B1 修复：assistant tool_calls 消息每回合 push 一次（非逐工具重复）
+        messages.push({ role: 'assistant', content: '', tool_calls: toolCalls });
 
         for (const [toolIndex, call] of toolCalls.entries()) {
           yield { type: 'status', stage: 'tool', message: `正在调用 ${call.name}…` };
-          yield { type: 'tool.start', toolName: call.name, runId: run.id };
-          const result = await this.executeToolCall(input, run.id, stepRow.id, toolIndex, call, toolDefs, input.signal);
+          yield { type: 'tool.start', toolName: call.name, runId };
+          const result = await this.executeToolCall(ctx, runId, stepRow.id, toolIndex, call, ctx.signal);
           // 生成类工具 → 转发 task.created（前端 TaskCard 依赖，与 Image/Video Agent 行为一致）
           const taskId = (result.output as { taskId?: string } | undefined)?.taskId;
           if (result.status === 'completed' && taskId && (call.name === 'image.generate' || call.name === 'video.generate')) {
+            taskRefs.push(taskId);
             yield { type: 'task.created', taskId, kind: call.name === 'image.generate' ? 'image' : 'video' };
           }
           // 回喂模型（无论成败——失败让模型看到错误并修正）
           // P6 Tool Result Budget：内容纳入确定性截断（不破坏 assistant tool_call / tool result 消息配对）
-          messages.push({ role: 'assistant', content: '', tool_calls: toolCalls });
-          messages.push({
-            role: 'tool',
-            content: this.truncateToolResult(JSON.stringify(result.output ?? result.error ?? {})),
-            tool_call_id: call.id,
-          });
+          const toolContent = this.truncateToolResult(JSON.stringify(result.output ?? result.error ?? {}));
+          messages.push({ role: 'tool', content: toolContent, tool_call_id: call.id });
+          // transcript checkpoint（CP4）：tool 结果（截断后内容与喂给 LLM 的一致）
+          await this.persistence.appendMessage(ctx.userId, runId, {
+            role: 'tool', content: toolContent, toolCallId: call.id,
+          }).catch((err) => this.logger.warn(`transcript tool 落库失败: ${(err as Error).message}`));
           this.compactToolResults(messages);
-          yield { type: 'tool.end', toolName: call.name, runId: run.id, status: result.status, outputSummary: result.outputSummary };
+          yield { type: 'tool.end', toolName: call.name, runId, status: result.status, outputSummary: result.outputSummary };
         }
-        await this.prisma.agentRunStep.update({
-          where: { id: stepRow.id }, data: { status: 'completed', completedAt: new Date(), output: { toolCount: toolCalls.length } },
-        });
-        await this.prisma.agentRun.update({ where: { id: run.id }, data: { currentStep: step + 1 } });
+        await this.persistence.updateStep(stepRow.id, { status: 'completed', completedAt: new Date(), output: { toolCount: toolCalls.length } });
+        await this.persistence.updateCurrentStep(runId, step + 1);
       }
-      if (finalStatus === 'completed' && input.signal.aborted) finalStatus = 'cancelled';
+      if (finalStatus === 'completed' && ctx.signal.aborted) finalStatus = 'cancelled';
       // MUST-2：maxSteps 耗尽且最后一轮仍是工具调用 → 硬失败，不得伪装 completed
       if (finalStatus === 'completed' && lastTurnHadToolCalls) {
         finalStatus = 'failed';
@@ -194,47 +239,67 @@ export class AgentLoopService {
         yield { type: 'status', stage: 'agent', message: '任务过于复杂，已达到最大步骤数' };
       }
 
-      await this.prisma.agentRunStep.create({
-        data: { runId: run.id, stepIndex: FINAL_STEP_INDEX, type: 'final', status: finalStatus === 'completed' ? 'completed' : 'failed', output: { finalStatus } },
+      await this.persistence.createStep({
+        runId, stepIndex: FINAL_STEP_INDEX, type: 'final',
+        status: finalStatus === 'completed' ? 'completed' : 'failed',
+        output: { finalStatus },
       });
     } catch (err) {
-      const appErr = err instanceof AppError ? err : mapProviderError(err as ProviderLikeError);
-      finalStatus = appErr.code === ErrorCode.AGENT_RUN_TIMEOUT ? 'timeout' : 'failed';
-      errorCode = appErr.code;
-      yield { type: 'error', code: appErr.code, message: appErr.message };
+      // 取消在回合内已被识别；此处仅为兜底（例如 createStep 阶段 signal 已 abort）
+      if (ctx.signal.aborted) {
+        finalStatus = 'cancelled';
+        errorCode = undefined;
+      } else {
+        const appErr = err instanceof AppError ? err : mapProviderError(err as ProviderLikeError);
+        finalStatus = appErr.code === ErrorCode.AGENT_RUN_TIMEOUT ? 'timeout' : 'failed';
+        errorCode = appErr.code;
+        yield { type: 'error', code: appErr.code, message: appErr.message };
+      }
     } finally {
       // 条件更新：终态不可复活（状态机锁定）
-      await this.prisma.agentRun.updateMany({
-        where: { id: run.id, status: 'running' },
-        data: { status: finalStatus, errorCode, errorMessage: errorCode ? this.messageFor(errorCode) : null, completedAt: new Date() },
+      await this.persistence.finalizeRun(runId, {
+        status: finalStatus, errorCode: errorCode ?? null, errorMessage: errorCode ? this.messageFor(errorCode) : null,
+        completedAt: new Date(),
       });
-      yield { type: 'agent.end', agentId: input.agent.id, runId: run.id, status: finalStatus };
-      yield { type: 'run.completed', runId: run.id, status: finalStatus };
+      yield { type: 'agent.end', agentId: ctx.agent.id, runId, status: finalStatus };
+      yield { type: 'run.completed', runId, status: finalStatus };
     }
+
+    return {
+      runId, status: finalStatus, content, errorCode,
+      errorMessage: errorCode ? this.messageFor(errorCode) : undefined,
+      taskRefs,
+    };
   }
 
-  /** 单个 Tool 执行：权限校验 → 幂等查重 → execute（超时包裹）→ ToolCall 落库 */
+  /** 单个 Tool 执行：权限校验 → 幂等查重 → execute（超时包裹）→ ToolCall 落库（P2 保持 M5 顺序） */
   private async executeToolCall(
-    input: AgentLoopInput, runId: string, stepId: string, toolIndex: number,
-    call: { id: string; name: string; arguments: string }, toolDefs: ToolDefinitionWire[], signal: AbortSignal,
+    ctx: AgentRuntimeContext, runId: string, stepId: string, toolIndex: number,
+    call: { id: string; name: string; arguments: string }, signal: AbortSignal,
   ): Promise<{ status: 'completed' | 'failed'; output?: unknown; error?: string; outputSummary?: string }> {
     const tool = this.registry.get(call.name);
     const idempotencyKey = createHash('sha256').update(`${runId}:${stepId}:${toolIndex}:${call.name}:${call.arguments}`).digest('hex');
 
     // 权限边界 1：Tool 必须在 Agent 允许清单内（LLM 输出不能扩大权限）
-    if (!tool || !input.agent.tools.includes(call.name)) {
-      await this.recordToolCall(stepId, call.name, idempotencyKey, call.arguments, undefined, 'failed', ErrorCode.TOOL_DENIED, '无权限调用该工具');
+    if (!tool || !ctx.agent.tools.includes(call.name)) {
+      await this.persistence.createToolCall({
+        runStepId: stepId, toolName: call.name, idempotencyKey, input: JSON.parse(call.arguments || '{}'),
+        status: 'failed', errorCode: ErrorCode.TOOL_DENIED, errorMessage: '无权限调用该工具',
+      }).catch(() => undefined);
       return { status: 'failed', error: '无权限调用该工具', outputSummary: `${call.name}：无权限` };
     }
-    // 权限边界 2：审批/高权限工具在 M4 一律拒绝（M6 接审批状态机）
+    // 权限边界 2：审批/高权限工具在 M4 一律拒绝（M7 接审批状态机）
     if (tool.requiresApproval || tool.permission === 'external_action') {
-      await this.recordToolCall(stepId, call.name, idempotencyKey, call.arguments, undefined, 'failed', ErrorCode.TOOL_DENIED, '该工具需要审批（M6 上线）');
+      await this.persistence.createToolCall({
+        runStepId: stepId, toolName: call.name, idempotencyKey, input: JSON.parse(call.arguments || '{}'),
+        status: 'failed', errorCode: ErrorCode.TOOL_DENIED, errorMessage: '该工具需要审批（M7 上线）',
+      }).catch(() => undefined);
       return { status: 'failed', error: '该工具需要审批，当前不可用', outputSummary: `${call.name}：需要审批` };
     }
 
     // 幂等查重：同一 (runStepId, idempotencyKey) 已完成 → 复用输出，不重复执行
-    const existing = await this.prisma.toolCall.findUnique({ where: { runStepId_idempotencyKey: { runStepId: stepId, idempotencyKey } } });
-    if (existing?.status === 'completed' && existing.output) {
+    const existing = await this.persistence.findToolCall(stepId, idempotencyKey);
+    if (existing?.status === 'completed' && existing.output != null) {
       return { status: 'completed', output: existing.output, outputSummary: '（复用已执行结果）' };
     }
 
@@ -244,7 +309,10 @@ export class AgentLoopService {
       parsedInput = tool.inputSchema.parse(JSON.parse(call.arguments || '{}'));
     } catch (err) {
       const msg = `参数校验失败: ${(err as Error).message}`;
-      await this.recordToolCall(stepId, call.name, idempotencyKey, call.arguments, undefined, 'failed', ErrorCode.VALIDATION_ERROR, msg);
+      await this.persistence.createToolCall({
+        runStepId: stepId, toolName: call.name, idempotencyKey, input: JSON.parse(call.arguments || '{}'),
+        status: 'failed', errorCode: ErrorCode.VALIDATION_ERROR, errorMessage: msg,
+      }).catch(() => undefined);
       return { status: 'failed', error: msg, outputSummary: `${call.name}：参数非法` };
     }
 
@@ -252,17 +320,14 @@ export class AgentLoopService {
     // 执行后更新该行终态。并发重试撞唯一约束 → 查重复用。
     let toolCallId: string;
     try {
-      const row = await this.prisma.toolCall.create({
-        data: {
-          runStepId: stepId, toolName: call.name, idempotencyKey,
-          input: JSON.parse(call.arguments || '{}') as never, status: 'running',
-        },
+      const row = await this.persistence.createToolCall({
+        runStepId: stepId, toolName: call.name, idempotencyKey, input: parsedInput, status: 'running',
       });
       toolCallId = row.id;
     } catch (err) {
       if ((err as { code?: string }).code === 'P2002') {
-        const existingRow = await this.prisma.toolCall.findUnique({ where: { runStepId_idempotencyKey: { runStepId: stepId, idempotencyKey } } });
-        if (existingRow?.status === 'completed' && existingRow.output) {
+        const existingRow = await this.persistence.findToolCall(stepId, idempotencyKey);
+        if (existingRow?.status === 'completed' && existingRow.output != null) {
           return { status: 'completed', output: existingRow.output, outputSummary: '（复用已执行结果）' };
         }
       }
@@ -270,45 +335,25 @@ export class AgentLoopService {
     }
 
     const toolCtx: ToolContext = {
-      userId: input.userId, projectId: input.projectId, conversationId: input.conversationId,
-      messageId: input.messageId, agentRunId: runId, agentRunStepId: stepId,
+      userId: ctx.userId, projectId: ctx.projectId, conversationId: ctx.conversationId,
+      messageId: ctx.messageId, agentRunId: runId, agentRunStepId: stepId,
       toolCallId, idempotencyKey, signal,
     };
     const startedAt = Date.now();
     try {
       const combinedSignal = AbortSignal.any([signal, AbortSignal.timeout(tool.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS)]);
       const output = await tool.execute(parsedInput, { ...toolCtx, signal: combinedSignal });
-      await this.prisma.toolCall.update({
-        where: { id: toolCallId },
-        data: { output: output as never, status: 'completed', completedAt: new Date(), durationMs: Date.now() - startedAt },
+      await this.persistence.updateToolCall(toolCallId, {
+        output, status: 'completed', completedAt: new Date(), durationMs: Date.now() - startedAt,
       }).catch((err) => this.logger.warn(`ToolCall 完成更新失败（幂等兜底）: ${(err as Error).message}`));
       return { status: 'completed', output, outputSummary: this.summarize(call.name, output) };
     } catch (err) {
+      // M5 行为冻结：工具层失败一律回喂模型（含取消中断）——取消在下一步步首检查中被识别
       const appErr = err instanceof AppError ? err : new AppError(ErrorCode.PROVIDER_UNKNOWN, (err as Error).message);
-      await this.prisma.toolCall.update({
-        where: { id: toolCallId },
-        data: { status: 'failed', errorCode: appErr.code, errorMessage: appErr.message, completedAt: new Date(), durationMs: Date.now() - startedAt },
+      await this.persistence.updateToolCall(toolCallId, {
+        status: 'failed', errorCode: appErr.code, errorMessage: appErr.message, completedAt: new Date(), durationMs: Date.now() - startedAt,
       }).catch((e) => this.logger.warn(`ToolCall 失败更新异常: ${(e as Error).message}`));
       return { status: 'failed', error: appErr.message, outputSummary: `${call.name}：执行失败` };
-    }
-  }
-
-  private async recordToolCall(
-    stepId: string, toolName: string, idempotencyKey: string, inputJson: string,
-    output: unknown, status: 'running' | 'completed' | 'failed', errorCode?: string, errorMessage?: string, durationMs?: number,
-  ) {
-    try {
-      await this.prisma.toolCall.create({
-        data: {
-          runStepId: stepId, toolName, idempotencyKey,
-          input: JSON.parse(inputJson || '{}') as never, output: output as never,
-          status, errorCode, errorMessage, durationMs,
-          completedAt: status === 'running' ? null : new Date(),
-        },
-      });
-    } catch (err) {
-      // UNIQUE(runStepId, idempotencyKey) 竞态：并发重复 → 已存在即幂等成功
-      this.logger.warn(`ToolCall 落库冲突（幂等兜底）: ${(err as Error).message}`);
     }
   }
 

@@ -82,6 +82,25 @@ describe('Agent Loop (e2e, mock 全链路)', () => {
     expect(calls[0].idempotencyKey).toBeTruthy();
   });
 
+  it('M6-P2：transcript 真库断言——run 消息有序且 tool_calls 快照/tool 配对完整', async () => {
+    const appAny = app as unknown as { get: <T>(type: unknown) => T };
+    const prisma = appAny.get<PrismaService>(PrismaService);
+    const run = await prisma.agentRun.findFirst({ where: { conversationId: convId }, include: { artifacts: true }, orderBy: { createdAt: 'asc' } });
+    expect(run).toBeTruthy();
+    const rows = await prisma.agentRunMessage.findMany({ where: { runId: run!.id }, orderBy: { sequence: 'asc' } });
+    const roles = rows.map((r) => r.role);
+    expect(roles.slice(0, 2)).toEqual(['system', 'user']);
+    expect(roles.at(-1)).toBe('assistant'); // final 回合
+    const assistantIdx = rows.findIndex((r) => r.role === 'assistant' && r.toolCalls != null);
+    expect(assistantIdx).toBeGreaterThan(-1);
+    const callIds = (rows[assistantIdx].toolCalls as Array<{ id: string; name: string }>).map((c) => c.id);
+    expect(callIds.length).toBeGreaterThan(0);
+    // 每条 tool_calls 都有配对的 tool 结果消息
+    for (const callId of callIds) {
+      expect(rows.some((r) => r.role === 'tool' && r.toolCallId === callId)).toBe(true);
+    }
+  });
+
   it('P3 linkage：Artifact.runId/toolCallId 非空；反向查询 AgentRun→Artifact、ToolCall→Artifact', async () => {
     const appAny = app as unknown as { get: <T>(type: unknown) => T };
     const prisma = appAny.get<PrismaService>(PrismaService);

@@ -4,8 +4,9 @@ import { mapProviderError, ProviderLikeError } from '../../../common/errors/prov
 
 export interface OpenAICompatibleConfig { baseUrl: string; apiKey: string; timeoutMs: number; }
 
-type ChatFn = (body: Record<string, unknown>) => Promise<Record<string, unknown>>;
-type StreamFn = (body: Record<string, unknown>) => AsyncIterable<Record<string, unknown>> | Promise<AsyncIterable<Record<string, unknown>>>;
+type RequestOptions = { signal?: AbortSignal };
+type ChatFn = (body: Record<string, unknown>, options?: RequestOptions) => Promise<Record<string, unknown>>;
+type StreamFn = (body: Record<string, unknown>, options?: RequestOptions) => AsyncIterable<Record<string, unknown>> | Promise<AsyncIterable<Record<string, unknown>>>;
 
 /** OpenAI / DeepSeek / Kimi / 阿里百炼 / 火山方舟 / 智谱 六家共用一个 adapter（baseUrl + key 配置化） */
 export class OpenAICompatibleAdapter implements LLMProvider {
@@ -15,13 +16,13 @@ export class OpenAICompatibleAdapter implements LLMProvider {
 
   constructor(cfg: OpenAICompatibleConfig, injected?: { chat?: ChatFn; stream?: StreamFn }) {
     const client = new OpenAI({ baseURL: cfg.baseUrl, apiKey: cfg.apiKey, timeout: cfg.timeoutMs, maxRetries: 0 });
-    this.chatFn = injected?.chat ?? (async (body) => (await client.chat.completions.create(body as never)) as unknown as Record<string, unknown>);
-    this.streamFn = injected?.stream ?? (async (body) => (await client.chat.completions.create({ ...body, stream: true } as never)) as unknown as AsyncIterable<Record<string, unknown>>);
+    this.chatFn = injected?.chat ?? (async (body, options) => (await client.chat.completions.create(body as never, options)) as unknown as Record<string, unknown>);
+    this.streamFn = injected?.stream ?? (async (body, options) => (await client.chat.completions.create({ ...body, stream: true } as never, options)) as unknown as AsyncIterable<Record<string, unknown>>);
   }
 
   async chat(params: ChatParams): Promise<ChatResponse> {
     try {
-      const r = await this.chatFn(this.buildBody(params, false));
+      const r = await this.chatFn(this.buildBody(params, false), { signal: params.signal });
       const choice = (r.choices as Array<{ message?: { content?: string | null; tool_calls?: unknown[] } }>)?.[0];
       const usage = r.usage as { prompt_tokens?: number; completion_tokens?: number } | undefined;
       return {
@@ -34,7 +35,8 @@ export class OpenAICompatibleAdapter implements LLMProvider {
 
   async *stream(params: ChatParams): AsyncIterable<LLMChunk> {
     try {
-      const s = await this.streamFn(this.buildBody(params, true));
+      // M6-A8：signal 经 SDK options 传入（body.signal 会被 JSON 序列化丢弃且不接入 fetch abort）
+      const s = await this.streamFn(this.buildBody(params, true), { signal: params.signal });
       // OpenAI 流式 tool_calls 以 delta 分片到达，按 index 聚合，流结束时一次产出内部协议块
       const acc = new Map<number, { id?: string; name?: string; args: string }>();
       for await (const chunk of s) {
@@ -77,7 +79,6 @@ export class OpenAICompatibleAdapter implements LLMProvider {
         : { type: 'json_object' };
     }
     if (p.tools?.length) body.tools = p.tools; // 内部协议与 OpenAI 格式同构，直接透传
-    if (p.signal) body.signal = p.signal;
     return body;
   }
 

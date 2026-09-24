@@ -27,13 +27,16 @@ export class ChatController {
     writer.init();
     const abort = new AbortController();
     const heartbeat = setInterval(() => writer.ping(), 15000);
-    const onClose = () => abort.abort();
-    req.on('close', onClose);
+    // M6-P2 修复（M1 潜伏 bug）：req 'close' 在 POST 请求体消费完即触发（Node 语义 = 请求完成，非连接断开），
+    // 注册时机晚于其触发 → 客户端断连从未真正取消。连接级事件是 res 'close'：
+    // 正常 end() 后也会触发（writableEnded=true，abort 为无害 no-op）；中途断开时 writableEnded=false → 真正取消。
+    const onClose = () => { if (!res.writableEnded) abort.abort(); };
+    res.on('close', onClose);
     try {
       await this.chatService.streamChat(ctx, writer, abort.signal, requestId);
     } finally {
       clearInterval(heartbeat);
-      req.off('close', onClose);
+      res.off('close', onClose);
       writer.end();
     }
   }

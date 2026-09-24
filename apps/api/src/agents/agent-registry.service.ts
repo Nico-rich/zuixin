@@ -2,7 +2,7 @@ import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { TaskIntent } from '@ai-agent/shared';
 import { PrismaService } from '../modules/prisma/prisma.service';
 import { MediaGenerationService } from '../modules/generations/media-generation.service';
-import { AgentLoopService } from '../core/agent-loop/agent-loop.service';
+import { AgentRuntimeEngine } from '../core/agent-loop/agent-runtime-engine';
 import { ContextAssembler } from '../core/context/context-assembler';
 import { Agent } from './agent.types';
 import { GeneralAssistantAgent } from './general/general.agent';
@@ -31,7 +31,7 @@ export class AgentRegistryService implements OnModuleInit {
 
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
-    @Inject(AgentLoopService) private readonly loop: AgentLoopService,
+    @Inject(AgentRuntimeEngine) private readonly engine: AgentRuntimeEngine,
     @Inject(ContextAssembler) private readonly context: ContextAssembler,
     @Inject(MediaGenerationService) private readonly generations: MediaGenerationService,
   ) {}
@@ -79,7 +79,7 @@ export class AgentRegistryService implements OnModuleInit {
       case 'general-assistant': {
         const cfg = (v.config ?? {}) as { maxSteps?: number; requiresTools?: boolean; knowledge?: { enabled?: boolean }; contextBudgetTokens?: number };
         return new GeneralAssistantAgent({
-          loop: this.loop, context: this.context,
+          engine: this.engine, context: this.context,
           config: {
             id: row.id, systemPrompt: v.systemPrompt, modelId: v.modelId,
             tools: (v.tools as string[]) ?? [], temperature: v.temperature,
