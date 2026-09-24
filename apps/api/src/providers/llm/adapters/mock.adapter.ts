@@ -41,6 +41,9 @@ export class MockLLMAdapter implements LLMProvider {
     if (/记住|记下/i.test(text) && has('memory.create_candidate')) {
       return { id: 'call_mock_memory', name: 'memory.create_candidate', arguments: JSON.stringify({ content: text, category: 'preference', importance: 70, confidence: 0.9 }) };
     }
+    if (/查一下|检索|知识库|资料/i.test(text) && has('knowledge.search')) {
+      return { id: 'call_mock_knowledge', name: 'knowledge.search', arguments: JSON.stringify({ query: text }) };
+    }
     return null;
   }
 

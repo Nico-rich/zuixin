@@ -14,6 +14,10 @@ export interface MemoryBlock {
   content: string;
   /** 组装排序权重，越小越靠前（默认 100；scope 优先级映射随未来源注册时定义） */
   order?: number;
+  /** token 估算（BudgetApplier 截断用） */
+  tokenCount?: number;
+  /** 来源元数据（引用/citation 预留，不注入模型） */
+  source?: Record<string, unknown>;
 }
 
 export interface AssembleContext {
@@ -21,10 +25,14 @@ export interface AssembleContext {
   conversationId: string;
   /** 会话所属项目（ProjectMemorySource 使用；M1 无项目时行为不变） */
   projectId?: string;
+  /** 当前用户消息（KnowledgeSource 检索 query；无则跳过检索） */
+  userMessage?: string;
   /** 组装历史时排除的消息 id（通常是本次用户消息） */
   excludeMessageId?: string;
   /** 最近消息条数上限（默认 8，与 M1 行为一致） */
   recentMessagesLimit?: number;
+  /** Knowledge 自动检索开关（Agent 配置 knowledge.enabled；默认关闭——不因普通聊天触发 embedding） */
+  knowledge?: { enabled: boolean };
 }
 
 /**

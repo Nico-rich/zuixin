@@ -26,7 +26,10 @@ export class GeneralAssistantAgent implements Agent {
       userId: ctx.userId,
       conversationId: ctx.conversationId,
       projectId: ctx.projectId,
+      userMessage: ctx.userMessage,
       excludeMessageId: ctx.messageId,
+      // Knowledge 自动检索开关（Agent 版本配置 knowledge.enabled；默认关闭，普通聊天不触发 embedding）
+      knowledge: { enabled: this.deps.config.knowledgeEnabled ?? false },
     });
     yield* this.deps.loop.execute({
       userId: ctx.userId,

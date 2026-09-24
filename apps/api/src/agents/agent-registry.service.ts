@@ -77,7 +77,7 @@ export class AgentRegistryService implements OnModuleInit {
     const v = row.activeVersion!; // refresh 已保证存在
     switch (kind) {
       case 'general-assistant': {
-        const cfg = (v.config ?? {}) as { maxSteps?: number; requiresTools?: boolean };
+        const cfg = (v.config ?? {}) as { maxSteps?: number; requiresTools?: boolean; knowledge?: { enabled?: boolean } };
         return new GeneralAssistantAgent({
           loop: this.loop, context: this.context,
           config: {
@@ -86,6 +86,7 @@ export class AgentRegistryService implements OnModuleInit {
             maxTokens: v.maxTokens ?? undefined, maxSteps: cfg.maxSteps,
             requiresTools: cfg.requiresTools,
             versionId: v.id, // Run 锁定版本（immutable 快照）
+            knowledgeEnabled: cfg.knowledge?.enabled ?? false,
           },
         });
       }

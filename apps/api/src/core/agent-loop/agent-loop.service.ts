@@ -25,6 +25,8 @@ export interface AgentLoopAgentConfig {
   maxSteps?: number;               // 默认 8
   /** AgentVersion 快照 id：Run 创建时锁定，此后永不改变 */
   versionId?: string;
+  /** Knowledge 自动检索开关（KnowledgeSource 触发机制；默认关闭） */
+  knowledgeEnabled?: boolean;
 }
 
 export interface AgentLoopInput {

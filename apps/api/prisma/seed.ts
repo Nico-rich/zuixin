@@ -140,7 +140,7 @@ async function main() {
     {
       id: 'seed-agent-general', slug: 'general-assistant', name: '通用助手', kind: 'builtin',
       systemPrompt: '你是 AI 智能创作平台的通用助手。当用户需要生成图片/视频/制品或建议保存记忆时，使用对应工具；普通问答直接回答。',
-      tools: ['image.generate', 'video.generate', 'artifact.create', 'memory.create_candidate'],
+      tools: ['image.generate', 'video.generate', 'artifact.create', 'memory.create_candidate', 'knowledge.search'],
     },
     { id: 'seed-agent-image', slug: 'image', name: '图片生成 Agent', kind: 'builtin', systemPrompt: '你负责图片生成任务。', tools: [] },
     { id: 'seed-agent-video', slug: 'video', name: '视频生成 Agent', kind: 'builtin', systemPrompt: '你负责视频生成任务。', tools: [] },
@@ -151,14 +151,17 @@ async function main() {
       update: { kind: a.kind },
       create: { id: a.id, slug: a.slug, name: a.name, kind: a.kind, builtin: true, enabled: true, priority: a.slug === 'general-assistant' ? 1 : 10 },
     });
-    // 幂等快照：若无 v1 则创建 published 版本并指向 activeVersionId
+    // 幂等快照：builtin Agent 的 v1 定义由 seed 刷新（dev 基线）；published 语义下生产变更走版本发布流
     const v1 = await prisma.agentVersion.upsert({
       where: { agentId_version: { agentId: agent.id, version: 1 } },
-      update: {},
+      update: {
+        systemPrompt: a.systemPrompt, tools: a.tools, temperature: 0.7,
+        config: a.slug === 'general-assistant' ? { maxSteps: 8, knowledge: { enabled: false } } : {},
+      },
       create: {
         agentId: agent.id, version: 1, status: 'published',
         systemPrompt: a.systemPrompt, tools: a.tools, temperature: 0.7,
-        config: a.slug === 'general-assistant' ? { maxSteps: 8 } : {},
+        config: a.slug === 'general-assistant' ? { maxSteps: 8, knowledge: { enabled: false } } : {},
       },
     });
     if (!agent.activeVersionId) {
@@ -166,10 +169,22 @@ async function main() {
     }
   }
 
+  // M5-P5: embedding 替身（确定性向量，无 Key 全链路可跑）
+  const embProvider = await prisma.provider.upsert({
+    where: { id: 'seed-emb-mock' },
+    update: {},
+    create: { id: 'seed-emb-mock', name: '本地Embedding替身', type: 'embedding', adapter: 'mock-embedding', baseUrl: '', enabled: true, healthStatus: 'healthy' },
+  });
+  await prisma.model.upsert({
+    where: { id: 'seed-emb-mock-model' },
+    update: {},
+    create: { id: 'seed-emb-mock-model', providerId: embProvider.id, name: 'Mock Embedding', apiModelId: 'mock-embedding-1', type: 'embedding', capabilities: { dimensions: 64 }, enabled: true, priority: 1, isDefault: true },
+  });
+
   const routingPolicy = {
     confidenceThreshold: 0.7,
     routerModelId: 'seed-model-mock-router-1',
-    defaults: { llm: 'seed-model-mock-echo', image: 'seed-img-mock-model', video: 'seed-vid-mock-model', vision: null },
+    defaults: { llm: 'seed-model-mock-echo', image: 'seed-img-mock-model', video: 'seed-vid-mock-model', vision: null, embedding: 'seed-emb-mock-model' },
     agentMapping: { chat: 'general-assistant', image_generation: 'image', video_generation: 'video' },
   };
   await prisma.systemSetting.upsert({

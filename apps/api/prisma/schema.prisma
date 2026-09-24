@@ -90,6 +90,7 @@ enum ProviderType {
   llm
   image
   video
+  embedding
 }
 enum HealthStatus {
   untested
@@ -100,6 +101,7 @@ enum ModelType {
   llm
   image
   video
+  embedding
 }
 enum TaskType {
   image
@@ -380,6 +382,7 @@ model Project {
   artifacts     Artifact[]
   agentRuns     AgentRun[]
   knowledgeBases KnowledgeBase[]
+  documents       Document[]
   @@index([userId, updatedAt])
 }
 
@@ -579,10 +582,11 @@ enum KnowledgeBaseStatus {
   disabled
 }
 enum DocumentSourceType {
-  upload
+  text
+  file
 }
 enum DocumentStatus {
-  uploaded
+  pending
   processing
   ready
   failed
@@ -610,18 +614,21 @@ model KnowledgeBase {
 
 model Document {
   id          String             @id @default(uuid())
-  kbId        String
-  kb          KnowledgeBase      @relation(fields: [kbId], references: [id], onDelete: Cascade)
+  kbId        String?            // 可选分组（KnowledgeBase 为未来组织层，P5 不强制）
+  kb          KnowledgeBase?     @relation(fields: [kbId], references: [id], onDelete: SetNull)
   userId      String
   user        User               @relation(fields: [userId], references: [id], onDelete: Cascade)
-  title       String
-  sourceType  DocumentSourceType @default(upload)
+  projectId   String?            // 项目归属（project scope 权限）
+  project     Project?           @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  name        String
+  sourceType  DocumentSourceType
+  content     String?            @db.Text // text 源直存内容
   sourceUri   String?
-  storageKey  String
-  mimeType    String
-  sizeBytes   Int
-  contentHash String
-  status      DocumentStatus     @default(uploaded)
+  storageKey  String?            // file 源文件存储
+  mimeType    String?
+  sizeBytes   Int?
+  contentHash String?            // file 源去重（sha256）
+  status      DocumentStatus     @default(pending)
   errorCode   String?
   chunkCount  Int                @default(0)
   version     Int                @default(1)
@@ -630,13 +637,16 @@ model Document {
   updatedAt   DateTime           @updatedAt
   chunks      DocumentChunk[]
   @@unique([kbId, contentHash])
-  @@index([kbId, status])
+  @@index([userId, projectId])
+  @@index([userId, status])
 }
 
 model DocumentChunk {
   id             String   @id @default(uuid())
   documentId     String
   document       Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  userId         String   // 冗余：权限快路径（SQL 层过滤）
+  projectId      String?  // 冗余：project scope 过滤
   chunkIndex     Int
   content        String   @db.Text
   tokenCount     Int      @default(0)
@@ -644,4 +654,6 @@ model DocumentChunk {
   embeddingModel String
   createdAt      DateTime @default(now())
   @@unique([documentId, chunkIndex])
+  @@index([userId, projectId])
+  @@index([documentId])
 }
