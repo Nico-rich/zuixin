@@ -173,6 +173,34 @@ describe('AgentLoopService', () => {
     }));
   });
 
+  it('M5-P6：超大 Tool Result → 确定性截断（消息配对完整，tool_call_id 保留）', async () => {
+    const bigOutput = { result: 'x'.repeat(6000) };
+    const bigTool: Tool = {
+      name: 'big.tool', description: 'x', permission: 'read',
+      inputSchema: z.strictObject({ v: z.string() }),
+      execute: vi.fn().mockResolvedValue(bigOutput),
+    };
+    let capturedToolMsg: { content: string; tool_call_id?: string; role: string } | undefined;
+    const { svc } = makeLoop({
+      tools: [bigTool],
+      streamFn: async function* (p) {
+        const msgs = (p as { messages: Array<{ role: string; content: string; tool_call_id?: string }> }).messages;
+        if (msgs.some((m) => m.role === 'tool')) {
+          capturedToolMsg = msgs.find((m) => m.role === 'tool');
+          yield { type: 'text', text: 'done' };
+        } else {
+          yield { type: 'tool_calls', toolCalls: [{ id: 'c1', name: 'big.tool', arguments: '{"v":"x"}' }] };
+        }
+      },
+    });
+    const input = { ...makeLoop().input, agent: { ...makeLoop().input.agent, tools: ['big.tool'] } };
+    await collect(svc.execute(input));
+    expect(capturedToolMsg).toBeTruthy();
+    expect(capturedToolMsg!.role).toBe('tool');        // 消息仍在 → 配对完整
+    expect(capturedToolMsg!.tool_call_id).toBe('c1');  // tool_call_id 保留 → sequence 合法
+    expect(capturedToolMsg!.content.length).toBeLessThanOrEqual(4200); // 4000 + 标记
+  });
+
   it('capability：未声明 functionCalling → 默认视为支持，携带 tools', async () => {
     let capturedTools: unknown = 'unset';
     const { svc } = makeLoop({

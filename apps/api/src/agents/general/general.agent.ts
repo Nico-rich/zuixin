@@ -30,6 +30,8 @@ export class GeneralAssistantAgent implements Agent {
       excludeMessageId: ctx.messageId,
       // Knowledge 自动检索开关（Agent 版本配置 knowledge.enabled；默认关闭，普通聊天不触发 embedding）
       knowledge: { enabled: this.deps.config.knowledgeEnabled ?? false },
+      // 上下文预算（AgentVersion 配置；默认 limits.contextBudgetTokens=8000）
+      budgetTokens: this.deps.config.contextBudgetTokens,
     });
     yield* this.deps.loop.execute({
       userId: ctx.userId,

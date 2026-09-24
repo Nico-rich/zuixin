@@ -192,7 +192,7 @@ async function main() {
     update: { value: routingPolicy },
     create: { key: 'routingPolicy', value: routingPolicy },
   });
-  const limits = { dailyImage: 50, dailyVideo: 10, dailyMemoryCandidates: 20, videoConcurrency: 1, monthlyTokenBudget: 0, agentRunTimeoutMs: 120000 };
+  const limits = { dailyImage: 50, dailyVideo: 10, dailyMemoryCandidates: 20, videoConcurrency: 1, monthlyTokenBudget: 0, agentRunTimeoutMs: 120000, contextBudgetTokens: 8000 };
   await prisma.systemSetting.upsert({
     where: { key: 'limits' },
     update: { value: limits },

@@ -83,4 +83,14 @@ describe('AgentsAdminService（版本生命周期 + immutable 守卫）', () => 
     prisma.agentVersion.findFirst.mockResolvedValue({ id: 'v3', agentId: 'agent-1', version: 3, status: 'draft' });
     await expect(svc.rollback('agent-1', 'v3')).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
   });
+
+  it('M5-P6：AgentVersion config.contextBudgetTokens 属服务端配置（编辑草稿时透传，用户 Tool input 无法触碰）', async () => {
+    const { svc, prisma } = makeService();
+    prisma.agent.findUnique.mockResolvedValue({ id: 'agent-1', activeVersionId: 'v-pub' });
+    prisma.agentVersion.findFirst.mockResolvedValue({ id: 'v-draft', agentId: 'agent-1', version: 2, status: 'draft' });
+    await svc.editDraft('agent-1', { config: { contextBudgetTokens: 12000 } });
+    expect(prisma.agentVersion.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ config: { contextBudgetTokens: 12000 } }),
+    }));
+  });
 });

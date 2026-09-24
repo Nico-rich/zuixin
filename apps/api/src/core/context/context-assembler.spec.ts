@@ -1,9 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
 import { ContextAssembler } from './context-assembler';
+import { ContextBudgetService } from './context-budget.service';
+import { SimpleTokenEstimator } from './token-estimator';
 import { MemoryBlock } from './types';
 
 function makeAssembler() {
   const prisma = {
+    systemSetting: { findUnique: vi.fn().mockResolvedValue({ key: 'limits', value: { contextBudgetTokens: 8000 } }) },
     message: {
       findMany: vi.fn().mockResolvedValue([
         { id: 'm9', role: 'user', content: '倒数第1条（最新）' },
@@ -11,7 +14,7 @@ function makeAssembler() {
       ]),
     },
   };
-  const svc = new ContextAssembler(prisma as never);
+  const svc = new ContextAssembler(prisma as never, new ContextBudgetService(new SimpleTokenEstimator()));
   return { svc, prisma };
 }
 

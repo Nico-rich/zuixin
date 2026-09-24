@@ -14,6 +14,10 @@ export interface MemoryBlock {
   content: string;
   /** 组装排序权重，越小越靠前（默认 100；scope 优先级映射随未来源注册时定义） */
   order?: number;
+  /** 截断优先级（ContextBudgetService 分配预算顺序，越小越优先保留；默认按 scope 映射） */
+  priority?: number;
+  /** required=true 的块（如 System Prompt）不可被预算截断删除 */
+  required?: boolean;
   /** token 估算（BudgetApplier 截断用） */
   tokenCount?: number;
   /** 来源元数据（引用/citation 预留，不注入模型） */
@@ -33,6 +37,8 @@ export interface AssembleContext {
   recentMessagesLimit?: number;
   /** Knowledge 自动检索开关（Agent 配置 knowledge.enabled；默认关闭——不因普通聊天触发 embedding） */
   knowledge?: { enabled: boolean };
+  /** 上下文 token 预算（AgentVersion 配置覆盖；默认 limits.contextBudgetTokens=8000，服务端配置，Tool/用户不可改） */
+  budgetTokens?: number;
 }
 
 /**

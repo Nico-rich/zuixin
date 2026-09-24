@@ -27,6 +27,8 @@ export interface AgentLoopAgentConfig {
   versionId?: string;
   /** Knowledge 自动检索开关（KnowledgeSource 触发机制；默认关闭） */
   knowledgeEnabled?: boolean;
+  /** 上下文 token 预算（AgentVersion config 覆盖 limits 默认；服务端配置，用户不可改） */
+  contextBudgetTokens?: number;
 }
 
 export interface AgentLoopInput {
@@ -44,6 +46,9 @@ export interface AgentLoopInput {
 const DEFAULT_MAX_STEPS = 8;
 const DEFAULT_DEADLINE_MS = 120_000;
 const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
+/** Tool Result 内容预算（确定性截断，防止多工具结果无限增长；消息配对不受影响） */
+const TOOL_RESULT_MAX_CHARS = 4000;
+const TOOL_RESULTS_TOTAL_MAX_CHARS = 8000;
 /** final 步骤的 stepIndex（run 内唯一，避免与真实循环步冲突） */
 const FINAL_STEP_INDEX = 999;
 
@@ -166,8 +171,14 @@ export class AgentLoopService {
             yield { type: 'task.created', taskId, kind: call.name === 'image.generate' ? 'image' : 'video' };
           }
           // 回喂模型（无论成败——失败让模型看到错误并修正）
+          // P6 Tool Result Budget：内容纳入确定性截断（不破坏 assistant tool_call / tool result 消息配对）
           messages.push({ role: 'assistant', content: '', tool_calls: toolCalls });
-          messages.push({ role: 'tool', content: JSON.stringify(result.output ?? result.error ?? {}), tool_call_id: call.id });
+          messages.push({
+            role: 'tool',
+            content: this.truncateToolResult(JSON.stringify(result.output ?? result.error ?? {})),
+            tool_call_id: call.id,
+          });
+          this.compactToolResults(messages);
           yield { type: 'tool.end', toolName: call.name, runId: run.id, status: result.status, outputSummary: result.outputSummary };
         }
         await this.prisma.agentRunStep.update({
@@ -314,6 +325,38 @@ export class AgentLoopService {
   private async resolveLLM(agent: AgentLoopAgentConfig): Promise<ResolvedLLM> {
     if (agent.modelId) return this.llmManager.resolve(agent.modelId);
     return this.modelResolver.resolveDefaultLLM();
+  }
+
+  /**
+   * Tool Result 确定性截断（P6）：
+   * 单条 > TOOL_RESULT_MAX_CHARS → 截断到上限（保留头部）；
+   * 累计 tool 消息内容 > TOOL_RESULTS_TOTAL_MAX_CHARS → 从最旧的 tool 消息截断到 500 字符并加标记。
+   * 只截内容不删消息——assistant tool_call / tool result 配对永远完整，provider message sequence 合法。
+   */
+  private truncateToolResult(content: string): string {
+    let truncated = content;
+    if (truncated.length > TOOL_RESULT_MAX_CHARS) {
+      truncated = truncated.slice(0, TOOL_RESULT_MAX_CHARS) + `…（已截断，共 ${content.length} 字符）`;
+    }
+    return truncated;
+  }
+
+  /** 累计截断：tool 结果内容总量超限时从最旧截断（只缩内容，不删消息，配对完整） */
+  private compactToolResults(messages: ChatMessage[]): void {
+    const toolIdx: number[] = [];
+    let total = 0;
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].role === 'tool') { toolIdx.push(i); total += messages[i].content.length; }
+    }
+    if (total <= TOOL_RESULTS_TOTAL_MAX_CHARS) return;
+    for (const i of toolIdx) {
+      const m = messages[i];
+      if (m.content.length > 500) {
+        messages[i] = { ...m, content: m.content.slice(0, 500) + '…（历史工具结果已截断）' };
+        total -= m.content.length - messages[i].content.length;
+      }
+      if (total <= TOOL_RESULTS_TOTAL_MAX_CHARS) break;
+    }
   }
 
   private summarize(name: string, output: unknown): string {
