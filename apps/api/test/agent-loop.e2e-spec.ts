@@ -50,6 +50,7 @@ describe('Agent Loop (e2e, mock 全链路)', () => {
       .buffer(true).parse((r, cb) => { let s = ''; r.on('data', (c) => (s += c)); r.on('end', () => cb(null, s)); })
       .expect(200);
     const text = res.body as string;
+    expect(text).toContain('event: run.created'); // 前端 Timeline 接线依赖的事件契约
     expect(text).toContain('event: agent.start');
     expect(text).toContain('event: tool.start');
     expect(text).toContain('"toolName":"artifact.create"');
@@ -117,6 +118,35 @@ describe('Agent Loop (e2e, mock 全链路)', () => {
     expect(agg.body.data.llmRounds).toBeGreaterThanOrEqual(1);
     expect(agg.body.data.byKind.length).toBeGreaterThanOrEqual(1);
     await request(app.getHttpServer()).get(`/api/v1/usage/agent-runs/${'0'.repeat(32)}`).set('Cookie', cookie).expect(404);
+  });
+
+  it('M5-P8：Timeline 投影——全源合并/终态映射/用量并入/敏感数据不外泄', async () => {
+    const appAny = app as unknown as { get: <T>(type: unknown) => T };
+    const prisma = appAny.get<PrismaService>(PrismaService);
+    const runs = await prisma.agentRun.findMany({ where: { conversationId: convId }, include: { artifacts: true } });
+    expect(runs.length).toBe(2);
+    const artifactRun = runs.find((r) => r.artifacts.length > 0)!;
+    expect(artifactRun).toBeTruthy();
+
+    const res = await request(app.getHttpServer()).get(`/api/v1/agent-runs/${artifactRun.id}/timeline`).set('Cookie', cookie).expect(200);
+    const tl = res.body.data;
+    expect(tl.runId).toBe(artifactRun.id);
+    expect(tl.status).toBe('completed');
+    expect(tl.agentName).toBeTruthy();
+    const types = tl.items.map((i: { type: string }) => i.type);
+    expect(types[0]).toBe('run.started');
+    for (const expected of ['step.tool_call', 'tool.started', 'tool.completed', 'step.final', 'artifact.created', 'run.completed', 'usage.summary']) {
+      expect(types).toContain(expected);
+    }
+    expect(types.indexOf('run.completed')).toBeLessThan(types.indexOf('usage.summary'));
+    // 用量并入（P4 聚合复用）
+    expect(tl.usage.llmRounds).toBeGreaterThanOrEqual(1);
+    // 敏感数据零外泄：items 不含 raw input/output 字段
+    const serialized = JSON.stringify(tl.items);
+    expect(serialized).not.toContain('"input"');
+    expect(serialized).not.toContain('"output"');
+    // 不存在 run → 404
+    await request(app.getHttpServer()).get(`/api/v1/agent-runs/${'0'.repeat(32)}/timeline`).set('Cookie', cookie).expect(404);
   });
 
   it('agent-runs API：自己的 run 可读；他人 run → 404（防枚举）', async () => {

@@ -22,6 +22,46 @@ export interface ProjectItem { id: string; name: string; updatedAt: string; }
 
 export interface ActiveTask { taskId: string; kind: 'image' | 'video'; }
 
+export interface TimelineItem {
+  id: string;
+  type: string;
+  status: 'success' | 'failed' | 'running' | 'info';
+  timestamp: string;
+  title: string;
+  summary?: string;
+  durationMs?: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface RunTimelineUsage {
+  runId: string;
+  durationMs: number;
+  totalTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  llmCost: number;
+  imageCost: number;
+  videoCost: number;
+  totalCost: number;
+  llmRounds: number;
+  imageCount: number;
+  videoSeconds: number;
+  failedCalls: number;
+  byKind: Array<{ kind: string; count: number; cost: number; tokens: number }>;
+}
+
+export interface RunTimeline {
+  runId: string;
+  agentId: string;
+  agentName: string;
+  agentVersion: number;
+  status: string;
+  startedAt: string;
+  completedAt: string | null;
+  items: TimelineItem[];
+  usage: RunTimelineUsage | null;
+}
+
 export interface ChatStreamEventMap {
   message_start: { messageId: string; conversationId: string; createdAt: string };
   message_delta: { delta: string };

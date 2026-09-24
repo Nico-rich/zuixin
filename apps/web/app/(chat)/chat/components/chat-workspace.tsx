@@ -8,6 +8,7 @@ import { Sidebar } from './sidebar';
 import { ChatInput } from './chat-input';
 import { MessageBubble } from './message-bubble';
 import { TaskCard } from './task-card';
+import { RunTimeline } from './run-timeline';
 import { ActiveTask, AttachmentView, ChatMessage, ChatStreamEventMap } from './types';
 
 interface HistoryMessage {
@@ -25,6 +26,7 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
   const [tasks, setTasks] = useState<ActiveTask[]>([]);
   const [thinking, setThinking] = useState('');
   const [currentTool, setCurrentTool] = useState('');
+  const [runIds, setRunIds] = useState<Record<string, string>>({});
   const [streaming, setStreaming] = useState(false);
   const [fatalError, setFatalError] = useState('');
   const abortRef = useRef<AbortController | null>(null);
@@ -83,6 +85,13 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
         let data: ChatStreamEventMap[keyof ChatStreamEventMap] | null = null;
         try { data = JSON.parse(raw); } catch { return; }
         switch (event) {
+          case 'run.created': {
+            const r = data as ChatStreamEventMap['run_created'];
+            if (assistantIdRef.current) {
+              setRunIds((prev) => ({ ...prev, [assistantIdRef.current!]: r.runId }));
+            }
+            break;
+          }
           case 'message_start': {
             const d = data as ChatStreamEventMap['message_start'];
             assistantIdRef.current = d.messageId;
@@ -181,7 +190,10 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
               </div>
             )}
             {messages.map((m) => (
-              <MessageBubble key={m.id} message={m} streaming={m.status === 'streaming'} onRetry={() => retry(m.id)} />
+              <div key={m.id}>
+                <MessageBubble message={m} streaming={m.status === 'streaming'} onRetry={() => retry(m.id)} />
+                {runIds[m.id] && <RunTimeline runId={runIds[m.id]} />}
+              </div>
             ))}
             {tasks.map((t) => (
               <TaskCard key={t.taskId} taskId={t.taskId} kind={t.kind} onDone={onTaskDone} />
