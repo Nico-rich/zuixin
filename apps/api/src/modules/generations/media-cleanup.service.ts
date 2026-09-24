@@ -27,7 +27,7 @@ export class MediaCleanupService {
     const now = Date.now();
     const rows = await this.prisma.generationTask.findMany({
       where: { status: 'processing' },
-      select: { id: true, type: true, startedAt: true, userId: true, providerId: true, modelId: true, conversationId: true, messageId: true },
+      select: { id: true, type: true, startedAt: true, userId: true, providerId: true, modelId: true, conversationId: true, messageId: true, runId: true },
     });
     let swept = 0;
     for (const row of rows) {
@@ -45,7 +45,7 @@ export class MediaCleanupService {
         userId: row.userId, conversationId: row.conversationId ?? undefined, messageId: row.messageId ?? undefined, taskId: row.id,
         kind: row.type, providerId: row.providerId ?? '', modelId: row.modelId ?? '',
         imageCount: 0, videoSeconds: 0, latencyMs: now - (row.startedAt?.getTime() ?? now),
-        status: 'failed', errorCode: ErrorCode.MEDIA_TASK_TIMEOUT,
+        status: 'failed', errorCode: ErrorCode.MEDIA_TASK_TIMEOUT, runId: row.runId ?? undefined,
       }).catch(() => undefined);
       swept++;
       this.logger.warn({ taskId: row.id, type: row.type, provider: row.providerId ?? 'unknown' }, '孤儿任务已清扫为失败（超时）');

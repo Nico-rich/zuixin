@@ -164,7 +164,7 @@ export class MediaGenerationService {
         userId: task.userId, conversationId: task.conversationId ?? undefined, messageId: task.messageId ?? undefined, taskId,
         kind: task.type, providerId: result.providerId, modelId: result.modelId,
         imageCount: result.imageCount, videoSeconds: result.videoSeconds,
-        latencyMs: Date.now() - startedAt, status: 'success',
+        latencyMs: Date.now() - startedAt, status: 'success', runId: task.runId ?? undefined,
       });
       await this.events.publish('task', { type: 'task.completed', taskId, progress: 100 });
       this.logger.log({ taskId, userId: task.userId, type: task.type, provider: result.providerId, latencyMs: Date.now() - startedAt }, '媒体任务完成');

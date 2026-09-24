@@ -111,22 +111,33 @@ export class AgentLoopService {
         }
         const toolsToSend = toolDefs.length && supportsTools ? toolDefs : undefined;
         const turnStarted = Date.now();
-        const stream = resolved.adapter.stream({
-          model: resolved.apiModelId, messages, temperature: input.agent.temperature ?? 0.7,
-          maxTokens: input.agent.maxTokens, tools: toolsToSend, signal: input.signal,
-        });
+        // 每回合 LLM 用量落库（M5-P4：成功/失败均记录——失败回合可能已计费，必须可观测）
         let toolCalls: Array<{ id: string; name: string; arguments: string }> | undefined;
-        for await (const chunk of stream) {
-          if (chunk.type === 'text') yield { type: 'text.delta', text: chunk.text };
-          else if (chunk.type === 'tool_calls') toolCalls = chunk.toolCalls;
+        try {
+          const stream = resolved.adapter.stream({
+            model: resolved.apiModelId, messages, temperature: input.agent.temperature ?? 0.7,
+            maxTokens: input.agent.maxTokens, tools: toolsToSend, signal: input.signal,
+          });
+          for await (const chunk of stream) {
+            if (chunk.type === 'text') yield { type: 'text.delta', text: chunk.text };
+            else if (chunk.type === 'tool_calls') toolCalls = chunk.toolCalls;
+          }
+        } catch (err) {
+          const appErr = err instanceof AppError ? err : mapProviderError(err as ProviderLikeError);
+          await this.usage.recordChatUsage({
+            userId: input.userId, conversationId: input.conversationId ?? '', messageId: input.messageId,
+            providerId: resolved.providerId, modelId: resolved.modelId, runId: run.id,
+            inputTokens: 0, outputTokens: 0, latencyMs: Date.now() - turnStarted,
+            status: 'failed', errorCode: appErr.code,
+          }).catch(() => undefined);
+          throw err;
         }
-        lastTurnHadToolCalls = !!toolCalls?.length;
-        // 每回合 LLM 用量落库（runId 关联 → 未来按 Run 聚合四类成本）
         await this.usage.recordChatUsage({
           userId: input.userId, conversationId: input.conversationId ?? '', messageId: input.messageId,
           providerId: resolved.providerId, modelId: resolved.modelId, runId: run.id,
           inputTokens: 0, outputTokens: 0, latencyMs: Date.now() - turnStarted, status: 'success',
         }).catch(() => undefined);
+        lastTurnHadToolCalls = !!toolCalls?.length;
         if (!toolCalls?.length) break; // final 回答已流式输出
 
         // 循环检测：连续两次相同 Tool 同参数

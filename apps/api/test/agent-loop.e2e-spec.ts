@@ -110,6 +110,15 @@ describe('Agent Loop (e2e, mock 全链路)', () => {
     expect(mem?.source).toBe('agent');
   });
 
+  it('M5-P4：usage 聚合 API——run 归属可读（LLM 回合 ≥1），他人 run → 404', async () => {
+    const list = await request(app.getHttpServer()).get(`/api/v1/agent-runs?conversationId=${convId}`).set('Cookie', cookie).expect(200);
+    const runId = list.body.data[0].id;
+    const agg = await request(app.getHttpServer()).get(`/api/v1/usage/agent-runs/${runId}`).set('Cookie', cookie).expect(200);
+    expect(agg.body.data.llmRounds).toBeGreaterThanOrEqual(1);
+    expect(agg.body.data.byKind.length).toBeGreaterThanOrEqual(1);
+    await request(app.getHttpServer()).get(`/api/v1/usage/agent-runs/${'0'.repeat(32)}`).set('Cookie', cookie).expect(404);
+  });
+
   it('agent-runs API：自己的 run 可读；他人 run → 404（防枚举）', async () => {
     const list = await request(app.getHttpServer()).get(`/api/v1/agent-runs?conversationId=${convId}`).set('Cookie', cookie).expect(200);
     expect(list.body.data.length).toBe(2);

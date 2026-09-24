@@ -47,7 +47,7 @@ function makeLoop(opts: { tools?: Tool[]; streamFn?: (params: { tools?: unknown 
     },
     signal: new AbortController().signal,
   };
-  return { svc, prisma, registry, input };
+  return { svc, prisma, registry, input, usage };
 }
 
 function collect<T>(it: AsyncIterable<T>): Promise<T[]> {
@@ -210,6 +210,21 @@ describe('AgentLoopService', () => {
     expect(prisma.agentRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ status: 'failed', errorCode: 'NO_TOOL_CAPABILITY' }),
     }));
+  });
+
+  it('M5-P4：LLM 回合失败 → usage 仍记录（failed + errorCode，可能已计费必须可观测）', async () => {
+    const { svc, usage } = makeLoop({
+      streamFn: async function* () {
+        throw Object.assign(new Error('boom'), { status: 429 });
+      },
+    });
+    const input = makeLoop().input;
+    await collect(svc.execute(input));
+    expect(usage.recordChatUsage).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'failed', errorCode: 'PROVIDER_RATE_LIMITED', runId: 'run-1',
+    }));
+    // 成功路径没有记录（回合失败后直接抛出）
+    expect(usage.recordChatUsage).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'success' }));
   });
 
   it('用户取消：signal abort → run cancelled', async () => {
