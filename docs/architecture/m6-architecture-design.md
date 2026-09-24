@@ -796,3 +796,44 @@ B2（usage tokens 消费）、B5（dashscope 超时加固）、B7（TaskStatus.t
 ### 绝对不能提前做（M6 内禁止）
 
 Human Approval、external_action、Ecommerce DataSource、Workflow 引擎、多 Agent 协作、Billing、OCR、独立向量库、外部可观测平台接入。
+
+---
+
+## 29. M6 实施完成状态（P1~P7 全部落地，2026-09-24）
+
+### 29.1 实施与设计差异（如实记录）
+
+| 项 | 设计 | 实施 | 差异说明 |
+|---|---|---|---|
+| resume 起点 | §8.4 规则 3a~3d | ResumePlanner 纯函数（llm/tools/final 三模式） | 等价实现；规则 4 的行状态由 engine 幂等键 + P2002 running 行同行重试承载 |
+| waiting 触发 | §9.1 引擎检查任务状态 | executeToolList → resolveGenerationTask（enterWaiting 条件更新 running+workerId→waiting+waitingOnTaskId+清 lease） | waiting 不占用 worker（§P4-5）；tool 结果由 resume 补写（不预写占位） |
+| 唤醒 jobId | §9.1 `run:{runId}` 去重 | 唯一键 `run-{runId}-wake-{ts}` | BullMQ jobId 禁冒号；且复用 create 同键会在原 job 未移除时被 BullMQ 去重吞掉 → run 永久 stuck queued（实测修复）。去重改由条件更新 waiting→queued + claim 承担 |
+| queued 丢失 job | §10.1 dead-letter 重入队 | recoverStale：queued 超 2×leaseTTL 无执行迹象 → 兜底重入队 | 补齐"任何路径都不让 run 永久停留" |
+| LLM 瞬时重试 | §10.1 maxRetries=2、1s/4s+全幅 jitter | engine 回合内重试（retryable 判定走 RETRYABLE_CODES） | 每回合一条 usage（回合粒度）；退避可中断（cancel 不拖延） |
+| Tool 重试 | §10.1 tool.retryPolicy 默认 1 次 | 仅显式声明 retryPolicy 时消费（未声明=单次，M0~M5 冻结） | 默认策略会在 M5 冻结集上改变工具失败行为，故收紧为显式声明 |
+| cancel 快速通道 | §11.2 订阅 cancel 提示 | Redis 提示通道 + 心跳 15s DB 兜底 | 双通道；DB 条件更新仍是唯一事实 |
+| SSE 游标 | §16 Last-Event-ID 三元组过滤 | 按投影确定性排序 + id 定位；items 为 id 幂等 upsert（同 id 状态演进如 task.created→task.completed 重发）；瞬态项（run.waiting）cursor 未命中 → 全量兜底 | usage.summary 限定终态产出（运行中时间戳漂移会破坏游标稳定性） |
+| e2e 执行 | 并行 | vitest fileParallelism:false 串行 | 真实共享 PostgreSQL/Redis/BullMQ 下并行套件的 Worker 互抢 job，时序断言无确定性 |
+
+### 29.2 运维手册（恢复/回滚/sweep 语义）
+
+- **run 卡住诊断**：`SELECT id,status,workerId,leaseUntil,waitingOnTaskId,startedAt FROM "AgentRun" WHERE status IN ('queued','running','waiting');`
+  - queued 且 startedAt 超 2min → job 丢失，下轮 recoverStale（5min）自动重入队；
+  - running 且 lease 过期 → 下轮 recoverStale 重入队（新 worker 接管）；
+  - waiting 且任务已终态 → hook 或 recoverStale 兜底唤醒；
+  - 任何状态超 deadline（limits.agentRunDeadlineMs，默认 40min）→ timeout 终态。
+- **代码回滚**：新列/枚举值/新表均为增量、零破坏；回滚前需确认无活跃异步 run（或折叠 SQL：
+  `UPDATE "AgentRun" SET status='timeout' WHERE status='waiting' OR status='queued' OR (status='running' AND "workerId" IS NOT NULL);`）。
+- **Redis 不可用**：入队/唤醒失败 → run 停留在 queued/waiting，由 recoverStale 重入队兜底（at-least-once + 幂等）；
+  SSE 实时通知中断（尽力而为），历史事实仍由 Timeline 投影提供。
+- **worker 缩容/重启**：优雅停机（SIGTERM）释放 lease → 新 worker 立即可接管；硬崩溃由 lease 过期（60s）+ BullMQ stalled（~30s）+ recoverStale（5min）三层恢复。
+
+### 29.3 Exactly-once 边界（诚实声明）
+
+| 面 | 保证 | 机制 |
+|---|---|---|
+| GenerationTask | exactly-once 执行 | 原子 claim（pending→processing 条件更新）+ 全局幂等键 |
+| Tool 副作用 | effectively-once | UNIQUE(runStepId, idempotencyKey) 行复用 + GenerationTask/Artifact 幂等键 + memory 软去重；无幂等键的只读工具天然幂等 |
+| LLM 回合 | at-least-once | 崩溃于 assistant 落库前 → 重打该回合（每次真实调用记一条 usage，计费=真实调用次数） |
+| resume/wake/claim | 幂等 | 条件更新 + jobId 唯一 + 终态封锁 |
+

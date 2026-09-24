@@ -694,3 +694,41 @@ describe('AgentRuntimeEngine（M6-P5 LLM 瞬时重试 + tool retryPolicy）', ()
     expect(plainTool.execute).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('AgentRuntimeEngine（M6-P7 lease fencing：旧 worker 迟写被拒，DB 为事实）', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('P7-4 finalize count=0（已被接管/外部终态）→ outcome 以 DB 终态为准（cancelled 竞争获胜）', async () => {
+    const streamFn = vi.fn(async function* () { yield { type: 'text', text: '本应完成' }; });
+    const { engine, persistence, state } = makeEngine({ streamFn });
+    (persistence.finalizeRun as ReturnType<typeof vi.fn>).mockImplementation(async (_id, data: Record<string, unknown>) => {
+      state.finalize.push({ ...data });
+      return { count: 0 }; // 旧 worker 迟写被拒
+    });
+    (persistence.getRunStatus as ReturnType<typeof vi.fn>).mockResolvedValue({ status: 'cancelled' });
+    const { outcome } = await run(engine, asyncInput({}));
+    expect(outcome.status).toBe('cancelled'); // 绝不覆盖外部终态（completed 结果被丢弃）
+    expect(state.finalize[0]).toMatchObject({ status: 'completed' }); // 迟写尝试已发出但 count=0
+  });
+
+  it('P7-4 finalize count=0 且 DB 无终态（仍 running——被接管）→ outcome 保持引擎结果，不伪造', async () => {
+    const streamFn = vi.fn(async function* () { yield { type: 'text', text: '完成' }; });
+    const { engine, persistence } = makeEngine({ streamFn });
+    (persistence.finalizeRun as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+    (persistence.getRunStatus as ReturnType<typeof vi.fn>).mockResolvedValue({ status: 'running' });
+    const { outcome } = await run(engine, asyncInput({}));
+    expect(outcome.status).toBe('completed'); // 新 worker 接管中：不做越权终态写，outcome 仅作报告
+  });
+
+  it('P7-5 状态机：waiting 期间外部 timeout 竞争获胜 → outcome timeout（deadline 语义不复活）', async () => {
+    const streamFn = vi.fn(async function* () {
+      yield { type: 'tool_calls', toolCalls: [{ id: 'c1', name: 'image.generate', arguments: '{"prompt":"x"}' }] };
+    });
+    const { engine, persistence } = makeEngine({ tools: [imageTool], streamFn });
+    (persistence.getGenerationTask as ReturnType<typeof vi.fn>).mockResolvedValue({ status: 'pending', output: null });
+    (persistence.enterWaiting as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 }); // 外部 timeout 抢先
+    (persistence.getRunStatus as ReturnType<typeof vi.fn>).mockResolvedValue({ status: 'timeout' });
+    const { outcome } = await run(engine, asyncInput({}, [imageTool]));
+    expect(outcome.status).toBe('timeout'); // DB 事实；绝不 waiting→running 复活
+  });
+});
