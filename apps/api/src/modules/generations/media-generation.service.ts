@@ -186,6 +186,7 @@ export class MediaGenerationService {
       userId: current!.userId, conversationId: current!.conversationId ?? undefined, messageId: current!.messageId ?? undefined, taskId,
       kind: current!.type, providerId: current!.providerId ?? '', modelId: current!.modelId ?? '',
       imageCount: 0, videoSeconds: 0, latencyMs: Date.now() - startedAt, status: 'failed', errorCode: code,
+      runId: current!.runId ?? undefined, // M6-A9：失败归因补齐 runId（与成功/清扫路径一致）
     }).catch(() => undefined);
     await this.events.publish('task', { type: 'task.progress', taskId, progress: 100, message: '失败' });
     this.logger.warn({ taskId, code, provider: current!.providerId ?? 'unknown' }, `媒体任务失败: ${message}`);

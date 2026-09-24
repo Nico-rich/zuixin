@@ -11,5 +11,9 @@ export default defineConfig({
   migrations: {
     path: 'prisma/migrations',
     seed: 'tsx prisma/seed.ts',
+    // shadow 库每次创建/重置后执行（pgvector：历史迁移 M5-P1 含 CREATE EXTENSION vector）
+    initShadowDb: 'CREATE EXTENSION IF NOT EXISTS vector;',
   },
+  // initShadowDb 属外部库修改，需显式开启
+  experimental: { externalTables: true },
 });

@@ -192,7 +192,16 @@ async function main() {
     update: { value: routingPolicy },
     create: { key: 'routingPolicy', value: routingPolicy },
   });
-  const limits = { dailyImage: 50, dailyVideo: 10, dailyMemoryCandidates: 20, videoConcurrency: 1, monthlyTokenBudget: 0, agentRunTimeoutMs: 120000, contextBudgetTokens: 8000 };
+  const limits = {
+    dailyImage: 50, dailyVideo: 10, dailyMemoryCandidates: 20, videoConcurrency: 1, monthlyTokenBudget: 0,
+    agentRunTimeoutMs: 120000, // 同步 run deadline（M5 语义）
+    contextBudgetTokens: 8000,
+    // M6: 异步长任务分层超时（lease 与 run deadline 分离，见 m6-architecture-design §12）
+    agentRunDeadlineMs: 2400000,   // async run 总 deadline（40min，自 startedAt，含 waiting）
+    agentRunLeaseTtlMs: 60000,     // lease TTL
+    agentRunHeartbeatMs: 15000,    // 心跳间隔
+    agentRunLlmTurnMs: 120000,     // LLM 单回合流级 watchdog
+  };
   await prisma.systemSetting.upsert({
     where: { key: 'limits' },
     update: { value: limits },

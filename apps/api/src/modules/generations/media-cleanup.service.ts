@@ -54,13 +54,17 @@ export class MediaCleanupService {
     return swept;
   }
 
-  /** 清扫 stale AgentRun（M4 Audit MUST-1）：running 且 startedAt 超过阈值 → timeout。返回清扫数。 */
+  /**
+   * 清扫 stale AgentRun（M4 Audit MUST-1）：running 且 startedAt 超过阈值 → timeout。返回清扫数。
+   * M6-A2：只扫 `workerId IS NULL` 的同步 run（M5 语义不变）；异步 run（workerId 非空）由 lease 恢复链路
+   * （P3）接管——cleanup worker 绝不把合法 long-running async run 直接 timeout。
+   */
   async sweepAgentRuns(): Promise<number> {
     const now = Date.now();
     const limits = await this.prisma.systemSetting.findUnique({ where: { key: 'limits' } });
     const timeoutMs = (limits?.value as { agentRunTimeoutMs?: number } | null)?.agentRunTimeoutMs ?? DEFAULT_AGENT_RUN_TIMEOUT_MS;
     const rows = await this.prisma.agentRun.findMany({
-      where: { status: 'running' },
+      where: { status: 'running', workerId: null },
       select: { id: true, startedAt: true, agentId: true, userId: true },
     });
     let swept = 0;

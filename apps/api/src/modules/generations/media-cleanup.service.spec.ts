@@ -46,7 +46,13 @@ describe('MediaCleanupService.sweepAgentRuns（M4 Audit MUST-1）', () => {
   it('已终态 run 不受影响（查询只取 running）', async () => {
     const { svc, prisma } = makeService();
     await svc.sweepAgentRuns();
-    expect(prisma.agentRun.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { status: 'running' } }));
+    expect(prisma.agentRun.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ status: 'running' }) }));
+  });
+
+  it('M6-A2：只扫同步 run（workerId IS NULL）——异步 run 由 lease 恢复链路接管，不被 120s 误杀', async () => {
+    const { svc, prisma } = makeService();
+    await svc.sweepAgentRuns();
+    expect(prisma.agentRun.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { status: 'running', workerId: null } }));
   });
 
   it('并发清扫：条件更新竞态（count=0）→ 不重复计入', async () => {

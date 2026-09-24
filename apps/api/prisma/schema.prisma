@@ -3,8 +3,9 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider          = "postgresql"
+  url               = env("DATABASE_URL")
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL") // 持久 shadow 库（预装 pgvector，重放含 CREATE EXTENSION 的历史迁移所需）
 }
 
 // ===== 枚举 =====
@@ -443,6 +444,7 @@ model Artifact {
   summary        String?        @db.Text
   content        Json?
   storageKey     String?
+  idempotencyKey String?        // M6: resume 重放去重（部分唯一索引，见 migration）
   status         ArtifactStatus @default(ready)
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
@@ -457,6 +459,7 @@ model Artifact {
 enum AgentRunStatus {
   queued
   running
+  waiting // M6: run 存活但无 worker，等待外部异步任务（GenerationTask）完成
   completed
   failed
   cancelled
@@ -501,11 +504,24 @@ model AgentRun {
   createdAt      DateTime       @default(now())
   startedAt      DateTime       @default(now())
   completedAt    DateTime?
+  // ===== M6: Long-running Agent Runtime（P1 数据层；claim/renew/recover 逻辑 P3 实现）=====
+  workerId        String?      // lease 持有者（worker 实例 id）；NULL = 同步 run（M5 语义，sweep 沿用 120s）
+  leaseUntil      DateTime?    // 租约到期时刻（心跳续期）
+  heartbeatAt     DateTime?    // 最近心跳（可观测）
+  waitingOnTaskId String?      // waiting 时等待的 GenerationTask
+  retryOfRunId    String?      // Retry = 新 Run 血缘（不重新打开 terminal run）
+  retryOf         AgentRun?  @relation("RetryChain", fields: [retryOfRunId], references: [id], onDelete: SetNull)
+  retries         AgentRun[] @relation("RetryChain")
+  attempt         Int          @default(1)
   steps          AgentRunStep[]
   tasks          GenerationTask[]
   artifacts      Artifact[]
+  messages       AgentRunMessage[]
   @@index([userId, createdAt])
   @@index([conversationId])
+  @@index([status])
+  @@index([retryOfRunId])
+  @@index([waitingOnTaskId])
 }
 
 model AgentRunStep {
@@ -536,6 +552,7 @@ model ToolCall {
   status         ToolCallStatus @default(running)
   errorCode      String?
   errorMessage   String?
+  attempts       Int            @default(1) // M6: 同一行内重试次数（可观测）
   durationMs     Int?
   startedAt      DateTime       @default(now())
   completedAt    DateTime?
@@ -543,6 +560,23 @@ model ToolCall {
   artifacts      Artifact[]
   @@unique([runStepId, idempotencyKey])
   @@index([toolName, startedAt])
+}
+
+// ===== M6: Agent Run Transcript（LLM 消息持久化，resume 重放唯一输入）=====
+// 最小字段判断：role 用字符串（序列本身即协议）；无 message type/status（append-only，终态语义由 run 承担）；
+// 无 provider metadata（usage_records 已按回合归因，不重复存）；不存 chain-of-thought（M4 红线延续）。
+// assistant 行携带 toolCalls Json 快照（LLM 调用决策事实，resume 不重打 LLM）；tool 行携带 toolCallId（LLM call id）配对。
+model AgentRunMessage {
+  id         String   @id @default(uuid())
+  runId      String
+  run        AgentRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  sequence   Int
+  role       String // system | user | assistant | tool
+  content    String   @db.Text
+  toolCallId String? // role=tool 时 = LLM 生成的 call id（配对；非 ToolCall 行 id）
+  toolCalls  Json?   // role=assistant 时 = tool_calls 数组快照 [{id,name,arguments}]
+  createdAt  DateTime @default(now())
+  @@unique([runId, sequence])
 }
 
 // ===== M5: Agent 版本 =====

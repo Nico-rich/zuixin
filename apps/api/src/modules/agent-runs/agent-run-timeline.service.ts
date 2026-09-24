@@ -124,7 +124,7 @@ export class AgentRunTimelineService {
     const terminalType = {
       completed: 'run.completed', failed: 'run.failed',
       cancelled: 'run.cancelled', timeout: 'run.timeout',
-      running: null, queued: null,
+      running: null, queued: null, waiting: null, // 非终态不产终态项（M6 waiting）
     }[run.status] as TimelineItemType | null;
     if (terminalType) {
       items.push({
