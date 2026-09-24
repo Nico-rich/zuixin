@@ -228,30 +228,22 @@ model Attachment {
 
 // ===== Agent =====
 model Agent {
-  id           String    @id @default(uuid())
-  slug         String    @unique
-  name         String
-  description  String?
-  systemPrompt String    @db.Text
-  modelId      String?
-  model        Model?    @relation(fields: [modelId], references: [id])
-  tools        Json      @default("[]")
-  temperature  Float     @default(0.7)
-  maxTokens    Int?
-  enabled      Boolean   @default(true)
-  priority     Int       @default(100)
-  builtin      Boolean   @default(false)
-  kind         String    @default("builtin") // builtin(代码类) | custom(纯 prompt 配置)
-  version      Int       @default(1)
-  scope        String    @default("system") // system | user(预留)
-  activeVersionId String?       @unique
+  id              String    @id @default(uuid())
+  slug            String    @unique
+  name            String
+  description     String?
+  enabled         Boolean   @default(true)
+  priority        Int       @default(100)
+  builtin         Boolean   @default(false)
+  kind            String    @default("builtin") // builtin(代码类) | custom(纯 prompt 配置)
+  scope           String    @default("system") // system | user(预留)
+  activeVersionId String?   @unique
   activeVersion   AgentVersion? @relation("ActiveVersion", fields: [activeVersionId], references: [id], onDelete: SetNull)
-  config       Json?
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
-  messages     Message[]
-  runs         AgentRun[]
-  versions     AgentVersion[]
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  messages        Message[]
+  runs            AgentRun[]
+  versions        AgentVersion[]
 }
 
 // ===== Provider 与模型 =====
@@ -293,7 +285,6 @@ model Model {
   isDefault     Boolean    @default(false)
   createdAt     DateTime   @default(now())
   updatedAt     DateTime   @updatedAt
-  agents        Agent[]
   agentVersions AgentVersion[]
   tasks         GenerationTask[]
   usages        UsageRecord[]

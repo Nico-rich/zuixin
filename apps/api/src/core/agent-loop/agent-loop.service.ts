@@ -23,6 +23,8 @@ export interface AgentLoopAgentConfig {
   temperature?: number;
   maxTokens?: number;
   maxSteps?: number;               // 默认 8
+  /** AgentVersion 快照 id：Run 创建时锁定，此后永不改变 */
+  versionId?: string;
 }
 
 export interface AgentLoopInput {
@@ -72,6 +74,7 @@ export class AgentLoopService {
     const run = await this.prisma.agentRun.create({
       data: {
         userId: input.userId, agentId: input.agent.id,
+        agentVersionId: input.agent.versionId, // 锁定版本快照，永不改变
         projectId: input.projectId, conversationId: input.conversationId,
         maxSteps, metadata: { agentTools: input.agent.tools },
       },

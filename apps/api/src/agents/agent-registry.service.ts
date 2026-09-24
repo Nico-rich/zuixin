@@ -39,9 +39,16 @@ export class AgentRegistryService implements OnModuleInit {
   async onModuleInit() { await this.refresh(); }
 
   async refresh(): Promise<void> {
-    const rows = await this.prisma.agent.findMany({ where: { enabled: true } });
+    const rows = await this.prisma.agent.findMany({
+      where: { enabled: true },
+      include: { activeVersion: true },
+    });
     const next = new Map<string, Agent>();
     for (const row of rows) {
+      if (!row.activeVersion) {
+        this.logger.warn(`Agent ${row.slug} 无 activeVersion，跳过加载（需在后台发布版本）`);
+        continue;
+      }
       const agent = this.buildAgent(row);
       if (agent) next.set(row.slug, agent);
     }
@@ -60,20 +67,25 @@ export class AgentRegistryService implements OnModuleInit {
   list(): Agent[] { return [...this.agents.values()]; }
 
   private buildAgent(row: {
-    id: string; slug: string; kind: string; systemPrompt: string; modelId: string | null;
-    tools: unknown; temperature: number; maxTokens: number | null; config: unknown;
+    id: string; slug: string; kind: string;
+    activeVersion: {
+      id: string; version: number; systemPrompt: string; modelId: string | null;
+      tools: unknown; temperature: number; maxTokens: number | null; config: unknown;
+    } | null;
   }): Agent | null {
     const kind = row.kind === 'custom' ? 'general-assistant' : row.slug;
+    const v = row.activeVersion!; // refresh 已保证存在
     switch (kind) {
       case 'general-assistant': {
-        const cfg = (row.config ?? {}) as { maxSteps?: number; requiresTools?: boolean };
+        const cfg = (v.config ?? {}) as { maxSteps?: number; requiresTools?: boolean };
         return new GeneralAssistantAgent({
           loop: this.loop, context: this.context,
           config: {
-            id: row.id, systemPrompt: row.systemPrompt, modelId: row.modelId,
-            tools: (row.tools as string[]) ?? [], temperature: row.temperature,
-            maxTokens: row.maxTokens ?? undefined, maxSteps: cfg.maxSteps,
+            id: row.id, systemPrompt: v.systemPrompt, modelId: v.modelId,
+            tools: (v.tools as string[]) ?? [], temperature: v.temperature,
+            maxTokens: v.maxTokens ?? undefined, maxSteps: cfg.maxSteps,
             requiresTools: cfg.requiresTools,
+            versionId: v.id, // Run 锁定版本（immutable 快照）
           },
         });
       }

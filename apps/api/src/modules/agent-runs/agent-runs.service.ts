@@ -15,7 +15,8 @@ export class AgentRunsService {
           orderBy: { stepIndex: 'asc' },
           include: { toolCalls: { orderBy: { startedAt: 'asc' } } },
         },
-        agent: { select: { id: true, slug: true, name: true, version: true } },
+        agent: { select: { id: true, slug: true, name: true } },
+        agentVersion: { select: { id: true, version: true, status: true } },
       },
     });
     if (!run) throw new AppError(ErrorCode.NOT_FOUND, '运行不存在');

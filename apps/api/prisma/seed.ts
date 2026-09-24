@@ -135,7 +135,7 @@ async function main() {
     });
   }
 
-  // M4: 内置 Agent 三件套（kind=builtin 映射代码类；general-assistant 走 Agent Loop + 工具）
+  // M4/M5: 内置 Agent 三件套（定义迁移至 AgentVersion v1 published；Registry 只读 activeVersion）
   const agents = [
     {
       id: 'seed-agent-general', slug: 'general-assistant', name: '通用助手', kind: 'builtin',
@@ -146,11 +146,24 @@ async function main() {
     { id: 'seed-agent-video', slug: 'video', name: '视频生成 Agent', kind: 'builtin', systemPrompt: '你负责视频生成任务。', tools: [] },
   ];
   for (const a of agents) {
-    await prisma.agent.upsert({
+    const agent = await prisma.agent.upsert({
       where: { id: a.id },
-      update: { systemPrompt: a.systemPrompt, tools: a.tools, kind: a.kind },
-      create: { id: a.id, slug: a.slug, name: a.name, kind: a.kind, systemPrompt: a.systemPrompt, tools: a.tools, builtin: true, enabled: true, priority: a.slug === 'general-assistant' ? 1 : 10 },
+      update: { kind: a.kind },
+      create: { id: a.id, slug: a.slug, name: a.name, kind: a.kind, builtin: true, enabled: true, priority: a.slug === 'general-assistant' ? 1 : 10 },
     });
+    // 幂等快照：若无 v1 则创建 published 版本并指向 activeVersionId
+    const v1 = await prisma.agentVersion.upsert({
+      where: { agentId_version: { agentId: agent.id, version: 1 } },
+      update: {},
+      create: {
+        agentId: agent.id, version: 1, status: 'published',
+        systemPrompt: a.systemPrompt, tools: a.tools, temperature: 0.7,
+        config: a.slug === 'general-assistant' ? { maxSteps: 8 } : {},
+      },
+    });
+    if (!agent.activeVersionId) {
+      await prisma.agent.update({ where: { id: agent.id }, data: { activeVersionId: v1.id } });
+    }
   }
 
   const routingPolicy = {
