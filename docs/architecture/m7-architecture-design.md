@@ -265,3 +265,34 @@ Commerce Data → commerce.analysis.generate（facts/derived/anomalies 服务端
 
 - 单测 4：规则异常（双源）/分层标注/证据快照/Artifact 镜像/非法类型。
 - e2e 3：分析（营收-14%/访问-25%/ROAS-37.5% 三异常 + DB 分层断言）→ 简报（自动关联证据 + 镜像制品）→ 闭环（简报方向进入既有 Image Agent 管线，waiting→resume 全复用）。
+
+## 6. M7-P6 Workflow Engine（⏳ 施工中——2026-09-24 下班暂停，续接点见 §6.1 末尾）
+
+### 6.1 数据模型与状态机
+
+- `Workflow`（draft/published/archived）→ `WorkflowVersion`（不可变，Run 锁定 versionId）→ `WorkflowRun`（queued/running/waiting/completed/failed/cancelled/timeout，复用 M6 lease 字段与 waiting 语义）→ `WorkflowStepRun`（UNIQUE(runId, stepIndex)，attempt 级重试）；
+- waiting 两种目标：`waitingOnApprovalId`（审批步骤）/ `waitingOnAgentRunId`（agent 步骤的子 AgentRun 终态）；
+- 幂等：`UNIQUE(workflowId, idempotencyKey)` 部分唯一索引 WHERE attempt=1（raw SQL，同 m6_p5 手法）；触发器四种：manual/webhook/schedule/event；
+- `WorkflowWebhook`（token + secretEncrypted AES-GCM at rest）+ `WebhookDelivery`（UNIQUE(webhookId, eventId) 防重放）；
+- `Approval.workflowRunId`：审批步骤绑定（与 agentRunId/toolCallId 场景互斥）。
+
+**步骤类型**：condition（安全路径取值 + eq/neq/gt/lt/contains，绝无 eval）/ tool（ToolRegistry 同步执行）/ agent（子 AgentRun + waiting 唤醒）/ approval（Approval + waiting）/ external_action（复用 P3 服务，approvalId 取自前置审批步骤）/ output。
+
+**复用而非重造**（M6 原语集）：claim 条件更新、lease 续期 fencing、waiting→queued 唤醒 + 唯一 jobId `wf-{id}-wake-{ts}`、cancel 三态条件更新、recoverStale 双兜底（审批终态/子 run 终态）、resume 时 executor 按 DB 事实重评估 waiting 步骤。
+
+### 6.2 API 面（计划）
+
+```
+GET/POST /workflows；GET/PATCH /workflows/:id（编辑=新版本）
+POST /workflows/:id/publish / :id/archive；GET /workflows/:id/versions
+POST /workflows/:id/runs（idempotencyKey 去重）；GET /workflows/:id/runs
+GET /workflows/runs/:runId（+steps）；GET /workflows/runs/:runId/timeline（投影）
+POST /workflows/runs/:runId/cancel / :runId/retry
+POST /hooks/workflows/:token（公开端点：HMAC 签名 + timestamp ±5min + eventId 防重放）
+```
+
+### 6.3 最小 UI（apps/web）
+
+Workflow 列表 / 详情（版本）/ Run 列表 / Run Timeline（不做 React Flow IDE）。
+
+**⏳ 续接点（2026-09-25）**：① `prisma migrate dev` 应用未迁移的 schema 增量（Approval.workflowRunId + WorkflowWebhook.secretEncrypted，当前仅磁盘编辑）；② 按 §6 实现 worker/workflow + modules/workflows + queue 注册 + Approval.decide 经 EventBus 唤醒 workflow + 部分唯一索引 + web UI + 测试。详见 memory m7-progress。

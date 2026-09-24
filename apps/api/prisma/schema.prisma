@@ -161,6 +161,8 @@ model User {
   commerceRevenue     CommerceRevenueMetric[]
   commerceAnalyses  CommerceAnalysis[]
   creativeBriefs    CreativeBrief[]
+  workflows         Workflow[]
+  workflowRuns      WorkflowRun[]
   knowledgeBases KnowledgeBase[]
   documents      Document[]
 }
@@ -401,6 +403,7 @@ model Project {
   externalActions ExternalAction[]
   commerceAnalyses CommerceAnalysis[]
   creativeBriefs   CreativeBrief[]
+  workflows        Workflow[]
   knowledgeBases KnowledgeBase[]
   documents       Document[]
   @@index([userId, updatedAt])
@@ -568,6 +571,8 @@ model Approval {
   project     Project?       @relation(fields: [projectId], references: [id], onDelete: SetNull)
   agentRunId  String?
   agentRun    AgentRun?      @relation(fields: [agentRunId], references: [id], onDelete: Cascade)
+  workflowRunId String?      // M7-P6: Workflow 审批步骤绑定（与 agentRunId/toolCallId 场景互斥）
+  workflowRun  WorkflowRun?  @relation(fields: [workflowRunId], references: [id], onDelete: SetNull)
   toolCallId  String?
   toolCall    ToolCall?      @relation(fields: [toolCallId], references: [id], onDelete: Cascade)
   waitingRuns AgentRun[]     @relation("RunWaitingApproval")
@@ -586,6 +591,7 @@ model Approval {
   @@index([projectId])
   @@index([agentRunId])
   @@index([toolCallId])
+  @@index([workflowRunId])
   @@index([status, expiresAt])
 }
 
@@ -1096,4 +1102,142 @@ model CreativeBrief {
   @@index([userId, createdAt])
   @@index([agentRunId])
   @@index([commerceAnalysisId])
+}
+
+// ===== M7-P6: Workflow Engine（确定性编排 ≠ Agent 动态推理；复用 M6 lease/waiting/resume/cancel 原语集）=====
+enum WorkflowStatus {
+  draft
+  published
+  archived
+}
+
+enum WorkflowRunStatus {
+  queued
+  running
+  waiting
+  completed
+  failed
+  cancelled
+  timeout
+}
+
+enum WorkflowTriggerType {
+  manual
+  webhook
+  schedule
+  event
+}
+
+model Workflow {
+  id          String           @id @default(uuid())
+  userId      String
+  user        User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId   String?
+  project     Project?         @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  name        String
+  description String?          @db.Text
+  status      WorkflowStatus   @default(draft)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  versions    WorkflowVersion[]
+  runs        WorkflowRun[]
+  webhooks    WorkflowWebhook[]
+  @@index([userId, updatedAt])
+}
+
+// Version 不可变：每次编辑 = 新版本；Run 锁定 versionId（绝不执行被覆盖的定义）
+model WorkflowVersion {
+  id         String           @id @default(uuid())
+  workflowId String
+  workflow   Workflow         @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  version    Int
+  status     WorkflowStatus   @default(draft)
+  definition Json // { triggers: [...], steps: [...] }
+  createdAt  DateTime         @default(now())
+  runs       WorkflowRun[]
+  @@unique([workflowId, version])
+}
+
+model WorkflowRun {
+  id                 String            @id @default(uuid())
+  workflowId         String
+  workflow           Workflow          @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  versionId          String            // 锁定执行版本（不可变快照）
+  version            WorkflowVersion   @relation(fields: [versionId], references: [id], onDelete: Restrict)
+  userId             String
+  user               User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId          String?
+  triggerType        WorkflowTriggerType
+  triggerId          String?           // 触发源（webhook eventId / schedule cron 键 / event 名）
+  idempotencyKey     String
+  attempt            Int               @default(1)
+  status             WorkflowRunStatus @default(queued)
+  currentStep        Int               @default(0)
+  input              Json?
+  output             Json?
+  errorCode          String?
+  errorMessage       String?
+  // M6 原语复用：lease 字段 + waiting 目标（与 AgentRun 同构，独立表）
+  workerId           String?
+  leaseUntil         DateTime?
+  heartbeatAt        DateTime?
+  waitingOnApprovalId String?
+  waitingOnAgentRunId String? // agent 步骤的子 AgentRun 终态唤醒
+  startedAt          DateTime          @default(now())
+  completedAt        DateTime?
+  createdAt          DateTime          @default(now())
+  steps              WorkflowStepRun[]
+  @@index([userId, createdAt])
+  @@index([workflowId, createdAt])
+  @@index([status])
+  @@index([waitingOnApprovalId])
+  @@index([waitingOnAgentRunId])
+}
+
+model WorkflowStepRun {
+  id               String          @id @default(uuid())
+  workflowRunId    String
+  workflowRun      WorkflowRun     @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
+  stepId           String          // 定义内 step id
+  stepIndex        Int
+  stepType         String          // condition | tool | agent | approval | external_action | output
+  status           String          @default("queued") // queued | running | waiting | completed | failed | cancelled | skipped
+  input            Json?
+  output           Json?
+  errorCode        String?
+  errorMessage     String?
+  attempt          Int             @default(0)
+  approvalId       String?
+  externalActionId String?
+  agentRunId       String?         // agent 步骤的子 AgentRun
+  startedAt        DateTime?
+  completedAt      DateTime?
+  createdAt        DateTime        @default(now())
+  @@unique([workflowRunId, stepIndex])
+  @@index([workflowRunId, stepId])
+}
+
+// Webhook 触发器（签名/防重放/去重；secret AES-256-GCM at rest，仅校验时服务端解密）
+model WorkflowWebhook {
+  id               String   @id @default(uuid())
+  workflowId       String
+  workflow         Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  token            String   @unique // 端点标识（URL 中的随机 token）
+  secretEncrypted  String   // HMAC 密钥密文（校验时解密做 timing-safe 比对）
+  enabled          Boolean  @default(true)
+  lastDeliveredAt  DateTime?
+  createdAt        DateTime @default(now())
+  deliveries       WebhookDelivery[]
+  @@index([workflowId])
+}
+
+model WebhookDelivery {
+  id          String           @id @default(uuid())
+  webhookId   String
+  webhook     WorkflowWebhook  @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+  eventId     String           // 防重放：同一 eventId 只接受一次
+  payloadHash String
+  status      String           @default("accepted") // accepted | duplicate | rejected
+  createdAt   DateTime         @default(now())
+  @@unique([webhookId, eventId])
 }
