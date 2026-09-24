@@ -148,6 +148,8 @@ model User {
   artifacts     Artifact[]
   agentRuns     AgentRun[]
   approvals     Approval[]
+  connections   Connection[]
+  oauthStates   OAuthState[]
   knowledgeBases KnowledgeBase[]
   documents      Document[]
 }
@@ -384,6 +386,7 @@ model Project {
   artifacts     Artifact[]
   agentRuns     AgentRun[]
   approvals     Approval[]
+  connections   Connection[]
   knowledgeBases KnowledgeBase[]
   documents       Document[]
   @@index([userId, updatedAt])
@@ -566,6 +569,61 @@ model Approval {
   @@index([agentRunId])
   @@index([toolCallId])
   @@index([status, expiresAt])
+}
+
+// ===== M7-P2: Connection / OAuth / Credential（统一第三方账号连接体系）=====
+enum ConnectionStatus {
+  active
+  expired
+  revoked
+}
+
+model Connection {
+  id                String           @id @default(uuid())
+  userId            String
+  user              User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId         String?
+  project           Project?         @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  provider          String           // mock | shopify | amazon | meta_ads | google_ads | tiktok_ads
+  providerAccountId String?
+  status            ConnectionStatus @default(active)
+  scope             Json?
+  expiresAt         DateTime?
+  revokedAt         DateTime?
+  lastSyncedAt      DateTime?
+  metadata          Json?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+  credentials       Credential[]
+  @@index([userId, provider])
+  @@index([projectId])
+  @@index([userId, provider, providerAccountId])
+}
+
+// 凭证：AES-256-GCM 密文 at rest；绝不进 API 响应/DTO/prompt/log
+model Credential {
+  id             String     @id @default(uuid())
+  connectionId   String
+  connection     Connection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  type           String     // access_token | refresh_token
+  encryptedValue String
+  expiresAt      DateTime?
+  createdAt      DateTime   @default(now())
+  @@index([connectionId, type])
+}
+
+// OAuth state：single-use、短时（10min）、user+project+provider 绑定
+model OAuthState {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId String?
+  provider  String
+  state     String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  @@index([userId, createdAt])
 }
 
 model AgentRunStep {
