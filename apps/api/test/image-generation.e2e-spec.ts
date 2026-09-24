@@ -81,6 +81,13 @@ describe('Image Generation (e2e, mock 全链路)', () => {
     expect(attachments[0].kind).toBe('generated_image');
   });
 
+  it('P3 linkage：非 Agent 路径（ImageAgent 直连）runId/toolCallId 为 null', async () => {
+    const appAny = app as unknown as { get: <T>(type: unknown) => T };
+    const task = await appAny.get<PrismaService>(PrismaService).generationTask.findUnique({ where: { id: taskId } });
+    expect(task?.runId).toBeNull();
+    expect(task?.toolCallId).toBeNull();
+  });
+
   it('越权访问任务 → 404；取消已完成任务 → 409', async () => {
     await request(app.getHttpServer()).get(`/api/v1/tasks/${'0'.repeat(32)}`).set('Cookie', cookie).expect(404);
     const res = await request(app.getHttpServer()).post(`/api/v1/tasks/${taskId}/cancel`).set(XRW).set('Cookie', cookie).expect(409);

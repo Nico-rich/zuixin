@@ -314,8 +314,10 @@ model GenerationTask {
   errorMessage   String?
   attempts       Int         @default(0)
   idempotencyKey String?     @unique
-  runId          String?
-  toolCallId     String?
+  runId          String?     // AgentRun 追溯（非 Agent 场景为 null）
+  run            AgentRun?   @relation(fields: [runId], references: [id], onDelete: Restrict)
+  toolCallId     String?     // ToolCall 追溯（非 Agent 场景为 null）
+  toolCall       ToolCall?   @relation(fields: [toolCallId], references: [id], onDelete: Restrict)
   costEstimate   Float?
   startedAt      DateTime?
   completedAt    DateTime?
@@ -323,6 +325,8 @@ model GenerationTask {
   attachments    Attachment[]
   @@index([userId, createdAt])
   @@index([status])
+  @@index([runId])
+  @@index([toolCallId])
 }
 
 // ===== 用量与成本 =====
@@ -427,8 +431,10 @@ model Artifact {
   conversation   Conversation?  @relation(fields: [conversationId], references: [id], onDelete: SetNull)
   messageId      String?
   taskId         String?
-  runId          String?
-  toolCallId     String?
+  runId          String?        // AgentRun 追溯（非 Agent 场景为 null）
+  run            AgentRun?      @relation(fields: [runId], references: [id], onDelete: Restrict)
+  toolCallId     String?        // ToolCall 追溯（非 Agent 场景为 null）
+  toolCall       ToolCall?      @relation(fields: [toolCallId], references: [id], onDelete: Restrict)
   type           ArtifactType
   title          String
   summary        String?        @db.Text
@@ -440,6 +446,8 @@ model Artifact {
   @@index([userId, createdAt])
   @@index([projectId])
   @@index([conversationId])
+  @@index([runId])
+  @@index([toolCallId])
 }
 
 // ===== M4: Agent 执行 =====
@@ -491,6 +499,8 @@ model AgentRun {
   startedAt      DateTime       @default(now())
   completedAt    DateTime?
   steps          AgentRunStep[]
+  tasks          GenerationTask[]
+  artifacts      Artifact[]
   @@index([userId, createdAt])
   @@index([conversationId])
 }
@@ -526,6 +536,8 @@ model ToolCall {
   durationMs     Int?
   startedAt      DateTime       @default(now())
   completedAt    DateTime?
+  tasks          GenerationTask[]
+  artifacts      Artifact[]
   @@unique([runStepId, idempotencyKey])
   @@index([toolName, startedAt])
 }

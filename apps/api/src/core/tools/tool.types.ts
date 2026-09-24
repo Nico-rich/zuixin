@@ -13,6 +13,7 @@ export interface ToolContext {
   messageId?: string;        // 展示锚点（生成结果附件挂到当前 assistant 消息）
   agentRunId: string;
   agentRunStepId: string;
+  toolCallId: string;        // ToolCall 追溯（AgentLoop 注入，Tool 不得自定）
   idempotencyKey: string;
   signal: AbortSignal;
 }

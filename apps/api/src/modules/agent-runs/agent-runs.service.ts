@@ -17,6 +17,8 @@ export class AgentRunsService {
         },
         agent: { select: { id: true, slug: true, name: true } },
         agentVersion: { select: { id: true, version: true, status: true } },
+        tasks: { orderBy: { createdAt: 'asc' } },
+        artifacts: { orderBy: { createdAt: 'asc' } },
       },
     });
     if (!run) throw new AppError(ErrorCode.NOT_FOUND, '运行不存在');

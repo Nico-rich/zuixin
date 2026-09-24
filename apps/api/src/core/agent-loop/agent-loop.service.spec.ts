@@ -23,8 +23,9 @@ function makeLoop(opts: { tools?: Tool[]; streamFn?: (params: { tools?: unknown 
       update: vi.fn().mockResolvedValue({}),
     },
     toolCall: {
-      create: vi.fn().mockResolvedValue({}),
+      create: vi.fn().mockImplementation(({ data }) => Promise.resolve({ id: `tc-${Math.random().toString(36).slice(2, 8)}`, ...data })),
       findUnique: vi.fn().mockResolvedValue(null),
+      update: vi.fn().mockResolvedValue({}),
     },
   };
   const registry = makeRegistry(opts.tools ?? []);
@@ -100,7 +101,10 @@ describe('AgentLoopService', () => {
       expect.objectContaining({ userId: 'u1', conversationId: 'c1', agentRunId: 'run-1' }),
     );
     expect(prisma.toolCall.create).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({ toolName: 'image.generate', status: 'completed' }),
+      data: expect.objectContaining({ toolName: 'image.generate', status: 'running' }),
+    }));
+    expect(prisma.toolCall.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: 'completed', output: { taskId: 'task-1', status: 'pending' } }),
     }));
   });
 

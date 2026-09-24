@@ -208,7 +208,7 @@ export class AgentLoopService {
       return { status: 'failed', error: '该工具需要审批，当前不可用', outputSummary: `${call.name}：需要审批` };
     }
 
-    // 幂等查重：同一 (runId, idempotencyKey) 已完成 → 复用输出，不重复执行
+    // 幂等查重：同一 (runStepId, idempotencyKey) 已完成 → 复用输出，不重复执行
     const existing = await this.prisma.toolCall.findUnique({ where: { runStepId_idempotencyKey: { runStepId: stepId, idempotencyKey } } });
     if (existing?.status === 'completed' && existing.output) {
       return { status: 'completed', output: existing.output, outputSummary: '（复用已执行结果）' };
@@ -224,20 +224,47 @@ export class AgentLoopService {
       return { status: 'failed', error: msg, outputSummary: `${call.name}：参数非法` };
     }
 
+    // 执行前先落 ToolCall 行（running）——行 id 作为 toolCallId 注入执行上下文（FK 追溯真实行）；
+    // 执行后更新该行终态。并发重试撞唯一约束 → 查重复用。
+    let toolCallId: string;
+    try {
+      const row = await this.prisma.toolCall.create({
+        data: {
+          runStepId: stepId, toolName: call.name, idempotencyKey,
+          input: JSON.parse(call.arguments || '{}') as never, status: 'running',
+        },
+      });
+      toolCallId = row.id;
+    } catch (err) {
+      if ((err as { code?: string }).code === 'P2002') {
+        const existingRow = await this.prisma.toolCall.findUnique({ where: { runStepId_idempotencyKey: { runStepId: stepId, idempotencyKey } } });
+        if (existingRow?.status === 'completed' && existingRow.output) {
+          return { status: 'completed', output: existingRow.output, outputSummary: '（复用已执行结果）' };
+        }
+      }
+      throw err;
+    }
+
     const toolCtx: ToolContext = {
       userId: input.userId, projectId: input.projectId, conversationId: input.conversationId,
       messageId: input.messageId, agentRunId: runId, agentRunStepId: stepId,
-      idempotencyKey, signal,
+      toolCallId, idempotencyKey, signal,
     };
     const startedAt = Date.now();
     try {
       const combinedSignal = AbortSignal.any([signal, AbortSignal.timeout(tool.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS)]);
       const output = await tool.execute(parsedInput, { ...toolCtx, signal: combinedSignal });
-      await this.recordToolCall(stepId, call.name, idempotencyKey, call.arguments, output, 'completed', undefined, undefined, Date.now() - startedAt);
+      await this.prisma.toolCall.update({
+        where: { id: toolCallId },
+        data: { output: output as never, status: 'completed', completedAt: new Date(), durationMs: Date.now() - startedAt },
+      }).catch((err) => this.logger.warn(`ToolCall 完成更新失败（幂等兜底）: ${(err as Error).message}`));
       return { status: 'completed', output, outputSummary: this.summarize(call.name, output) };
     } catch (err) {
       const appErr = err instanceof AppError ? err : new AppError(ErrorCode.PROVIDER_UNKNOWN, (err as Error).message);
-      await this.recordToolCall(stepId, call.name, idempotencyKey, call.arguments, undefined, 'failed', appErr.code, appErr.message, Date.now() - startedAt);
+      await this.prisma.toolCall.update({
+        where: { id: toolCallId },
+        data: { status: 'failed', errorCode: appErr.code, errorMessage: appErr.message, completedAt: new Date(), durationMs: Date.now() - startedAt },
+      }).catch((e) => this.logger.warn(`ToolCall 失败更新异常: ${(e as Error).message}`));
       return { status: 'failed', error: appErr.message, outputSummary: `${call.name}：执行失败` };
     }
   }

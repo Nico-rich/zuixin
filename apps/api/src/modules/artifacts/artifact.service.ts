@@ -12,6 +12,9 @@ export interface CreateArtifactInput {
   conversationId?: string;
   messageId?: string;
   taskId?: string;
+  /** AgentRun/ToolCall 追溯（非 Agent 场景留空——由调用链显式传递） */
+  runId?: string;
+  toolCallId?: string;
 }
 
 /** Artifact 最小写入方（M4）：仅 create/read，无 Workflow；归属校验与全站同模式 */
@@ -39,6 +42,8 @@ export class ArtifactService {
         conversationId: input.conversationId,
         messageId: input.messageId,
         taskId: input.taskId,
+        runId: input.runId,
+        toolCallId: input.toolCallId,
         status: 'ready',
       },
     });

@@ -5,14 +5,14 @@ import { ToolContext } from '../tool.types';
 function makeCtx(over: Partial<ToolContext> = {}): ToolContext {
   return {
     userId: 'u1', projectId: 'p1', conversationId: 'c1', messageId: 'm1',
-    agentRunId: 'run1', agentRunStepId: 'step1', idempotencyKey: 'ik-1',
-    signal: new AbortController().signal,
+    agentRunId: 'run1', agentRunStepId: 'step1', toolCallId: 'call-1',
+    idempotencyKey: 'ik-1', signal: new AbortController().signal,
     ...over,
   };
 }
 
 describe('image.generate Tool（Agent → Tool → Service 分层）', () => {
-  it('透传身份上下文 + 幂等键，返回任务引用', async () => {
+  it('透传身份上下文 + 幂等键 + runId/toolCallId，返回任务引用', async () => {
     const generations = {
       prepareMediaTask: vi.fn().mockResolvedValue({ id: 'task-1', status: 'pending' }),
     };
@@ -21,7 +21,7 @@ describe('image.generate Tool（Agent → Tool → Service 分层）', () => {
     expect(generations.prepareMediaTask).toHaveBeenCalledWith(expect.objectContaining({
       userId: 'u1', conversationId: 'c1', messageId: 'm1', type: 'image',
       params: { prompt: '主图', count: 2, aspectRatio: undefined, referenceImages: undefined },
-      idempotencyKey: 'ik-1',
+      idempotencyKey: 'ik-1', runId: 'run1', toolCallId: 'call-1',
     }));
     expect(out).toEqual({ taskId: 'task-1', status: 'pending' });
   });
@@ -55,6 +55,7 @@ describe('artifact.create Tool', () => {
     const out = await tool.execute({ type: 'creative_brief', title: '主图方案', content: { audience: '科技感' } }, makeCtx());
     expect(artifacts.create).toHaveBeenCalledWith('u1', expect.objectContaining({
       type: 'creative_brief', projectId: 'p1', conversationId: 'c1', messageId: 'm1',
+      runId: 'run1', toolCallId: 'call-1',
     }));
     expect(out).toEqual({ artifactId: 'art-1', status: 'ready' });
   });

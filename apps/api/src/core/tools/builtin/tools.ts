@@ -23,7 +23,7 @@ export function createImageGenerateTool(generations: MediaGenerationService): To
       const task = await generations.prepareMediaTask({
         userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.messageId, type: 'image',
         params: { prompt: input.prompt, aspectRatio: input.aspectRatio, count: input.count, referenceImages: input.referenceImages },
-        idempotencyKey: ctx.idempotencyKey,
+        idempotencyKey: ctx.idempotencyKey, runId: ctx.agentRunId, toolCallId: ctx.toolCallId,
       });
       return { taskId: task.id, status: task.status };
     },
@@ -47,7 +47,7 @@ export function createVideoGenerateTool(generations: MediaGenerationService): To
       const task = await generations.prepareMediaTask({
         userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.messageId, type: 'video',
         params: { prompt: input.prompt, duration: input.duration, aspectRatio: input.aspectRatio, referenceImages: input.referenceImages },
-        idempotencyKey: ctx.idempotencyKey,
+        idempotencyKey: ctx.idempotencyKey, runId: ctx.agentRunId, toolCallId: ctx.toolCallId,
       });
       return { taskId: task.id, status: task.status };
     },
@@ -71,6 +71,7 @@ export function createArtifactTool(artifacts: ArtifactService): Tool {
       const artifact = await artifacts.create(ctx.userId, {
         type: input.type, title: input.title, summary: input.summary, content: input.content,
         projectId: ctx.projectId, conversationId: ctx.conversationId, messageId: ctx.messageId,
+        runId: ctx.agentRunId, toolCallId: ctx.toolCallId,
       });
       return { artifactId: artifact.id, status: artifact.status };
     },

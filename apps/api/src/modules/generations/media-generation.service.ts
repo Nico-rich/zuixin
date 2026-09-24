@@ -20,6 +20,9 @@ export interface PrepareMediaInput {
   params: Record<string, unknown>;
   /** 幂等键（ToolCall 透传）：UNIQUE 兜底，同一 ToolCall 重试绝不产生第二个任务 */
   idempotencyKey?: string;
+  /** AgentRun/ToolCall 追溯（非 Agent 场景留空——由调用链显式传递，服务不自行猜测） */
+  runId?: string;
+  toolCallId?: string;
 }
 
 const DEFAULT_DAILY_IMAGE_LIMIT = 50;
@@ -82,6 +85,8 @@ export class MediaGenerationService {
           statusMessage: '排队中',
           input: input.params as never,
           idempotencyKey: input.idempotencyKey,
+          runId: input.runId,
+          toolCallId: input.toolCallId,
         },
       });
       const queue = input.type === 'image' ? this.imageQueue : this.videoQueue;

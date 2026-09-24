@@ -81,6 +81,20 @@ describe('Agent Loop (e2e, mock 全链路)', () => {
     expect(calls[0].idempotencyKey).toBeTruthy();
   });
 
+  it('P3 linkage：Artifact.runId/toolCallId 非空；反向查询 AgentRun→Artifact、ToolCall→Artifact', async () => {
+    const appAny = app as unknown as { get: <T>(type: unknown) => T };
+    const prisma = appAny.get<PrismaService>(PrismaService);
+    const artifact = await prisma.artifact.findFirst({ where: { conversationId: convId } });
+    expect(artifact?.runId).toBeTruthy();
+    expect(artifact?.toolCallId).toBeTruthy();
+
+    // 反向：run → artifacts；toolCall → artifacts
+    const runWithArtifacts = await prisma.agentRun.findUnique({ where: { id: artifact!.runId! }, include: { artifacts: true, tasks: true } });
+    expect(runWithArtifacts?.artifacts.map((a) => a.id)).toContain(artifact!.id);
+    const callWithArtifacts = await prisma.toolCall.findUnique({ where: { id: artifact!.toolCallId! }, include: { artifacts: true } });
+    expect(callWithArtifacts?.artifacts.map((a) => a.id)).toContain(artifact!.id);
+  });
+
   it('Loop 调 memory.create_candidate：只产候选不绕过状态机', async () => {
     const before = await (app as unknown as { get: <T>(t: unknown) => T }).get<PrismaService>(PrismaService).memory.count();
     await request(app.getHttpServer()).post('/api/v1/chat').set(XRW).set('Cookie', cookie)
