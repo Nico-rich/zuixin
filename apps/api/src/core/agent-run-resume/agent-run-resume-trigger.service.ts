@@ -4,8 +4,10 @@ import { Queue } from 'bullmq';
 import { PrismaService } from '../../modules/prisma/prisma.service';
 import { AGENT_RUN_QUEUE } from '../queue/queue.module';
 import { DEFAULT_RUN_DEADLINE_MS } from '../agent-run-lease/agent-run-lease.service';
+import { EventBusService, agentRunChannel } from '../events/event-bus.service';
 
 const TASK_TERMINAL = ['completed', 'failed', 'cancelled'] as const;
+
 
 /**
  * M6-P4 GenerationTask 终态 → AgentRun 唤醒（waiting → queued → worker claim → resume）：
@@ -22,6 +24,7 @@ export class AgentRunResumeTrigger {
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @InjectQueue(AGENT_RUN_QUEUE) private readonly agentRunQueue: Queue,
+    @Inject(EventBusService) private readonly events: EventBusService,
   ) {}
 
   /** GenerationTask 终态 hook（executeTask 完成/失败路径 + sweep 超时路径） */
@@ -31,6 +34,9 @@ export class AgentRunResumeTrigger {
       select: { id: true, status: true, runId: true },
     });
     if (!task || !task.runId || !(TASK_TERMINAL as readonly string[]).includes(task.status)) return;
+    // M6-P6：任务终态实时通知（SSE 观察层；Timeline 投影仍是历史事实）
+    await this.events.publish(agentRunChannel(task.runId), { type: `task.${task.status}`, taskId, runId: task.runId })
+      .catch(() => undefined);
     await this.wakeWaitingRun(task.runId, taskId);
   }
 

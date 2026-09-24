@@ -3,6 +3,7 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { PrismaService } from '../../modules/prisma/prisma.service';
 import { AGENT_RUN_QUEUE } from '../queue/queue.module';
+import { EventBusService, agentRunChannel } from '../events/event-bus.service';
 
 /** M6-P3 默认时间分层（可被 system_settings.limits 覆盖；lease ≠ run deadline，绝不混用） */
 export const DEFAULT_LEASE_TTL_MS = 60_000;
@@ -32,6 +33,7 @@ export class AgentRunLeaseService {
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @InjectQueue(AGENT_RUN_QUEUE) private readonly agentRunQueue: Queue,
+    @Inject(EventBusService) private readonly events: EventBusService,
   ) {}
 
   private ttlMs(value: unknown, fallback: number): number {
@@ -134,6 +136,8 @@ export class AgentRunLeaseService {
         if (done.count > 0) {
           timedOut++;
           this.logger.warn({ runId: row.id, status: row.status }, 'run 超过 deadline → timeout');
+          // M6-P6 观察通道：SSE 订阅者实时看到 timeout 终态（并收流）
+          await this.events.publish(agentRunChannel(row.id), { type: 'run.timeout', runId: row.id, status: 'timeout' }).catch(() => undefined);
         }
         continue;
       }

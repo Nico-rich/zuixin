@@ -147,12 +147,14 @@ export class AgentRunTimelineService {
       });
     }
 
-    // 6. Usage 汇总（复用 P4 聚合，不重复计算）
+    // 6. Usage 汇总（复用 P4 聚合，不重复计算）。
+    // M6-P6：仅终态产出——运行中的 usage 汇总时间戳持续漂移（completedAt ?? now），破坏 SSE
+    // Last-Event-ID 断点语义（客户端 cursor 恒落在会移动的最后一项上）。运行中聚合值仍经 usage 字段返回。
     const usage = await aggregateRunUsage(this.prisma, userId, runId).catch(() => null);
-    if (usage) {
+    if (usage && run.completedAt) {
       items.push({
         id: `usage-${run.id}`, type: 'usage.summary', status: 'info',
-        timestamp: (run.completedAt ?? new Date()).toISOString(),
+        timestamp: run.completedAt.toISOString(),
         title: '用量汇总',
         summary: `LLM 回合 ${usage.llmRounds} · 图片 ${usage.imageCount} · 视频 ${usage.videoSeconds}s · 失败 ${usage.failedCalls}`,
         metadata: {

@@ -13,7 +13,8 @@ function makeService(rows: Array<Record<string, unknown>> = []) {
       findMany: vi.fn().mockResolvedValue(rows),
     },
   };
-  return { svc: new AgentRunLeaseService(prisma as never, queue as never), prisma, queue };
+  const events = { publish: vi.fn().mockResolvedValue(undefined) };
+  return { svc: new AgentRunLeaseService(prisma as never, queue as never, events as never), prisma, queue, events };
 }
 
 describe('AgentRunLeaseService（claim/renew/release + stale recovery）', () => {

@@ -524,6 +524,7 @@ export class AgentRuntimeEngine {
       // P4-5 waiting：异步 run + 生成任务未终态 → running→waiting + waitingOnTaskId + 释放 worker
       const decision = await this.resolveGenerationTask(ctx, runId, call.name, result, isAsync);
       if (decision.action === 'waiting') {
+        taskRefs.push(decision.waitingTaskId!); // 等待中的任务引用（outcome.taskRefs → driver 发 run.waiting 事件）
         yield { type: 'task.created', taskId: decision.waitingTaskId!, kind: call.name === 'image.generate' ? 'image' : 'video' };
         return { stop: true, waiting: true };
       }

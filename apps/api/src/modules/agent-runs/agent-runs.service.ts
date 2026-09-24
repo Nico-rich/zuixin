@@ -6,7 +6,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AgentRunMessagesService } from './agent-run-messages.service';
 import { AGENT_RUN_QUEUE } from '../../core/queue/queue.module';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
-import { EventBusService } from '../../core/events/event-bus.service';
+import { EventBusService, agentRunChannel } from '../../core/events/event-bus.service';
 import { CreateAgentRunDto } from './agent-runs.dto';
 
 const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled', 'timeout'] as const;
@@ -27,6 +27,13 @@ export class AgentRunsService {
     @InjectQueue(AGENT_RUN_QUEUE) private readonly agentRunQueue: Queue,
     @Inject(EventBusService) private readonly events: EventBusService,
   ) {}
+
+  /** SSE 观察端点用：归属校验（userId 首条件，防枚举 404）+ 当前状态 */
+  async getStatus(userId: string, id: string) {
+    const run = await this.prisma.agentRun.findFirst({ where: { id, userId }, select: { id: true, status: true } });
+    if (!run) throw new AppError(ErrorCode.NOT_FOUND, '运行不存在');
+    return run;
+  }
 
   async get(userId: string, id: string) {
     const run = await this.prisma.agentRun.findFirst({
@@ -144,6 +151,8 @@ export class AgentRunsService {
     }
     // 快速通道：worker 收到提示立即 abort（heartbeat 15s 仍是 DB 事实兜底）
     await this.events.publish(AGENT_RUN_CANCEL_CHANNEL, { runId }).catch(() => undefined);
+    // M6-P6 观察通道：SSE 订阅者实时看到取消终态（并收流）
+    await this.events.publish(agentRunChannel(runId), { type: 'run.cancelled', runId, status: 'cancelled' }).catch(() => undefined);
     return { runId, status: 'cancelled' };
   }
 

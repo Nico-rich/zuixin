@@ -4,6 +4,7 @@ import { AgentRuntimeEngine, AgentRuntimeContext, AgentRunOutcome } from '../../
 import { ContextAssembler } from '../../core/context/context-assembler';
 import { ChatMessage } from '../../providers/llm/llm.types';
 import { AgentRunLeaseService } from '../../core/agent-run-lease/agent-run-lease.service';
+import { EventBusService, agentRunChannel } from '../../core/events/event-bus.service';
 import { planResume } from '../../core/agent-loop/resume-planner';
 
 /**
@@ -20,6 +21,7 @@ export class AsyncAgentRunDriver {
     @Inject(AgentRuntimeEngine) private readonly engine: AgentRuntimeEngine,
     @Inject(ContextAssembler) private readonly context: ContextAssembler,
     @Inject(AgentRunLeaseService) private readonly lease: AgentRunLeaseService,
+    @Inject(EventBusService) private readonly events: EventBusService,
   ) {}
 
   async execute(runId: string, signal: AbortSignal, controls: { active: boolean }): Promise<AgentRunOutcome> {
@@ -89,11 +91,15 @@ export class AsyncAgentRunDriver {
     while (true) {
       const { done, value } = await generator.next();
       if (done) { outcome = value; break; }
-      // P3：无 SSE 订阅，事件不消费（P6 接 EventBus 观察层）
+      // M6-P6：engine 事件 → run 观察通道（SSE 实时通知；DB Timeline 投影仍是历史事实来源）
+      await this.events.publish(agentRunChannel(runId), value as Record<string, unknown>).catch(() => undefined);
     }
 
-    // waiting：run 仍存活（已落库 waiting+waitingOnTaskId），assistant Message 保持 streaming，无终态写
-    if (outcome.status !== 'waiting') {
+    if (outcome.status === 'waiting') {
+      // P4 waiting：run 仍存活（已落库 waiting+waitingOnTaskId），assistant Message 保持 streaming，无终态写
+      const taskId = outcome.taskRefs[0];
+      await this.events.publish(agentRunChannel(runId), { type: 'run.waiting', runId, taskId }).catch(() => undefined);
+    } else {
       await this.finalizeAssistantMessage(run, metadata.assistantMessageId, outcome);
     }
     return outcome;
