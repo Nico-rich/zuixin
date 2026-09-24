@@ -1,6 +1,7 @@
 import { ZodSchema } from 'zod';
 
-export type ToolPermission = 'read' | 'write' | 'generate' | 'external_action';
+/** M7-P3：扩展权限位（向后兼容——原有 read/write/generate/external_action 语义不变） */
+export type ToolPermission = 'read' | 'write' | 'generate' | 'external_action' | 'financial' | 'destructive';
 
 /**
  * Tool 执行上下文——由 AgentLoop 服务端注入，Tool 不得自行指定身份。
@@ -25,7 +26,8 @@ export interface Tool {
   inputSchema: ZodSchema;
   outputSchema?: ZodSchema;
   permission: ToolPermission;
-  requiresApproval?: boolean;   // M6 审批预留；M4 全部 false
+  /** M7-P1 起生效：true 时 Engine 审批门接管（async waiting → 人工决定 → resume 执行）；sync 路径仍拒绝 */
+  requiresApproval?: boolean;
   timeoutMs?: number;
   retryPolicy?: { maxRetries: number; retryableCodes: string[] };
   execute(input: unknown, ctx: ToolContext): Promise<unknown>;

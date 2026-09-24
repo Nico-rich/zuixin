@@ -150,6 +150,7 @@ model User {
   approvals     Approval[]
   connections   Connection[]
   oauthStates   OAuthState[]
+  externalActions ExternalAction[]
   knowledgeBases KnowledgeBase[]
   documents      Document[]
 }
@@ -387,6 +388,7 @@ model Project {
   agentRuns     AgentRun[]
   approvals     Approval[]
   connections   Connection[]
+  externalActions ExternalAction[]
   knowledgeBases KnowledgeBase[]
   documents       Document[]
   @@index([userId, updatedAt])
@@ -517,6 +519,7 @@ model AgentRun {
   waitingOnTaskId     String?      // waiting 时等待的 GenerationTask
   waitingOnApprovalId String?      // M7-P1: waiting 时等待的 Approval（与 waitingOnTaskId 互斥）
   waitingOnApproval   Approval?    @relation("RunWaitingApproval", fields: [waitingOnApprovalId], references: [id], onDelete: SetNull)
+  externalActions     ExternalAction[]
   approvals           Approval[]   // 本 run 产生的审批
   retryOfRunId    String?      // Retry = 新 Run 血缘（不重新打开 terminal run）
   retryOf         AgentRun?  @relation("RetryChain", fields: [retryOfRunId], references: [id], onDelete: SetNull)
@@ -554,6 +557,7 @@ model Approval {
   toolCallId  String?
   toolCall    ToolCall?      @relation(fields: [toolCallId], references: [id], onDelete: Cascade)
   waitingRuns AgentRun[]     @relation("RunWaitingApproval")
+  externalActions ExternalAction[]
   status      ApprovalStatus @default(requested)
   riskLevel   String         @default("medium") // low | medium | high
   reason      String
@@ -595,6 +599,7 @@ model Connection {
   createdAt         DateTime         @default(now())
   updatedAt         DateTime         @updatedAt
   credentials       Credential[]
+  externalActions   ExternalAction[]
   @@index([userId, provider])
   @@index([projectId])
   @@index([userId, provider, providerAccountId])
@@ -624,6 +629,51 @@ model OAuthState {
   usedAt    DateTime?
   createdAt DateTime  @default(now())
   @@index([userId, createdAt])
+}
+
+// ===== M7-P3: External Action（副作用执行的统一审计面；绝不存凭证）=====
+enum ExternalActionStatus {
+  pending_approval // 审批中（P1 状态机承接）
+  executing
+  completed
+  failed
+  cancelled
+}
+
+model ExternalAction {
+  id                String               @id @default(uuid())
+  userId            String
+  user              User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId         String?
+  project           Project?             @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  agentRunId        String?
+  agentRun          AgentRun?            @relation(fields: [agentRunId], references: [id], onDelete: SetNull)
+  toolCallId        String?
+  toolCall          ToolCall?            @relation(fields: [toolCallId], references: [id], onDelete: SetNull)
+  approvalId        String?
+  approval          Approval?            @relation(fields: [approvalId], references: [id], onDelete: SetNull)
+  connectionId      String?
+  connection        Connection?          @relation(fields: [connectionId], references: [id], onDelete: SetNull)
+  provider          String
+  actionType        String
+  permission        String               // external_action | financial | destructive（执行时快照）
+  riskLevel         String               // low | medium | high（分类快照）
+  input             Json                 // 业务输入；绝不包含凭证
+  status            ExternalActionStatus @default(pending_approval)
+  externalRequestId String?              // 远端幂等键（Provider Adapter 侧去重）
+  result            Json?
+  errorCode         String?
+  error             String?
+  idempotencyKey    String               // 业务幂等键（同一动作绝不重复执行）
+  startedAt         DateTime?
+  completedAt       DateTime?
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+  @@unique([userId, provider, idempotencyKey])
+  @@index([userId, createdAt])
+  @@index([agentRunId])
+  @@index([approvalId])
+  @@index([toolCallId])
 }
 
 model AgentRunStep {
@@ -661,6 +711,7 @@ model ToolCall {
   tasks          GenerationTask[]
   artifacts      Artifact[]
   approvals      Approval[]
+  externalActions ExternalAction[]
   @@unique([runStepId, idempotencyKey])
   @@index([toolName, startedAt])
 }

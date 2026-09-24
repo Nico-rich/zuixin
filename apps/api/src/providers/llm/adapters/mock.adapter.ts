@@ -27,6 +27,9 @@ export class MockLLMAdapter implements LLMProvider {
   private maybeToolCall(params: ChatParams) {
     if (!params.tools?.length) return null;
     const last = params.messages.at(-1);
+    // 只在用户消息上启发式触发工具（tool 结果是 JSON 且可能回显触发词——如 payload.title 含"发布到"，
+    // 内容匹配会无限再触发同一工具 → run 永久 waiting。真实模型不做此启发式，替身必须隔离）
+    if (last?.role !== 'user') return null;
     const text = typeof last?.content === 'string' ? last.content : '';
     const has = (name: string) => params.tools!.some((t) => t.function.name === name);
     if (/图|图片|海报|主图|插画|logo|图标|banner/i.test(text) && has('image.generate')) {
@@ -37,6 +40,9 @@ export class MockLLMAdapter implements LLMProvider {
     }
     if (/方案|简报|brief/i.test(text) && has('artifact.create')) {
       return { id: 'call_mock_artifact', name: 'artifact.create', arguments: JSON.stringify({ type: 'creative_brief', title: text.slice(0, 40), summary: text }) };
+    }
+    if (/发布到|上架|publish to/i.test(text) && has('external_action.execute')) {
+      return { id: 'call_mock_extact', name: 'external_action.execute', arguments: JSON.stringify({ actionType: 'success', payload: { title: text.slice(0, 40) } }) };
     }
     if (/发布|外部操作|publish/i.test(text) && has('external_action.demo')) {
       return { id: 'call_mock_external', name: 'external_action.demo', arguments: JSON.stringify({ title: text.slice(0, 40), content: text }) };

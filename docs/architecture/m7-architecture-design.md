@@ -145,3 +145,48 @@ DELETE /connections/:id
 
 - 单测：CredentialService 加解密/密文格式；OAuthState 单次消费/过期；refresh 竞态（并发只执行一次远端调用）。
 - e2e：mock provider 全生命周期（start→callback→refresh→revoke→reconnect）、invalid state、expired state、重复 callback、越权矩阵、DB 密文断言。
+
+## 3. M7-P3 External Action Framework
+
+### 3.1 数据模型
+
+- `ExternalAction`：id/userId/projectId?/agentRunId?/toolCallId?/approvalId?/connectionId?/provider/actionType/permission(快照)/riskLevel(快照)/input(Json，绝不含凭证)/status(pending_approval|executing|completed|failed|cancelled)/externalRequestId/result/errorCode/error/idempotencyKey/startedAt/completedAt；
+- `UNIQUE(userId, provider, idempotencyKey)`：同一业务键绝不重复执行外部动作；
+- `ToolPermission` 扩展 `financial`/`destructive`（向后兼容，原有值语义不变）。
+
+### 3.2 执行链（职责固定，绝不短路）
+
+```
+Agent → Tool(external_action.execute) → Engine P1 审批门（waiting → 人工 decide → resume）
+     → ExternalActionService.execute：
+        ① 审批复核（toolCallId/approvalId → Approval 必须 approved——绝不只信 LLM）
+        ② 幂等裁决（completed 复用结果；executing/failed 残留行复用同一 externalRequestId）
+        ③ 连接校验（active；revoked/expired → 409）——校验失败不落孤儿行
+        ④ 行 pending_approval → executing（approval/connection/externalRequestId 绑定）
+        ⑤ Provider Adapter 执行（accessToken 服务端解密注入，绝不落库/回传/进 Tool 结果）
+        ⑥ completed/failed/cancelled 终态落库
+```
+
+### 3.3 幂等与 exactly-once 边界
+
+- 同一 ToolCall resume 重放 → Engine 幂等键 + ExternalAction 唯一键双重去重；
+- 崩溃残留 executing 行 → 复用行 + 同一 externalRequestId 续跑（Provider 侧幂等键）；
+- 语义：ExternalAction = at-least-once + Provider 层 requestId 去重（文档化为边界，不做分布式事务）。
+
+### 3.4 Provider Adapter
+
+- `ExternalActionProvider` 接口 + 注册表；`MockExternalActionProvider` 测试向量（success/failure/timeout/retry/duplicate/forbidden + AbortSignal）；
+- 真实平台适配器（shopify/amazon/meta/google/tiktok）留接口位，无真实凭据不实现、不伪造。
+
+### 3.5 API
+
+```
+GET /external-actions?agentRunId=   （审计读取面，userId 首条件）
+GET /external-actions/:id
+```
+
+### 3.6 测试
+
+- 单测 9：审批复核/幂等复用/残留行续跑/连接三类失败无孤儿行/失败落库/取消落库/不支持 provider/风险分级。
+- e2e 8：全链路审批执行+审计绑定、reject 零副作用、failure/retry/timeout 向量、崩溃残留幂等、连接吊销、越权。
+- **实测修复**：MockLLM 启发式只在 role=user 消息触发——tool 结果 JSON 回显触发词（payload.title 含"发布到"）会无限再触发同一工具 → run 永久 waiting。
