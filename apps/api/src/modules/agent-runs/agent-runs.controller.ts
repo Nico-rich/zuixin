@@ -38,4 +38,16 @@ export class AgentRunsController {
   timelineOf(@Req() req: Request & { user: AuthedUser }, @Param('id') id: string) {
     return this.timeline.build(req.user.userId, id);
   }
+
+  /** M6-P5 Cancel：queued/running/waiting → cancelled（原子条件更新；已终态 409，越权 404） */
+  @Post(':id/cancel')
+  cancel(@Req() req: Request & { user: AuthedUser }, @Param('id') id: string) {
+    return this.runs.cancel(req.user.userId, id);
+  }
+
+  /** M6-P5 Retry：终态 run → 新 run（retryOfRunId 血缘 + attempt+1；幂等唯一索引，越权 404） */
+  @Post(':id/retry')
+  retry(@Req() req: Request & { user: AuthedUser }, @Param('id') id: string) {
+    return this.runs.retry(req.user.userId, id);
+  }
 }

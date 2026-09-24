@@ -1,10 +1,12 @@
-import { Inject, Injectable, Logger, OnApplicationShutdown } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnApplicationShutdown, OnModuleInit } from '@nestjs/common';
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job } from 'bullmq';
 import { hostname } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { AGENT_RUN_QUEUE } from '../../core/queue/queue.module';
 import { AgentRunLeaseService } from '../../core/agent-run-lease/agent-run-lease.service';
+import { EventBusService } from '../../core/events/event-bus.service';
+import { AGENT_RUN_CANCEL_CHANNEL } from '../../modules/agent-runs/agent-runs.service';
 import { AsyncAgentRunDriver } from './async-agent-run.driver';
 
 /**
@@ -15,7 +17,7 @@ import { AsyncAgentRunDriver } from './async-agent-run.driver';
  */
 @Processor(AGENT_RUN_QUEUE, { concurrency: Number(process.env.AGENT_RUN_WORKER_CONCURRENCY ?? 2) })
 @Injectable()
-export class AgentRunProcessor extends WorkerHost implements OnApplicationShutdown {
+export class AgentRunProcessor extends WorkerHost implements OnApplicationShutdown, OnModuleInit {
   private readonly logger = new Logger('AgentRunWorker');
   private readonly instanceId = `${hostname()}:${process.pid}:${randomBytes(4).toString('hex')}`;
   private active: { abort: AbortController; controls: { active: boolean }; runId: string; workerId: string } | null = null;
@@ -23,8 +25,20 @@ export class AgentRunProcessor extends WorkerHost implements OnApplicationShutdo
   constructor(
     @Inject(AgentRunLeaseService) private readonly lease: AgentRunLeaseService,
     @Inject(AsyncAgentRunDriver) private readonly driver: AsyncAgentRunDriver,
+    @Inject(EventBusService) private readonly events: EventBusService,
   ) {
     super();
+  }
+
+  /** M6-P5 cancel 快速通道：Redis 提示 → 立即 abort 本地 Engine（DB 条件更新与心跳 15s 仍是事实兜底） */
+  async onModuleInit(): Promise<void> {
+    await this.events.subscribe(AGENT_RUN_CANCEL_CHANNEL, (event) => {
+      const runId = event.runId as string | undefined;
+      if (runId && this.active?.runId === runId) {
+        this.logger.warn({ runId }, '收到 cancel 提示（快速通道）→ abort Engine');
+        this.active.abort.abort();
+      }
+    });
   }
 
   async process(job: Job<{ runId?: string }>): Promise<void> {

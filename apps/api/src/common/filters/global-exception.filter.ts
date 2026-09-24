@@ -42,6 +42,7 @@ export class GlobalExceptionFilter implements ExceptionFilter {
       case 'NOT_FOUND': return HttpStatus.NOT_FOUND;
       case 'QUOTA_EXCEEDED': case 'RATE_LIMITED': return HttpStatus.TOO_MANY_REQUESTS;
       case 'TASK_NOT_CANCELLABLE': return HttpStatus.CONFLICT;
+      case 'RUN_NOT_CANCELLABLE': case 'RUN_NOT_RETRYABLE': return HttpStatus.CONFLICT; // M6-P5：终态不可取消/非终态不可重试
       case 'UNSUPPORTED_PARAMETER': return HttpStatus.BAD_REQUEST;
       default: return HttpStatus.BAD_GATEWAY; // provider 类错误
     }

@@ -74,17 +74,19 @@ describe('M6-P2 取消链路 (e2e, 慢速 mock + 连接销毁)', () => {
     // 等待引擎收尾（abort → cancelled 终态 + finalize）
     await new Promise((r) => setTimeout(r, 800));
 
-    const runs = await prisma.agentRun.findMany({ orderBy: { createdAt: 'desc' }, take: 5, where: { status: 'cancelled' } });
-    expect(runs.length).toBeGreaterThanOrEqual(1);
-    const run = runs[0];
-    expect(run.errorCode).toBeNull(); // cancelled 不是失败，无错误码
+    // 本测试的 run 精确定位（全量并行跑时其他套件也会产生 cancelled 行——按本测试消息内容归因，不做全局查询）
+    const userMsg = await prisma.message.findFirst({ where: { content: '今天天气怎么样呀，请慢慢讲给我听', role: 'user' }, orderBy: { createdAt: 'desc' } });
+    expect(userMsg).toBeTruthy();
+    const run = await prisma.agentRun.findFirst({ where: { conversationId: userMsg!.conversationId, status: 'cancelled' } });
+    expect(run).toBeTruthy();
+    expect(run!.errorCode).toBeNull(); // cancelled 不是失败，无错误码
 
     // 中断回合 usage：AGENT_CANCELLED（M6-A8 归因）
-    const usage = await prisma.usageRecord.findMany({ where: { runId: run.id } });
+    const usage = await prisma.usageRecord.findMany({ where: { runId: run!.id } });
     expect(usage.some((u) => u.errorCode === 'AGENT_CANCELLED')).toBe(true);
 
     // assistant message 落库 cancelled（M1 语义：保留部分内容）
-    const msg = await prisma.message.findMany({ where: { conversationId: run.conversationId!, role: 'assistant' }, orderBy: { createdAt: 'desc' }, take: 1 });
+    const msg = await prisma.message.findMany({ where: { conversationId: run!.conversationId!, role: "assistant" }, orderBy: { createdAt: 'desc' }, take: 1 });
     expect(msg[0].status).toBe('cancelled');
   });
 

@@ -76,6 +76,9 @@ export interface AgentRunOutcome {
 const DEFAULT_MAX_STEPS = 8;
 const DEFAULT_DEADLINE_MS = 120_000;
 const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
+/** P5-10：LLM 瞬时故障回合内重试上限与退避（1s/4s + 调用侧全幅 jitter ±30%） */
+const LLM_MAX_RETRIES = 2;
+const LLM_RETRY_BACKOFF_MS = [1000, 4000];
 /** Tool Result 内容预算（确定性截断，防止多工具结果无限增长；消息配对不受影响） */
 const TOOL_RESULT_MAX_CHARS = 4000;
 const TOOL_RESULTS_TOTAL_MAX_CHARS = 8000;
@@ -200,21 +203,45 @@ export class AgentRuntimeEngine {
         }
         const toolsToSend = toolDefs.length && supportsTools ? toolDefs : undefined;
         const turnStarted = Date.now();
-        // 每回合 LLM 用量落库（M5-P4：成功/失败均记录——失败回合可能已计费，必须可观测）
+        // P5-10：LLM 瞬时故障回合内自动重试（maxRetries=2，指数退避 + 全幅 jitter ±30%）；
+        // 每回合一条 usage（回合粒度，非尝试粒度）；不可重试错误/取消直通（不重试）。
         let toolCalls: Array<{ id: string; name: string; arguments: string }> | undefined;
         let turnText = '';
-        try {
-          const stream = resolved.adapter.stream({
-            model: resolved.apiModelId, messages, temperature: ctx.agent.temperature ?? 0.7,
-            maxTokens: ctx.agent.maxTokens, tools: toolsToSend, signal: ctx.signal,
-          });
-          for await (const chunk of stream) {
-            if (chunk.type === 'text') {
-              content += chunk.text; turnText += chunk.text;
-              yield { type: 'text.delta', text: chunk.text };
-            } else if (chunk.type === 'tool_calls') toolCalls = chunk.toolCalls;
+        let turnError: unknown = null;
+        for (let attempt = 0; attempt <= LLM_MAX_RETRIES; attempt++) {
+          const contentLenAtAttempt = content.length; // 失败重试回滚本回合部分文本（避免重复计入最终回答）
+          const turnLenAtAttempt = turnText.length;
+          try {
+            const stream = resolved.adapter.stream({
+              model: resolved.apiModelId, messages, temperature: ctx.agent.temperature ?? 0.7,
+              maxTokens: ctx.agent.maxTokens, tools: toolsToSend, signal: ctx.signal,
+            });
+            for await (const chunk of stream) {
+              if (chunk.type === 'text') {
+                content += chunk.text; turnText += chunk.text;
+                yield { type: 'text.delta', text: chunk.text };
+              } else if (chunk.type === 'tool_calls') toolCalls = chunk.toolCalls;
+            }
+            turnError = null;
+            break;
+          } catch (err) {
+            turnError = err;
+            content = content.slice(0, contentLenAtAttempt);
+            turnText = turnText.slice(0, turnLenAtAttempt);
+            // M6-A8：用户取消优先识别（绝不伪装 provider failure，也绝不重试已取消的回合）
+            if (ctx.signal.aborted) break;
+            const appErr = err instanceof AppError ? err : mapProviderError(err as ProviderLikeError);
+            if (!appErr.retryable || attempt >= LLM_MAX_RETRIES) break;
+            const jitter = 0.7 + Math.random() * 0.6;
+            yield { type: 'status', stage: 'agent', message: '模型暂时不可用，正在重试…' };
+            try {
+              await this.sleep(Math.round(LLM_RETRY_BACKOFF_MS[Math.min(attempt, LLM_RETRY_BACKOFF_MS.length - 1)] * jitter), ctx.signal);
+            } catch {
+              break; // 退避被取消打断 → 走取消路径（turnError 保留 → AGENT_CANCELLED usage）
+            }
           }
-        } catch (err) {
+        }
+        if (turnError) {
           // M6-A8：用户取消 → cancelled（绝不伪装成 provider failure）；中断回合仍记 usage（可能已计费）
           if (ctx.signal.aborted) {
             finalStatus = 'cancelled';
@@ -226,14 +253,14 @@ export class AgentRuntimeEngine {
             });
             break;
           }
-          const appErr = err instanceof AppError ? err : mapProviderError(err as ProviderLikeError);
+          const appErr = turnError instanceof AppError ? turnError : mapProviderError(turnError as ProviderLikeError);
           await this.persistence.recordChatUsage({
             userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.messageId ?? '',
             providerId: resolved.providerId, modelId: resolved.modelId, runId,
             inputTokens: 0, outputTokens: 0, latencyMs: Date.now() - turnStarted,
             status: 'failed', errorCode: appErr.code,
           });
-          throw err;
+          throw turnError;
         }
         await this.persistence.recordChatUsage({
           userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.messageId ?? '',
@@ -424,22 +451,55 @@ export class AgentRuntimeEngine {
       toolCallId, idempotencyKey, signal,
     };
     const startedAt = Date.now();
-    try {
-      const combinedSignal = AbortSignal.any([signal, AbortSignal.timeout(tool.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS)]);
-      const output = await tool.execute(parsedInput, { ...toolCtx, signal: combinedSignal });
+    // P5-10：tool.retryPolicy 消费（M6 起生效；未声明 policy = 不重试，M0~M5 行为冻结）。
+    // 同一 ToolCall 行内重试；瞬时失败（retryableCodes/RETRYABLE_CODES）才重试，入参非法/权限/取消不重试。
+    const policy = tool.retryPolicy;
+    const maxToolAttempts = policy ? policy.maxRetries + 1 : 1;
+    let output: unknown;
+    let lastErr: unknown = null;
+    let attemptsUsed = 0;
+    for (let attemptIdx = 0; attemptIdx < maxToolAttempts; attemptIdx++) {
+      attemptsUsed++;
+      try {
+        const combinedSignal = AbortSignal.any([signal, AbortSignal.timeout(tool.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS)]);
+        output = await tool.execute(parsedInput, { ...toolCtx, signal: combinedSignal });
+        lastErr = null;
+        break;
+      } catch (err) {
+        lastErr = err;
+        if (!policy || signal.aborted) break; // 无策略 / 已取消 → 不重试（取消在下一步步首检查中被识别）
+        const appErr = err instanceof AppError ? err : new AppError(ErrorCode.PROVIDER_UNKNOWN, (err as Error).message);
+        const retryable = policy.retryableCodes.includes(appErr.code) || appErr.retryable;
+        if (!retryable || attemptIdx >= policy.maxRetries) break;
+        try {
+          await this.sleep(Math.round(500 * (attemptIdx + 1) * (0.7 + Math.random() * 0.6)), signal);
+        } catch {
+          break; // 退避被取消打断 → 失败回喂（取消在下一步步首检查中被识别）
+        }
+      }
+    }
+    if (lastErr === null) {
       await this.persistence.updateToolCall(toolCallId, {
         output, status: 'completed', completedAt: new Date(), durationMs: Date.now() - startedAt,
-        incrementAttempts: retryingExistingRow, // 同一行重试可观测
+        incrementAttempts: retryingExistingRow || attemptsUsed > 1, // 同一行重试可观测
       }).catch((err) => this.logger.warn(`ToolCall 完成更新失败（幂等兜底）: ${(err as Error).message}`));
       return { status: 'completed', output, outputSummary: this.summarize(call.name, output) };
-    } catch (err) {
-      // M5 行为冻结：工具层失败一律回喂模型（含取消中断）——取消在下一步步首检查中被识别
-      const appErr = err instanceof AppError ? err : new AppError(ErrorCode.PROVIDER_UNKNOWN, (err as Error).message);
-      await this.persistence.updateToolCall(toolCallId, {
-        status: 'failed', errorCode: appErr.code, errorMessage: appErr.message, completedAt: new Date(), durationMs: Date.now() - startedAt,
-      }).catch((e) => this.logger.warn(`ToolCall 失败更新异常: ${(e as Error).message}`));
-      return { status: 'failed', error: appErr.message, outputSummary: `${call.name}：执行失败` };
     }
+    // M5 行为冻结：工具层失败一律回喂模型（含取消中断）——取消在下一步步首检查中被识别
+    const appErr = lastErr instanceof AppError ? lastErr : new AppError(ErrorCode.PROVIDER_UNKNOWN, (lastErr as Error).message);
+    await this.persistence.updateToolCall(toolCallId, {
+      status: 'failed', errorCode: appErr.code, errorMessage: appErr.message, completedAt: new Date(), durationMs: Date.now() - startedAt,
+    }).catch((e) => this.logger.warn(`ToolCall 失败更新异常: ${(e as Error).message}`));
+    return { status: 'failed', error: appErr.message, outputSummary: `${call.name}：执行失败` };
+  }
+
+  /** 可中断 sleep（cancel 期间退避立即可恢复，不拖延取消） */
+  private async sleep(ms: number, signal: AbortSignal): Promise<void> {
+    if (signal.aborted) throw new Error('aborted');
+    await new Promise<void>((resolve, reject) => {
+      const t = setTimeout(resolve, ms);
+      signal.addEventListener('abort', () => { clearTimeout(t); reject(new Error('aborted')); }, { once: true });
+    });
   }
 
   /**

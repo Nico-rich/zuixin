@@ -4,6 +4,7 @@ import { AgentRuntimeEngine, AgentRuntimeContext, AgentRunOutcome } from './agen
 import { ToolRegistry } from '../tools/tool-registry.service';
 import { Tool } from '../tools/tool.types';
 import { AgentRuntimePersistence } from './runtime-persistence';
+import { AppError, ErrorCode } from '../../common/errors/app-error';
 
 function makeRegistry(tools: Tool[] = []) {
   const registry = new ToolRegistry();
@@ -82,6 +83,11 @@ async function run(engine: AgentRuntimeEngine, input: AgentRuntimeContext): Prom
     events.push(value as { type: string; [k: string]: unknown });
   }
   return { events, outcome };
+}
+
+/** 异步模式输入（runId + workerId + resume 计划；tools 需与被测 engine 一致） */
+function asyncInput(overrides: Partial<AgentRuntimeContext> = {}, tools: Tool[] = []): AgentRuntimeContext {
+  return { ...makeEngine({ tools }).input, runId: 'run-existing', workerId: 'worker-A', seedTranscript: false, ...overrides };
 }
 
 const imageTool: Tool = {
@@ -462,10 +468,6 @@ describe('AgentRuntimeEngine（M6-P4 durable resume + waiting）', () => {
   beforeEach(() => { vi.clearAllMocks(); });
 
   /** 异步模式输入（runId + workerId + resume 计划；tools 需与被测 engine 一致） */
-  function asyncInput(overrides: Partial<AgentRuntimeContext> = {}, tools: Tool[] = []): AgentRuntimeContext {
-    return { ...makeEngine({ tools }).input, runId: 'run-existing', workerId: 'worker-A', seedTranscript: false, ...overrides };
-  }
-
   it('P4-3 resume tools：已持久化 tool decision 继续执行——绝不重新调用 LLM（本回合 0 次 LLM）', async () => {
     const streamFn = vi.fn(async function* () { yield { type: 'text', text: '续跑完成' }; });
     const { engine, persistence, state } = makeEngine({ tools: [imageTool], streamFn });
@@ -585,5 +587,110 @@ describe('AgentRuntimeEngine（M6-P4 durable resume + waiting）', () => {
     expect(outcome.status).toBe('timeout');
     expect(imageTool.execute).not.toHaveBeenCalled();
     expect(streamFn).not.toHaveBeenCalled();
+  });
+});
+
+describe('AgentRuntimeEngine（M6-P5 LLM 瞬时重试 + tool retryPolicy）', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('P5-10 LLM transient：2 次瞬时失败后成功 → 3 次尝试，回合仅 1 条 success usage（回合粒度）', async () => {
+    let calls = 0;
+    const streamFn = vi.fn(async function* () {
+      calls++;
+      if (calls <= 2) throw new AppError(ErrorCode.PROVIDER_TIMEOUT, 'timeout');
+      yield { type: 'text', text: '恢复成功' };
+    });
+    const { engine, state } = makeEngine({ streamFn });
+    const { outcome } = await run(engine, makeEngine().input);
+    expect(outcome.status).toBe('completed');
+    expect(calls).toBe(3); // 初次 + 2 次重试
+    expect(state.usage).toHaveLength(1);
+    expect(state.usage[0]).toMatchObject({ status: 'success' });
+  });
+
+  it('P5-10 不可重试错误（AUTH）→ 不重试，usage failed + run failed', async () => {
+    const streamFn = vi.fn(async function* () {
+      throw new AppError(ErrorCode.PROVIDER_AUTH, 'auth fail');
+    });
+    const { engine, state } = makeEngine({ streamFn });
+    const { outcome } = await run(engine, makeEngine().input);
+    expect(outcome.status).toBe('failed');
+    expect(streamFn).toHaveBeenCalledTimes(1);
+    expect(state.usage[0]).toMatchObject({ status: 'failed', errorCode: ErrorCode.PROVIDER_AUTH });
+  });
+
+  it('P5-10 重试耗尽（3 次全失败）→ failed + 1 条 usage（回合粒度，非尝试粒度）', async () => {
+    const streamFn = vi.fn(async function* () {
+      throw new AppError(ErrorCode.PROVIDER_OVERLOADED, 'overloaded');
+    });
+    const { engine, state } = makeEngine({ streamFn });
+    const { outcome } = await run(engine, makeEngine().input);
+    expect(outcome.status).toBe('failed');
+    expect(streamFn).toHaveBeenCalledTimes(3);
+    expect(state.usage).toHaveLength(1);
+    expect(state.usage[0]).toMatchObject({ status: 'failed', errorCode: ErrorCode.PROVIDER_OVERLOADED });
+  });
+
+  it('P5-3 退避期间 cancel → 立即停止，不重试已取消回合，usage = AGENT_CANCELLED', async () => {
+    const ac = new AbortController();
+    let calls = 0;
+    const streamFn = vi.fn(async function* () {
+      calls++;
+      throw new AppError(ErrorCode.PROVIDER_TIMEOUT, 'timeout'); // 每次尝试都瞬时失败（退避 1s+）
+    });
+    const { engine, state } = makeEngine({ streamFn });
+    const input = { ...makeEngine().input, signal: ac.signal };
+    setTimeout(() => ac.abort(), 150); // 第一次退避（~1s）期间取消
+    const { outcome } = await run(engine, input);
+    expect(outcome.status).toBe('cancelled');
+    expect(calls).toBeLessThan(3); // 退避被打断，绝不重试已取消回合
+    expect(state.usage[0]).toMatchObject({ status: 'failed', errorCode: ErrorCode.AGENT_CANCELLED });
+  });
+
+  it('P5-10 tool retryPolicy：瞬时失败 1 次后成功 → 同一行重试（attempts 递增），结果回喂', async () => {
+    const flakyTool: Tool = {
+      name: 'image.generate', description: 'x', permission: 'generate',
+      inputSchema: z.strictObject({ prompt: z.string().min(1) }),
+      retryPolicy: { maxRetries: 1, retryableCodes: [ErrorCode.PROVIDER_TIMEOUT] },
+      execute: vi.fn()
+        .mockRejectedValueOnce(new AppError(ErrorCode.PROVIDER_TIMEOUT, 't'))
+        .mockResolvedValue({ taskId: 'task-9', status: 'completed' }),
+    };
+    let turn = 0;
+    const streamFn = vi.fn(async function* () {
+      turn++;
+      if (turn === 1) yield { type: 'tool_calls', toolCalls: [{ id: 'c1', name: 'image.generate', arguments: '{"prompt":"x"}' }] };
+      else yield { type: 'text', text: '完成' };
+    });
+    const { engine, state } = makeEngine({ tools: [flakyTool], streamFn });
+    const { outcome } = await run(engine, asyncInput({}, [flakyTool]));
+    expect(flakyTool.execute).toHaveBeenCalledTimes(2);
+    expect(outcome.status).toBe('completed');
+    expect(state.toolCallUpdates[0]).toMatchObject({ data: { status: 'completed', incrementAttempts: true } });
+  });
+
+  it('P5-10 tool retryPolicy：不可重试错误 → 不重试（1 次执行即回喂）', async () => {
+    const strictTool: Tool = {
+      name: 'image.generate', description: 'x', permission: 'generate',
+      inputSchema: z.strictObject({ prompt: z.string().min(1) }),
+      retryPolicy: { maxRetries: 2, retryableCodes: [ErrorCode.PROVIDER_TIMEOUT] },
+      execute: vi.fn().mockRejectedValue(new AppError(ErrorCode.PROVIDER_AUTH, 'no')),
+    };
+    const streamFn = vi.fn(async function* () { yield { type: 'text', text: '完成' }; });
+    const { engine } = makeEngine({ tools: [strictTool], streamFn });
+    await run(engine, asyncInput({ resume: { mode: 'tools', startStep: 0, pendingCalls: [{ llmCallId: 'c1', name: 'image.generate', arguments: '{"prompt":"x"}', toolIndex: 0 }], lastToolSignature: null } }, [strictTool]));
+    expect(strictTool.execute).toHaveBeenCalledTimes(1); // 权限类错误绝不重试
+  });
+
+  it('P5-10 未声明 retryPolicy → 单次执行（M0~M5 行为冻结）', async () => {
+    const plainTool: Tool = {
+      name: 'image.generate', description: 'x', permission: 'generate',
+      inputSchema: z.strictObject({ prompt: z.string().min(1) }),
+      execute: vi.fn().mockRejectedValue(new AppError(ErrorCode.PROVIDER_TIMEOUT, 't')),
+    };
+    const streamFn = vi.fn(async function* () { yield { type: 'text', text: '完成' }; });
+    const { engine } = makeEngine({ tools: [plainTool], streamFn });
+    await run(engine, asyncInput({ resume: { mode: 'tools', startStep: 0, pendingCalls: [{ llmCallId: 'c1', name: 'image.generate', arguments: '{"prompt":"x"}', toolIndex: 0 }], lastToolSignature: null } }, [plainTool]));
+    expect(plainTool.execute).toHaveBeenCalledTimes(1);
   });
 });

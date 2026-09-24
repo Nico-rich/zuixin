@@ -137,6 +137,25 @@ export class AgentRunLeaseService {
         }
         continue;
       }
+      if (row.status === 'queued') {
+        // 丢失 job 兜底（dead-letter 语义）：job 因同键碰撞/重试耗尽消失而 run 仍 queued → 重新入队
+        // （claim 条件更新为最终防线，重复入队幂等——绝不产生重复执行）
+        const queuedFor = now.getTime() - row.startedAt.getTime();
+        if (queuedFor > 2 * DEFAULT_LEASE_TTL_MS) {
+          await this.agentRunQueue.add(
+            'execute',
+            { runId: row.id },
+            {
+              jobId: `run-${row.id}-recover-${now.getTime()}`,
+              attempts: 2, backoff: { type: 'exponential', delay: 2000 },
+              removeOnComplete: true, removeOnFail: { count: 500 },
+            },
+          );
+          reEnqueued++;
+          this.logger.warn({ runId: row.id }, 'queued 超时无执行迹象（job 丢失）→ 兜底重入队');
+        }
+        continue;
+      }
       if (row.status === 'waiting' && row.waitingOnTaskId) {
         // hook 丢失兜底：任务已终态但 run 仍 waiting → 唤醒（hook 与 sweep 双通道，至少一次语义 + 幂等）
         const task = await this.prisma.generationTask.findUnique({

@@ -68,7 +68,10 @@ export class AgentRunResumeTrigger {
       'execute',
       { runId },
       {
-        jobId: `run-${runId}`, // 与 create 同键：活跃/已完成的同键 job 去重（BullMQ 禁冒号）
+        // 唯一键：不得复用 create 的 `run-{runId}`——原 job 可能尚未被 removeOnComplete 移除，
+        // BullMQ 同键 add 会命中已有 job 而不再入队（run 永久 stuck queued）。重复唤醒的去重
+        // 由条件更新 waiting→queued（原子）与 claim（最终防线）承担，不依赖 jobId。
+        jobId: `run-${runId}-wake-${Date.now()}`,
         attempts: 2, backoff: { type: 'exponential', delay: 2000 },
         removeOnComplete: true, removeOnFail: { count: 500 },
       },

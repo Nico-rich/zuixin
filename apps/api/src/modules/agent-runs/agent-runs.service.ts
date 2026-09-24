@@ -1,11 +1,18 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
+import { AgentRunStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AgentRunMessagesService } from './agent-run-messages.service';
 import { AGENT_RUN_QUEUE } from '../../core/queue/queue.module';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
+import { EventBusService } from '../../core/events/event-bus.service';
 import { CreateAgentRunDto } from './agent-runs.dto';
+
+const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled', 'timeout'] as const;
+const ACTIVE_STATUSES = ['queued', 'running', 'waiting'] as const;
+/** cancel 提示通道（Redis Pub/Sub 快速通道；DB 条件更新仍是唯一事实来源） */
+export const AGENT_RUN_CANCEL_CHANNEL = 'agent-run:cancel';
 
 /**
  * AgentRun 读写（M4 只读 + M6-P3 异步创建入口）：
@@ -18,6 +25,7 @@ export class AgentRunsService {
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(AgentRunMessagesService) private readonly messages: AgentRunMessagesService,
     @InjectQueue(AGENT_RUN_QUEUE) private readonly agentRunQueue: Queue,
+    @Inject(EventBusService) private readonly events: EventBusService,
   ) {}
 
   async get(userId: string, id: string) {
@@ -108,6 +116,124 @@ export class AgentRunsService {
       },
     );
     return { runId: run.id, status: 'queued' };
+  }
+
+  /**
+   * M6-P5 Cancel（原子状态转换）：
+   * - 条件更新 queued/running/waiting → cancelled（count=0 = 已终态 → 409 RUN_NOT_CANCELLABLE）；
+   * - 终态绝不重新打开；cancel 与 complete/timeout 竞争由 DB 串行裁决（输家 count=0）；
+   * - waiting 附带 best-effort 任务取消意图（仅 pending → cancelled；processing 不打断，其完成后的
+   *   唤醒 hook 发现 run 已非 waiting → no-op，TOCTOU 由此闭合）；
+   * - Redis 提示通道（快速取消，非事实来源）——worker 心跳 15s 兜底检测 DB 状态。
+   */
+  async cancel(userId: string, runId: string) {
+    const run = await this.prisma.agentRun.findFirst({ where: { id: runId, userId }, select: { id: true, status: true, waitingOnTaskId: true } });
+    if (!run) throw new AppError(ErrorCode.NOT_FOUND, '运行不存在');
+    const done = await this.prisma.agentRun.updateMany({
+      where: { id: runId, userId, status: { in: ACTIVE_STATUSES as unknown as AgentRunStatus[] } },
+      data: { status: 'cancelled', completedAt: new Date() },
+    });
+    if (done.count === 0) throw new AppError(ErrorCode.RUN_NOT_CANCELLABLE, '运行已结束，无法取消');
+
+    // 等待中的生成任务：pending → cancelled（best-effort 取消意图；任务终态 hook 不会复活已 cancelled 的 run）
+    if (run.status === 'waiting' && run.waitingOnTaskId) {
+      await this.prisma.generationTask.updateMany({
+        where: { id: run.waitingOnTaskId, status: 'pending' },
+        data: { status: 'cancelled', statusMessage: 'Agent 运行已取消', completedAt: new Date() },
+      }).catch(() => undefined);
+    }
+    // 快速通道：worker 收到提示立即 abort（heartbeat 15s 仍是 DB 事实兜底）
+    await this.events.publish(AGENT_RUN_CANCEL_CHANNEL, { runId }).catch(() => undefined);
+    return { runId, status: 'cancelled' };
+  }
+
+  /**
+   * M6-P5 Retry（绝不重新打开旧 Run）：
+   * - 旧 run 必须终态（否则 409 RUN_NOT_RETRYABLE）；旧 run 永远保持 terminal；
+   * - 新 run：retryOfRunId=旧run.id、attempt=旧.attempt+1、同 conversation 新 assistant 消息；
+   *   用户消息从旧 transcript 第一条 user 消息复制（不新建 user Message，避免用户气泡重复）；
+   * - 上下文重新组装（retry = 新执行，允许新上下文）；Agent 重新验证 scope（enabled+system）+ activeVersion 重解析；
+   * - 幂等：DB 部分唯一索引 (retryOfRunId)——重复 POST retry 返回同一 retry run，绝不多建。
+   */
+  async retry(userId: string, oldRunId: string) {
+    const old = await this.prisma.agentRun.findFirst({ where: { id: oldRunId, userId }, select: { id: true, status: true, attempt: true, conversationId: true, projectId: true, agentId: true, metadata: true } });
+    if (!old) throw new AppError(ErrorCode.NOT_FOUND, '运行不存在');
+    if (!(TERMINAL_STATUSES as readonly string[]).includes(old.status)) {
+      throw new AppError(ErrorCode.RUN_NOT_RETRYABLE, '运行尚未结束，无法重试');
+    }
+    // 幂等：已有 retry 子 run → 直接返回（并发下由部分唯一索引兜底 P2002 → 查重返回）
+    const existingRetry = await this.prisma.agentRun.findFirst({ where: { userId, retryOfRunId: old.id } });
+    if (existingRetry) return { runId: existingRetry.id, status: existingRetry.status, attempt: existingRetry.attempt, retryOfRunId: old.id };
+
+    // 用户消息：旧 transcript 第一条 user 行（sync 旧 run 无 transcript → 回退 metadata.userMessageId 的 Message 内容）
+    const userTranscript = await this.prisma.agentRunMessage.findFirst({ where: { runId: old.id, role: 'user' }, orderBy: { sequence: 'asc' } });
+    let retryMessage = userTranscript?.content;
+    if (!retryMessage) {
+      const userMessageId = (old.metadata as { userMessageId?: string } | null)?.userMessageId;
+      const m = userMessageId ? await this.prisma.message.findFirst({ where: { id: userMessageId, userId } }) : null;
+      retryMessage = m?.content ?? undefined;
+    }
+    if (!retryMessage) throw new AppError(ErrorCode.RUN_NOT_RETRYABLE, '无可重试的用户消息');
+
+    // 重新验证 scope：Agent 仍 enabled+system；版本 = 当前 activeVersion（retry = 新执行）
+    const agent = await this.prisma.agent.findFirst({
+      where: { id: old.agentId, enabled: true, scope: 'system' },
+      include: { activeVersion: true },
+    });
+    if (!agent || !agent.activeVersion) throw new AppError(ErrorCode.RUN_NOT_RETRYABLE, 'Agent 已不可用，无法重试');
+    const version = agent.activeVersion;
+    const config = (version.config ?? {}) as { maxSteps?: number };
+
+    // conversation：原对话仍属用户且未删除 → 复用；否则新建（同 projectId 语义）
+    let conversationId = old.conversationId;
+    if (conversationId) {
+      const c = await this.prisma.conversation.findFirst({ where: { id: conversationId, userId, deletedAt: null } });
+      if (!c) conversationId = null;
+    }
+    const projectId = old.projectId
+      ? ((await this.prisma.project.findFirst({ where: { id: old.projectId, userId, deletedAt: null } }))?.id ?? null)
+      : null;
+    if (!conversationId) {
+      const created = await this.prisma.conversation.create({ data: { userId, projectId } });
+      conversationId = created.id;
+    }
+
+    const assistantMessage = await this.prisma.message.create({
+      data: { conversationId, userId, role: 'assistant', content: '', status: 'streaming' },
+    });
+
+    const create = () => this.prisma.agentRun.create({
+      data: {
+        userId, agentId: agent.id, agentVersionId: version.id,
+        projectId, conversationId,
+        status: 'queued', maxSteps: config.maxSteps ?? 8,
+        retryOfRunId: old.id, attempt: old.attempt + 1,
+        metadata: { agentTools: version.tools ?? [], assistantMessageId: assistantMessage.id, async: true, retryOf: old.id },
+      },
+    });
+    let run: { id: string; status: string; attempt: number };
+    try {
+      run = await create();
+    } catch (err) {
+      // 并发重复 retry：部分唯一索引 P2002 → 返回已存在的 retry run（绝不产生第二个）
+      if ((err as { code?: string }).code === 'P2002') {
+        const won = await this.prisma.agentRun.findFirst({ where: { userId, retryOfRunId: old.id } });
+        if (won) return { runId: won.id, status: won.status, attempt: won.attempt, retryOfRunId: old.id };
+      }
+      throw err;
+    }
+    // transcript seed：旧用户消息复制（seq 0；retry 上下文由 worker 首次执行时重新组装）
+    await this.messages.append(userId, run.id, { role: 'user', content: retryMessage });
+    await this.agentRunQueue.add(
+      'execute',
+      { runId: run.id },
+      {
+        jobId: `run-${run.id}`,
+        attempts: 2, backoff: { type: 'exponential', delay: 2000 },
+        removeOnComplete: true, removeOnFail: { count: 500 },
+      },
+    );
+    return { runId: run.id, status: run.status, attempt: run.attempt, retryOfRunId: old.id };
   }
 
   private async requireConversation(userId: string, id: string) {
