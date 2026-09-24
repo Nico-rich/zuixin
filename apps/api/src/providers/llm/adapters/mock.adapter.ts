@@ -44,6 +44,24 @@ export class MockLLMAdapter implements LLMProvider {
     if (/发布到|上架|publish to/i.test(text) && has('external_action.execute')) {
       return { id: 'call_mock_extact', name: 'external_action.execute', arguments: JSON.stringify({ actionType: 'success', payload: { title: text.slice(0, 40) } }) };
     }
+    if (/广告|投放|ROAS/i.test(text) && has('commerce.ads.performance')) {
+      return { id: 'call_mock_ads', name: 'commerce.ads.performance', arguments: JSON.stringify({ timeRange: { days: 30 } }) };
+    }
+    if (/流量|访客/i.test(text) && has('commerce.traffic.summary')) {
+      return { id: 'call_mock_traffic', name: 'commerce.traffic.summary', arguments: JSON.stringify({ timeRange: { days: 30 } }) };
+    }
+    if (/对比|环比|同比/i.test(text) && has('commerce.analytics.compare')) {
+      return { id: 'call_mock_compare', name: 'commerce.analytics.compare', arguments: JSON.stringify({ base: { days: 30 }, compare: { days: 30 } }) };
+    }
+    if (/商品|产品|选品/i.test(text) && has('commerce.products.list')) {
+      return { id: 'call_mock_products', name: 'commerce.products.list', arguments: JSON.stringify({ page: 1, pageSize: 10 }) };
+    }
+    if (/订单|成交|购买/i.test(text) && has('commerce.orders.summary')) {
+      return { id: 'call_mock_orders', name: 'commerce.orders.summary', arguments: JSON.stringify({ timeRange: { days: 30 } }) };
+    }
+    if (/销售|营收|店铺|分析/i.test(text) && has('commerce.analytics.summary')) {
+      return { id: 'call_mock_analytics', name: 'commerce.analytics.summary', arguments: JSON.stringify({ timeRange: { days: 30 } }) };
+    }
     if (/发布|外部操作|publish/i.test(text) && has('external_action.demo')) {
       return { id: 'call_mock_external', name: 'external_action.demo', arguments: JSON.stringify({ title: text.slice(0, 40), content: text }) };
     }

@@ -151,6 +151,14 @@ model User {
   connections   Connection[]
   oauthStates   OAuthState[]
   externalActions ExternalAction[]
+  commerceProducts    CommerceProduct[]
+  commerceOrders      CommerceOrder[]
+  commerceTraffic     CommerceTrafficMetric[]
+  commerceConversions CommerceConversionMetric[]
+  commerceCampaigns   CommerceCampaign[]
+  commerceAdMetrics   CommerceAdMetric[]
+  commerceInventory   CommerceInventoryMetric[]
+  commerceRevenue     CommerceRevenueMetric[]
   knowledgeBases KnowledgeBase[]
   documents      Document[]
 }
@@ -844,4 +852,187 @@ model DocumentChunk {
   @@unique([documentId, chunkIndex])
   @@index([userId, projectId])
   @@index([documentId])
+}
+
+// ===== M7-P4: Commerce（规范化电商数据层；工具集全部 read-only）=====
+// 数据管线：External API → Provider Adapter → Normalize → 本层 → Commerce Tool → Agent。
+// 当前唯一实现 = MockCommerceAdapter（读本层种子数据）；真实平台适配器留接口位，绝不伪造第三方数据。
+model CommerceProduct {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider     String   @default("mock")
+  connectionId String?
+  externalId   String
+  title        String
+  description  String?
+  price        Float?
+  currency     String   @default("CNY")
+  status       String   @default("active") // active | draft | archived
+  sku          String?
+  imageUrl     String?
+  inventory    Int?
+  category     String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  @@unique([userId, provider, externalId])
+  @@index([userId, provider, status])
+}
+
+model CommerceOrder {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider     String   @default("mock")
+  connectionId String?
+  externalId   String
+  orderNumber  String
+  status       String // pending | paid | fulfilled | cancelled | refunded
+  totalAmount  Float
+  currency     String   @default("CNY")
+  itemCount    Int      @default(0)
+  orderedAt    DateTime
+  createdAt    DateTime @default(now())
+  items        CommerceOrderItem[]
+  @@unique([userId, provider, externalId])
+  @@index([userId, provider, orderedAt])
+  @@index([userId, provider, status])
+}
+
+model CommerceOrderItem {
+  id         String        @id @default(uuid())
+  orderId    String
+  order      CommerceOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId  String?
+  title      String
+  quantity   Int
+  unitPrice  Float
+  totalPrice Float
+  @@index([orderId])
+}
+
+// 指标快照（周期 + 维度；服务层按 (period, dimension) 幂等同步，不做强唯一约束）
+model CommerceTrafficMetric {
+  id             String   @id @default(uuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider       String   @default("mock")
+  connectionId   String?
+  periodStart    DateTime
+  periodEnd      DateTime
+  dimension      String   @default("all") // all | source | channel
+  dimensionValue String   @default("all")
+  impressions    Int      @default(0)
+  visits         Int      @default(0)
+  uniqueVisitors Int      @default(0)
+  @@index([userId, provider, periodStart, dimension, dimensionValue])
+}
+
+model CommerceConversionMetric {
+  id             String   @id @default(uuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider       String   @default("mock")
+  connectionId   String?
+  periodStart    DateTime
+  periodEnd      DateTime
+  dimension      String   @default("all") // all | source | channel
+  dimensionValue String   @default("all")
+  clicks         Int      @default(0)
+  addToCart      Int      @default(0)
+  checkouts      Int      @default(0)
+  orders         Int      @default(0)
+  revenue        Float    @default(0)
+  @@index([userId, provider, periodStart, dimension, dimensionValue])
+}
+
+model CommerceCampaign {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider     String   @default("mock")
+  connectionId String?
+  externalId   String
+  name         String
+  status       String   @default("active") // active | paused | ended
+  objective    String?
+  budget       Float?
+  startDate    DateTime?
+  endDate      DateTime?
+  createdAt    DateTime @default(now())
+  adGroups     CommerceAdGroup[]
+  @@unique([userId, provider, externalId])
+  @@index([userId, provider, status])
+}
+
+model CommerceAdGroup {
+  id         String           @id @default(uuid())
+  campaignId String
+  campaign   CommerceCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  externalId String
+  name       String
+  status     String           @default("active")
+  ads        CommerceAd[]
+  @@unique([campaignId, externalId])
+}
+
+model CommerceAd {
+  id          String           @id @default(uuid())
+  adGroupId   String
+  adGroup     CommerceAdGroup  @relation(fields: [adGroupId], references: [id], onDelete: Cascade)
+  externalId  String
+  name        String
+  status      String           @default("active") // active | paused
+  creativeType String          @default("image") // image | video
+  previewUrl  String?
+  @@unique([adGroupId, externalId])
+}
+
+model CommerceAdMetric {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider     String   @default("mock")
+  connectionId String?
+  campaignId   String?
+  adId         String?
+  periodStart  DateTime
+  periodEnd    DateTime
+  impressions  Int      @default(0)
+  clicks       Int      @default(0)
+  spend        Float    @default(0)
+  conversions  Int      @default(0)
+  revenue      Float    @default(0)
+  @@index([userId, provider, periodStart, campaignId])
+  @@index([userId, provider, periodStart, adId])
+}
+
+model CommerceInventoryMetric {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider     String   @default("mock")
+  connectionId String?
+  productId    String?
+  periodStart  DateTime
+  periodEnd    DateTime
+  stock        Int      @default(0)
+  reserved     Int      @default(0)
+  sold         Int      @default(0)
+  @@index([userId, provider, periodStart, productId])
+}
+
+model CommerceRevenueMetric {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider     String   @default("mock")
+  connectionId String?
+  periodStart  DateTime
+  periodEnd    DateTime
+  revenue      Float    @default(0)
+  orders       Int      @default(0)
+  refunds      Float    @default(0)
+  netRevenue   Float    @default(0)
+  @@index([userId, provider, periodStart])
 }

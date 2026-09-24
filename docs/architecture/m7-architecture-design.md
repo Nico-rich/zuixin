@@ -190,3 +190,41 @@ GET /external-actions/:id
 - 单测 9：审批复核/幂等复用/残留行续跑/连接三类失败无孤儿行/失败落库/取消落库/不支持 provider/风险分级。
 - e2e 8：全链路审批执行+审计绑定、reject 零副作用、failure/retry/timeout 向量、崩溃残留幂等、连接吊销、越权。
 - **实测修复**：MockLLM 启发式只在 role=user 消息触发——tool 结果 JSON 回显触发词（payload.title 含"发布到"）会无限再触发同一工具 → run 永久 waiting。
+
+## 4. M7-P4 E-commerce DataSource + Commerce Tools
+
+### 4.1 规范化电商模型（11 表，全部 read-only）
+
+Product / Order / OrderItem / TrafficMetric / ConversionMetric / Campaign / AdGroup / Ad / AdMetric / InventoryMetric / RevenueMetric。
+指标表 = 周期快照 + 维度（dimension/dimensionValue）；`UNIQUE(userId, provider, externalId)` 幂等同步；服务层按 (period, dimension) 幂等更新（不强唯一约束）。
+
+### 4.2 数据管线（LLM 绝不直连外部 API）
+
+```
+External API → Provider Adapter → Normalize → CommerceService → Commerce Tool → Agent
+```
+- `CommerceProvider` 接口 + `MockCommerceAdapter`（读规范化种子数据，明确标注 mock，不伪造第三方数据）；
+- 真实平台适配器（Amazon/Shopify/MetaAds/GoogleAds/TikTokAds）留接口位，无真实凭据不注册。
+
+### 4.3 数据真实性分层（LLM 不得编造数据）
+
+- 工具结果严格分层：`facts`（原始聚合事实）/ `derived`（服务端计算：ctr/cvr/roas/cpc/aov/conversionRate/changePct）；
+- LLM 解读/建议只出现在对话层（P5 Analysis 承接），绝不进入 facts/derived；
+- **重复计数防线**：指标快照的 dimension=all 行与 source 行是父子关系——总量只取 all 行，source 仅用于分布（实测修复：初次实现把 source 子集累加进总量，impressions 翻倍）。
+
+### 4.4 工具（第一批 9 个，permission=read，零写路径）
+
+```
+commerce.products.list / products.get
+commerce.orders.list / orders.summary
+commerce.traffic.summary
+commerce.ads.campaigns.list / ads.performance
+commerce.analytics.summary / analytics.compare
+```
+统一参数：timeRange{start,end,days(≤92)}/filters/page/pageSize/sort/groupBy/limit；
+连接解析与 P3 同构（显式 connectionId 或默认 active 连接；无连接 → 明确提示）。
+
+### 4.5 测试
+
+- 单测 8：时间窗校验/连接解析/facts-derived 分层/aov-roas-ctr 计算/两期变化率零基数不伪造/来源分布不重复计数。
+- e2e 7：6 个工具经真实 Agent 链路断言 facts/derived 数值；只读保证（数据零变更）；无连接失败回喂。
