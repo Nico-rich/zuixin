@@ -2252,3 +2252,20 @@ M5 设计：`docs/architecture/m5-architecture-design.md`（已确认 + 10 条�
 - 全量测试 196 全绿、typecheck clean、build 通过
 - pgvector 扩展已在 PG 容器安装（extension "vector" 存在）
 - 每个 Phase 完成必须 typecheck+test 通过再进入下一阶段（用户硬约束）
+
+---
+
+# M5-P2 数据库修复记录（2026-09-24）
+
+**事件**：pgvector 镜像切换（postgres:16-alpine[musl] → pgvector/pgvector:pg16[glibc]）复用同一数据卷，text 索引 collation 不一致导致索引损坏：Provider 主键唯一性失效 → seed 重复插入 2 组行 → Prisma `model→provider` 嵌套读取 panic（nested_read.rs Option::unwrap）→ 14 e2e 失败。
+
+**修复（用户授权方案 A，保留历史数据）**：
+1. 核验：16 行（预期 14）；重复 id = seed-llm-mock、seed-llm-OpenAI 各 ×2（内容完全一致，确属 seed 在不同时点重复插入，非业务分歧）
+2. 备份：`pg_dump -t "Provider"` → /tmp/provider-before-reindex.sql（未入库）
+3. 删除后插入的重复行（ctid 更大者）→ 0 重复、14 行
+4. `REINDEX DATABASE agent_platform` → 0 无效索引
+5. 验证：唯一约束恢复（重复插入被拒）；7 个模型 × include provider 全部 OK（panic 消除）
+6. migrate deploy + seed 幂等：Provider/Model/Agent/AgentVersion 四表 0 重复
+7. 全量回归：api 202 测试全绿（38 文件）、typecheck clean、build 3 包——M1~M4 + M5-P1/P2 全部通过
+
+**长期约束**：compose 已加注释锁定——禁止切回 musl 系镜像复用同一数据卷；换镜像须同 libc 或换后立即 REINDEX DATABASE。

@@ -1,5 +1,10 @@
 services:
   postgres:
+    # ⚠️ 镜像锁定约束（2026-09-24 修复记录）：
+    # 本镜像为 Debian/glibc。数据卷 pgdata 于 M5-P1 从 postgres:16-alpine（musl）迁移而来，
+    # text 列 btree 索引因 libc/collation 不一致发生过索引损坏（Provider 重复主键 + Prisma nested_read panic）。
+    # 已通过「去重 + REINDEX DATABASE」修复。此后禁止切回 alpine/musl 系镜像复用同一数据卷；
+    # 若必须更换镜像，须同 libc（Debian/glibc 系）或在更换后立即执行 REINDEX DATABASE。
     image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: agent
