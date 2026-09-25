@@ -1,6 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ExternalActionsService, classifyRisk, ExecuteExternalActionInput } from './external-actions.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
+import { bindPayload } from '../approvals/approval-binding';
+
+/** 引擎审批门的绑定口径：(工具名, 工具入参) —— 审批行由引擎在同一 helper 下写入（Pre-M9 Approval Binding） */
+const TOOL_NAME = 'external_action.execute';
+const toolInput = { actionType: 'success', payload: { title: 'x' } };
+const approvedPayload = bindPayload({ toolName: TOOL_NAME, input: toolInput }, TOOL_NAME, toolInput);
 
 const baseRow = {
   id: 'ea-1', status: 'pending_approval', externalRequestId: 'req-1', provider: 'mock',
@@ -15,7 +21,9 @@ function makeService(opts: {
   claimCount?: number;
 } = {}) {
   const prisma = {
-    approval: { findFirst: vi.fn().mockResolvedValue({ id: 'a1', status: 'approved', userId: 'u1', riskLevel: 'high' }) },
+    approval: { findFirst: vi.fn().mockResolvedValue({ id: 'a1', status: 'approved', userId: 'u1', riskLevel: 'high', payload: approvedPayload }) },
+    // Pre-M9：引擎路径的绑定校验以 ToolCall 行为事实源（toolName + 工具入参）
+    toolCall: { findUnique: vi.fn().mockResolvedValue({ toolName: TOOL_NAME, input: toolInput }) },
     connection: { findFirst: vi.fn().mockResolvedValue({ id: 'conn-1', status: 'active', provider: 'mock' }) },
     externalAction: {
       // 调用序：①幂等查重 ②建行后行读取 ③完成后行读取（或轮询）
@@ -165,5 +173,52 @@ describe('ExternalActionsService（M7-P3 审批复核 + Pre-M9 C2 claim-then-exe
     const { svc, prisma } = makeService();
     await expect(svc.execute(input({ provider: 'shopify' }))).rejects.toMatchObject({ code: 'PROVIDER_UNSUPPORTED' });
     expect(prisma.externalAction.create).not.toHaveBeenCalled();
+  });
+
+  it('Pre-M9 Binding（引擎口径）：审批未绑定/绑定到别的工具入参 → APPROVAL_BINDING_MISMATCH，绝不执行', async () => {
+    // ① 升级前的旧审批（payload 无 __binding）→ fail-closed
+    const legacy = makeService();
+    legacy.prisma.approval.findFirst.mockResolvedValue({
+      id: 'a1', status: 'approved', userId: 'u1', riskLevel: 'high', payload: { toolName: TOOL_NAME, input: toolInput },
+    });
+    await expect(legacy.svc.execute(input())).rejects.toMatchObject({ code: ErrorCode.APPROVAL_BINDING_MISMATCH });
+    expect(legacy.mockProvider.execute).not.toHaveBeenCalled();
+
+    // ② 审批绑定的是另一个工具入参（批准 A、执行 B）→ 拒绝
+    const other = makeService();
+    const otherInput = { actionType: 'success', payload: { title: '另一个标题' } };
+    other.prisma.approval.findFirst.mockResolvedValue({
+      id: 'a1', status: 'approved', userId: 'u1', riskLevel: 'high',
+      payload: bindPayload({ toolName: TOOL_NAME, input: otherInput }, TOOL_NAME, otherInput),
+    });
+    await expect(other.svc.execute(input())).rejects.toMatchObject({ code: ErrorCode.APPROVAL_BINDING_MISMATCH });
+    expect(other.mockProvider.execute).not.toHaveBeenCalled();
+    expect(other.prisma.externalAction.create).not.toHaveBeenCalled();
+  });
+
+  it('Pre-M9 Binding（引擎口径）：工具入参被换成另一个动作（子动作不一致）→ APPROVAL_BINDING_MISMATCH', async () => {
+    const { svc, prisma, mockProvider } = makeService();
+    // 绑定与工具行一致（自洽），但本次执行的动作 actionType/payload 与工具入参里描述的动作不同
+    await expect(svc.execute(input({ actionType: 'success', payload: { title: '被替换的载荷' } })))
+      .rejects.toMatchObject({ code: ErrorCode.APPROVAL_BINDING_MISMATCH });
+    expect(mockProvider.execute).not.toHaveBeenCalled();
+    expect(prisma.externalAction.create).not.toHaveBeenCalled();
+  });
+
+  it('Pre-M9 Binding（工作流口径 approvalId）：绑定与渲染载荷一致 → 放行；执行时换载荷 → 拒绝', async () => {
+    const { svc, prisma, mockProvider } = makeService();
+    const rendered = { title: '渲染后的载荷' };
+    prisma.approval.findFirst.mockResolvedValue({
+      id: 'a1', status: 'approved', userId: 'u1', riskLevel: 'high',
+      payload: bindPayload({ stepId: 's1', boundActionType: 'shop.publish' }, 'shop.publish', rendered),
+    });
+    await svc.execute(input({ toolCallId: undefined, approvalId: 'a1', actionType: 'shop.publish', payload: rendered }));
+    expect(mockProvider.execute).toHaveBeenCalledTimes(1);
+
+    // 执行时把载荷换成别的（金额/收件人/目标资源被替换）→ 拒绝（绝不放行到 provider）
+    mockProvider.execute.mockClear();
+    await expect(svc.execute(input({ toolCallId: undefined, approvalId: 'a1', actionType: 'shop.publish', payload: { title: '被替换' } })))
+      .rejects.toMatchObject({ code: ErrorCode.APPROVAL_BINDING_MISMATCH });
+    expect(mockProvider.execute).not.toHaveBeenCalled();
   });
 });

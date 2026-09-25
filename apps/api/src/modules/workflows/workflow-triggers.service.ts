@@ -1,7 +1,7 @@
 import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
-import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { CryptoService } from '../../core/crypto/crypto.service';
 import { EventBusService } from '../../core/events/event-bus.service';
@@ -20,8 +20,11 @@ export const WEBHOOK_REJECT_MESSAGE = 'webhook 鉴权失败';
 
 /**
  * M7-P6 触发器（webhook/schedule/event；manual 由 API 直入）：
- * - webhook：HMAC-SHA256 签名（secret AES at rest，校验时解密 + timingSafeEqual）+ timestamp ±5min
- *   + eventId 防重放（WebhookDelivery UNIQUE，重复 → 409 WEBHOOK_REPLAY）；
+ * - webhook：HMAC-SHA256 签名（secret AES at rest，校验时解密 + timingSafeEqual）；
+ *   **Pre-M9 签名契约（对外，固定顺序）**：`signature = hex(HMAC_SHA256(secret, timestamp + eventId + rawBody))`，
+ *   其中 timestamp 为 `X-Hook-Timestamp` 原始字符串、eventId 为 `X-Hook-Event-ID`、rawBody 为**未经解析的原始字节**
+ *   （HTTP 层 express.raw 保留）。三者任一处被改动签名即失效 → 时间戳不再可被"重签"绕过。
+ *   容忍窗 ±5min（超窗 → 401 WEBHOOK_TIMESTAMP_STALE）+ eventId 防重放（WebhookDelivery UNIQUE，重复 → 409 WEBHOOK_REPLAY）；
  * - schedule：BullMQ repeatable job（发布注册/归档注销；e2e 可直调 tickScheduled 模拟触发）；
  * - event：EventBus 订阅 → run（幂等键 = event id 或载荷摘要）。
  * 幂等：所有触发器 → WorkflowRunsService.createRun（唯一键去重，同一触发绝不产生第二个 run）。
@@ -90,28 +93,47 @@ export class WorkflowTriggersService implements OnModuleInit {
     return { token, secret };
   }
 
-  /** 签名 + timestamp + 防重放验证（任何失败均不泄露内部细节） */
+  /**
+   * 签名 + timestamp + 防重放验证（任何失败均不泄露内部细节）。
+   *
+   * Pre-M9 修复：签名串从"仅 rawBody"改为 **`timestamp + eventId + rawBody`**（顺序固定，字面拼接，无分隔符）。
+   * 旧格式未覆盖 timestamp/eventId → 攻击者可在容忍窗内**无限重放**同一份载荷（eventId 可每次换新，
+   * WebhookDelivery 的 UNIQUE 形同虚设）。现在 timestamp/eventId 一经改动签名即失效。
+   *
+   * 校验顺序（**刻意为之**，兼顾反枚举与可诊断性）：
+   * 1. 结构性缺参（无 timestamp/eventId、timestamp 非数字）→ 统一文案 401（与"未知 token/坏签名"不可区分）；
+   * 2. HMAC 校验 → 不通过统一文案 401（**未持密钥者永远止步于此，响应与 token 是否存在无关 → 不可枚举**）；
+   * 3. 时间窗 ±5min → 超窗 `WEBHOOK_TIMESTAMP_STALE`（仅"签名有效"者可达，不构成枚举信道）；
+   * 4. eventId 唯一约束 → 重放 `WEBHOOK_REPLAY`(409)。
+   */
   async verifyWebhook(token: string, rawBody: Buffer, headers: { signature?: string; timestamp?: string; eventId?: string }): Promise<{ workflowId: string; eventId: string }> {
     // M8-P8：体积上限（defense in depth —— express.raw limit 之外的二次校验；超限不进入 HMAC/解析/落库）
     if (rawBody.length > WEBHOOK_MAX_BODY_BYTES) {
       throw new AppError(ErrorCode.VALIDATION_ERROR, 'webhook 载荷超过大小限制');
     }
     const webhook = await this.prisma.workflowWebhook.findUnique({ where: { token } });
-    // M8-P8：错误文案统一为单一措辞（不区分"不存在/已禁用/签名错/时间戳错"——防 token 探测与状态枚举）
+    // M8-P8：错误文案统一为单一措辞（不区分"不存在/已禁用/签名错/结构缺参"——防 token 探测与状态枚举）
     if (!webhook || !webhook.enabled) throw new AppError(ErrorCode.WEBHOOK_SIGNATURE_INVALID, WEBHOOK_REJECT_MESSAGE);
+    // Pre-M9：timestamp/eventId 参与签名 → 缺参或非法一律走统一拒绝（不留"半校验"状态）
+    const rawTimestamp = headers.timestamp ?? '';
+    const eventId = headers.eventId ?? '';
+    const ts = Number(rawTimestamp);
+    if (!rawTimestamp || !eventId || !Number.isFinite(ts)) {
+      throw new AppError(ErrorCode.WEBHOOK_SIGNATURE_INVALID, WEBHOOK_REJECT_MESSAGE);
+    }
     const secret = this.crypto.decrypt(webhook.secretEncrypted);
-    const expected = createHmac('sha256', secret).update(rawBody).digest('hex');
+    // 签名串：timestamp + eventId + body（顺序固定并文档化；签名覆盖全部可被重放利用的字段）
+    const expected = createHmac('sha256', secret).update(`${rawTimestamp}${eventId}`).update(rawBody).digest('hex');
     const provided = headers.signature ?? '';
     const a = Buffer.from(expected, 'utf8');
     const b = Buffer.from(provided, 'utf8');
     if (a.length !== b.length || !timingSafeEqual(a, b)) {
       throw new AppError(ErrorCode.WEBHOOK_SIGNATURE_INVALID, WEBHOOK_REJECT_MESSAGE);
     }
-    const ts = Number(headers.timestamp);
-    if (!Number.isFinite(ts) || Math.abs(Date.now() - ts) > WEBHOOK_TIMESTAMP_TOLERANCE_MS) {
-      throw new AppError(ErrorCode.WEBHOOK_SIGNATURE_INVALID, WEBHOOK_REJECT_MESSAGE);
+    // 签名有效之后才判定时间窗（未持密钥者到不了这里 → 不构成枚举信道）
+    if (Math.abs(Date.now() - ts) > WEBHOOK_TIMESTAMP_TOLERANCE_MS) {
+      throw new AppError(ErrorCode.WEBHOOK_TIMESTAMP_STALE, `webhook 时间戳超出容忍窗口（±${WEBHOOK_TIMESTAMP_TOLERANCE_MS / 60_000} 分钟）`);
     }
-    const eventId = headers.eventId ?? randomUUID();
     // 防重放：同一 eventId 只接受一次（UNIQUE 约束为最终防线）
     try {
       await this.prisma.webhookDelivery.create({

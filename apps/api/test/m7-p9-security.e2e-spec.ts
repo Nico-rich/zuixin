@@ -11,6 +11,7 @@ import { csrfProtection } from '../src/modules/auth/csrf.middleware';
 import { PrismaService } from '../src/modules/prisma/prisma.service';
 import { RateLimitService } from '../src/core/rate-limit/rate-limit.service';
 import { ExternalActionsService } from '../src/modules/external-actions/external-actions.service';
+import { bindPayload } from '../src/modules/approvals/approval-binding';
 
 const XRW = { 'X-Requested-With': 'XMLHttpRequest' };
 
@@ -189,14 +190,29 @@ describe('M7-P9 Security Hardening (e2e)', () => {
       data: { userId, status: 'rejected', riskLevel: 'high', reason: '旁路测试', rejectedAt: new Date() },
     });
     await expect(actions.execute(mkInput({ approvalId: rejected.id }))).rejects.toMatchObject({ code: 'TOOL_DENIED' });
-    // 3. 审批 approved + 显式连接已吊销 → CONNECTION_REVOKED（执行前校验）
+    // 2.5 Pre-M9 Approval Binding：审批 approved 但绑定的是**另一个动作**（批准 A、执行 B）→
+    //     即使有 approved 也必须拒绝（fail-closed；绑定口径 = actionType + 载荷摘要）
+    const boundOther = await prisma.approval.create({
+      data: {
+        userId, status: 'approved', riskLevel: 'high', reason: '旁路测试', approvedAt: new Date(),
+        payload: bindPayload({}, 'shop.publish', { amount: 999 }) as never,
+      },
+    });
+    await expect(actions.execute(mkInput({ approvalId: boundOther.id, connectionId })))
+      .rejects.toMatchObject({ code: 'APPROVAL_BINDING_MISMATCH' });
+
+    // 3. 审批 approved（绑定到本次动作）+ 显式连接已吊销 → CONNECTION_REVOKED（执行前校验）
     const approved = await prisma.approval.create({
-      data: { userId, status: 'approved', riskLevel: 'high', reason: '旁路测试', approvedAt: new Date() },
+      data: {
+        userId, status: 'approved', riskLevel: 'high', reason: '旁路测试', approvedAt: new Date(),
+        // Pre-M9：审批必须绑定到本次要执行的动作，否则执行链在连接校验之前就 fail-closed
+        payload: bindPayload({}, 'success', {}) as never,
+      },
     });
     await prisma.connection.update({ where: { id: connectionId }, data: { status: 'revoked' } });
     await expect(actions.execute(mkInput({ approvalId: approved.id, connectionId }))).rejects.toMatchObject({ code: 'CONNECTION_REVOKED' });
     await prisma.connection.update({ where: { id: connectionId }, data: { status: 'active' } });
-    await prisma.approval.deleteMany({ where: { id: { in: [rejected.id, approved.id] } } });
+    await prisma.approval.deleteMany({ where: { id: { in: [rejected.id, approved.id, boundOther.id] } } });
   });
 
   it('P9 凭证零泄漏：连接 API 响应不含明文/密文凭证；DB 密文可逆但与响应隔离', async () => {

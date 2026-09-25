@@ -12,6 +12,7 @@ import { Tool, ToolContext } from '../tools/tool.types';
 import { mapProviderError, ProviderLikeError } from '../../common/errors/provider-error';
 import { AGENT_RUNTIME_PERSISTENCE, AgentRuntimePersistence } from './runtime-persistence';
 import { ResumePlan } from './resume-planner';
+import { assertApprovalBinding, bindPayload, requiresHumanApproval } from '../../modules/approvals/approval-binding';
 
 const GENERATION_TOOLS = ['image.generate', 'video.generate'];
 /** M7-P9 Prompt Injection 防线：不可信数据工具（电商/外部/绩效回流）的返回内容一律按数据解读 */
@@ -410,7 +411,8 @@ export class AgentRuntimeEngine {
     }
     // 权限边界 2：审批/高权限工具——同步路径维持 M4 冻结拒绝（无 resume 通道，绝不悬置）；
     // 异步路径走 M7-P1 审批状态机（waiting → 人工决定 → resume 执行或失败回喂）。
-    const approvalRequired = !!tool.requiresApproval || tool.permission === 'external_action';
+    // Pre-M9：判定改用统一 predicate（按权限分类：external_action/financial/destructive 全部需审批）。
+    const approvalRequired = requiresHumanApproval(tool);
     if (approvalRequired && !isAsync) {
       await this.persistence.createToolCall({
         runStepId: stepId, toolName: call.name, idempotencyKey, input: JSON.parse(call.arguments || '{}'),
@@ -507,6 +509,20 @@ export class AgentRuntimeEngine {
       }
       const approval = await this.persistence.getApprovalForToolCall(existing.id);
       if (approval?.status === 'approved') {
+        // Pre-M9 Approval Binding：执行前重算摘要，与"被批准的那个动作"逐项比对
+        // （审批绑 actionType + payloadHash；不一致 → 拒绝执行并落失败行，绝不放行到 Tool 实现）
+        try {
+          assertApprovalBinding({
+            payload: approval.payload, actionType: call.name, action: parsedInput,
+            reason: `工具 ${call.name}`,
+          });
+        } catch (err) {
+          const message = (err as Error).message;
+          await this.persistence.updateToolCall(existing.id, {
+            status: 'failed', errorCode: ErrorCode.APPROVAL_BINDING_MISMATCH, errorMessage: message, completedAt: new Date(),
+          });
+          return { status: 'failed', error: message, outputSummary: `${call.name}：审批绑定不一致，已拒绝执行` };
+        }
         // 审批通过 → 同一行继续执行（waiting_approval/running 残留皆可；行内终态由 executeToolRow 落）
         return this.executeToolRow(ctx, runId, tool, parsedInput, stepId, existing.id, idempotencyKey, existing.status === 'running', signal);
       }
@@ -552,9 +568,10 @@ export class AgentRuntimeEngine {
     const ttl = await this.approvalTtlMs();
     const approval = await this.persistence.createApproval({
       userId: ctx.userId, projectId: ctx.projectId, agentRunId: runId, toolCallId: rowId,
-      riskLevel: tool.permission === 'external_action' ? 'high' : 'medium',
+      riskLevel: tool.permission === 'external_action' || tool.permission === 'financial' || tool.permission === 'destructive' ? 'high' : 'medium',
       reason: `工具 ${call.name} 需要人工审批`,
-      payload: { toolName: call.name, input: parsedInput },
+      // Pre-M9 Approval Binding：payload 内嵌 __binding（actionType=工具名，payloadHash=本次入参摘要）
+      payload: bindPayload({ toolName: call.name, input: parsedInput }, call.name, parsedInput),
       expiresAt: ttl > 0 ? new Date(Date.now() + ttl) : null,
     });
     const entered = await this.persistence.enterWaitingApproval(runId, approval.id, ctx.workerId);

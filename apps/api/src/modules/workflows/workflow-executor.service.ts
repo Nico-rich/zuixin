@@ -9,6 +9,7 @@ import { AgentRunMessagesService } from '../agent-runs/agent-run-messages.servic
 import { AGENT_RUN_QUEUE } from '../../core/queue/queue.module';
 import { AppError, ErrorCode, RETRYABLE_CODES } from '../../common/errors/app-error';
 import { QuotaService } from '../billing/quota.service';
+import { bindPayload } from '../approvals/approval-binding';
 import {
   WorkflowContext, WorkflowDefinition, WorkflowStepDef, evaluateCondition, renderTemplate,
 } from './workflow-types';
@@ -195,11 +196,20 @@ export class WorkflowExecutor {
             approval.status === 'expired' ? '审批已过期' : '审批未通过',
           );
         }
+        // Pre-M9 Approval Binding：把审批绑定到"将被执行的具体动作"——取本步骤之后第一个 external_action
+        // 步骤（定义来自已发布版本，运行时冻结），渲染其载荷并写入 __binding；无下游外部动作时绑定本步骤自身。
+        const boundStep = steps.slice(run.currentStep + 1).find((s) => s.type === 'external_action');
+        const boundActionType = boundStep?.externalAction?.actionType ?? `workflow.approval:${step.id}`;
+        const boundAction = boundStep ? renderArgs(boundStep.externalAction!.payload ?? {}, ctx) : { stepId: step.id };
         const approval = await this.prisma.approval.create({
           data: {
             userId: run.userId, projectId: run.projectId, workflowRunId: run.id,
             status: 'requested', riskLevel: step.approval!.riskLevel ?? 'medium',
             reason: step.approval!.reason,
+            payload: bindPayload(
+              { stepId: step.id, boundActionType, boundAction },
+              boundActionType, boundAction,
+            ) as never,
             expiresAt: new Date(Date.now() + (step.approval!.expiresMs ?? APPROVAL_TTL_MS)),
           },
         });

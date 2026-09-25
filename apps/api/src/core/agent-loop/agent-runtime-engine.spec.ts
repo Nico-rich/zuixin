@@ -5,6 +5,7 @@ import { ToolRegistry } from '../tools/tool-registry.service';
 import { Tool } from '../tools/tool.types';
 import { AgentRuntimePersistence } from './runtime-persistence';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
+import { assertApprovalBinding, bindPayload } from '../../modules/approvals/approval-binding';
 
 function makeRegistry(tools: Tool[] = []) {
   const registry = new ToolRegistry();
@@ -805,7 +806,11 @@ describe('AgentRuntimeEngine（M7-P1 Approval 审批门）', () => {
     (persistence.findToolCall as ReturnType<typeof vi.fn>)
       .mockResolvedValueOnce({ id: 'tc-1', status: 'waiting_approval', output: null })
       .mockResolvedValue({ id: 'tc-1', status: 'completed', output: { artifactId: 'a1', executed: true } });
-    (persistence.getApprovalForToolCall as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'approval-1', status: 'approved' });
+    // Pre-M9 Approval Binding：approved 的审批必须携带与本次执行动作一致的 __binding（引擎落库时写入）
+    (persistence.getApprovalForToolCall as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'approval-1', status: 'approved',
+      payload: bindPayload({ toolName: 'external_action.demo', input: { title: '发布' } }, 'external_action.demo', { title: '发布' }),
+    });
     const { outcome } = await run(engine, asyncInput({ resume: planTools() }, [approvalTool]));
     expect(outcome.status).toBe('completed');
     expect(approvalTool.execute).toHaveBeenCalledTimes(1); // 只执行一次（后续回合 completed 行复用）
@@ -872,6 +877,118 @@ describe('AgentRuntimeEngine（M7-P1 Approval 审批门）', () => {
     const { outcome } = await run(engine, asyncInput({ resume: planTools() }, [approvalTool]));
     expect(outcome.status).toBe('completed');
     expect(approvalTool.execute).not.toHaveBeenCalled();
+  });
+});
+
+describe('AgentRuntimeEngine（Pre-M9 Approval Binding 绑定校验 + 统一审批 predicate）', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  /** 本次真正要执行的动作（= LLM 给出的入参，resume 时来自 pendingCalls.arguments） */
+  const action = { title: '发布' };
+  const toolOf = (name: string, permission: Tool['permission']): Tool => ({
+    name, description: '敏感操作', permission,
+    inputSchema: z.strictObject({ title: z.string().min(1) }),
+    execute: vi.fn().mockResolvedValue({ artifactId: 'a1', executed: true }),
+  });
+  const streamFor = (name: string) => {
+    let calls = 0;
+    return vi.fn(async function* () {
+      calls++;
+      if (calls === 1) yield { type: 'tool_calls', toolCalls: [{ id: 'c1', name, arguments: JSON.stringify(action) }] };
+      else yield { type: 'text', text: '完成' };
+    });
+  };
+  const resumePlan = (name: string): AgentRuntimeContext['resume'] => ({
+    mode: 'tools', startStep: 0,
+    pendingCalls: [{ llmCallId: 'c1', name, arguments: JSON.stringify(action), toolIndex: 0 }],
+    lastToolSignature: null,
+  });
+  /** 绑定到指定 (动作类型, 动作载荷) 的 approved 审批行 */
+  const approvedFor = (actionType: string, boundAction: unknown) => ({
+    id: 'approval-1', status: 'approved',
+    payload: bindPayload({ toolName: actionType }, actionType, boundAction),
+  });
+
+  it('绑定一致 → 放行执行（同一行落 completed，不重建审批）', async () => {
+    const tool = toolOf('external_action.demo', 'external_action');
+    const { engine, persistence, state } = makeEngine({ tools: [tool], streamFn: streamFor(tool.name) });
+    (persistence.findToolCall as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ id: 'tc-1', status: 'waiting_approval', output: null })
+      .mockResolvedValue({ id: 'tc-1', status: 'completed', output: { executed: true } });
+    (persistence.getApprovalForToolCall as ReturnType<typeof vi.fn>).mockResolvedValue(approvedFor(tool.name, action));
+    const { outcome } = await run(engine, asyncInput({ resume: resumePlan(tool.name) }, [tool]));
+    expect(outcome.status).toBe('completed');
+    expect(tool.execute).toHaveBeenCalledTimes(1);
+    expect(state.toolCallUpdates.some((u) => u.id === 'tc-1' && u.data.status === 'completed')).toBe(true);
+    expect(persistence.createApproval).not.toHaveBeenCalled();
+  });
+
+  it('载荷摘要不一致（批准 A、执行 B）→ 拒绝执行 + APPROVAL_BINDING_MISMATCH，绝不调用 Tool', async () => {
+    const tool = toolOf('external_action.demo', 'external_action');
+    const { engine, persistence, state } = makeEngine({ tools: [tool], streamFn: streamFor(tool.name) });
+    (persistence.findToolCall as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'tc-1', status: 'waiting_approval', output: null });
+    // 审批绑定的是 title=旧标题，本次实际执行 title=发布
+    (persistence.getApprovalForToolCall as ReturnType<typeof vi.fn>)
+      .mockResolvedValue(approvedFor(tool.name, { title: '旧标题' }));
+    const { outcome } = await run(engine, asyncInput({ resume: resumePlan(tool.name) }, [tool]));
+    expect(tool.execute).not.toHaveBeenCalled();
+    expect(outcome.status).toBe('completed'); // 拒绝后失败事实回喂 LLM（不直接终止 run）
+    expect(state.toolCallUpdates.some(
+      (u) => u.id === 'tc-1' && u.data.status === 'failed' && u.data.errorCode === ErrorCode.APPROVAL_BINDING_MISMATCH,
+    )).toBe(true);
+  });
+
+  it('动作类型不一致（拿另一个工具的审批解锁本工具）→ 拒绝执行', async () => {
+    const tool = toolOf('external_action.demo', 'external_action');
+    const { engine, persistence, state } = makeEngine({ tools: [tool], streamFn: streamFor(tool.name) });
+    (persistence.findToolCall as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'tc-1', status: 'waiting_approval', output: null });
+    // 摘要相同但 actionType 是别的工具 —— 跨工具解锁必须失败
+    (persistence.getApprovalForToolCall as ReturnType<typeof vi.fn>)
+      .mockResolvedValue(approvedFor('billing.charge', action));
+    const { outcome } = await run(engine, asyncInput({ resume: resumePlan(tool.name) }, [tool]));
+    expect(outcome.status).toBe('completed');
+    expect(tool.execute).not.toHaveBeenCalled();
+    expect(state.toolCallUpdates.some(
+      (u) => u.id === 'tc-1' && u.data.status === 'failed' && u.data.errorCode === ErrorCode.APPROVAL_BINDING_MISMATCH,
+    )).toBe(true);
+  });
+
+  it('升级前旧审批（payload 无 __binding）→ fail-closed 拒绝执行（业务字段完全一致也不例外）', async () => {
+    const tool = toolOf('external_action.demo', 'external_action');
+    const { engine, persistence, state } = makeEngine({ tools: [tool], streamFn: streamFor(tool.name) });
+    (persistence.findToolCall as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'tc-1', status: 'waiting_approval', output: null });
+    (persistence.getApprovalForToolCall as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'approval-1', status: 'approved', payload: { toolName: tool.name, input: action },
+    });
+    const { outcome } = await run(engine, asyncInput({ resume: resumePlan(tool.name) }, [tool]));
+    expect(outcome.status).toBe('completed');
+    expect(tool.execute).not.toHaveBeenCalled();
+    expect(state.toolCallUpdates.some(
+      (u) => u.id === 'tc-1' && u.data.status === 'failed' && u.data.errorCode === ErrorCode.APPROVAL_BINDING_MISMATCH,
+    )).toBe(true);
+  });
+
+  it('统一审批 predicate：financial 权限工具（未显式 requiresApproval）→ 异步进 waiting + Approval(high) 且载荷自带可校验 binding', async () => {
+    const tool = toolOf('billing.charge', 'financial');
+    const { engine, persistence, state } = makeEngine({ tools: [tool], streamFn: streamFor(tool.name) });
+    const { events, outcome } = await run(engine, asyncInput({}, [tool]));
+    expect(outcome.status).toBe('waiting');
+    expect(tool.execute).not.toHaveBeenCalled();
+    expect(persistence.createApproval).toHaveBeenCalledWith(expect.objectContaining({ riskLevel: 'high' }));
+    // 引擎写入的审批载荷必须能被同一 helper 校验通过（写读口径一致）
+    const payload = (persistence.createApproval as ReturnType<typeof vi.fn>).mock.calls[0][0].payload;
+    expect(() => assertApprovalBinding({ payload, actionType: tool.name, action })).not.toThrow();
+    expect(events.some((e) => e.type === 'approval.requested' && e.toolName === tool.name)).toBe(true);
+    expect(state.finalize).toHaveLength(0);
+  });
+
+  it('统一审批 predicate：destructive 权限工具在同步路径维持 M4 冻结拒绝（绝不悬置）', async () => {
+    const tool = toolOf('resource.delete', 'destructive');
+    const { engine, state, input } = makeEngine({ tools: [tool], streamFn: streamFor(tool.name) });
+    const { outcome } = await run(engine, input);
+    expect(outcome.status).toBe('completed');
+    expect(tool.execute).not.toHaveBeenCalled();
+    expect(state.toolCallCreates.some((c) => c.status === 'failed' && c.errorCode === ErrorCode.TOOL_DENIED)).toBe(true);
   });
 });
 

@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 import { ChatMessage, ChatParams, ChatResponse, LLMChunk, LLMProvider } from '../llm.types';
 import { mapProviderError, ProviderLikeError } from '../../../common/errors/provider-error';
+import { manualRedirectFetch } from '../../../modules/security/provider-base-url.guard';
 
 export interface OpenAICompatibleConfig { baseUrl: string; apiKey: string; timeoutMs: number; }
 
@@ -15,7 +16,8 @@ export class OpenAICompatibleAdapter implements LLMProvider {
   private readonly streamFn: StreamFn;
 
   constructor(cfg: OpenAICompatibleConfig, injected?: { chat?: ChatFn; stream?: StreamFn }) {
-    const client = new OpenAI({ baseURL: cfg.baseUrl, apiKey: cfg.apiKey, timeout: cfg.timeoutMs, maxRetries: 0 });
+    // Pre-M9 F3-B：禁止自动跟随重定向（3xx 会绕过 baseUrl 校验）；出网策略与 baseUrl 校验同源
+    const client = new OpenAI({ baseURL: cfg.baseUrl, apiKey: cfg.apiKey, timeout: cfg.timeoutMs, maxRetries: 0, fetch: manualRedirectFetch });
     this.chatFn = injected?.chat ?? (async (body, options) => (await client.chat.completions.create(body as never, options)) as unknown as Record<string, unknown>);
     this.streamFn = injected?.stream ?? (async (body, options) => (await client.chat.completions.create({ ...body, stream: true } as never, options)) as unknown as AsyncIterable<Record<string, unknown>>);
   }

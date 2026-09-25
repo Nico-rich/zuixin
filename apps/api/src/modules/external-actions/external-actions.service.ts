@@ -7,6 +7,7 @@ import { ExternalActionProvidersService } from './external-action-providers.serv
 import { AuditService } from '../audit/audit.service';
 import { BillingService } from '../billing/billing.service';
 import { QuotaService } from '../billing/quota.service';
+import { assertApprovalBinding, hashPayload } from '../approvals/approval-binding';
 
 /** Pre-M9 C2：claim 失败轮询赢家终态的时长上限 */
 const EXECUTING_POLL_MS = 20_000;
@@ -56,9 +57,18 @@ export class ExternalActionsService {
     @Inject(QuotaService) private readonly quota: QuotaService,
   ) {}
 
-  /** 审批复核：绝不只信 Engine/LLM——执行前必须存在 approved 的 Approval 且绑定一致（否则抛出，永不返回 null） */
+  /**
+   * 审批复核：绝不只信 Engine/LLM——执行前必须存在 approved 的 Approval 且**绑定与本次执行的动作一致**
+   * （否则抛出，永不返回 null）。两条授权来源的绑定口径（均由 approvals 模块同一 helper 读写）：
+   * - approvalId（工作流审批步骤直连）：绑定口径 = (actionType, 渲染后的载荷) —— 审批步骤创建时即绑定
+   *   下游 external_action 步骤的具体动作；
+   * - toolCallId（引擎审批门）：绑定口径 = (工具名, 工具入参) —— 引擎审批门按工具调用绑定。此处再校验
+   *   ①审批确实绑定到该 ToolCall 行的 (toolName, input)；②**本次真正执行的动作**必须与已批准工具入参里的
+   *   actionType/payload 逐项一致（子动作一致）——调用方无法用"另一个绑定的审批"解锁本动作，
+   *   也无法在执行时把动作换成别的（载荷比较用同一稳定序列化摘要）。
+   */
   private async verifyApproval(userId: string, input: ExecuteExternalActionInput): Promise<{ id: string; riskLevel: string }> {
-    let approval: { id: string; status: string; userId: string; riskLevel: string } | null = null;
+    let approval: { id: string; status: string; userId: string; riskLevel: string; payload: unknown } | null = null;
     if (input.approvalId) {
       approval = await this.prisma.approval.findFirst({ where: { id: input.approvalId, userId } });
     } else if (input.toolCallId) {
@@ -69,6 +79,34 @@ export class ExternalActionsService {
     }
     if (!approval) throw new AppError(ErrorCode.TOOL_DENIED, '缺少审批记录，外部动作被拒绝');
     if (approval.status !== 'approved') throw new AppError(ErrorCode.TOOL_DENIED, '审批未通过，外部动作被拒绝');
+
+    if (input.toolCallId) {
+      // 引擎路径：审批行的绑定口径是 (工具名, 工具入参)——以 ToolCall 行为事实源重算比对
+      const row = await this.prisma.toolCall.findUnique({
+        where: { id: input.toolCallId }, select: { toolName: true, input: true },
+      });
+      if (!row) throw new AppError(ErrorCode.TOOL_DENIED, '缺少工具调用记录，外部动作被拒绝');
+      assertApprovalBinding({
+        payload: approval.payload, actionType: row.toolName, action: row.input, reason: `工具 ${row.toolName}`,
+      });
+      const approved = (row.input ?? {}) as { actionType?: unknown; payload?: unknown };
+      const approvedPayload = approved.payload ?? {};
+      const executedPayload = input.payload ?? {};
+      if (approved.actionType !== input.actionType
+        || hashPayload(approvedPayload) !== hashPayload(executedPayload)) {
+        throw new AppError(
+          ErrorCode.APPROVAL_BINDING_MISMATCH,
+          `审批绑定的动作与本次执行不一致（批准=${String(approved.actionType)}，实际=${input.actionType}），拒绝执行`,
+        );
+      }
+      return { id: approval.id, riskLevel: approval.riskLevel };
+    }
+
+    // 工作流/直连路径：绑定口径 = (actionType, 载荷)。摘要取自 input.actionType/input.payload（即将发给 provider 的同一份数据）
+    assertApprovalBinding({
+      payload: approval.payload, actionType: input.actionType, action: input.payload ?? {},
+      reason: `外部动作 ${input.actionType}`,
+    });
     return { id: approval.id, riskLevel: approval.riskLevel };
   }
 

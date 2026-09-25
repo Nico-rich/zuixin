@@ -12,6 +12,7 @@ import {
   EXTENSION_KINDS, ExtensionKind, ExtensionManifest, ExtensionPermissionName, WRAPPABLE_TOOL_PERMISSIONS,
   checkParamConstraints, parseManifest, renderAgentPrompt, signChecksum, verifySignature, zodObjectKeys,
 } from './manifest';
+import { DroppedTool, EffectiveAgentTools, resolveEffectiveAgentTools } from './effective-agent-tools';
 
 /**
  * M8-P6 Extension SDK —— 扩展注册表 / 安装 / 声明式物化。
@@ -22,6 +23,10 @@ import {
  * - 版本不可变：draft → published（签名）→ deprecated → archived，绝不逆向；published 版本行永不 UPDATE 内容；
  * - 安装版本锁定：ExtensionInstallation.versionId 固定，绝不漂移（升级 = 显式重新 install）；
  * - 权限：平台白名单 + kind 能力域；安装需组织 agent.write；平台级扩展仅平台管理员可管理；
+ * - F4（agent 类工具白名单）：Agent.tools **绝不**取自 manifest 原声明，而是 effective = 请求 ∩ 平台注册表 ∩
+ *   可包装权限面 ∩ 扩展/组织策略面（交集；external_action/destructive/financial 等绝不由清单自声明获得）；
+ *   判定只有一处实现（effective-agent-tools.ts 的 resolveEffectiveAgentTools），三条路径（install 声明校验 /
+ *   setEnabled 重放 / materializeAgent 物化）共用；
  * - 凭证：manifest 绝不携带；provider 类安装时由组织 config 提供 → CryptoService AES-256-GCM 加密落库。
  */
 @Injectable()
@@ -115,18 +120,50 @@ export class ExtensionsService implements OnModuleInit {
         }
       }
     }
-    if (manifest.kind === 'agent' && manifest.agent) {
-      for (const name of manifest.agent.tools) this.requirePlatformTool(name);
-    }
+    // agent.tools 的判定**只有一处实现**：见 effective-agent-tools 的 resolveEffectiveAgentTools（本文件不复制该逻辑）
     if (manifest.kind === 'workflow_step' && manifest.workflow_step) {
       const params = manifest.workflow_step.params as { toolName?: unknown };
       if (manifest.workflow_step.stepType === 'tool' && typeof params.toolName === 'string') this.requirePlatformTool(params.toolName);
     }
   }
 
-  private parse(raw: unknown, slug: string) {
+  // ===== F4：agent 类 effective tools（唯一实现；install / setEnabled / materializeAgent 共用）=====
+
+  /**
+   * 薄适配：把平台注册表 + 审计日志接到唯一实现 resolveEffectiveAgentTools 上。
+   * lookup 只信平台注册表（授权控制面事实源）；orgAllowlist 预留组织策略面（当前无该表/列，生产不传）。
+   */
+  private effectiveAgentTools(
+    extensionId: string, requested: readonly string[], declaredPermissions: readonly ExtensionPermissionName[],
+    orgAllowlist?: readonly string[],
+  ): EffectiveAgentTools {
+    return resolveEffectiveAgentTools({
+      extensionId, requested, declaredPermissions,
+      lookup: (name) => this.registry.get(name),
+      ...(orgAllowlist ? { orgAllowlist } : {}),
+      onDropped: (d: DroppedTool) => this.logger.warn(
+        `扩展 ${extensionId} 的 Agent 工具被剔除：${d.name}（${d.reason}）——${d.detail}`,
+      ),
+    });
+  }
+
+  /**
+   * 声明期校验（create/update/publish/install 的 parse 路径）：用同一 helper 求交集，
+   * 只要出现任何剔除项（越权/未知/扩展链/策略面外）→ 直接拒绝（AppError VALIDATION_ERROR）。
+   * 说明：声明期 fail-closed（恶意清单绝不落库）；物化期另有兜底剔除（见 materializeAgent）。
+   */
+  private assertAgentToolsDeclarable(ref: string, manifest: ExtensionManifest): void {
+    if (manifest.kind !== 'agent' || !manifest.agent) return;
+    const { dropped } = this.effectiveAgentTools(ref, manifest.agent.tools, manifest.permissions);
+    if (!dropped.length) return;
+    const detail = dropped.map((d) => `${d.name}（${d.detail}）`).join('；');
+    throw new AppError(ErrorCode.VALIDATION_ERROR, `扩展 manifest 非法：agent.tools 含不可获得的工具：${detail}`);
+  }
+
+  private parse(raw: unknown, slug: string, ref = slug) {
     const parsed = parseManifest(raw, { slug });
     this.validateRefs(parsed.manifest);
+    this.assertAgentToolsDeclarable(ref, parsed.manifest);
     return parsed;
   }
 
@@ -169,7 +206,7 @@ export class ExtensionsService implements OnModuleInit {
 
     let versionId: string | undefined;
     if (input.manifest !== undefined) {
-      const parsed = this.parse(input.manifest, ext.slug);
+      const parsed = this.parse(input.manifest, ext.slug, ext.id);
       if (parsed.manifest.kind !== ext.kind) throw new AppError(ErrorCode.VALIDATION_ERROR, 'kind 与 manifest.kind 不一致');
       const draft = await this.prisma.extensionVersion.findFirst({ where: { extensionId: id, status: 'draft' }, orderBy: { version: 'desc' } });
       if (draft) {
@@ -214,7 +251,7 @@ export class ExtensionsService implements OnModuleInit {
     if (target.status !== 'draft') throw new AppError(ErrorCode.VALIDATION_ERROR, `只有 draft 版本可发布（当前 ${target.status}）`);
 
     // 发布前重新校验（平台工具在 draft 期间可能已被移除）
-    const parsed = this.parse(target.manifest, ext.slug);
+    const parsed = this.parse(target.manifest, ext.slug, ext.id);
     // 签名 = HMAC(manifest checksum, 平台密钥)；checksum 与落库 manifest 必须同源（install 会复算比对）
     const checksum = parsed.checksum;
     const signature = signChecksum(checksum, this.platformKey);
@@ -354,7 +391,7 @@ export class ExtensionsService implements OnModuleInit {
 
     // 完整性校验：checksum 必须与 manifest 内容一致 + 发布签名必须有效（防篡改/防伪造）
     const manifest = version.manifest as unknown as ExtensionManifest;
-    const parsed = this.parse(manifest, ext.slug);
+    const parsed = this.parse(manifest, ext.slug, ext.id);
     if (parsed.checksum !== version.checksum) throw new AppError(ErrorCode.VALIDATION_ERROR, '版本校验和不一致（manifest 被篡改）');
     if (!verifySignature(version.checksum, version.signature, this.platformKey)) {
       throw new AppError(ErrorCode.VALIDATION_ERROR, '版本签名无效（未发布或签名不匹配）');
@@ -404,6 +441,8 @@ export class ExtensionsService implements OnModuleInit {
     const updated = await this.prisma.extensionInstallation.update({ where: { id: installation.id }, data: { status: nextStatus } });
     const version = await this.prisma.extensionVersion.findUnique({ where: { id: installation.versionId } });
     if (enabled) {
+      // F4：此处**不**重新解析清单（版本锁定、已发布行不可变），但仍走同一份 effective 计算——
+      // materialize → materializeAgent 内求交集并剔除越权工具（历史数据/注册表漂移在此被修复）
       if (version) await this.materialize(installation.id, ext, version.id, version.manifest as unknown as ExtensionManifest, organizationId);
     } else {
       await this.deactivateMaterialized(ext, organizationId);
@@ -438,7 +477,11 @@ export class ExtensionsService implements OnModuleInit {
     }
   }
 
-  /** agent 类：物化为组织私有 Agent（scope=organization, kind=custom）+ 已发布 AgentVersion */
+  /**
+   * agent 类：物化为组织私有 Agent（scope=organization, kind=custom）+ 已发布 AgentVersion。
+   * F4：工具清单在此求交集（effective tools）——install / setEnabled（重放已存清单）两条路径共用本方法，
+   * 因此两条路径共用同一份 effective 计算；越权工具绝不写入 AgentVersion.tools。
+   */
   private async materializeAgent(
     ext: { id: string; slug: string; name: string; description: string | null },
     versionId: string, manifest: ExtensionManifest, organizationId: string,
@@ -452,6 +495,17 @@ export class ExtensionsService implements OnModuleInit {
       'organization.id': organizationId,
     });
 
+    // F4（唯一实现）：清单里的 tools 只是"请求"，绝不原样落库——
+    // effective = 请求 ∩ 平台注册表 ∩ 可包装权限面（read/write/generate）∩ 扩展/组织策略面。
+    // 越权项（external_action/destructive/financial 等）在此被剔除并审计；已发布版本行不可变 → 剔除清单落既有的 AgentVersion.config。
+    const effective = this.effectiveAgentTools(ext.id, block.tools, manifest.permissions);
+    const config = {
+      extensionId: ext.id, extensionVersion: versionId,
+      ...(effective.dropped.length
+        ? { toolPolicy: { dropped: effective.dropped.map((d) => ({ name: d.name, reason: d.reason })) } }
+        : {}),
+    };
+
     const existing = await this.prisma.agent.findUnique({ where: { slug }, include: { activeVersion: true } });
     if (!existing) {
       const agent = await this.prisma.agent.create({
@@ -462,26 +516,27 @@ export class ExtensionsService implements OnModuleInit {
       });
       const created = await this.prisma.agentVersion.create({
         data: {
-          agentId: agent.id, version: 1, status: 'published', systemPrompt, tools: block.tools,
-          temperature: 0.7, config: { extensionId: ext.id, extensionVersion: versionId },
+          agentId: agent.id, version: 1, status: 'published', systemPrompt, tools: effective.tools,
+          temperature: 0.7, config,
         },
       });
       await this.prisma.agent.update({ where: { id: agent.id }, data: { activeVersionId: created.id } });
       return agent.id;
     }
 
-    // 幂等：同一锁定版本重复 install → 不新建版本行（版本不可变、无谓漂移）
+    // 幂等：同一锁定版本 + 已存工具集与本次求交结果一致 → 不新建版本行（版本不可变、无谓漂移）
+    // 工具集不一致（历史越权数据 / 注册表或权限面漂移）→ 修复为新版本（绝不沿用越权清单）
     const current = existing.activeVersion;
     const currentConfig = (current?.config ?? {}) as { extensionVersion?: string };
-    if (current && currentConfig.extensionVersion === versionId) {
+    if (current && currentConfig.extensionVersion === versionId && sameToolList(current.tools, effective.tools)) {
       await this.prisma.agent.update({ where: { id: existing.id }, data: { enabled: true } });
       return existing.id;
     }
     const max = await this.prisma.agentVersion.aggregate({ where: { agentId: existing.id }, _max: { version: true } });
     const created = await this.prisma.agentVersion.create({
       data: {
-        agentId: existing.id, version: (max._max.version ?? 0) + 1, status: 'draft', systemPrompt, tools: block.tools,
-        temperature: 0.7, config: { extensionId: ext.id, extensionVersion: versionId },
+        agentId: existing.id, version: (max._max.version ?? 0) + 1, status: 'draft', systemPrompt, tools: effective.tools,
+        temperature: 0.7, config,
       },
     });
     await this.prisma.$transaction([
@@ -669,6 +724,13 @@ export class ExtensionsService implements OnModuleInit {
 /** 组织内 Agent slug（Agent.slug 全局唯一 → 以 org 哈希后缀隔离） */
 export function extensionAgentSlug(extensionSlug: string, organizationId: string): string {
   return `ext-${extensionSlug}-${hashSuffix(organizationId)}`;
+}
+
+/** AgentVersion.tools（Json 列）与本次求交结果是否一致（顺序敏感：清单本身有语义顺序） */
+function sameToolList(stored: unknown, effective: readonly string[]): boolean {
+  return Array.isArray(stored)
+    && stored.length === effective.length
+    && stored.every((v, i) => v === effective[i]);
 }
 
 function hashSuffix(value: string): string {

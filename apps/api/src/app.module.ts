@@ -42,23 +42,20 @@ import { ChatModule } from './modules/chat/chat.module';
 import { UsageApiModule } from './modules/usage/usage-api.module';
 import { ProviderRoutingApiModule } from './modules/provider-routing/provider-routing-api.module';
 import { GlobalExceptionFilter } from './common/filters/global-exception.filter';
+import { createHttpLoggerParams } from './common/logging/pino-logging';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true, envFilePath: ['.env', '../../.env'] }),
-    LoggerModule.forRoot({
-      pinoHttp: {
-        level: process.env.LOG_LEVEL ?? 'info',
-        transport: process.env.NODE_ENV === 'production' ? undefined : { target: 'pino-pretty', options: { singleLine: true } },
-        genReqId: (req, res) => {
-          const id = (req.headers['x-request-id'] as string) ?? randomUUID();
-          res.setHeader('X-Request-Id', id);
-          return id;
-        },
-        redact: ['req.headers.authorization', 'req.headers.cookie', 'apiKey'],
-        autoLogging: { ignore: (req) => req.url === '/api/v1/health' },
+    // Pre-M9 F1：HTTP 日志脱敏（redact/serializer/深度擦洗集中在 common/logging/pino-logging.ts，与 Worker 同源）
+    LoggerModule.forRoot(createHttpLoggerParams('api', {
+      genReqId: (req, res) => {
+        const id = (req.headers['x-request-id'] as string) ?? randomUUID();
+        res.setHeader('X-Request-Id', id);
+        return id;
       },
-    }),
+      autoLogging: { ignore: (req) => req.url === '/api/v1/health' },
+    })),
     PrismaModule,
     CryptoModule,
     SecurityModule, // M8-P8 安全面（SSRF 防线 / 禁用用户与会话撤销判定）

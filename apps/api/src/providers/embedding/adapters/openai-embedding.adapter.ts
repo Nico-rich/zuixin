@@ -1,5 +1,6 @@
 import OpenAI from 'openai';
 import { EmbeddingProvider } from '../embedding.types';
+import { manualRedirectFetch } from '../../../modules/security/provider-base-url.guard';
 
 export interface OpenAIEmbeddingConfig { baseUrl: string; apiKey: string; timeoutMs: number; }
 
@@ -9,7 +10,8 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   private readonly client: OpenAI;
 
   constructor(private readonly cfg: OpenAIEmbeddingConfig, private readonly model: string, private readonly dimensions: number) {
-    this.client = new OpenAI({ baseURL: cfg.baseUrl, apiKey: cfg.apiKey, timeout: cfg.timeoutMs, maxRetries: 0 });
+    // Pre-M9 F3-B：禁止自动跟随重定向
+    this.client = new OpenAI({ baseURL: cfg.baseUrl, apiKey: cfg.apiKey, timeout: cfg.timeoutMs, maxRetries: 0, fetch: manualRedirectFetch });
   }
 
   getDimensions(): number { return this.dimensions; }

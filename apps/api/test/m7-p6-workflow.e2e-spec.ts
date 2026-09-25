@@ -256,16 +256,21 @@ describe('M7-P6 Workflow Engine (e2e, 真实 Queue + Worker)', () => {
   it('P6 webhook 触发：HMAC 签名 → run；重放 409 / 坏签名 401 / 过期 timestamp 401 / 未知 token 401', async () => {
     expect(webhook).toBeTruthy();
     const payload = JSON.stringify({ orderId: 'hook-1', amount: 99 });
-    const sign = () => createHmac('sha256', webhook!.secret).update(payload).digest('hex');
+    // Pre-M9：签名串 = timestamp + eventId + rawBody（顺序固定，见 WebhookHooksController/TriggersService 文档）
+    const sign = (timestamp: string, eventId: string, body: string = payload) =>
+      createHmac('sha256', webhook!.secret).update(`${timestamp}${eventId}`).update(body).digest('hex');
     const headers = (eventId: string, signature: string, timestamp: string) => ({
       'X-Hook-Signature': signature, 'X-Hook-Timestamp': timestamp, 'X-Hook-Event-Id': eventId,
     });
+    const post = (eventId: string, signature: string, timestamp: string, token: string = webhook!.token) =>
+      request(app.getHttpServer())
+        .post(`/api/v1/hooks/workflows/${token}`)
+        .set('Content-Type', 'application/json')
+        .set(headers(eventId, signature, timestamp))
+        .send(payload);
 
-    const ok = await request(app.getHttpServer())
-      .post(`/api/v1/hooks/workflows/${webhook!.token}`)
-      .set('Content-Type', 'application/json')
-      .set(headers('evt-1', sign(), String(Date.now())))
-      .send(payload).expect(201);
+    const ts1 = String(Date.now());
+    const ok = await post('evt-1', sign(ts1, 'evt-1'), ts1).expect(201);
     const runId = ok.body.data.runId as string;
     runIds.push(runId);
     expect(await approveAndWait(runId)).toBe('completed');
@@ -273,30 +278,30 @@ describe('M7-P6 Workflow Engine (e2e, 真实 Queue + Worker)', () => {
     expect(run?.triggerType).toBe('webhook');
     expect(run?.input).toMatchObject({ orderId: 'hook-1' });
 
-    // 重放同一 eventId → 409
-    await request(app.getHttpServer())
-      .post(`/api/v1/hooks/workflows/${webhook!.token}`)
-      .set('Content-Type', 'application/json')
-      .set(headers('evt-1', sign(), String(Date.now())))
-      .send(payload).expect(409);
-    // 坏签名 → 401
-    await request(app.getHttpServer())
-      .post(`/api/v1/hooks/workflows/${webhook!.token}`)
-      .set('Content-Type', 'application/json')
-      .set(headers('evt-2', 'deadbeef', String(Date.now())))
-      .send(payload).expect(401);
-    // 过期 timestamp（10 分钟前）→ 401
-    await request(app.getHttpServer())
-      .post(`/api/v1/hooks/workflows/${webhook!.token}`)
-      .set('Content-Type', 'application/json')
-      .set(headers('evt-3', sign(), String(Date.now() - 10 * 60_000)))
-      .send(payload).expect(401);
-    // 未知 token → 401
-    await request(app.getHttpServer())
-      .post('/api/v1/hooks/workflows/unknown-token-1234')
-      .set('Content-Type', 'application/json')
-      .set(headers('evt-4', sign(), String(Date.now())))
-      .send(payload).expect(401);
+    // 重放同一 eventId（签名有效）→ 409 WEBHOOK_REPLAY
+    const ts2 = String(Date.now());
+    const replay = await post('evt-1', sign(ts2, 'evt-1'), ts2).expect(409);
+    expect(replay.body.error.code).toBe('WEBHOOK_REPLAY');
+    // 坏签名 → 401（统一文案，不区分原因）
+    const ts3 = String(Date.now());
+    const bad = await post('evt-2', 'deadbeef', ts3).expect(401);
+    expect(bad.body.error.code).toBe('WEBHOOK_SIGNATURE_INVALID');
+    // Pre-M9 回归：signature 覆盖 timestamp/eventId —— 同一签名换新 eventId（旧格式下可无限重放）→ 401
+    const ts4 = String(Date.now());
+    await post('evt-replay-2', sign(ts4, 'evt-1'), ts4).expect(401);
+    // Pre-M9 回归：signature 覆盖 timestamp —— 旧签名换个时间戳（旧格式可"重签"绕过时间窗）→ 401
+    // 注意：两个时间戳必须**不同**（同毫秒会让用例变成空断言）； tsB 仍在容忍窗内，故只有签名不匹配能拦下它
+    const tsA = String(Date.now());
+    const tsB = String(Date.now() + 5_000);
+    await post('evt-5', sign(tsA, 'evt-5'), tsB).expect(401);
+    // 超窗 timestamp（10 分钟前，签名有效）→ 401 WEBHOOK_TIMESTAMP_STALE
+    const stale = String(Date.now() - 10 * 60_000);
+    const staleRes = await post('evt-3', sign(stale, 'evt-3'), stale).expect(401);
+    expect(staleRes.body.error.code).toBe('WEBHOOK_TIMESTAMP_STALE');
+    // 未知 token → 401（与坏签名同文案，不可枚举）
+    const ts6 = String(Date.now());
+    const unknown = await post('evt-4', sign(ts6, 'evt-4'), ts6, 'unknown-token-1234').expect(401);
+    expect(unknown.body.error.message).toBe('webhook 鉴权失败');
   });
 
   it('P6 schedule 触发（直调 tick 模拟 cron）：时间桶幂等——同分钟重复 tick 只产生一个 run', async () => {
