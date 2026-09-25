@@ -8,6 +8,7 @@ import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { EventBusService } from '../../core/events/event-bus.service';
 import { WORKFLOW_CANCEL_CHANNEL } from '../../core/events/workflow-channels';
 import { WorkflowDefinition } from './workflow-types';
+import { AuditService } from '../audit/audit.service';
 
 const TERMINAL = ['completed', 'failed', 'cancelled', 'timeout'] as const;
 const ACTIVE = ['queued', 'running', 'waiting'] as const;
@@ -27,6 +28,7 @@ export class WorkflowRunsService {
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @InjectQueue(WORKFLOW_QUEUE) private readonly workflowQueue: Queue,
     @Inject(EventBusService) private readonly events: EventBusService,
+    @Inject(AuditService) private readonly audit: AuditService,
   ) {}
 
   /** 最新 published 版本（Run 锁定快照） */
@@ -83,6 +85,11 @@ export class WorkflowRunsService {
         removeOnComplete: true, removeOnFail: { count: 500 },
       },
     );
+    await this.audit.write({
+      userId, action: 'workflow_run.created', projectId: wf.projectId,
+      targetType: 'workflow_run', targetId: run.id, workflowRunId: run.id,
+      metadata: { workflowId: wf.id, version: version.version, triggerType: input.triggerType },
+    });
     return run;
   }
 
@@ -167,12 +174,11 @@ export class WorkflowRunsService {
     });
     if (done.count === 0) throw new AppError(ErrorCode.WORKFLOW_RUN_NOT_CANCELLABLE, '运行已结束，无法取消');
     // 附带清理（best-effort；终态绝不复活）
-    if (run.waitingOnApprovalId) {
-      await this.prisma.approval.updateMany({
-        where: { id: run.waitingOnApprovalId, status: 'requested' },
-        data: { status: 'cancelled', cancelledAt: new Date() },
-      }).catch(() => undefined);
-    }
+    // 附带清理按 workflowRunId 兜底——覆盖「审批已建但 run.waitingOnApprovalId 未落库」的竞态窗口
+    await this.prisma.approval.updateMany({
+      where: { workflowRunId: runId, status: 'requested' },
+      data: { status: 'cancelled', cancelledAt: new Date() },
+    }).catch(() => undefined);
     if (run.waitingOnAgentRunId) {
       await this.prisma.agentRun.updateMany({
         where: { id: run.waitingOnAgentRunId, status: { in: ['queued', 'running', 'waiting'] } },
@@ -180,6 +186,10 @@ export class WorkflowRunsService {
       }).catch(() => undefined);
     }
     await this.events.publish(WORKFLOW_CANCEL_CHANNEL, { runId }).catch(() => undefined);
+    await this.audit.write({
+      userId, action: 'workflow_run.cancelled',
+      targetType: 'workflow_run', targetId: runId, workflowRunId: runId,
+    });
     return { runId, status: 'cancelled' };
   }
 

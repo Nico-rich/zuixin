@@ -32,7 +32,7 @@ function makeService(overrides: Record<string, unknown> = {}) {
   };
   const queue = { add: vi.fn().mockResolvedValue({ id: 'j1' }) };
   const events = { subscribe: vi.fn().mockResolvedValue(undefined) };
-  const svc = new DelegationService(prisma as never, queue as never, events as never);
+  const svc = new DelegationService(prisma as never, queue as never, events as never, { write: vi.fn().mockResolvedValue(undefined) } as never);
   return { svc, prisma, queue, events };
 }
 

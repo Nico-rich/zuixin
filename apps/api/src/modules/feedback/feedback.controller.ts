@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { FeedbackService } from './feedback.service';
 import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe';
 import { AuthedUser, JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { RateLimit, RateLimitGuard } from '../../core/rate-limit/rate-limit.guard';
 
 const SubmitFeedbackSchema = z.strictObject({
   projectId: z.string().uuid().optional().nullable(),
@@ -38,6 +39,8 @@ export class FeedbackController {
   constructor(@Inject(FeedbackService) private readonly feedback: FeedbackService) {}
 
   @Post()
+  @UseGuards(RateLimitGuard)
+  @RateLimit({ name: 'feedback-submit', limit: 30, windowMs: 60_000 })
   @UsePipes(new ZodValidationPipe(SubmitFeedbackSchema))
   submit(@Req() req: Request & { user: AuthedUser }, @Body() dto: z.infer<typeof SubmitFeedbackSchema>) {
     return this.feedback.submit(req.user.userId, dto);
@@ -49,6 +52,8 @@ export class FeedbackController {
   }
 
   @Post('performance')
+  @UseGuards(RateLimitGuard)
+  @RateLimit({ name: 'feedback-submit', limit: 30, windowMs: 60_000 })
   @UsePipes(new ZodValidationPipe(CapturePerformanceSchema))
   capture(@Req() req: Request & { user: AuthedUser }, @Body() dto: z.infer<typeof CapturePerformanceSchema>) {
     return this.feedback.capturePerformance(req.user.userId, dto);

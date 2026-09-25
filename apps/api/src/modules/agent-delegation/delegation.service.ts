@@ -5,6 +5,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AGENT_RUN_QUEUE } from '../../core/queue/queue.module';
 import { EventBusService, agentRunChannel } from '../../core/events/event-bus.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
+import { AuditService } from '../audit/audit.service';
 
 const CHILD_TERMINAL = ['completed', 'failed', 'cancelled', 'timeout'] as const;
 const DEFAULT_MAX_DEPTH = 3;
@@ -37,6 +38,7 @@ export class DelegationService {
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @InjectQueue(AGENT_RUN_QUEUE) private readonly agentRunQueue: Queue,
     @Inject(EventBusService) private readonly events: EventBusService,
+    @Inject(AuditService) private readonly audit: AuditService,
   ) {}
 
   private async limits(): Promise<{ maxDepth: number; maxChildren: number }> {
@@ -130,6 +132,11 @@ export class DelegationService {
       }
     });
     this.logger.log({ parentRunId: parent.id, childRunId: child.id, depth: parent.depth + 1 }, '委派子任务已创建');
+    await this.audit.write({
+      userId: input.userId, action: 'delegation.created', projectId: parent.projectId,
+      targetType: 'agent_delegation', targetId: delegationRow.id, agentRunId: parent.id,
+      metadata: { childRunId: child.id, childAgentId: childAgent.id, depth: parent.depth + 1 },
+    });
     return { __waiting_delegation: true, delegationId: delegationRow.id, childRunId: child.id };
   }
 

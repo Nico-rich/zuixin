@@ -4,6 +4,7 @@ import { ConnectionsService } from './connections.service';
 import { CallbackQuerySchema, StartConnectionSchema } from './connections.dto';
 import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe';
 import { AuthedUser, JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { RateLimit, RateLimitGuard } from '../../core/rate-limit/rate-limit.guard';
 
 /**
  * M7-P2 Connection API（JWT + ownership + 404 防枚举；响应永不包含凭证）。
@@ -26,6 +27,8 @@ export class ConnectionsController {
 
   /** 发起 OAuth（建 single-use state）→ authorizeUrl */
   @Post(':provider/start')
+  @UseGuards(RateLimitGuard)
+  @RateLimit({ name: 'oauth-start', limit: 30, windowMs: 60_000 })
   start(
     @Req() req: Request & { user: AuthedUser },
     @Param('provider') provider: string,
@@ -36,6 +39,8 @@ export class ConnectionsController {
 
   /** OAuth 回调（state 单次消费 + 交换 token + 加密入库） */
   @Get(':provider/callback')
+  @UseGuards(RateLimitGuard)
+  @RateLimit({ name: 'oauth-callback', limit: 60, windowMs: 60_000 })
   callback(
     @Req() req: Request & { user: AuthedUser },
     @Param('provider') provider: string,

@@ -166,6 +166,7 @@ model User {
   feedbacks         Feedback[]
   creativePerformances CreativePerformance[]
   performanceSnapshots PerformanceSnapshot[]
+  auditLogs         AuditLog[]
   knowledgeBases KnowledgeBase[]
   documents      Document[]
 }
@@ -1331,4 +1332,26 @@ model PerformanceSnapshot {
   capturedAt  DateTime @default(now())
   @@index([userId, periodStart])
   @@index([projectId])
+}
+
+// ===== M7-P9: AuditLog（关键行为追踪：who/what/when/which project/run/tool/approval/action）=====
+model AuditLog {
+  id               String   @id @default(uuid())
+  userId           String
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId        String?
+  action           String // approval.decided | external_action.executed | connection.established | connection.revoked | workflow_run.created | workflow_run.cancelled | delegation.created | webhook.accepted | auth.login
+  targetType       String?
+  targetId         String?
+  agentRunId       String?
+  toolCallId       String?
+  approvalId       String?
+  externalActionId String?
+  workflowRunId    String?
+  connectionId     String?
+  metadata         Json?
+  createdAt        DateTime @default(now())
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+  @@index([agentRunId])
 }

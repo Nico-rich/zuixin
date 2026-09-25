@@ -11,7 +11,7 @@ function makeService(rows: Array<Record<string, unknown>> = []) {
   };
   const resume = { wakeWaitingRunByApproval: vi.fn().mockResolvedValue({ woken: true }) };
   const events = { publish: vi.fn().mockResolvedValue(undefined) };
-  return { svc: new ApprovalsService(prisma as never, resume as never, events as never), prisma, resume, events };
+  return { svc: new ApprovalsService(prisma as never, resume as never, events as never, { write: vi.fn().mockResolvedValue(undefined) } as never), prisma, resume, events };
 }
 
 describe('ApprovalsService（M7-P1 状态机 + 竞态 + 归属）', () => {

@@ -23,6 +23,9 @@ import { ConnectionsApiModule } from './modules/connections/connections-api.modu
 import { ExternalActionsApiModule } from './modules/external-actions/external-actions-api.module';
 import { WorkflowsApiModule } from './modules/workflows/workflows-api.module';
 import { FeedbackApiModule } from './modules/feedback/feedback-api.module';
+import { AuditApiModule } from './modules/audit/audit-api.module';
+import { AuditModule } from './modules/audit/audit.module';
+import { RateLimitModule } from './core/rate-limit/rate-limit.module';
 import { KnowledgeApiModule } from './modules/knowledge/knowledge.module';
 import { GenerationsModule } from './modules/generations/generations.module';
 import { TasksModule } from './modules/tasks/tasks.module';
@@ -48,6 +51,8 @@ import { GlobalExceptionFilter } from './common/filters/global-exception.filter'
     }),
     PrismaModule,
     CryptoModule,
+    AuditModule,
+    RateLimitModule,
     StorageModule,
     QueueModule,
     CircuitBreakerModule,
@@ -66,6 +71,7 @@ import { GlobalExceptionFilter } from './common/filters/global-exception.filter'
     ExternalActionsApiModule,
     WorkflowsApiModule,
     FeedbackApiModule,
+    AuditApiModule,
     KnowledgeApiModule,
     GenerationsModule,
     TasksModule,

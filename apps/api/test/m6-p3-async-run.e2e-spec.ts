@@ -99,7 +99,8 @@ describe('M6-P3 异步 AgentRun (e2e, 真实 Queue + Worker)', () => {
     const finalStatus = await waitForTerminal(prisma, runId);
     expect(finalStatus).toBe('completed');
 
-    const run = await prisma.agentRun.findUnique({ where: { id: runId }, include: { steps: { include: { toolCalls: true } }, messages: true } });
+    // M7-P9 确定性修复：messages 按 sequence 排序（无 orderBy 时物理顺序不可保证——全量串行套件下偶发 flake）
+    const run = await prisma.agentRun.findUnique({ where: { id: runId }, include: { steps: { include: { toolCalls: true } }, messages: { orderBy: { sequence: 'asc' } } } });
     expect(run?.workerId).toBeTruthy(); // 由 worker claim
     expect(run?.steps.some((s) => s.type === 'tool_call' && s.toolCalls.some((t) => t.toolName === 'image.generate'))).toBe(true);
     expect(run?.steps.some((s) => s.type === 'final')).toBe(true);

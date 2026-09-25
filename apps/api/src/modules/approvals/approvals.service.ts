@@ -4,6 +4,7 @@ import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { AgentRunResumeTrigger } from '../../core/agent-run-resume/agent-run-resume-trigger.service';
 import { EventBusService, agentRunChannel } from '../../core/events/event-bus.service';
 import { WORKFLOW_APPROVAL_DECIDED_CHANNEL } from '../../core/events/workflow-channels';
+import { AuditService } from '../audit/audit.service';
 
 const DECIDED = ['approved', 'rejected', 'expired', 'cancelled'] as const;
 
@@ -23,6 +24,7 @@ export class ApprovalsService {
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(AgentRunResumeTrigger) private readonly resume: AgentRunResumeTrigger,
     @Inject(EventBusService) private readonly events: EventBusService,
+    @Inject(AuditService) private readonly audit: AuditService,
   ) {}
 
   /** 懒过期：requested 且 expiresAt 已过 → expired（返回是否发生变更） */
@@ -123,6 +125,13 @@ export class ApprovalsService {
         .catch(() => undefined);
     }
     this.logger.log({ id, target }, 'Approval 已决断');
+    // M7-P9 审计：who/what/when/which run/approval
+    await this.audit.write({
+      userId, action: 'approval.decided', projectId: a.projectId,
+      targetType: 'approval', targetId: id, approvalId: id,
+      agentRunId: a.agentRunId ?? undefined, workflowRunId: a.workflowRunId ?? undefined,
+      metadata: { decision: target },
+    });
     return this.prisma.approval.findFirst({ where: { id, userId } });
   }
 

@@ -4,6 +4,7 @@ import { ApprovalsService } from './approvals.service';
 import { ListApprovalsSchema } from './approvals.dto';
 import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe';
 import { AuthedUser, JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { RateLimit, RateLimitGuard } from '../../core/rate-limit/rate-limit.guard';
 
 /**
  * M7-P1 Approval API（JWT + ownership + 404 防枚举）：
@@ -30,16 +31,22 @@ export class ApprovalsController {
   }
 
   @Post(':id/approve')
+  @UseGuards(RateLimitGuard)
+  @RateLimit({ name: 'approval-decide', limit: 300, windowMs: 60_000 })
   approve(@Req() req: Request & { user: AuthedUser }, @Param('id') id: string) {
     return this.approvals.approve(req.user.userId, id);
   }
 
   @Post(':id/reject')
+  @UseGuards(RateLimitGuard)
+  @RateLimit({ name: 'approval-decide', limit: 300, windowMs: 60_000 })
   reject(@Req() req: Request & { user: AuthedUser }, @Param('id') id: string) {
     return this.approvals.reject(req.user.userId, id);
   }
 
   @Post(':id/cancel')
+  @UseGuards(RateLimitGuard)
+  @RateLimit({ name: 'approval-decide', limit: 300, windowMs: 60_000 })
   cancel(@Req() req: Request & { user: AuthedUser }, @Param('id') id: string) {
     return this.approvals.cancel(req.user.userId, id);
   }

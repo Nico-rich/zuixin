@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { PrismaModule } from './modules/prisma/prisma.module';
 import { CryptoModule } from './core/crypto/crypto.module';
+import { AuditModule } from './modules/audit/audit.module';
 import { ProvidersModule } from './providers/providers.module';
 import { CircuitBreakerModule } from './core/circuit-breaker/circuit-breaker.module';
 import { RouterModule } from './core/router/router.module';
@@ -17,7 +18,7 @@ import { WorkflowWorkerModule } from './worker/workflow/workflow-worker.module';
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true, envFilePath: ['.env', '../../.env'] }),
-    PrismaModule, CryptoModule, ProvidersModule, CircuitBreakerModule, RouterModule,
+    PrismaModule, CryptoModule, AuditModule, ProvidersModule, CircuitBreakerModule, RouterModule,
     StorageModule, UsageModule, QueueModule,
     ImageWorkerModule,
     VideoWorkerModule,

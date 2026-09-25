@@ -4,6 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { CredentialService } from '../connections/credentials.service';
 import { ExternalActionProvidersService } from './external-action-providers.service';
+import { AuditService } from '../audit/audit.service';
 
 /** M7-P3 风险分级（快照入库；financial/destructive → high，external_action → medium，其余 low） */
 export function classifyRisk(permission: string): 'low' | 'medium' | 'high' {
@@ -45,6 +46,7 @@ export class ExternalActionsService {
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(CredentialService) private readonly credentials: CredentialService,
     @Inject(ExternalActionProvidersService) private readonly providers: ExternalActionProvidersService,
+    @Inject(AuditService) private readonly audit: AuditService,
   ) {}
 
   /** 审批复核：绝不只信 Engine/LLM——执行前必须存在 approved 的 Approval 且绑定一致（否则抛出，永不返回 null） */
@@ -101,6 +103,13 @@ export class ExternalActionsService {
         data: { status: 'completed', completedAt: new Date(), result: result as never },
       });
       this.logger.log({ actionId, provider: input.provider, actionType: input.actionType }, '外部动作完成');
+      await this.audit.write({
+        userId: input.userId, action: 'external_action.executed', projectId: input.projectId,
+        targetType: 'external_action', targetId: actionId, externalActionId: actionId,
+        agentRunId: input.agentRunId, toolCallId: input.toolCallId, approvalId: approval.id,
+        connectionId: connection.id,
+        metadata: { provider: input.provider, actionType: input.actionType, status: 'completed' },
+      });
       return this.toView(done);
     } catch (err) {
       const aborted = input.signal.aborted;
@@ -111,6 +120,13 @@ export class ExternalActionsService {
           ? { status: 'cancelled', completedAt: new Date(), errorCode: ErrorCode.AGENT_CANCELLED, error: '执行已取消' }
           : { status: 'failed', completedAt: new Date(), errorCode: appErr.code, error: appErr.message },
       }).catch(() => null);
+      await this.audit.write({
+        userId: input.userId, action: 'external_action.executed', projectId: input.projectId,
+        targetType: 'external_action', targetId: actionId, externalActionId: actionId,
+        agentRunId: input.agentRunId, toolCallId: input.toolCallId, approvalId: approval.id,
+        connectionId: connection.id,
+        metadata: { provider: input.provider, actionType: input.actionType, status: aborted ? 'cancelled' : 'failed', errorCode: appErr.code },
+      });
       this.logger.warn({ actionId, errorCode: appErr.code }, '外部动作失败/取消');
       if (aborted) throw err; // AbortError 上抛：Engine 识别为取消
       throw appErr;

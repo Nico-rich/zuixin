@@ -5,6 +5,7 @@ import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { OAuthProvidersService } from './oauth/oauth-providers.service';
 import { CredentialService } from './credentials.service';
 import { CONNECTION_SELECT } from './connections.dto';
+import { AuditService } from '../audit/audit.service';
 
 const OAUTH_STATE_TTL_MS = 10 * 60_000; // 短时 single-use（10min）
 
@@ -25,6 +26,7 @@ export class ConnectionsService {
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(OAuthProvidersService) private readonly providers: OAuthProvidersService,
     @Inject(CredentialService) private readonly credentials: CredentialService,
+    @Inject(AuditService) private readonly audit: AuditService,
   ) {}
 
   private requireProvider(name: string) {
@@ -111,6 +113,11 @@ export class ConnectionsService {
     });
     await this.credentials.store(connection.id, tokens);
     this.logger.log({ userId, provider, connectionId: connection.id }, 'OAuth 连接建立');
+    await this.audit.write({
+      userId, action: 'connection.established', projectId: row.projectId,
+      targetType: 'connection', targetId: connection.id, connectionId: connection.id,
+      metadata: { provider, providerAccountId: tokens.providerAccountId },
+    });
     return connection;
   }
 
@@ -123,7 +130,7 @@ export class ConnectionsService {
   }
 
   async revoke(userId: string, id: string) {
-    const c = await this.prisma.connection.findFirst({ where: { id, userId }, select: { id: true, status: true, provider: true } });
+    const c = await this.prisma.connection.findFirst({ where: { id, userId }, select: { id: true, status: true, provider: true, projectId: true } });
     if (!c) throw new AppError(ErrorCode.NOT_FOUND, '连接不存在');
     const done = await this.prisma.connection.updateMany({
       where: { id, userId, status: { in: ['active', 'expired'] } },
@@ -136,6 +143,10 @@ export class ConnectionsService {
       await this.requireProvider(c.provider).revoke(refreshToken).catch(() => undefined);
     }
     this.logger.log({ userId, connectionId: id }, '连接已吊销');
+    await this.audit.write({
+      userId, action: 'connection.revoked', projectId: c.projectId ?? undefined,
+      targetType: 'connection', targetId: id, connectionId: id, metadata: { provider: c.provider },
+    });
     return this.get(userId, id);
   }
 

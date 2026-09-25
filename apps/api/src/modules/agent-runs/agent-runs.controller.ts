@@ -5,6 +5,7 @@ import { AgentRunTimelineService } from './agent-run-timeline.service';
 import { CreateAgentRunSchema } from './agent-runs.dto';
 import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe';
 import { AuthedUser, JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { RateLimit, RateLimitGuard } from '../../core/rate-limit/rate-limit.guard';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { EventBusService, agentRunChannel } from '../../core/events/event-bus.service';
 import { SSEWriter, SSESink } from '../chat/sse-writer';
@@ -32,8 +33,10 @@ export class AgentRunsController {
     return this.runs.get(req.user.userId, id);
   }
 
-  /** M6-P3 异步入口：创建即返回（201 {runId, status:'queued'}），执行在 Worker 进程 */
+  /** M6-P3 异步入口：创建即返回（201 {runId, status:'queued'}），执行在 Worker 进程；M7-P9 限流 60/min */
   @Post()
+  @UseGuards(RateLimitGuard)
+  @RateLimit({ name: 'agent-run-create', limit: 300, windowMs: 60_000 })
   @UsePipes(new ZodValidationPipe(CreateAgentRunSchema))
   create(@Req() req: Request & { user: AuthedUser }, @Body() dto: { agentId?: string; conversationId?: string | null; projectId?: string | null; message: string }) {
     return this.runs.createAsync(req.user.userId, dto);

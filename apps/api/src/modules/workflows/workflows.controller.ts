@@ -5,6 +5,7 @@ import { WorkflowRunsService } from './workflow-runs.service';
 import { CreateWorkflowSchema, UpdateWorkflowSchema, CreateWorkflowRunSchema } from './workflows.dto';
 import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe';
 import { AuthedUser, JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { RateLimit, RateLimitGuard } from '../../core/rate-limit/rate-limit.guard';
 import { WorkflowDefinition } from './workflow-types';
 
 /**
@@ -65,8 +66,10 @@ export class WorkflowsController {
     return this.workflows.remove(req.user.userId, id);
   }
 
-  /** Run 创建（manual 触发；幂等键去重） */
+  /** Run 创建（manual 触发；幂等键去重）；M7-P9 限流 60/min */
   @Post(':id/runs')
+  @UseGuards(RateLimitGuard)
+  @RateLimit({ name: 'workflow-run-create', limit: 60, windowMs: 60_000 })
   createRun(
     @Req() req: Request & { user: AuthedUser },
     @Param('id') id: string,

@@ -360,4 +360,25 @@ Creative → Publish → Performance（回流）→ 阈值记忆（服务端规�
 
 - Worker 进程无 AuthModule（@Global 只在 API 进程）——controller 与 service 同模块会导致 worker 侧 JwtAuthGuard 依赖解析失败：FeedbackModule（服务层）/ FeedbackApiModule（HTTP 面）分层（与既有模块同构）。
 
+## 9. M7-P9 Security Hardening（✅ 2026-09-25 完成）
+
+### 9.1 防线清单
+
+| # | 防线 | 实现 |
+|---|---|---|
+| 1 | IDOR | P1~P8 各面 userId 首条件 + e2e 越权矩阵（404 防枚举） |
+| 2 | 凭证安全 | AES-256-GCM at rest；DTO 零凭证字段；e2e 断言响应/DB 分离（P2 + P9 复核） |
+| 3 | Prompt Injection | 不可信数据工具（commerce./external_action./performance.）的 Agent 注入运行时护栏 system 行（引擎层，不改 AgentVersion 快照；resume 由引擎重建、driver 重放过滤全部 system 行防重复）；商域结果 meta.untrusted 标注；e2e 断言注入内容只出现在 tool 数据行、零指令执行 |
+| 4 | Tool Injection | 权限/审批校验全部服务端 DB 事实（不读 LLM 输出）；P3 复核层（P9 旁路矩阵：无审批/未批准/吊销连接一律拒绝） |
+| 5 | Approval Bypass | external_action 执行前复核 approval 必须 approved（P3 设计；P9 矩阵 e2e） |
+| 6 | Webhook | HMAC-SHA256 + timestamp ±5min + eventId 防重放 + 幂等键（P6） |
+| 7 | Rate Limit | Redis 固定窗口（RateLimitService + @RateLimit 装饰器守卫）：agent-run/workflow-run 创建、审批决断、OAuth start/callback、webhook（按 token）、反馈提交；Redis 故障 → 放行（限流是保护面不放大故障） |
+| 8 | Audit | AuditLog（who/what/when/project/run/tool/approval/action）+ 服务层接线（approval.decided/external_action.executed/connection.established-revoked/workflow_run.created-cancelled/delegation.created/webhook.accepted）；best-effort 写入不阻断主流程；GET /audit-logs userId 隔离 |
+
+### 9.2 实测修复
+
+- **AuditService 必须同时注册于 WorkerModule**：被 worker 侧服务（ExternalActions/Delegation/Workflow*）注入，仅 AppModule 的 @Global 不足以覆盖 worker 依赖图。
+- webhook 限流 keyFn 的 params 类型转换需 `as unknown as`（express 类型不重叠）。
+- P9 旁路矩阵测试的连接吊销必须显式 connectionId（默认解析取首个 active，全量吊销会先命中 NOT_FOUND）。
+
 **✅ 续接点（2026-09-25）**：① `prisma migrate dev` 应用未迁移的 schema 增量（Approval.workflowRunId + WorkflowWebhook.secretEncrypted，当前仅磁盘编辑）；② 按 §6 实现 worker/workflow + modules/workflows + queue 注册 + Approval.decide 经 EventBus 唤醒 workflow + 部分唯一索引 + web UI + 测试。详见 memory m7-progress。

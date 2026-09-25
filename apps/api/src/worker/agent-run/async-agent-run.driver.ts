@@ -109,11 +109,11 @@ export class AsyncAgentRunDriver {
     return outcome;
   }
 
-  /** P3 最小续跑重放：transcript（去掉 seq0 user 与开头 system 行）→ LLM messages 顺序 */
+  /** P3 最小续跑重放：transcript（去掉 seq0 user 与全部 system 行）→ LLM messages 顺序。
+   *  system 行（systemPrompt + M7-P9 运行时护栏）由 engine 每次重建——绝不重复注入。 */
   private replayHistory(transcript: Array<{ role: string; content: string; toolCallId: string | null; toolCalls: unknown }>): ChatMessage[] {
-    const rows = transcript.filter((r) => r.role !== 'user');
-    const withoutSystem = rows[0]?.role === 'system' ? rows.slice(1) : rows; // systemPrompt 由 engine 前插
-    return withoutSystem.map((r) => ({
+    const rows = transcript.filter((r) => r.role !== 'user' && r.role !== 'system');
+    return rows.map((r) => ({
       role: r.role as ChatMessage['role'],
       content: r.content,
       tool_call_id: r.toolCallId ?? undefined,

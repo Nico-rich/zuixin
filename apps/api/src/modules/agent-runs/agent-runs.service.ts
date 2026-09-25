@@ -151,13 +151,11 @@ export class AgentRunsService {
         data: { status: 'cancelled', statusMessage: 'Agent 运行已取消', completedAt: new Date() },
       }).catch(() => undefined);
     }
-    // M7-P1：等待中的审批 → cancelled（best-effort；不唤醒——run 已 cancelled）
-    if (run.status === 'waiting' && run.waitingOnApprovalId) {
-      await this.prisma.approval.updateMany({
-        where: { id: run.waitingOnApprovalId, status: 'requested' },
-        data: { status: 'cancelled', cancelledAt: new Date() },
-      }).catch(() => undefined);
-    }
+    // M7-P1：审批附带取消按 agentRunId 兜底——覆盖「审批已建但 waitingOnApprovalId 未落库」的竞态窗口
+    await this.prisma.approval.updateMany({
+      where: { agentRunId: runId, status: 'requested' },
+      data: { status: 'cancelled', cancelledAt: new Date() },
+    }).catch(() => undefined);
     // M7-P7：委派级联取消（子及后代条件取消；已终态容忍）
     await this.delegation.cancelChildren(runId).catch(() => undefined);
     // 快速通道：worker 收到提示立即 abort（heartbeat 15s 仍是 DB 事实兜底）

@@ -93,7 +93,7 @@ export class CommerceService {
     const connection = await this.resolveConnection(userId, provider.name, input.connectionId);
     const params = this.listParams(input, this.resolveTimeRange(input.timeRange));
     const page = await provider.listProducts({ userId, connectionId: connection.id }, params);
-    return { facts: { items: page.items, total: page.total, page: page.page, pageSize: page.pageSize }, meta: { provider: provider.name, readOnly: true } };
+    return { facts: { items: page.items, total: page.total, page: page.page, pageSize: page.pageSize }, meta: { provider: provider.name, readOnly: true, untrusted: true } };
   }
 
   async productsGet(userId: string, input: CommerceToolInput) {
@@ -102,7 +102,7 @@ export class CommerceService {
     const connection = await this.resolveConnection(userId, provider.name, input.connectionId);
     const product = await provider.getProduct({ userId, connectionId: connection.id }, input.productId);
     if (!product) throw new AppError(ErrorCode.NOT_FOUND, '商品不存在');
-    return { facts: { product }, meta: { provider: provider.name, readOnly: true } };
+    return { facts: { product }, meta: { provider: provider.name, readOnly: true, untrusted: true } };
   }
 
   async ordersList(userId: string, input: CommerceToolInput) {
@@ -110,7 +110,7 @@ export class CommerceService {
     const connection = await this.resolveConnection(userId, provider.name, input.connectionId);
     const timeRange = this.resolveTimeRange(input.timeRange);
     const page = await provider.listOrders({ userId, connectionId: connection.id }, this.listParams(input, timeRange));
-    return { facts: { items: page.items, total: page.total, page: page.page, pageSize: page.pageSize }, meta: { provider: provider.name, timeRange, readOnly: true } };
+    return { facts: { items: page.items, total: page.total, page: page.page, pageSize: page.pageSize }, meta: { provider: provider.name, timeRange, readOnly: true, untrusted: true } };
   }
 
   /** 订单汇总：facts 原始聚合 + derived（客单价 aov） */
@@ -129,7 +129,7 @@ export class CommerceService {
     return {
       facts: { orderCount: page.total, validOrderCount: count, revenue: round2(revenue), byStatus: statusCount },
       derived: { aov: count > 0 ? round2(revenue / count) : 0 },
-      meta: { provider: provider.name, timeRange, readOnly: true },
+      meta: { provider: provider.name, timeRange, readOnly: true, untrusted: true },
     };
   }
 
@@ -153,7 +153,7 @@ export class CommerceService {
     return {
       facts: { impressions, visits, uniqueVisitors, bySource },
       derived: { avgVisitsPerVisitor: uniqueVisitors > 0 ? round2(visits / uniqueVisitors) : 0 },
-      meta: { provider: provider.name, timeRange, readOnly: true },
+      meta: { provider: provider.name, timeRange, readOnly: true, untrusted: true },
     };
   }
 
@@ -161,7 +161,7 @@ export class CommerceService {
     const provider = this.provider(input.provider);
     const connection = await this.resolveConnection(userId, provider.name, input.connectionId);
     const page = await provider.listCampaigns({ userId, connectionId: connection.id }, this.listParams(input, this.resolveTimeRange(input.timeRange)));
-    return { facts: { items: page.items, total: page.total, page: page.page, pageSize: page.pageSize }, meta: { provider: provider.name, readOnly: true } };
+    return { facts: { items: page.items, total: page.total, page: page.page, pageSize: page.pageSize }, meta: { provider: provider.name, readOnly: true, untrusted: true } };
   }
 
   /** 广告表现：按 campaign 分组——facts 原始聚合 + derived（ctr/cvr/roas/cpc，服务端计算，绝不混入 LLM 推测） */
@@ -195,7 +195,7 @@ export class CommerceService {
         cpc: g.clicks > 0 ? round2(g.spend / g.clicks) : 0,
       });
     }
-    return { facts, derived, meta: { provider: provider.name, timeRange, readOnly: true } };
+    return { facts, derived, meta: { provider: provider.name, timeRange, readOnly: true, untrusted: true } };
   }
 
   /** 分析汇总：跨 revenue/traffic/conversion/ad 四源聚合——facts 原始 + derived 比率 */
@@ -233,7 +233,7 @@ export class CommerceService {
         roas: spend > 0 ? round2(adRevenue / spend) : 0,
         aov: orders > 0 ? round2(revenue / orders) : 0,
       },
-      meta: { provider: provider.name, timeRange, readOnly: true },
+      meta: { provider: provider.name, timeRange, readOnly: true, untrusted: true },
     };
   }
 
@@ -249,7 +249,7 @@ export class CommerceService {
       const b = factsB[key] ?? 0;
       deltas[key] = { base: a, compare: b, changePct: a !== 0 ? round2(((b - a) / a) * 100) : null };
     }
-    return { facts: deltas, derived: { note: 'changePct 为服务端计算的百分比变化；因果解读属于 LLM 推测，不得作为事实' }, meta: { provider: base.meta.provider, base: base.meta.timeRange, compare: compare.meta.timeRange, readOnly: true } };
+    return { facts: deltas, derived: { note: 'changePct 为服务端计算的百分比变化；因果解读属于 LLM 推测，不得作为事实' }, meta: { provider: base.meta.provider, base: base.meta.timeRange, compare: compare.meta.timeRange, readOnly: true, untrusted: true } };
   }
 
   /** 库存汇总：facts 原始聚合 + derived 售罄率（read-only） */
@@ -265,7 +265,7 @@ export class CommerceService {
     return {
       facts: { stock, reserved, sold },
       derived: { sellThrough: stock + sold > 0 ? round2(sold / (stock + sold)) : 0 },
-      meta: { provider: provider.name, timeRange, readOnly: true },
+      meta: { provider: provider.name, timeRange, readOnly: true, untrusted: true },
     };
   }
 }

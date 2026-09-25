@@ -9,6 +9,7 @@ import { WORKFLOW_QUEUE } from '../../core/queue/queue.module';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { WorkflowRunsService } from './workflow-runs.service';
 import { WorkflowDefinition } from './workflow-types';
+import { AuditService } from '../audit/audit.service';
 
 const WEBHOOK_TIMESTAMP_TOLERANCE_MS = 5 * 60_000;
 
@@ -32,6 +33,7 @@ export class WorkflowTriggersService implements OnModuleInit {
     @Inject(EventBusService) private readonly events: EventBusService,
     @Inject(WorkflowRunsService) private readonly runs: WorkflowRunsService,
     @InjectQueue(WORKFLOW_QUEUE) private readonly workflowQueue: Queue,
+    @Inject(AuditService) private readonly audit: AuditService,
   ) {}
 
   /** 启动自愈：已发布且带 schedule/event 触发器的工作流重新注册（重启后调度不丢） */
@@ -142,6 +144,11 @@ export class WorkflowTriggersService implements OnModuleInit {
       workflowId, triggerType: 'webhook', triggerId: eventId, idempotencyKey, payload,
     });
     await this.prisma.workflowWebhook.update({ where: { token }, data: { lastDeliveredAt: new Date() } }).catch(() => undefined);
+    await this.audit.write({
+      userId: wf.userId, action: 'webhook.accepted', projectId: wf.projectId,
+      targetType: 'workflow_webhook', targetId: token, workflowRunId: run.id,
+      metadata: { workflowId, eventId },
+    });
     return { runId: run.id };
   }
 
