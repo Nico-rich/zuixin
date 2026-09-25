@@ -78,6 +78,13 @@ P7 ─┘
 4. 重投必须换 jobId（active job 同 id 被判重丢弃）；
 5. 组织私有 Agent 建 run 需扩展 agent-runs.service 的 scope 解析（原硬编码 system）——系统路径零漂移（m6-p3 复验 5/5）。
 
+## 6.5 P8/P9 第二轮并行（2026-09-25）
+
+- 同模式：worktree m8-p8-security（87041f1）/ m8-p9-reliability（0e89638），文件边界预分配（main.ts：P8 安全区 / P9 只加一行 shutdown）；
+- P8：19 项真实缺口（3 项可利用）修复 + 安全 E2E 29；P9：2 个真实 bug（workflow recoverStale 无周期接线、Redis 探针冷启动假 503）+ 故障注入 E2E 23 + 真实 load/DR drill；
+- 合并零冲突（边界预分配生效）；P8 唯一越界 = 修正 m8-p6-extension e2e fixture（RFC2606 不可解析域名被新 DNS 层拒绝——校验未放宽）；
+- P10 串行：全量 110 文件/899 测试 ×2 轮 + fresh-DB 迁移重放 + 基线文档。
+
 ## 7. 完成状态
 
 - 全部 5 Phase 合并于 main（85aa2db/6d54179/112d48d 三个整合 commit）；

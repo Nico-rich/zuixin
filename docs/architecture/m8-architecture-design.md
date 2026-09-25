@@ -216,14 +216,28 @@ Plan（code free/pro/team/enterprise + entitlements）/ Subscription（每组织
 
 - invoke 句柄尚无生产调用方（接入 chat/media/agent 会触碰冻结模块，超出 P7 边界）——P7 交付路由决策层 + 审计；接入点留待 M8 后续或显式解冻决策。
 
-## 8. M8-P8 Enterprise Security
+## 8. M8-P8 Enterprise Security（✅ 2026-09-25 完成，并行 Agent）
 
-（施工时补全）
+- 完整审计见 `docs/security/m8-security-audit.md`（11 节 + 19 项真实缺口 + NOT VERIFIED 清单）；
+- **修复 3 项可利用缺口**：① 登出只撤 refresh、access token 在 TTL 内继续有效 → access token 加 sid 会话标识 + JwtAuthGuard 校验会话未撤销/用户 active（只缓存肯定结论）；② 禁用账号旧 token 仍可读写 → 全端点用户状态校验；③ SSRF 守卫对 IPv6 方括号形式/内嵌 IPv4 永不命中且无 DNS 层 → 全新 `modules/security/ssrf-guard.ts`（协议 allowlist + 完整 IP 分类 + IPv6 展开 + 可注入 DNS resolver + fail-closed），接入扩展 provider 物化；
+- 上传加固（服务端权威大小/MIME 白名单/文件名 sanitize/魔术字节嗅探）、webhook 加固（统一错误文案/载荷复杂度+体积二次校验）、API 加固（显式 body limit 413 映射/CORS 解析策略）；
+- 安全 E2E 29 项（真实基础设施）；M0-M7 认证行为零漂移。
 
-## 9. M8-P9 Reliability / Disaster Recovery
+## 9. M8-P9 Reliability / Disaster Recovery（✅ 2026-09-25 完成，并行 Agent）
 
-（施工时补全）
+- 详见 `docs/operations/m8-production-readiness.md` 与 `docs/operations/m8-disaster-recovery.md`；
+- **修复 2 个真实 bug**：① WorkflowLeaseService.recoverStale 只有测试直调、无周期任务接线（生产里 workflow 丢 job 无人重投/worker 崩溃永久 running/超时无人判）→ 接线进 MediaCleanupProcessor 5min 清扫周期；② Redis 健康探针 enableOfflineQueue=false 导致冷启动首个 ping 假 503 → 专用探针客户端；
+- /live（进程存活恒定 200）/ /ready（DB+Redis 分级探测，非关键依赖不整体 503）/ /health（兼容扩展明细）；
+- graceful shutdown（SIGTERM/SIGINT → app.close → worker 等当前 job → 30s 兜底强制退出）；
+- 背压：全局 agent-run 队列深度水位 429（与 per-org 并发配额互补；fail-open 绝不误拒）；
+- scheduler processor stalled 判定（running 心跳 + 超时归 failed，一致性优先）；
+- **真实 load 数字**：/live 50 并发×200 请求 p50 27.65ms / p95 52.32ms / p99 54.93ms / 0 错误 / 1502 req/s；20 并发 agent run 全部完成（端到端 p50 529ms）；50 job 队列 32.72 job/s；
+- **真实 DR drill**：pg_dump 5.3MB（0.72s）→ 回灌独立临时容器（schema 指纹全等 73 表/862 列/238 索引 + 逐表行数全等）→ 清理；MinIO mc mirror 往返 md5 全 MATCH；生产库全程只读。
 
-## 10. M8-P10 Final Hardening / Release
+## 10. M8-P10 Final Hardening / Release（✅ 2026-09-25 完成，串行）
 
-（施工时补全）
+- 全量 fresh 回归两轮：api **110 文件 / 899 测试全绿**（含 M0-M7 + M8-P1~P9 全部 E2E）；
+- workspace typecheck 4/4、build 3/3（零缓存）；
+- fresh-DB migration 重放验证：临时数据库（预装 pgvector）`prisma migrate deploy` 全部迁移成功（生产库零触碰）；
+- 基础设施真实健康（PostgreSQL/pgvector/Redis/BullMQ/Worker/MinIO）；
+- 工作树干净；基线：`docs/architecture/m8-final-baseline.md`。
