@@ -112,9 +112,41 @@ Plan（code free/pro/team/enterprise + entitlements）/ Subscription（每组织
 
 （施工时补全）
 
-## 6. M8-P6 Extension SDK / Marketplace Foundation
+## 6. M8-P6 Extension SDK / Marketplace Foundation（✅ 2026-09-25 完成）
 
-（施工时补全）
+### 6.1 声明式扩展（绝不执行任意代码）
+
+- manifest 是**纯 JSON 数据**（zod strictObject 按 kind 校验：tool / agent / provider / workflow_step）；任何函数、类实例、宿主路径、数据库连接串、密钥字面量（`sk-…`）在解析期一律拒绝（`findNonJsonPath` / `findSecretPath`）；
+- **绝不使用 eval / Function / vm / child_process / 动态 import**——扩展的全部能力 = 组合平台既有 tool / Agent / Provider，越权能力无从表达；
+- 权限白名单 `tool.execute / agent.run / provider.call / workflow.step / config.read / config.write`，并按 kind 限定能力域（agent 类不得声明 tool.execute）；块内 `permissions` 归一化折叠到顶层（顶层与块内不一致 → 拒绝），checksum 只覆盖归一化后的 manifest（键序无关的稳定序列化）。
+
+### 6.2 版本状态机与签名（draft → published → deprecated → archived，绝不逆向）
+
+- 扩展级与版本级双层状态：`update` 只产出 draft 版本（published 版本行永不被修改）；`publish` = draft → published + HMAC-SHA256 签名（`signChecksum(manifest.checksum, ENCRYPTION_KEY)`），旧 published 版本自动 archived；
+- **安装完整性校验**：install 时复算 manifest checksum 并与版本行比对（防篡改）+ timingSafeEqual 验签（防伪造）；`ENCRYPTION_KEY` 缺失 → 拒绝发布（绝不产生无签名发布）；
+- **安装版本锁定**：installation 只指向某一版本，后续 publish 绝不使已安装实例漂移；升级必须显式 install 指定 versionId。
+
+### 6.3 物化执行（tool / agent / provider / workflow_step）
+
+- tool：ExtensionsService 注入 ToolRegistry，将「已启用安装 × 扩展 published × 锁定版本 published」的期望集合与已注册集合求差 → 运行期 `register` 包装工具 `ext.<slug>.<name>`（paramConstraints 执行前校验 + 输入原样透传；inputSchema/permission/requiresApproval/retryPolicy 全部继承 baseTool，**权限绝不提升**）；disable/uninstall/deprecate 立即回收；`onModuleInit` 全量 reconcile（重启自愈）；
+  - 只允许包装 read/write/generate 类平台工具；destructive / financial / external_action 一律拒绝；baseTool / agent.tools / step.toolName 均不得指向 `ext.*`（**禁止扩展链**）；
+- agent：物化为组织私有 Agent（scope=organization、kind=custom）+ 已发布 AgentVersion（systemPrompt 由白名单模板变量渲染，tools = 声明的平台工具子集），复用既有 Agent 运行时（AgentRun 锁定 AgentVersion）；
+- provider：物化 Provider（adapter 仅 `openai-compatible`）+ Model 行；**apiKey 只能由安装时组织 config 提供**并 AES-256-GCM 加密落库（manifest 绝不携带）；baseUrl 强制 https 公网（拒绝 userinfo / localhost / 私网 / 链路本地 → 防 SSRF）；installation.config 落库前键名脱敏；
+- workflow_step：仅登记可查询的步骤模板（`GET /extensions/steps`），本 Phase 不改执行器。
+
+### 6.4 多租户与生命周期
+
+- 可见性：平台级（organizationId=null）+ 本组织私有；跨组织访问一律 404（防枚举）；管理语义 = 组织 `agent.write`（平台级扩展需平台管理员），marketplace 目录 = `organization.read`；
+- 安装/卸载/启停 = `agent.write`；非组织成员安装 → 403；
+- **卸载标记而非删除**物化资源（Agent/Provider enabled=false、Model 禁用）：AgentRun / GenerationTask 有 FK 引用，保留审计与血缘；
+- Provider 表无 organization 列（平台级资源）→ 以确定性命名 `[ext:<slug>:<orgHash>]` 隔离各组织安装实例（已知限制：命名隔离而非行级隔离）。
+
+### 6.5 实测修复（诚实记录）
+
+- **Nest 管道位置**：`@UsePipes(ZodValidationPipe)` 是方法级管道，会一并校验 `@Param('id')` 字符串 → 所有带 `:id` 的子路由恒定 400；改为参数级 `@Body(new ZodValidationPipe(Schema))`（与 organizations.controller 约定一致）。单测（直调 service）无法暴露此类缺陷，e2e 拦下；
+- **enable 复用密钥**：provider 类扩展重新启用时不会再索取明文 apiKey，改为复用已加密落库的密文（否则启用即 400）；
+- **组织私有 Agent 无法创建 run**：既有创建路径硬编码 `scope='system'` → agent-runs.service 的 Agent 解析改为「系统 Agent 或本人所属组织的私有 Agent」（越权/跨组织返回 404），系统 Agent 行为零漂移；
+
 
 ## 7. M8-P7 Intelligent Provider Routing
 

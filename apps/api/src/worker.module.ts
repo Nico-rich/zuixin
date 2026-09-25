@@ -17,6 +17,7 @@ import { MediaCleanupWorkerModule } from './worker/media-cleanup/media-cleanup-w
 import { VideoWorkerModule } from './worker/video/video-worker.module';
 import { AgentRunWorkerModule } from './worker/agent-run/agent-run-worker.module';
 import { WorkflowWorkerModule } from './worker/workflow/workflow-worker.module';
+import { ExtensionsModule } from './modules/extensions/extensions.module';
 
 @Module({
   imports: [
@@ -25,6 +26,8 @@ import { WorkflowWorkerModule } from './worker/workflow/workflow-worker.module';
     StorageModule, UsageModule, QueueModule,
     TracingModule, // M8-P3 可观测性（Worker 侧指标采样/审计 trace 注入）
     QueueDepthWorkerModule, // M8-P3 队列深度采样（仅 Worker 进程）
+    // M8-P6：扩展工具在 Worker 侧注册（agent run 执行时 ToolRegistry 必须含扩展工具；onModuleInit 自愈）
+    ExtensionsModule,
     ImageWorkerModule,
     VideoWorkerModule,
     MediaCleanupWorkerModule,
