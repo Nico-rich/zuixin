@@ -27,6 +27,9 @@ export const ErrorCode = {
   WORKFLOW_RUN_NOT_RETRYABLE: 'WORKFLOW_RUN_NOT_RETRYABLE',     // M7-P6: 非终态 run 不可 retry → 409
   WEBHOOK_SIGNATURE_INVALID: 'WEBHOOK_SIGNATURE_INVALID', // M7-P6: 签名/timestamp 校验失败 → 401
   WEBHOOK_REPLAY: 'WEBHOOK_REPLAY',                 // M7-P6: eventId 重放 → 409
+  WEBHOOK_TIMESTAMP_STALE: 'WEBHOOK_TIMESTAMP_STALE', // Pre-M9: webhook timestamp 超出容忍窗 → 401
+  APPROVAL_BINDING_MISMATCH: 'APPROVAL_BINDING_MISMATCH', // Pre-M9: 审批 payloadHash/actionType 与实际执行不一致 → 拒绝执行
+  SSRF_BLOCKED: 'SSRF_BLOCKED', // Pre-M9 F3-A: 下载目标 IP/域名未通过安全校验 → 拒绝
   DELEGATION_DEPTH_EXCEEDED: 'DELEGATION_DEPTH_EXCEEDED',   // M7-P7: 委派深度超限（回喂 LLM）
   DELEGATION_CHILDREN_LIMIT: 'DELEGATION_CHILDREN_LIMIT',   // M7-P7: 子任务数超限（回喂 LLM）
   DELEGATION_CYCLE: 'DELEGATION_CYCLE',                     // M7-P7: 委派环检测（回喂 LLM）
