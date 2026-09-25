@@ -26,6 +26,7 @@ import { FeedbackApiModule } from './modules/feedback/feedback-api.module';
 import { AuditApiModule } from './modules/audit/audit-api.module';
 import { OrganizationsApiModule } from './modules/organizations/organizations-api.module';
 import { BillingApiModule } from './modules/billing/billing-api.module';
+import { ExtensionsApiModule } from './modules/extensions/extensions-api.module';
 import { AuditModule } from './modules/audit/audit.module';
 import { RateLimitModule } from './core/rate-limit/rate-limit.module';
 import { KnowledgeApiModule } from './modules/knowledge/knowledge.module';
@@ -57,6 +58,7 @@ import { GlobalExceptionFilter } from './common/filters/global-exception.filter'
     RateLimitModule,
     OrganizationsApiModule,
     BillingApiModule,
+    ExtensionsApiModule,
     StorageModule,
     QueueModule,
     CircuitBreakerModule,

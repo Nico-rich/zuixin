@@ -15,12 +15,15 @@ import { MediaCleanupWorkerModule } from './worker/media-cleanup/media-cleanup-w
 import { VideoWorkerModule } from './worker/video/video-worker.module';
 import { AgentRunWorkerModule } from './worker/agent-run/agent-run-worker.module';
 import { WorkflowWorkerModule } from './worker/workflow/workflow-worker.module';
+import { ExtensionsModule } from './modules/extensions/extensions.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true, envFilePath: ['.env', '../../.env'] }),
     PrismaModule, CryptoModule, AuditModule, BillingModule, ProvidersModule, CircuitBreakerModule, RouterModule,
     StorageModule, UsageModule, QueueModule,
+    // M8-P6：扩展工具在 Worker 侧注册（agent run 执行时 ToolRegistry 必须含扩展工具；onModuleInit 自愈）
+    ExtensionsModule,
     ImageWorkerModule,
     VideoWorkerModule,
     MediaCleanupWorkerModule,

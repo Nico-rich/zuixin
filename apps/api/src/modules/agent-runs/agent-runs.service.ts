@@ -32,6 +32,32 @@ export class AgentRunsService {
     @Inject(QuotaService) private readonly quota: QuotaService,
   ) {}
 
+  /**
+   * Agent 可运行解析（M8-P6 增量，默认路径行为不变）：
+   * - 缺省 = general-assistant（system）；
+   * - 指定 agentId：system 直接可用；scope=organization（扩展/组织自定义）必须调用者仍是该组织成员
+   *   （组织已删除或非成员 → null → 404 防枚举）；
+   * - 其它 scope（user 等）不可执行。
+   */
+  private async resolveRunnableAgent(userId: string, agentId?: string) {
+    const include = { activeVersion: true } as const;
+    if (!agentId) {
+      return this.prisma.agent.findFirst({ where: { slug: 'general-assistant', enabled: true, scope: 'system' }, include });
+    }
+    const agent = await this.prisma.agent.findFirst({ where: { id: agentId, enabled: true }, include });
+    if (!agent) return null;
+    if (agent.scope === 'system') return agent;
+    if (agent.scope !== 'organization' || !agent.organizationId) return null;
+    const [member, organization] = await Promise.all([
+      this.prisma.organizationMember.findUnique({
+        where: { organizationId_userId: { organizationId: agent.organizationId, userId } },
+        select: { id: true },
+      }),
+      this.prisma.organization.findFirst({ where: { id: agent.organizationId, deletedAt: null }, select: { id: true } }),
+    ]);
+    return member && organization ? agent : null;
+  }
+
   /** SSE 观察端点用：归属校验（userId 首条件，防枚举 404）+ 当前状态 */
   async getStatus(userId: string, id: string) {
     const run = await this.prisma.agentRun.findFirst({ where: { id, userId }, select: { id: true, status: true } });
@@ -88,13 +114,8 @@ export class AgentRunsService {
     }
     const projectId = dto.projectId ?? conversation.projectId ?? null;
 
-    // Agent 解析：仅 enabled 系统 Agent；版本由服务端 activeVersion 解析（客户端不可指定）
-    const agent = await this.prisma.agent.findFirst({
-      where: dto.agentId
-        ? { id: dto.agentId, enabled: true, scope: 'system' }
-        : { slug: 'general-assistant', enabled: true, scope: 'system' },
-      include: { activeVersion: true },
-    });
+    // Agent 解析：enabled 系统 Agent + 本组织私有 Agent（M8-P6 扩展物化）；版本由服务端 activeVersion 解析（客户端不可指定）
+    const agent = await this.resolveRunnableAgent(userId, dto.agentId);
     if (!agent) throw new AppError(ErrorCode.NOT_FOUND, 'Agent 不存在或不可用');
     if (!agent.activeVersion) throw new AppError(ErrorCode.VALIDATION_ERROR, 'Agent 尚无已发布版本');
     const version = agent.activeVersion;
