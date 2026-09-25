@@ -102,14 +102,18 @@ describe('Knowledge (e2e, mock-embedding 全链路)', () => {
   it('KnowledgeSource（Path A）：enabled 时注入 [Knowledge] 块；disabled 不检索', async () => {
     const appAny = app as unknown as { get: <T>(type: unknown) => T };
     const assembler = appAny.get<ContextAssembler>(ContextAssembler);
+    // 查询用词与文档高重叠：mock-embedding 为「字符袋」语义（charCode % 1536），
+    // 平台固定维度 1536 后原自然问句与 800 字块相似度仅 ≈0.300（浮点边界，pgvector 实测 0.2946），
+    // 会被 KnowledgeSource 的 0.3 阈值过滤——此处取重叠充分的问法（≈0.50）以保证断言稳定。
+    const relevant = '智能插排 主图规范 品牌色';
     const enabled = await assembler.assemble({
       userId, conversationId: '00000000-0000-0000-0000-000000000000',
-      userMessage: '智能插排的主图规范是什么', knowledge: { enabled: true },
+      userMessage: relevant, knowledge: { enabled: true },
     });
     expect(enabled.blocks.some((b) => b.scope === 'knowledge' && b.content.includes('[Knowledge]'))).toBe(true);
     const disabled = await assembler.assemble({
       userId, conversationId: '00000000-0000-0000-0000-000000000000',
-      userMessage: '智能插排的主图规范是什么', knowledge: { enabled: false },
+      userMessage: relevant, knowledge: { enabled: false },
     });
     expect(disabled.blocks.some((b) => b.scope === 'knowledge')).toBe(false);
   });

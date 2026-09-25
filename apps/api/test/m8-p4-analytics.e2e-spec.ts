@@ -9,7 +9,7 @@ import { GlobalExceptionFilter } from '../src/common/filters/global-exception.fi
 import { TransformInterceptor } from '../src/common/interceptors/transform.interceptor';
 import { csrfProtection } from '../src/modules/auth/csrf.middleware';
 import { PrismaService } from '../src/modules/prisma/prisma.service';
-import { dayRange, periodOf } from '../src/modules/analytics/analytics.service';
+import { addDays, dayRange, periodOf } from '../src/modules/analytics/analytics.service';
 
 const XRW = { 'X-Requested-With': 'XMLHttpRequest' };
 
@@ -235,6 +235,69 @@ describe('M8-P4 Analytics / BI (e2e)', () => {
     }
     const agent = data.sources.find((s: { kind: string }) => s.kind === 'agent');
     expect(agent.metricKeys).toEqual(expect.arrayContaining(['runs', 'completed', 'failed', 'cancelled', 'timeout']));
+  });
+
+  /**
+   * P2 性能包新语义（读时全量刷新 → 读只补当日 + 显式刷新维护历史）：
+   * 读端点**只补刷当日**——历史日期不再因一次 GET 被顺带重算，故历史日的账本行
+   * 不会凭空出现在读数里；回填历史必须走 POST /analytics/refresh（owner）。
+   */
+  it('P2 读路径只补刷当日：历史日不写聚合行（读数不含未刷新的历史行），POST /analytics/refresh 才回填', async () => {
+    const back = addDays(periodOf(new Date()), -3); // 3 天前（range=week 窗口内）
+    const { start } = dayRange(back);
+    await prisma.usageLedgerEntry.create({
+      data: {
+        organizationId: orgA, userId: userAId, kind: 'storage', quantity: 7, unit: 'gb_day',
+        idempotencyKey: `p2-backfill-${Date.now()}`, period: back.slice(0, 7), createdAt: start,
+      },
+    });
+
+    const before = await request(app.getHttpServer()).get(`/api/v1/analytics/overview?organizationId=${orgA}&range=week`)
+      .set(XRW).set('Cookie', cookieA).expect(200);
+    // 读端点覆盖该历史日，但只补刷当日 → 历史日既无聚合行，读数也不含这笔
+    expect(await prisma.analyticsAggregate.count({ where: { organizationId: orgA, period: back } })).toBe(0);
+    const beforeVal = Number(before.body.data.facts.usage.storage ?? 0);
+
+    const refreshed = await request(app.getHttpServer()).post('/api/v1/analytics/refresh')
+      .set(XRW).set('Cookie', cookieA).send({ organizationId: orgA, from: back, to: back }).expect(201);
+    expect(refreshed.body.data).toMatchObject({ from: back, to: back, days: 1, periods: [back] });
+    expect(await prisma.analyticsAggregate.count({ where: { organizationId: orgA, period: back } })).toBe(5); // 5 维度各一行
+
+    const after = await request(app.getHttpServer()).get(`/api/v1/analytics/overview?organizationId=${orgA}&range=week`)
+      .set(XRW).set('Cookie', cookieA).expect(200);
+    expect(Number(after.body.data.facts.usage.storage ?? 0)).toBe(beforeVal + 7); // 回填后历史行进入读数
+
+    // 区间上限：>366 天 → 服务端校验拒绝（绝不 6.2k 查询长跑）
+    await request(app.getHttpServer()).post('/api/v1/analytics/refresh').set(XRW).set('Cookie', cookieA)
+      .send({ organizationId: orgA, from: addDays(periodOf(new Date()), -400), to: periodOf(new Date()) }).expect(400);
+    // 起始晚于结束 → 400
+    await request(app.getHttpServer()).post('/api/v1/analytics/refresh').set(XRW).set('Cookie', cookieA)
+      .send({ organizationId: orgA, from: periodOf(new Date()), to: addDays(periodOf(new Date()), -1) }).expect(400);
+  });
+
+  it('P2 显式刷新 RBAC：匿名 401 / 非成员 403 / member 403 / owner 200（缺省刷当日）', async () => {
+    await request(app.getHttpServer()).post('/api/v1/analytics/refresh').set(XRW)
+      .send({ organizationId: orgA }).expect(401); // 匿名
+
+    await request(app.getHttpServer()).post('/api/v1/analytics/refresh').set(XRW).set('Cookie', cookieB)
+      .send({ organizationId: orgA }).expect(403); // 非成员（他人组织）
+
+    // member：分析可读（billing.read），但刷新是组织级写 → billing.write（仅 owner）
+    const member = await prisma.user.create({ data: { email: `m8p4-m-${Date.now()}@example.com`, passwordHash: 'unused-hash' } });
+    await prisma.organizationMember.create({ data: { organizationId: orgA, userId: member.id, role: 'member' } });
+    const { JwtService } = await import('@nestjs/jwt');
+    const cookieM = `agent_access=${await app.get(JwtService).signAsync({ sub: member.id, role: 'user' })}`;
+    await request(app.getHttpServer()).get(`/api/v1/analytics/overview?organizationId=${orgA}&range=day`)
+      .set(XRW).set('Cookie', cookieM).expect(200);
+    await request(app.getHttpServer()).post('/api/v1/analytics/refresh').set(XRW).set('Cookie', cookieM)
+      .send({ organizationId: orgA }).expect(403);
+    await prisma.organizationMember.deleteMany({ where: { organizationId: orgA, userId: member.id } });
+    await prisma.user.delete({ where: { id: member.id } });
+
+    // owner：显式刷新（缺省 organizationId = 个人组织）
+    const own = await request(app.getHttpServer()).post('/api/v1/analytics/refresh').set(XRW).set('Cookie', cookieA)
+      .send({}).expect(201);
+    expect(own.body.data.periods).toEqual([periodOf(new Date())]); // 缺省只刷当日
   });
 
   it('P4 RBAC：他人组织 403 / 匿名 401 / 本组织成员 200', async () => {

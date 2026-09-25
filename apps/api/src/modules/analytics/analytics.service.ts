@@ -13,7 +13,11 @@ import { AppError, ErrorCode } from '../../common/errors/app-error';
  *   （先查后写；唯一键 P2002 兜底 update——并发刷新绝不产生第二行）；
  * - 组织归因与 M8-P2 计费一致（BillingService.organizationFor）：run.project.organizationId
  *   > run 无项目/项目无组织时的个人组织（isPersonal + ownerUserId）；
- * - 读路径只读聚合表（query），写路径只在 refresh*（overview/breakdown 入口显式调用）。
+ * - 读路径（P2 性能包）：只读聚合表（query）+ **当日**补偿刷新（refreshToday：单日、幂等、
+ *   17 查询上限），绝不按 range 内联刷新全区间——原实现 month=30×17、days=366≈6.2k 查询全在请求路径内。
+ * - **历史聚合由显式刷新维护**：POST /analytics/refresh（refreshAll，≤366 天）或后台/运维任务；
+ *   读请求只保证「今天」的数字实时（当日聚合随读写变化重算），历史日期的聚合行按刷新时点冻结。
+ * - 写路径只在 refresh*（显式入口）；刷新原语 refreshOrganization/refreshAll 语义不变（幂等）。
  */
 
 export type AnalyticsKind = 'usage' | 'agent' | 'generation' | 'provider' | 'workflow';
@@ -215,6 +219,15 @@ export class AnalyticsService {
     }
     for (const period of periods) await this.refreshOrganization(organizationId, period);
     return { organizationId, from, to, days: periods.length, periods };
+  }
+
+  /**
+   * P2 轻量补偿刷新（读路径唯一允许的刷新）：只补刷**当日**——单日幂等、查询数有上界（17），
+   * 与 range 无关。历史区间（week/month/自定义）只读已有聚合行，由显式刷新维护。
+   * 绝不在请求路径内联 refreshAll（原 month=30×17、days=366≈6.2k 查询）。
+   */
+  private async refreshToday(organizationId: string): Promise<void> {
+    await this.refreshOrganization(organizationId, periodOf(new Date()));
   }
 
   /**
@@ -423,7 +436,8 @@ export class AnalyticsService {
   /** 跨 kind 汇总（facts 各维度 + derived 服务端计算，均标注分层） */
   async overview(organizationId: string, range: AnalyticsRange = 'day') {
     const { from, to, days } = rangeOf(range);
-    await this.refreshAll(organizationId, from, to); // 先刷新（幂等）再读——绝不返回未刷新数据
+    // P2：出请求路径——只补刷当日（单日幂等），历史日期只读已有聚合行
+    await this.refreshToday(organizationId);
     const result = await this.query(organizationId, { from, to });
 
     const usage = result.facts.usage ?? {};
@@ -471,12 +485,12 @@ export class AnalyticsService {
     };
   }
 
-  /** 按天序列（facts 逐日；刷新区间幂等——与 overview 同一刷新原语） */
+  /** 按天序列（facts 逐日；P2：与 overview 同一「只补刷当日」语义，历史日只读聚合行） */
   async breakdown(organizationId: string, options: { kind?: AnalyticsKind; days?: number } = {}) {
     const days = Math.min(Math.max(Math.trunc(options.days ?? 30), 1), 366);
     const to = periodOf(new Date());
     const from = addDays(to, -(days - 1));
-    await this.refreshAll(organizationId, from, to);
+    await this.refreshToday(organizationId);
     const result = await this.query(organizationId, { kind: options.kind, from, to });
     return {
       organizationId,

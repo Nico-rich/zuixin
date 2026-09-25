@@ -14,6 +14,21 @@ export interface BudgetedContext {
 }
 
 /**
+ * scope → 默认优先级（导出：调用方构造 MemoryBlock 时复用同一映射，绝不各自硬编码优先级数字）。
+ * conversation=5 即「最近消息」组：组内从最新向前保留、预算不足整块丢弃。
+ */
+export function scopePriority(scope: MemoryBlock['scope']): number {
+  switch (scope) {
+    case 'system': return 0;
+    case 'project': return 1;
+    case 'user': return 2;
+    case 'conversation': return 5; // recent messages
+    case 'knowledge': return 4;
+  }
+  return 3; // summary 等未知源默认中位
+}
+
+/**
  * Context Budget 统一决策点——任何 Source 不得自行截断（P6 原则）。
  *
  * 截断策略（deterministic + explainable + stable）：
@@ -30,14 +45,7 @@ export class ContextBudgetService {
   constructor(@Inject('TOKEN_ESTIMATOR') private readonly estimator: TokenEstimator) {}
 
   private defaultPriority(scope: MemoryBlock['scope']): number {
-    switch (scope) {
-      case 'system': return 0;
-      case 'project': return 1;
-      case 'user': return 2;
-      case 'conversation': return 5; // recent messages
-      case 'knowledge': return 4;
-    }
-    return 3; // summary 等未知源默认中位
+    return scopePriority(scope);
   }
 
   apply(blocks: MemoryBlock[], budget: ContextBudget): BudgetedContext {
