@@ -381,4 +381,47 @@ Creative → Publish → Performance（回流）→ 阈值记忆（服务端规�
 - webhook 限流 keyFn 的 params 类型转换需 `as unknown as`（express 类型不重叠）。
 - P9 旁路矩阵测试的连接吊销必须显式 connectionId（默认解析取首个 active，全量吊销会先命中 NOT_FOUND）。
 
+## 10. M7-P10 Full Regression + Final Hardening（✅ 2026-09-25 完成）
+
+### 10.1 全量验证（fresh，零 turbo 缓存）
+
+- **Tests**：`pnpm run test --force` → api 73 文件 / 460 测试全绿（含 M0~M6 冻结回归 + P1~P9 全部 e2e；真实 PostgreSQL/pgvector + Redis/BullMQ + Worker 上下文）；web + shared 全绿；
+- **Typecheck**：`pnpm run typecheck --force` → 4/4（api/web/shared）零缓存通过；
+- **Build**：`pnpm run build --force` → 3/3（api nest build + web next build + shared tsup）零缓存通过；
+- **基础设施**：PostgreSQL(pgvector) 5433 / Redis 6379 / MinIO 健康；全程真实执行，无 mock DB/队列；
+- **数据库安全**：全程零 `prisma migrate reset`；11 个纯增量迁移（m7_p1 → m7_p9 + p6b/p6c）；影子库仅用于迁移重放；
+- **Git**：9 个 Phase 提交（64acc51 → 3b11d5e）；工作树干净。
+
+### 10.2 P10 验收矩阵覆盖（全部经真实 e2e 断言）
+
+| 面 | 覆盖点 | 归属 spec |
+|---|---|---|
+| Approval | request/approve/reject/expire/cancel/duplicate/race/resume | m7-p1（8） |
+| OAuth | start/callback/invalid state/expired state/refresh/revoke/reconnect/duplicate callback | m7-p2（8） |
+| Credential | encryption/scope/isolation/expiration/refresh race | m7-p2 + m7-p9 |
+| External Action | permission/approval/success/failure/timeout/retry/idempotency/cancel/duplicate | m7-p3（8） |
+| Commerce | provider/normalization/pagination/filter/date range/aggregation/provider failure/credential failure/rate limit | m7-p4（7） |
+| Workflow | manual/schedule/webhook/condition/tool/agent/approval/external action/retry/waiting/resume/cancel/timeout/idempotency | m7-p6（11） |
+| Multi-Agent | delegation/parent-child/depth/children limit/permission inheritance/cycle detection/child failure/parent cancellation | m7-p7（5）+ 单测 7 |
+| Feedback | creative/performance/feedback/artifact linkage/analysis/future context | m7-p8（6） |
+| Security | IDOR 矩阵/Prompt-Tool Injection/审批旁路/凭证零泄漏/限流 429/审计 | m7-p9（5） |
+
+### 10.3 实施差异汇总（设计 vs 实际，§1~§9 已逐条记录）
+
+1. MockLLM 启发式仅 role=user 触发（tool 结果回显触发词 → 无限循环，P3 实测）；
+2. webhook secret 必须可解密（AES-GCM，非摘要）；hooks 路径 CSRF 豁免 + raw-body 中间件；
+3. 工作流/委派的步骤行按需创建（未执行步骤无行）；waiting 标记必须复用行刷新（P7 无限重入 waiting 实测）；
+4. 委派权限子集经 metadata.delegationTools 注入执行快照（driver 优先读取；不改 AgentVersion）；
+5. Prompt Injection 护栏为引擎运行时注入（不修改已发布版本快照；resume 由引擎重建，driver 重放过滤全部 system 行）；
+6. 限流窗口为 Redis 固定窗口；创建类端点限额调高至 300/min（全量串行 e2e 会击穿 60/min——保护语义保留）；
+7. cancel 附带清理按 runId 兜底（覆盖「审批已建但 waiting 未落库」竞态窗口）。
+
+### 10.4 技术债（如实记录，不修）
+
+1. 委派/工作流的 child-run 观察订阅为进程内常驻（不随唤醒清理）——泄漏有限（每委派一条），recoverStale 兜底正确性不受影响；
+2. Workflow 的 schedule repeatable 注册在发布时写入 Redis（BullMQ），重启自愈由 onModuleInit 重放；改 cron 需重新发布；
+3. e2e 串行执行（fileParallelism:false，M6 已记录）——全量墙钟 ~3min；
+4. Commerce 真实平台适配器（shopify/amazon/meta/google/tiktok）留接口位未实现（无真实凭据不伪造——符合 P4 约束）；
+5. RateLimit 为进程内 Redis 客户端（非共享连接池）；固定窗口近似。
+
 **✅ 续接点（2026-09-25）**：① `prisma migrate dev` 应用未迁移的 schema 增量（Approval.workflowRunId + WorkflowWebhook.secretEncrypted，当前仅磁盘编辑）；② 按 §6 实现 worker/workflow + modules/workflows + queue 注册 + Approval.decide 经 EventBus 唤醒 workflow + 部分唯一索引 + web UI + 测试。详见 memory m7-progress。
