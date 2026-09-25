@@ -12,6 +12,7 @@ function makeService() {
       findFirst: vi.fn().mockResolvedValue(null),
       update: vi.fn().mockResolvedValue({}),
     },
+    memory: { findMany: vi.fn().mockResolvedValue([]) },
   };
   const commerce = {
     resolveTimeRange: vi.fn((input?: { start?: string; end?: string; days?: number }) => {

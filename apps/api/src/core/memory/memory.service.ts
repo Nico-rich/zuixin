@@ -20,6 +20,8 @@ export interface CreateMemoryInput {
   status?: MemoryStatus;
   source?: string;
   sourceMessageId?: string;
+  /** M7-P8：结构化元数据（如绩效记忆 kind/subjectId 幂等判定） */
+  metadata?: Record<string, unknown> | null;
 }
 
 export interface UpdateMemoryInput {
@@ -78,6 +80,7 @@ export class MemoryService {
         status: input.status ?? MemoryStatus.candidate,
         source: input.source,
         sourceMessageId: input.sourceMessageId,
+        metadata: (input.metadata as never) ?? undefined,
       },
     });
   }

@@ -163,6 +163,9 @@ model User {
   creativeBriefs    CreativeBrief[]
   workflows         Workflow[]
   workflowRuns      WorkflowRun[]
+  feedbacks         Feedback[]
+  creativePerformances CreativePerformance[]
+  performanceSnapshots PerformanceSnapshot[]
   knowledgeBases KnowledgeBase[]
   documents      Document[]
 }
@@ -1274,4 +1277,58 @@ model AgentDelegation {
   completedAt       DateTime?
   @@index([parentRunId])
   @@index([delegatedByRunId])
+}
+
+// ===== M7-P8: Feedback / Performance Learning（不改模型权重——经 Memory 闭环）=====
+model Feedback {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId   String?
+  subjectType String // artifact | creativeBrief | product | campaign | ad | generationTask | agentRun | analysis
+  subjectId   String
+  rating      Int // 1~5
+  comment     String?  @db.Text
+  createdAt   DateTime @default(now())
+  @@index([userId, createdAt])
+  @@index([subjectType, subjectId])
+}
+
+// 创意绩效（发布后回流：原始事实 + 服务端派生；learning 经 Memory 候选闭环）
+model CreativePerformance {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId   String?
+  artifactId  String?
+  campaignId  String?
+  adId        String?
+  platform    String   @default("mock")
+  periodStart DateTime
+  periodEnd   DateTime
+  impressions Int      @default(0)
+  clicks      Int      @default(0)
+  spend       Float    @default(0)
+  conversions Int      @default(0)
+  revenue     Float    @default(0)
+  orders      Int      @default(0)
+  capturedAt  DateTime @default(now())
+  @@index([userId, artifactId])
+  @@index([userId, campaignId])
+  @@index([userId, periodStart])
+}
+
+// 通用绩效快照（多源回流统一层）
+model PerformanceSnapshot {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId   String?
+  source      String   @default("mock") // mock | ads | commerce
+  periodStart DateTime
+  periodEnd   DateTime
+  metrics     Json // 结构化指标快照（facts 层，服务端计算）
+  capturedAt  DateTime @default(now())
+  @@index([userId, periodStart])
+  @@index([projectId])
 }

@@ -333,4 +333,31 @@ Workflow 列表 / 详情（版本 + 发布/归档 + 手动触发 + webhook 凭�
 - **身份/权限从 DB 解析**：DelegateInput 不携带 parentTools/parentAgentId（调用方不可信）——服务层从父 run 行 + agentVersion 解析（M6 红线延续）。
 - AgentRun 自关系生成递归类型 → TS 推断自引用（TS7022），血缘查询显式类型标注。
 
+## 8. M7-P8 Feedback / Performance Learning（✅ 2026-09-25 完成）
+
+### 8.1 数据模型
+
+- `Feedback`（subjectType：artifact/creativeBrief/product/campaign/ad/generationTask/agentRun/analysis + rating 1~5）；
+- `CreativePerformance`（发布后绩效回流：facts 原始 + 服务端 derived）+ `PerformanceSnapshot`（多源回流统一快照层）。
+
+### 8.2 学习闭环（不改模型权重——learning = Memory）
+
+```
+Creative → Publish → Performance（回流）→ 阈值记忆（服务端规则：CTR≥3% 或 ROAS≥2 → 好；≤1%/≤1 → 差）
+→ Feedback（评分 ≥4/≤2 → 记忆）→ performanceMemory（candidate）
+→ 未来 creativeBrief.create 的 evidence 自动附带（performance-memory 标注，与事实层严格分离）
+```
+- 幂等去重：同 (derivedFrom, subjectId) 只产一条候选（metadata 判定）；
+- insights 工具：performanceMemory（memory-candidate）+ recentPerformance（service-computed facts+derived）分层。
+
+### 8.3 工具与 API
+
+- 工具：`feedback.submit` / `performance.capture` / `performance.insights`；
+- API：POST/GET `/feedback`、POST/GET `/feedback/performance`、GET `/feedback/performance/insights`；
+- MemoryService.CreateMemoryInput 扩展 `metadata`（M2 服务边界内增量，向后兼容）。
+
+### 8.4 实测修复
+
+- Worker 进程无 AuthModule（@Global 只在 API 进程）——controller 与 service 同模块会导致 worker 侧 JwtAuthGuard 依赖解析失败：FeedbackModule（服务层）/ FeedbackApiModule（HTTP 面）分层（与既有模块同构）。
+
 **✅ 续接点（2026-09-25）**：① `prisma migrate dev` 应用未迁移的 schema 增量（Approval.workflowRunId + WorkflowWebhook.secretEncrypted，当前仅磁盘编辑）；② 按 §6 实现 worker/workflow + modules/workflows + queue 注册 + Approval.decide 经 EventBus 唤醒 workflow + 部分唯一索引 + web UI + 测试。详见 memory m7-progress。

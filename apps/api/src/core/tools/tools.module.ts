@@ -7,6 +7,8 @@ import { KnowledgeModule } from '../knowledge/knowledge.module';
 import { ExternalActionsModule } from '../../modules/external-actions/external-actions.module';
 import { CommerceModule } from '../../modules/commerce/commerce.module';
 import { AgentDelegationModule } from '../../modules/agent-delegation/agent-delegation.module';
+import { FeedbackModule } from '../../modules/feedback/feedback.module';
+import { FeedbackService } from '../../modules/feedback/feedback.service';
 import { MediaGenerationService } from '../../modules/generations/media-generation.service';
 import { ArtifactService } from '../../modules/artifacts/artifact.service';
 import { MemoryService } from '../memory/memory.service';
@@ -22,14 +24,15 @@ import { createExternalActionExecuteTool } from './builtin/external-action.tool'
 import { createCommerceTools } from './builtin/commerce.tools';
 import { createAnalysisTools } from './builtin/analysis.tools';
 import { createDelegateTool } from './builtin/delegation.tool';
+import { createFeedbackTools } from './builtin/feedback.tools';
 
 @Module({
-  imports: [GenerationsModule, ArtifactsModule, MemoryModule, KnowledgeModule, ExternalActionsModule, CommerceModule, AgentDelegationModule],
+  imports: [GenerationsModule, ArtifactsModule, MemoryModule, KnowledgeModule, ExternalActionsModule, CommerceModule, AgentDelegationModule, FeedbackModule],
   providers: [
     {
       provide: ToolRegistry,
-      inject: [MediaGenerationService, ArtifactService, MemoryService, KnowledgeService, ExternalActionsService, CommerceService, CommerceAnalysisService, DelegationService],
-      useFactory: (generations: MediaGenerationService, artifacts: ArtifactService, memories: MemoryService, knowledge: KnowledgeService, actions: ExternalActionsService, commerce: CommerceService, analysis: CommerceAnalysisService, delegation: DelegationService) => {
+      inject: [MediaGenerationService, ArtifactService, MemoryService, KnowledgeService, ExternalActionsService, CommerceService, CommerceAnalysisService, DelegationService, FeedbackService],
+      useFactory: (generations: MediaGenerationService, artifacts: ArtifactService, memories: MemoryService, knowledge: KnowledgeService, actions: ExternalActionsService, commerce: CommerceService, analysis: CommerceAnalysisService, delegation: DelegationService, feedback: FeedbackService) => {
         const registry = new ToolRegistry();
         registry.register(createImageGenerateTool(generations));
         registry.register(createVideoGenerateTool(generations));
@@ -41,6 +44,7 @@ import { createDelegateTool } from './builtin/delegation.tool';
         for (const t of createCommerceTools(commerce)) registry.register(t); // M7-P4：只读电商数据工具集
         for (const t of createAnalysisTools(analysis)) registry.register(t); // M7-P5：分析 + 创意简报
         registry.register(createDelegateTool(delegation)); // M7-P7：安全委派
+        for (const t of createFeedbackTools(feedback)) registry.register(t); // M7-P8：反馈/绩效学习闭环
         return registry;
       },
     },

@@ -160,8 +160,8 @@ export class CommerceAnalysisService {
 
   /**
    * 创意简报：problem/objective 必填；evidence = 最新/指定 Analysis 的 facts/derived/anomalies 快照
-   * （service-computed 标注）；LLM 创意方向字段原样存储（llm-suggestion 标注）；
-   * 镜像 Artifact(creative_brief)（复用现有制品体系，不重造媒体/制品层）。
+   * （service-computed 标注）+ 绩效记忆候选（M7-P8 学习闭环：历史创意表现沉淀，performance-memory 标注）；
+   * LLM 创意方向字段原样存储（llm-suggestion 标注）；镜像 Artifact(creative_brief)。
    */
   async createBrief(userId: string, input: BriefToolInput, ctx: { agentRunId?: string; projectId?: string; conversationId?: string; messageId?: string; idempotencyKey?: string } = {}) {
     let analysis: { id: string; facts: unknown; derived: unknown; anomalies: unknown } | null = null;
@@ -173,6 +173,12 @@ export class CommerceAnalysisService {
       // 未指定 → 自动关联最近一次 ready 分析（创意决策环的默认数据底座）
       analysis = await this.prisma.commerceAnalysis.findFirst({ where: { userId, status: 'ready' }, orderBy: { createdAt: 'desc' } });
     }
+    // M7-P8 学习闭环：绩效记忆候选作为证据底座（标注 performance-memory，与事实层严格分离）
+    const performanceMemory = await this.prisma.memory.findMany({
+      where: { userId, status: { in: ['candidate', 'active'] }, metadata: { path: ['kind'], equals: 'performance' } },
+      orderBy: { updatedAt: 'desc' },
+      take: 5,
+    });
 
     const row = await this.prisma.creativeBrief.create({
       data: {
@@ -184,11 +190,12 @@ export class CommerceAnalysisService {
         constraints: (input.constraints ?? null) as never,
         platform: input.platform,
         product: (input.product ? { source: 'llm-suggestion', data: input.product } : null) as never,
-        evidence: (analysis
+        evidence: (analysis || performanceMemory.length > 0
           ? {
-              source: 'commerce-analysis-snapshot', analysisId: analysis.id,
-              layering: { facts: 'service-computed', derived: 'service-computed', anomalies: 'service-rule' },
-              facts: analysis.facts, derived: analysis.derived, anomalies: analysis.anomalies,
+              source: 'commerce-analysis-snapshot', analysisId: analysis?.id ?? null,
+              layering: { facts: 'service-computed', derived: 'service-computed', anomalies: 'service-rule', performanceMemory: 'memory-candidate' },
+              facts: analysis?.facts ?? null, derived: analysis?.derived ?? null, anomalies: analysis?.anomalies ?? null,
+              performanceMemory: performanceMemory.map((m) => ({ id: m.id, content: m.content, status: m.status })),
             }
           : null) as never,
         status: 'ready',
