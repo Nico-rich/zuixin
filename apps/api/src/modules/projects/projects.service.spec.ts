@@ -10,27 +10,27 @@ function make() {
       update: vi.fn(),
     },
   };
-  const svc = new ProjectsService(prisma as never);
+  const svc = new ProjectsService(prisma as never, { ensurePersonalOrganization: vi.fn().mockResolvedValue({ id: 'org-personal' }), requireMembership: vi.fn().mockResolvedValue('owner') } as never);
   return { svc, prisma };
 }
 
 describe('ProjectsService', () => {
-  it('list 只查询本人的非删除项目', async () => {
+  it('list 查询本人的或所属组织成员的非删除项目（M8-P1 组织 scope）', async () => {
     const { svc, prisma } = make();
     prisma.project.findMany.mockResolvedValue([]);
     await svc.list('u1');
-    expect(prisma.project.findMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: { userId: 'u1', deletedAt: null },
-      orderBy: { updatedAt: 'desc' },
-    }));
+    const call = (prisma.project.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(call.where.deletedAt).toBe(null);
+    expect(call.where.OR).toHaveLength(2); // 本人 或 组织成员
+    expect(call.orderBy).toEqual({ updatedAt: 'desc' });
   });
 
-  it('create 创建项目', async () => {
+  it('create 创建项目（缺省挂个人组织）', async () => {
     const { svc, prisma } = make();
     prisma.project.create.mockResolvedValue({ id: 'p1' });
     await svc.create('u1', { name: '亚马逊店铺', description: 'x', metadata: { brand: '插排' } });
     expect(prisma.project.create).toHaveBeenCalledWith({
-      data: { userId: 'u1', name: '亚马逊店铺', description: 'x', metadata: { brand: '插排' } },
+      data: { userId: 'u1', organizationId: 'org-personal', name: '亚马逊店铺', description: 'x', metadata: { brand: '插排' } },
     });
   });
 

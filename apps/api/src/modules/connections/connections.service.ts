@@ -6,6 +6,7 @@ import { OAuthProvidersService } from './oauth/oauth-providers.service';
 import { CredentialService } from './credentials.service';
 import { CONNECTION_SELECT } from './connections.dto';
 import { AuditService } from '../audit/audit.service';
+import { OrganizationsService } from '../organizations/organizations.service';
 
 const OAUTH_STATE_TTL_MS = 10 * 60_000; // 短时 single-use（10min）
 
@@ -27,6 +28,7 @@ export class ConnectionsService {
     @Inject(OAuthProvidersService) private readonly providers: OAuthProvidersService,
     @Inject(CredentialService) private readonly credentials: CredentialService,
     @Inject(AuditService) private readonly audit: AuditService,
+    @Inject(OrganizationsService) private readonly orgs: OrganizationsService,
   ) {}
 
   private requireProvider(name: string) {
@@ -44,7 +46,11 @@ export class ConnectionsService {
   }
 
   async get(userId: string, id: string) {
-    const c = await this.prisma.connection.findFirst({ where: { id, userId }, select: CONNECTION_SELECT });
+    // M8-P1：本人或所属组织成员可见（跨组织 404 防枚举）
+    const c = await this.prisma.connection.findFirst({
+      where: { id, OR: [{ userId }, { organization: { deletedAt: null, members: { some: { userId } } } }] },
+      select: CONNECTION_SELECT,
+    });
     if (!c) throw new AppError(ErrorCode.NOT_FOUND, '连接不存在');
     return c;
   }
@@ -103,9 +109,12 @@ export class ConnectionsService {
       });
       return revived;
     }
+    // M8-P1：连接挂组织（缺省 = 个人组织）
+    const organizationId = (await this.orgs.ensurePersonalOrganization(userId)).id;
     const connection = await this.prisma.connection.create({
       data: {
         userId, provider, projectId: row.projectId,
+        organizationId,
         providerAccountId: tokens.providerAccountId,
         status: 'active', scope: tokens.scope as never,
       },

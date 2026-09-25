@@ -17,7 +17,7 @@ function makeAuth() {
   };
   const jwt = { signAsync: vi.fn().mockResolvedValue('jwt-token') };
   const kv = { get: vi.fn().mockResolvedValue('0'), incr: vi.fn().mockResolvedValue(1), set: vi.fn(), setNX: vi.fn(), del: vi.fn() };
-  const svc = new AuthService(prisma as never, jwt as never, kv as never);
+  const svc = new AuthService(prisma as never, jwt as never, kv as never, { ensurePersonalOrganization: vi.fn().mockResolvedValue({ id: 'org-1' }) } as never);
   return { svc, prisma, kv };
 }
 

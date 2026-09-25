@@ -33,7 +33,7 @@ function makeService() {
     refresh: vi.fn().mockResolvedValue({ accessToken: 'acc' }),
     getRefreshToken: vi.fn().mockResolvedValue('ref'),
   };
-  const svc = new ConnectionsService(prisma as never, providers as never, credentials as never, { write: vi.fn().mockResolvedValue(undefined) } as never);
+  const svc = new ConnectionsService(prisma as never, providers as never, credentials as never, { write: vi.fn().mockResolvedValue(undefined) } as never, { ensurePersonalOrganization: vi.fn().mockResolvedValue({ id: 'org-p' }) } as never);
   return { svc, prisma, providers, provider, credentials };
 }
 

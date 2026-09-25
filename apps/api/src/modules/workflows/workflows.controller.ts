@@ -28,7 +28,7 @@ export class WorkflowsController {
   @Post()
   create(
     @Req() req: Request & { user: AuthedUser },
-    @Body(new ZodValidationPipe(CreateWorkflowSchema)) dto: { name: string; description?: string; projectId?: string | null; definition: WorkflowDefinition },
+    @Body(new ZodValidationPipe(CreateWorkflowSchema)) dto: { name: string; description?: string; projectId?: string | null; organizationId?: string | null; definition: WorkflowDefinition },
   ) {
     return this.workflows.create(req.user.userId, dto);
   }

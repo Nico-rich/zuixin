@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { WorkflowDefinition, validateDefinition } from './workflow-types';
 import { WorkflowTriggersService } from './workflow-triggers.service';
+import { OrganizationsService } from '../organizations/organizations.service';
 
 /**
  * M7-P6 Workflow 读写（版本不可变：编辑 = 新版本；Run 锁定 versionId）：
@@ -18,6 +19,7 @@ export class WorkflowsService {
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(WorkflowTriggersService) private readonly triggers: WorkflowTriggersService,
+    @Inject(OrganizationsService) private readonly orgs: OrganizationsService,
   ) {}
 
   private requireDefinition(def: unknown): WorkflowDefinition {
@@ -28,8 +30,15 @@ export class WorkflowsService {
   }
 
   private async requireOwned(userId: string, id: string) {
+    // M8-P1：本人或所属组织成员可见（跨组织 404 防枚举）
     const w = await this.prisma.workflow.findFirst({
-      where: { id, userId },
+      where: {
+        id,
+        OR: [
+          { userId },
+          { organization: { deletedAt: null, members: { some: { userId } } } },
+        ],
+      },
       include: { versions: { orderBy: { version: 'desc' } } },
     });
     if (!w) throw new AppError(ErrorCode.NOT_FOUND, '工作流不存在');
@@ -52,15 +61,27 @@ export class WorkflowsService {
     return w;
   }
 
-  async create(userId: string, input: { name: string; description?: string; projectId?: string | null; definition: WorkflowDefinition }) {
+  async create(userId: string, input: { name: string; description?: string; projectId?: string | null; organizationId?: string | null; definition: WorkflowDefinition }) {
     const definition = this.requireDefinition(input.definition);
+    let projectOrgId: string | null = null;
     if (input.projectId) {
       const p = await this.prisma.project.findFirst({ where: { id: input.projectId, userId, deletedAt: null } });
       if (!p) throw new AppError(ErrorCode.NOT_FOUND, '项目不存在');
+      projectOrgId = p.organizationId;
+    }
+    // M8-P1：工作流挂组织（显式组织需权限校验；缺省 = 项目组织或个人组织）
+    let organizationId: string;
+    if (input.organizationId) {
+      await this.orgs.requireMembership(userId, input.organizationId);
+      organizationId = input.organizationId;
+    } else if (projectOrgId) {
+      organizationId = projectOrgId;
+    } else {
+      organizationId = (await this.orgs.ensurePersonalOrganization(userId)).id;
     }
     const w = await this.prisma.workflow.create({
       data: {
-        userId, projectId: input.projectId ?? null, name: input.name, description: input.description,
+        userId, organizationId, projectId: input.projectId ?? null, name: input.name, description: input.description,
         versions: { create: { version: 1, status: 'draft', definition: definition as never } },
       },
       include: { versions: true },

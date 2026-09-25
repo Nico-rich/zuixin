@@ -2,24 +2,42 @@ import { Inject, Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
+import { OrganizationsService } from '../organizations/organizations.service';
 import { CreateProjectDto, UpdateProjectDto } from './projects.dto';
 
 @Injectable()
 export class ProjectsService {
-  constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
+  constructor(
+    @Inject(PrismaService) private readonly prisma: PrismaService,
+    @Inject(OrganizationsService) private readonly orgs: OrganizationsService,
+  ) {}
 
   list(userId: string) {
+    // M8-P1：本人项目 + 所属组织成员可见的项目（组织 scope）
     return this.prisma.project.findMany({
-      where: { userId, deletedAt: null },
+      where: {
+        deletedAt: null,
+        OR: [
+          { userId },
+          { organization: { deletedAt: null, members: { some: { userId } } } },
+        ],
+      },
       orderBy: { updatedAt: 'desc' },
       take: 50,
-      select: { id: true, name: true, description: true, metadata: true, createdAt: true, updatedAt: true },
+      select: { id: true, name: true, description: true, metadata: true, organizationId: true, createdAt: true, updatedAt: true },
     });
   }
 
-  create(userId: string, dto: CreateProjectDto) {
+  async create(userId: string, dto: CreateProjectDto & { organizationId?: string | null }) {
+    // M8-P1：项目必须属于组织——指定组织需 membership；缺省 = 个人组织
+    let organizationId = dto.organizationId ?? null;
+    if (organizationId) {
+      await this.orgs.requirePermission(userId, organizationId, 'project.write'); // viewer 是成员但不可写
+    } else {
+      organizationId = (await this.orgs.ensurePersonalOrganization(userId)).id;
+    }
     return this.prisma.project.create({
-      data: { userId, name: dto.name, description: dto.description, metadata: (dto.metadata ?? undefined) as Prisma.InputJsonValue | undefined },
+      data: { userId, organizationId, name: dto.name, description: dto.description, metadata: (dto.metadata ?? undefined) as Prisma.InputJsonValue | undefined },
     });
   }
 
@@ -43,9 +61,17 @@ export class ProjectsService {
     await this.prisma.project.update({ where: { id }, data: { deletedAt: new Date() } });
   }
 
-  /** 归属校验：非本人 → 404（防枚举） */
+  /** 归属校验：本人或所属组织成员 → 404（防枚举；跨组织不可见） */
   private async requireOwned(userId: string, id: string) {
-    const p = await this.prisma.project.findFirst({ where: { id, userId, deletedAt: null } });
+    const p = await this.prisma.project.findFirst({
+      where: {
+        id, deletedAt: null,
+        OR: [
+          { userId },
+          { organization: { deletedAt: null, members: { some: { userId } } } },
+        ],
+      },
+    });
     if (!p) throw new AppError(ErrorCode.NOT_FOUND, '项目不存在');
     return p;
   }

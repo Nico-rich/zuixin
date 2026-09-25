@@ -167,6 +167,7 @@ model User {
   creativePerformances CreativePerformance[]
   performanceSnapshots PerformanceSnapshot[]
   auditLogs         AuditLog[]
+  organizationMemberships OrganizationMember[]
   knowledgeBases KnowledgeBase[]
   documents      Document[]
 }
@@ -259,7 +260,9 @@ model Agent {
   priority        Int       @default(100)
   builtin         Boolean   @default(false)
   kind            String    @default("builtin") // builtin(代码类) | custom(纯 prompt 配置)
-  scope           String    @default("system") // system | user(预留)
+  scope           String    @default("system") // system | organization | user
+  organizationId  String?   // M8-P1：scope=organization 时必填
+  organization    Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
   activeVersionId String?   @unique
   activeVersion   AgentVersion? @relation("ActiveVersion", fields: [activeVersionId], references: [id], onDelete: SetNull)
   createdAt       DateTime  @default(now())
@@ -392,6 +395,8 @@ model Project {
   id            String       @id @default(uuid())
   userId        String
   user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organizationId String?      // M8-P1：项目必须属于组织（存量 backfill 后服务层新建必填；nullable 为历史兼容）
+  organization  Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
   name          String
   description   String?      @db.Text
   metadata      Json?
@@ -622,6 +627,8 @@ model Connection {
   id                String           @id @default(uuid())
   userId            String
   user              User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organizationId    String?          // M8-P1：组织归属
+  organization      Organization?    @relation(fields: [organizationId], references: [id], onDelete: SetNull)
   projectId         String?
   project           Project?         @relation(fields: [projectId], references: [id], onDelete: SetNull)
   provider          String           // mock | shopify | amazon | meta_ads | google_ads | tiktok_ads
@@ -680,6 +687,8 @@ model ExternalAction {
   id                String               @id @default(uuid())
   userId            String
   user              User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organizationId    String?              // M8-P1：组织归属（审计/配额归属）
+  organization      Organization?        @relation(fields: [organizationId], references: [id], onDelete: SetNull)
   projectId         String?
   project           Project?             @relation(fields: [projectId], references: [id], onDelete: SetNull)
   agentRunId        String?
@@ -1148,6 +1157,8 @@ model Workflow {
   id          String           @id @default(uuid())
   userId      String
   user        User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organizationId String?       // M8-P1：组织归属（创建时由服务端解析；跨组织不可见）
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
   projectId   String?
   project     Project?         @relation(fields: [projectId], references: [id], onDelete: SetNull)
   name        String
@@ -1354,4 +1365,60 @@ model AuditLog {
   @@index([userId, createdAt])
   @@index([action, createdAt])
   @@index([agentRunId])
+}
+
+// ===== M8-P1: Multi-tenancy / Organization / RBAC =====
+enum OrganizationRole {
+  owner
+  admin
+  member
+  viewer
+}
+
+model Organization {
+  id          String                 @id @default(uuid())
+  name        String
+  slug        String                 @unique
+  isPersonal  Boolean                @default(false) // 个人默认组织（每用户一个，backfill + 懒创建）
+  ownerUserId String
+  deletedAt   DateTime?              // soft delete
+  createdAt   DateTime               @default(now())
+  updatedAt   DateTime               @updatedAt
+  members     OrganizationMember[]
+  invitations OrganizationInvitation[]
+  projects    Project[]
+  agents      Agent[]
+  workflows   Workflow[]
+  connections Connection[]
+  externalActions ExternalAction[]
+  @@index([ownerUserId])
+}
+
+model OrganizationMember {
+  id             String           @id @default(uuid())
+  organizationId String
+  organization   Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role           OrganizationRole @default(member)
+  joinedAt       DateTime         @default(now())
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  @@unique([organizationId, userId])
+  @@index([userId])
+}
+
+model OrganizationInvitation {
+  id               String       @id @default(uuid())
+  organizationId   String
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  email            String
+  role             OrganizationRole @default(member)
+  invitedByUserId  String
+  token            String       @unique
+  status           String       @default("pending") // pending | accepted | revoked | expired
+  expiresAt        DateTime
+  acceptedByUserId String?
+  createdAt        DateTime     @default(now())
+  @@index([organizationId, status])
 }

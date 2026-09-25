@@ -4,6 +4,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import * as argon2 from 'argon2';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { PrismaService } from '../prisma/prisma.service';
+import { OrganizationsService } from '../organizations/organizations.service';
 import { RedisKVService } from '../../core/circuit-breaker/redis-kv.service';
 import { LOGIN_FAIL_WINDOW_SEC, LOGIN_MAX_FAILS, REFRESH_TTL_SEC } from './auth.constants';
 
@@ -20,6 +21,7 @@ export class AuthService {
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(JwtService) private readonly jwt: JwtService,
     @Inject(RedisKVService) private readonly kv: RedisKVService,
+    @Inject(OrganizationsService) private readonly orgs: OrganizationsService,
   ) {}
 
   async login(email: string, password: string, meta: RequestMeta): Promise<AuthResult> {
@@ -37,6 +39,8 @@ export class AuthService {
     if (user.status !== 'active') throw new AppError(ErrorCode.FORBIDDEN, '账号已被禁用');
     await this.kv.set(failKey, '0', LOGIN_FAIL_WINDOW_SEC);
     await this.prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
+    // M8-P1：懒创建 Personal Organization（幂等；多租户基线）
+    await this.orgs.ensurePersonalOrganization(user.id).catch(() => undefined);
     return this.issueTokens(user, meta);
   }
 

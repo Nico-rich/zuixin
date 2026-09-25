@@ -48,6 +48,7 @@ export const CreateWorkflowSchema = z.strictObject({
   name: z.string().min(1).max(100),
   description: z.string().max(2000).optional(),
   projectId: z.string().uuid().optional().nullable(),
+  organizationId: z.string().uuid().optional().nullable(), // M8-P1：组织归属（缺省 = 项目组织或个人组织）
   definition: WorkflowDefinitionSchema,
 });
 

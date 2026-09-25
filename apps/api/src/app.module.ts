@@ -24,6 +24,7 @@ import { ExternalActionsApiModule } from './modules/external-actions/external-ac
 import { WorkflowsApiModule } from './modules/workflows/workflows-api.module';
 import { FeedbackApiModule } from './modules/feedback/feedback-api.module';
 import { AuditApiModule } from './modules/audit/audit-api.module';
+import { OrganizationsApiModule } from './modules/organizations/organizations-api.module';
 import { AuditModule } from './modules/audit/audit.module';
 import { RateLimitModule } from './core/rate-limit/rate-limit.module';
 import { KnowledgeApiModule } from './modules/knowledge/knowledge.module';
@@ -53,6 +54,7 @@ import { GlobalExceptionFilter } from './common/filters/global-exception.filter'
     CryptoModule,
     AuditModule,
     RateLimitModule,
+    OrganizationsApiModule,
     StorageModule,
     QueueModule,
     CircuitBreakerModule,
