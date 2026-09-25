@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { z } from 'zod';
 import { AgentRuntimeEngine, AgentRuntimeContext, AgentRunOutcome } from './agent-runtime-engine';
 import { ToolRegistry } from '../tools/tool-registry.service';
@@ -616,7 +616,11 @@ describe('AgentRuntimeEngine（M6-P4 durable resume + waiting）', () => {
 });
 
 describe('AgentRuntimeEngine（M6-P5 LLM 瞬时重试 + tool retryPolicy）', () => {
+  // 退避近零（生产默认 1s/4s + jitter 的真实计时器会让重试用例随机越过 5s 超时——MOCK_DELAY_MS 同模式测试开关）
+  const prevBackoff = process.env.LLM_RETRY_BACKOFF_MS;
+  process.env.LLM_RETRY_BACKOFF_MS = '1,2';
   beforeEach(() => { vi.clearAllMocks(); });
+  afterAll(() => { if (prevBackoff === undefined) delete process.env.LLM_RETRY_BACKOFF_MS; else process.env.LLM_RETRY_BACKOFF_MS = prevBackoff; });
 
   it('P5-10 LLM transient：2 次瞬时失败后成功 → 3 次尝试，回合仅 1 条 success usage（回合粒度）', async () => {
     let calls = 0;
@@ -657,19 +661,25 @@ describe('AgentRuntimeEngine（M6-P5 LLM 瞬时重试 + tool retryPolicy）', ()
   });
 
   it('P5-3 退避期间 cancel → 立即停止，不重试已取消回合，usage = AGENT_CANCELLED', async () => {
-    const ac = new AbortController();
-    let calls = 0;
-    const streamFn = vi.fn(async function* () {
-      calls++;
-      throw new AppError(ErrorCode.PROVIDER_TIMEOUT, 'timeout'); // 每次尝试都瞬时失败（退避 1s+）
-    });
-    const { engine, state } = makeEngine({ streamFn });
-    const input = { ...makeEngine().input, signal: ac.signal };
-    setTimeout(() => ac.abort(), 150); // 第一次退避（~1s）期间取消
-    const { outcome } = await run(engine, input);
-    expect(outcome.status).toBe('cancelled');
-    expect(calls).toBeLessThan(3); // 退避被打断，绝不重试已取消回合
-    expect(state.usage[0]).toMatchObject({ status: 'failed', errorCode: ErrorCode.AGENT_CANCELLED });
+    // 本用例需要真实退避窗口（取消发生在退避期间）——单独设 50ms 退避，20ms 后取消（确定性：jitter 下限 35ms > 20ms）
+    process.env.LLM_RETRY_BACKOFF_MS = '50,50';
+    try {
+      const ac = new AbortController();
+      let calls = 0;
+      const streamFn = vi.fn(async function* () {
+        calls++;
+        throw new AppError(ErrorCode.PROVIDER_TIMEOUT, 'timeout'); // 每次尝试都瞬时失败（退避 50ms+）
+      });
+      const { engine, state } = makeEngine({ streamFn });
+      const input = { ...makeEngine().input, signal: ac.signal };
+      setTimeout(() => ac.abort(), 20); // 第一次退避（≥35ms）期间取消
+      const { outcome } = await run(engine, input);
+      expect(outcome.status).toBe('cancelled');
+      expect(calls).toBeLessThan(3); // 退避被打断，绝不重试已取消回合
+      expect(state.usage[0]).toMatchObject({ status: 'failed', errorCode: ErrorCode.AGENT_CANCELLED });
+    } finally {
+      process.env.LLM_RETRY_BACKOFF_MS = '1,2';
+    }
   });
 
   it('P5-10 tool retryPolicy：瞬时失败 1 次后成功 → 同一行重试（attempts 递增），结果回喂', async () => {

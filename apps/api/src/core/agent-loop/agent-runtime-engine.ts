@@ -90,7 +90,7 @@ const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
 const DEFAULT_APPROVAL_TTL_MS = 24 * 3600_000;
 /** P5-10：LLM 瞬时故障回合内重试上限与退避（1s/4s + 调用侧全幅 jitter ±30%） */
 const LLM_MAX_RETRIES = 2;
-const LLM_RETRY_BACKOFF_MS = [1000, 4000];
+const DEFAULT_RETRY_BACKOFF_MS = [1000, 4000];
 /** Tool Result 内容预算（确定性截断，防止多工具结果无限增长；消息配对不受影响） */
 const TOOL_RESULT_MAX_CHARS = 4000;
 const TOOL_RESULTS_TOTAL_MAX_CHARS = 8000;
@@ -255,7 +255,7 @@ export class AgentRuntimeEngine {
             const jitter = 0.7 + Math.random() * 0.6;
             yield { type: 'status', stage: 'agent', message: '模型暂时不可用，正在重试…' };
             try {
-              await this.sleep(Math.round(LLM_RETRY_BACKOFF_MS[Math.min(attempt, LLM_RETRY_BACKOFF_MS.length - 1)] * jitter), ctx.signal);
+              await this.sleep(Math.round(this.retryBackoffMs()[Math.min(attempt, this.retryBackoffMs().length - 1)] * jitter), ctx.signal);
             } catch {
               break; // 退避被取消打断 → 走取消路径（turnError 保留 → AGENT_CANCELLED usage）
             }
@@ -639,6 +639,14 @@ export class AgentRuntimeEngine {
       status: 'failed', errorCode: appErr.code, errorMessage: appErr.message, completedAt: new Date(), durationMs: Date.now() - startedAt,
     }).catch((e) => this.logger.warn(`ToolCall 失败更新异常: ${(e as Error).message}`));
     return { status: 'failed', error: appErr.message, outputSummary: `${tool.name}：执行失败` };
+  }
+
+  /** 测试友好开关（与 MOCK_DELAY_MS 同模式）：LLM_RETRY_BACKOFF_MS=1,2 时退避近零——单测确定性；生产绝不受影响 */
+  private retryBackoffMs(): number[] {
+    const raw = process.env.LLM_RETRY_BACKOFF_MS;
+    if (!raw) return DEFAULT_RETRY_BACKOFF_MS;
+    const values = raw.split(',').map((s) => Math.max(0, Number(s) || 0)).filter((n) => n >= 0);
+    return values.length > 0 ? values : DEFAULT_RETRY_BACKOFF_MS;
   }
 
   /** 可中断 sleep（cancel 期间退避立即可恢复，不拖延取消） */
