@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger, OnApplicationShutdown } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnApplicationShutdown, OnModuleInit } from '@nestjs/common';
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job } from 'bullmq';
 import type { ScheduledJob } from '@prisma/client';
@@ -8,6 +8,21 @@ import { SchedulerService, SCHEDULED_ACTIVE_STATUSES } from '../../modules/sched
 import { EventPlatformService } from '../../modules/events/event-platform.service';
 import { PrismaService } from '../../modules/prisma/prisma.service';
 
+/** M8-P9 stalled 判定：running 行 updatedAt 落后超过 timeoutMs × 该系数（且不短于 3×心跳）判 stalled */
+const STALL_FACTOR = 3;
+/** M8-P9 心跳间隔上界/下界（timeoutMs/3，钳制到 [500ms, 5s]） */
+const HEARTBEAT_MIN_MS = 500;
+const HEARTBEAT_MAX_MS = 5_000;
+/** M8-P9 巡检周期（默认 60s）与优雅停机等待在途作业的上限（默认 25s，低于 30s 进程兜底） */
+const DEFAULT_RECONCILE_INTERVAL_MS = 60_000;
+const DEFAULT_SHUTDOWN_WAIT_MS = 25_000;
+
+export interface StalledReconcileResult {
+  /** 被判 stalled 的作业数（running 无心跳 → dead） */
+  reaped: number;
+  scanned: number;
+}
+
 /**
  * M8-P5 Scheduler worker（队列 concurrency=2；无需 claim/lease——作业是可重入的短任务，
  * 幂等由行状态条件更新保证：只有 pending/scheduled 行会被认领为 running，重复投递自然被挡掉）。
@@ -15,16 +30,20 @@ import { PrismaService } from '../../modules/prisma/prisma.service';
  * 未超 maxAttempts 则按 backoffMs 重投（新 jobId 变体，避免与仍在 active 的当前 job 撞 id）→
  * 超限 → dead + lastError（绝不无限重试）。超时：timeoutMs 到点判失败（有界调用）。
  *
- * 已知边界（P5 刻意不做 lease）：worker 在 running 期间进程崩溃 → 行停留在 running，不会自动重投
- * （需人工 resume/cancel 或后续 reconciler 按 updatedAt 兜底）；一致性优先于自动恢复——
- * 宁可停下也不冒"同一作业执行两次"的风险。
+ * M8-P9 补齐（P5 的"已知边界"）：worker 在 running 期间崩溃 → 行停留 running 的兜底。
+ *   - **心跳**：执行期间按 heartbeatMs 刷新 updatedAt（@updatedAt），使"活着"可被外部观测；
+ *   - **stalled 巡检**：running 且 updatedAt 落后 > max(timeoutMs×3, 3×心跳) → 判 **dead**（终态 failed
+ *     语义）+ lastError 留痕 + 事件落库；**绝不自动重投**——一致性优先：running 期间进程崩溃时
+ *     无法证明作业没有产生副作用，自动重投会冒"同一作业执行两次"的风险（人工 resume 走显式路径）；
+ *   - **优雅停机**：等在途作业收尾（有界，默认 25s），而不是直接丢弃。
  */
 @Processor(SCHEDULER_QUEUE, { concurrency: Number(process.env.SCHEDULER_WORKER_CONCURRENCY ?? 2) })
 @Injectable()
-export class SchedulerProcessor extends WorkerHost implements OnApplicationShutdown {
+export class SchedulerProcessor extends WorkerHost implements OnApplicationShutdown, OnModuleInit {
   private readonly logger = new Logger('SchedulerWorker');
   private readonly inFlight = new Set<string>();
   private shuttingDown = false;
+  private reconcileTimer: NodeJS.Timeout | null = null;
 
   constructor(
     @Inject(SchedulerService) private readonly scheduler: SchedulerService,
@@ -32,6 +51,47 @@ export class SchedulerProcessor extends WorkerHost implements OnApplicationShutd
     @Inject(EventPlatformService) private readonly events: EventPlatformService,
   ) {
     super();
+  }
+
+  /** M8-P9：启动 stalled 巡检定时器（仅 Worker 进程挂载本 processor）；unref 不阻塞进程退出 */
+  onModuleInit(): void {
+    const intervalMs = Number(process.env.SCHEDULER_RECONCILE_INTERVAL_MS ?? DEFAULT_RECONCILE_INTERVAL_MS);
+    const every = Number.isFinite(intervalMs) && intervalMs > 0 ? intervalMs : DEFAULT_RECONCILE_INTERVAL_MS;
+    this.reconcileTimer = setInterval(() => {
+      if (this.shuttingDown) return;
+      void this.reconcileStalled().catch((err) => this.logger.warn(`stalled 巡检失败: ${(err as Error).message}`));
+    }, every);
+    this.reconcileTimer.unref?.();
+  }
+
+  /**
+   * M8-P9 Stalled 巡检（幂等，多 Worker 并安全）：running 且心跳过期 → dead（终态失败，不重投）。
+   * 条件更新保证只有一个 worker 能判死同一行；已经完成/已重投的行不受影响。
+   */
+  async reconcileStalled(): Promise<StalledReconcileResult> {
+    const now = Date.now();
+    const rows = await this.prisma.scheduledJob.findMany({ where: { status: 'running' } });
+    let reaped = 0;
+    for (const row of rows) {
+      const heartbeatMs = Math.min(Math.max(Math.trunc(row.timeoutMs / 3), HEARTBEAT_MIN_MS), HEARTBEAT_MAX_MS);
+      const threshold = Math.max(row.timeoutMs * STALL_FACTOR, heartbeatMs * STALL_FACTOR);
+      const lag = now - row.updatedAt.getTime();
+      if (lag <= threshold) continue;
+      const done = await this.prisma.scheduledJob.updateMany({
+        where: { id: row.id, status: 'running' }, // 条件更新：与正常完成/重投竞争由 DB 串行裁决
+        data: {
+          status: 'dead',
+          completedAt: new Date(),
+          lastError: `stalled：running 期间心跳中断 ${lag}ms（阈值 ${threshold}ms）→ 判失败，不自动重投（人工 resume 走显式路径）`.slice(0, 2000),
+        },
+      });
+      if (done.count === 0) continue;
+      reaped++;
+      this.logger.error({ jobId: row.id, lag, threshold }, '调度作业心跳中断 → 判 dead（不自动重投，一致性优先）');
+      await this.emitEvent('scheduler.job.dead', row, row.attempts);
+    }
+    if (reaped > 0) this.logger.warn({ reaped, scanned: rows.length }, 'stalled 巡检完成');
+    return { reaped, scanned: rows.length };
   }
 
   async process(job: Job<{ jobId?: string }>): Promise<void> {
@@ -52,7 +112,15 @@ export class SchedulerProcessor extends WorkerHost implements OnApplicationShutd
     }
     const attempt = row.attempts + 1;
     this.inFlight.add(jobId);
-    this.logger.log({ jobId, handler: row.handler, attempt }, '调度作业开始执行');
+    // M8-P9 心跳：执行期间刷新 updatedAt，使 stalled 巡检能区分"进程已死"与"作业仍在跑"
+    const heartbeatMs = Math.min(Math.max(Math.trunc(row.timeoutMs / 3), HEARTBEAT_MIN_MS), HEARTBEAT_MAX_MS);
+    const heartbeat = setInterval(() => {
+      void this.prisma.scheduledJob
+        .updateMany({ where: { id: jobId, status: 'running' }, data: { updatedAt: new Date() } })
+        .catch((err) => this.logger.warn({ jobId }, `调度作业心跳失败: ${(err as Error).message}`));
+    }, heartbeatMs);
+    heartbeat.unref?.();
+    this.logger.log({ jobId, handler: row.handler, attempt, heartbeatMs }, '调度作业开始执行');
 
     const handler = this.scheduler.getHandler(row.handler);
     if (!handler) {
@@ -75,6 +143,7 @@ export class SchedulerProcessor extends WorkerHost implements OnApplicationShutd
       await this.onFailure(row, attempt, message(err));
       return;
     } finally {
+      clearInterval(heartbeat);
       this.inFlight.delete(jobId);
     }
 
@@ -140,11 +209,27 @@ export class SchedulerProcessor extends WorkerHost implements OnApplicationShutd
     return Promise.race([promise, timer]) as Promise<T>;
   }
 
+  /**
+   * M8-P9 优雅停机：停止认领新作业 + 等在途作业收尾（有界）。
+   * 等待上限默认 25s（低于 30s 进程兜底）：超时未收尾的作业由 stalled 巡检兜底判 dead，
+   * 绝不无限等待（挂住的停机比"少跑一个作业"危害更大）。
+   */
   async onApplicationShutdown(): Promise<void> {
     this.shuttingDown = true;
-    // 可重入作业：不等待在途任务（行状态由下一次投递/人工恢复），只记录
-    if (this.inFlight.size > 0) this.logger.warn({ count: this.inFlight.size }, '优雅停机：在途调度作业将按行状态兜底');
-    await Promise.resolve();
+    if (this.reconcileTimer) clearInterval(this.reconcileTimer);
+    this.reconcileTimer = null;
+    if (this.inFlight.size === 0) return;
+    const waitMs = Number(process.env.SCHEDULER_SHUTDOWN_WAIT_MS ?? DEFAULT_SHUTDOWN_WAIT_MS);
+    const deadline = Date.now() + (Number.isFinite(waitMs) && waitMs > 0 ? waitMs : DEFAULT_SHUTDOWN_WAIT_MS);
+    this.logger.log({ count: this.inFlight.size, waitMs }, '优雅停机：等待在途调度作业收尾');
+    while (this.inFlight.size > 0 && Date.now() < deadline) {
+      await delay(100).catch(() => undefined);
+    }
+    if (this.inFlight.size > 0) {
+      this.logger.warn({ count: this.inFlight.size }, '优雅停机：在途作业未在等待窗口内收尾 → 交由 stalled 巡检判 dead（不自动重投）');
+    } else {
+      this.logger.log('优雅停机：在途调度作业已全部收尾');
+    }
   }
 }
 

@@ -18,9 +18,14 @@ describe('Health (e2e)', () => {
 
   afterAll(async () => { await app.close(); });
 
-  it('GET /api/v1/health 返回 200 ok', async () => {
+  it('GET /api/v1/health 返回 200 ok（M8-P9：兼容保留 status，扩展依赖明细）', async () => {
     const res = await request(app.getHttpServer()).get('/api/v1/health').expect(200);
-    expect(res.body).toEqual({ status: 'ok' });
+    // M8-P9 前：body 形如 {status:'ok'}。现扩展为含 db/redis/queue/storage/checks 的报告，
+    // 但 status 字段语义与取值不变（既有探针/告警规则零改动可用）。
+    expect(res.body.status).toBe('ok');
+    expect(res.body.db.state).toBe('up');
+    expect(res.body.redis.state).toBe('up');
+    expect(res.body.checks.map((c: { name: string }) => c.name)).toEqual(['db', 'redis', 'storage']);
   });
 
   it('未捕获异常返回统一 envelope（含 requestId）', async () => {

@@ -11,6 +11,7 @@ import { csrfProtection } from './modules/auth/csrf.middleware';
 import { bodyLimitErrorHandler } from './modules/security/body-limit.middleware';
 import { corsOriginsFromEnv } from './modules/security/cors-policy';
 import { TracingMiddleware } from './core/tracing/tracing.middleware';
+import { registerGracefulShutdown } from './lifecycle/graceful-shutdown';
 
 /**
  * M8-P8 API 安全：请求体上限显式化（关闭 Nest 默认 body parser，改为在此集中注册，顺序可控可审计）：
@@ -43,5 +44,6 @@ async function bootstrap() {
   const port = Number(process.env.API_PORT ?? 3001);
   await app.listen(port);
   console.log(`API 已启动: http://localhost:${port}/api/v1/health`);
+  registerGracefulShutdown(app); // M8-P9 优雅停机：SIGTERM/SIGINT → 停收新请求 → 等在途收尾 → 30s 兜底强退
 }
 bootstrap();

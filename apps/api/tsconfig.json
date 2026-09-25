@@ -18,5 +18,5 @@
     "strictPropertyInitialization": false,
     "paths": { "@ai-agent/shared": ["../../packages/shared/dist"] }
   },
-  "include": ["src", "test", "prisma/seed.ts", "prisma.config.ts"]
+  "include": ["src", "test", "scripts", "prisma/seed.ts", "prisma.config.ts"]
 }
