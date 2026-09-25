@@ -100,13 +100,51 @@ Plan（code free/pro/team/enterprise + entitlements）/ Subscription（每组织
 - 全量套件历史 run 都归集到 admin 个人组织 ledger——配额 e2e 需先清空该组织 ledger 建立确定性基线；
 - mock LLM 环境 tokens=0（引擎不计量 token）——llm_tokens 断言改为条目存在性。
 
-## 3. M8-P3 Observability / Audit
+## 3. M8-P3 Observability / Audit（✅ 2026-09-25 完成，并行 Agent）
 
-（施工时补全）
+### 3.1 全链路 TraceContext（AsyncLocalStorage）
 
-## 4. M8-P4 Analytics / BI
+- `core/tracing/trace-context.ts`：requestId/traceId/organizationId/userId/projectId/runId/toolCallId/taskId/workflowRunId/provider；`runWithContext` + `current()`；
+- HTTP 传播中间件（main.ts 在 init 前注册）：req.id 复用、X-Trace-Id 继承+回写、res.on('finish') 采 request_count/request_latency_ms/error_count；
+- Worker：agent-run processor 置 runId、workflow processor 只置 workflowRunId（绝不冒充 agentRunId）；时长采样 agent_run_duration_ms/workflow_duration_ms；queue_depth 60s 周期四队列采样（timer.unref + onModuleDestroy 关探针）；
+- 已知限制：HTTP 上下文不含 userId/orgId（不改 JwtAuthGuard）；队列 payload 不跨进程传 traceId（身份红线延续）。
 
-（施工时补全）
+### 3.2 AuditLog 增强
+
+- AuditInput +6 字段：organizationId/actorId/requestId/traceId/result/reason；write() 从 TraceContext 自动注入；agentRunId/toolCallId/workflowRunId 亦从上下文补（显式优先）；
+- **强制脱敏**：maskSensitive 递归（子串+大小写不敏感命中 password/token/secret/apiKey/credential/encrypted 等即整棵子树 '***'——宁可多脱）；maskEmail 前缀保留；metadata 落库前必过脱敏；
+- login 成功/失败审计（auth.login / auth.login_failed；metadata 只含掩码 email）；未知邮箱失败不伪造归属（结构化 warn）。
+
+### 3.3 Metrics
+
+- MetricSample 表 + ObservabilityService.recordMetric（best-effort）；采样点：HTTP 三类、agent/workflow 时长、队列深度；
+- GET /metrics（userId 首条件 + organizationId 过滤经 requireMembership）。
+
+### 3.4 实测修复
+
+- **Nest app.use 必须在 app.init 之前**（init 才注册路由，之后追加的中间件不进请求链）——e2e 用 moduleRef.get(TracingMiddleware).handler 在 init 前注册；
+- AuthService 用 @Optional() @Inject(AuditService)（不改既有 auth.service.spec 的 4 参构造）。
+
+## 4. M8-P4 Analytics / BI（✅ 2026-09-25 完成，并行 Agent）
+
+### 4.1 聚合投影（不破坏事务库）
+
+- `AnalyticsAggregate`（UNIQUE(organizationId,userId,kind,period,source)）+ AnalyticsService 确定性投影：
+  - kind=usage source=usage_ledger（复用 P2 ledger，绝不建第二套事实）；
+  - kind=agent source=agent_run；kind=generation source=generation_task；kind=provider source=usage_record；kind=workflow source=workflow_run；
+- 归因：project.organizationId = org 或（个人组织且 userId=owner 且 projectId null）+ 历史 NULL 组织行兜底（与 BillingService.organizationFor 同源）；
+- 幂等刷新：findFirst→create/update + P2002 兜底；刷新是稠密写入（无数据为 0）；时长均值存 totals+samples，跨天读路径重算（绝不做平均的平均）；
+- provider/generation 维度单行 metrics 内 byProvider（唯一键不含 dimension 的取舍）；
+- **facts 只含事实**：metrics 只有原始聚合 + 服务端 derived（overview 的 derived 标注 service-computed），LLM 解读绝不入表。
+
+### 4.2 API（RBAC：requireMembership）
+
+- GET /analytics/overview（先幂等 refresh 后读）/ breakdown（自刷新窗口）/ sources（source 追溯）。
+
+### 4.3 实测修复
+
+- generation/provider 的 run 归因用 7 天回看窗（跨零点 run 的兜底）；e2e 用专用用户+专用个人组织隔离，断言用独立 DB 查询核对而非硬编码总量（防其他套件残留 flaky）；
+- worktree 首次 pnpm install 后 packages/shared/dist 缺失需 tsup 重建（合并时 Coordinator 已重建）。
 
 ## 5. M8-P5 Scheduler / Event Platform
 
@@ -148,9 +186,35 @@ Plan（code free/pro/team/enterprise + entitlements）/ Subscription（每组织
 - **组织私有 Agent 无法创建 run**：既有创建路径硬编码 `scope='system'` → agent-runs.service 的 Agent 解析改为「系统 Agent 或本人所属组织的私有 Agent」（越权/跨组织返回 404），系统 Agent 行为零漂移；
 
 
-## 7. M8-P7 Intelligent Provider Routing
+## 7. M8-P7 Intelligent Provider Routing（✅ 2026-09-25 完成，并行 Agent）
 
-（施工时补全）
+### 7.1 路由管道（服务端 deterministic；LLM 只表达能力需求）
+
+```
+候选收集（Provider.type 收窄 + ProviderCapability ∪ Model.capabilities 兜底）
+→ 模型选优 + 成本估算（token ÷1e6 × 价格；budget 可覆盖；非法值回退默认）
+→ disabled → policy_deny → costCeilingPerRequest → unhealthy → 熔断 open 逐级剔除
+→ 排序（allow 优先组 → policy.priority → provider.priority → 成本 → providerId 确定性兜底）
+→ 写 RoutingDecision（candidates 含拒绝原因 / reasonCode / estimatedCost / policyId）
+→ 返回 invoke 句柄（首选失败自动切下一候选，最多 2 次 fallback；回退成功改写决策行 reasonCode=fallback）
+```
+
+- 无可用候选：先落审计（providerId=null）再抛 PROVIDER_UNAVAILABLE（503）；
+- 熔断只剔除 open（half_open 作探测放行）；阈值/冷却读 Provider.retryConfig（缺省 5/60）；
+- **未暴露 route 端点**：客户端无法指定 provider——选择权 100% 服务端。
+
+### 7.2 策略/能力
+
+- ProviderPolicy（组织级：allow/deny、priority、costCeilingPerRequest/Monthly、dataPolicy）；写 = member.write 及以上、读 = organization.read；平台级策略（org=null）仅 admin；
+- ProviderCapability.syncFromProviders()：从真实 Provider/Model 派生（与 route 匹配规则同源），幂等 upsert + 失效清理。
+
+### 7.3 审计
+
+- GET /routing/decisions?runId=&organizationId=（org 收窄；平台级无组织决策不返回——防越权）。
+
+### 7.4 遗留（如实记录）
+
+- invoke 句柄尚无生产调用方（接入 chat/media/agent 会触碰冻结模块，超出 P7 边界）——P7 交付路由决策层 + 审计；接入点留待 M8 后续或显式解冻决策。
 
 ## 8. M8-P8 Enterprise Security
 
