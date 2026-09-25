@@ -14,6 +14,22 @@ export class GlobalExceptionFilter implements ExceptionFilter {
     const req = ctx.getRequest<Request & { id?: string }>();
     const requestId = req.id;
 
+    // M8-P8：body-parser 错误（express.json/raw/urlencoded）不是 HttpException（仅带 status/type 的普通 Error），
+    // 不显式处理会被兜底成 500 内部错误 —— 语义错误（体积超限/JSON 非法）必须是 4xx。
+    const bodyParserError = exception as { type?: unknown; status?: unknown; statusCode?: unknown };
+    if (exception instanceof Error && typeof bodyParserError.type === 'string' && bodyParserError.type.startsWith('entity.')) {
+      const status = Number(bodyParserError.status ?? bodyParserError.statusCode ?? HttpStatus.BAD_REQUEST);
+      const tooLarge = bodyParserError.type === 'entity.too.large';
+      this.logger.warn({ type: bodyParserError.type, requestId }, '请求体被拒绝');
+      res.status(tooLarge ? HttpStatus.PAYLOAD_TOO_LARGE : status).json({
+        error: {
+          code: ErrorCode.VALIDATION_ERROR,
+          message: tooLarge ? '请求体超过大小限制' : '请求体格式非法',
+          requestId,
+        },
+      });
+      return;
+    }
     if (exception instanceof MulterError) {
       const msg = exception.code === 'LIMIT_FILE_SIZE' ? '文件超过上传大小限制' : `上传失败：${exception.message}`;
       res.status(HttpStatus.BAD_REQUEST).json({ error: { code: ErrorCode.VALIDATION_ERROR, message: msg, requestId } });

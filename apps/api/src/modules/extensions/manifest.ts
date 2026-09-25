@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
+import { checkUrlSync } from '../security/ssrf-guard';
 
 /**
  * M8-P6 Extension SDK —— 声明式 manifest（严格 zod 校验；**绝无任何可执行代码路径**）。
@@ -222,25 +223,21 @@ export function findNonJsonPath(value: unknown, path = 'manifest', depth = 0): s
   return null;
 }
 
-/** 公网 https 校验（SSRF 边界：禁 localhost/私网/回环/内网域名） */
+/**
+ * 公网 https 校验（SSRF 边界：禁 localhost/私网/回环/link-local/内网域名）。
+ * M8-P8：判定收敛到 modules/security/ssrf-guard 的同步层（与 DNS 层校验共用同一份规则）。
+ * 返回 null = 通过；否则返回中文原因（保持既有文案契约）。
+ */
 export function assertPublicHttpsUrl(raw: string): string | null {
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    return 'baseUrl 非法';
+  const verdict = checkUrlSync(raw, { allowHttp: false });
+  if (verdict.ok) return null;
+  switch (verdict.reason) {
+    case 'protocol_not_allowed': return 'baseUrl 必须是 https';
+    case 'credentials_in_url': return 'baseUrl 不得包含凭证';
+    case 'internal_hostname': return 'baseUrl 不得指向本机/内网';
+    case 'private_ip': return 'baseUrl 不得指向私网地址';
+    default: return 'baseUrl 非法';
   }
-  if (url.protocol !== 'https:') return 'baseUrl 必须是 https';
-  if (url.username || url.password) return 'baseUrl 不得包含凭证';
-  const host = url.hostname.toLowerCase();
-  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) return 'baseUrl 不得指向本机/内网';
-  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
-    const [a, b] = host.split('.').map(Number);
-    const isPrivate = a === 10 || a === 127 || a === 0 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254);
-    if (isPrivate) return 'baseUrl 不得指向私网地址';
-  }
-  if (host === '[::1]' || host.startsWith('fd') || host.startsWith('fe80')) return 'baseUrl 不得指向私网地址';
-  return null;
 }
 
 /** zod 对象的字段名清单（用于 paramConstraints 引用校验；非 object schema → null） */

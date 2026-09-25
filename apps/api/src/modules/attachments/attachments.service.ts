@@ -1,27 +1,11 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { Attachment, AttachmentType } from '@prisma/client';
+import { Attachment } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
-import { extname } from 'node:path';
 import { Readable } from 'node:stream';
-import { LIMITS } from '@ai-agent/shared';
 import { PrismaService } from '../prisma/prisma.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { StorageAdapter } from '../../core/storage/storage.types';
-
-const ALLOWED_MIME: Record<string, AttachmentType> = {
-  'image/png': 'image', 'image/jpeg': 'image', 'image/webp': 'image', 'image/gif': 'image',
-  'video/mp4': 'video', 'video/webm': 'video', 'video/quicktime': 'video',
-  'application/pdf': 'file',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'file', // docx
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'file', // xlsx
-  'text/plain': 'file', 'text/markdown': 'file', 'text/csv': 'file',
-};
-
-const DEFAULT_EXT: Record<string, string> = {
-  'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp', 'image/gif': '.gif',
-  'video/mp4': '.mp4', 'video/webm': '.webm', 'video/quicktime': '.mov',
-  'application/pdf': '.pdf', 'text/plain': '.txt', 'text/markdown': '.md', 'text/csv': '.csv',
-};
+import { maxBytesForMime, sanitizeFilename, sniffMatchesMime, storageExtensionForMime, typeForMime } from '../security/upload-guard';
 
 const MAX_IMAGE_DATA_URL_BYTES = 8 * 1024 * 1024;
 
@@ -39,22 +23,35 @@ export class AttachmentsService {
     @Inject('STORAGE_ADAPTER') private readonly storage: StorageAdapter,
   ) {}
 
-  /** 上传：类型/大小校验 → 对象存储 → 附件行（kind=upload） */
+  /**
+   * 上传：白名单/大小/文件头校验 → 对象存储 → 附件行（kind=upload）。
+   * M8-P8 加固（顺序即防线）：
+   * 1. MIME 白名单（与 multer fileFilter 同一份定义）；
+   * 2. 大小上限按类型；以 buffer.length 为权威（绝不信任调用方传入的 size 字段）；
+   * 3. 文件头与声明 MIME 一致性（防伪造 Content-Type 绕过白名单）；
+   * 4. originalName 走 sanitizeFilename（去路径/控制字符/前导点，超长截断）；
+   * 5. storageKey 扩展名只来自服务端 MIME 映射（**用户文件名彻底不参与存储键**）。
+   */
   async save(userId: string, file: UploadFileInput, meta?: { conversationId?: string; messageId?: string }) {
-    const type = ALLOWED_MIME[file.mimetype];
+    const type = typeForMime(file.mimetype);
     if (!type) throw new AppError(ErrorCode.VALIDATION_ERROR, `不支持的文件类型：${file.mimetype}`);
-    const maxBytes = Number(LIMITS[`${type.toUpperCase()}_MAX_MB` as keyof typeof LIMITS]) * 1024 * 1024;
-    if (file.size <= 0) throw new AppError(ErrorCode.VALIDATION_ERROR, '文件为空');
-    if (file.size > maxBytes) throw new AppError(ErrorCode.VALIDATION_ERROR, `文件超过大小限制（${maxBytes / 1024 / 1024}MB）`);
+    const maxBytes = maxBytesForMime(file.mimetype);
+    const sizeBytes = file.buffer?.length ?? 0;
+    if (sizeBytes <= 0) throw new AppError(ErrorCode.VALIDATION_ERROR, '文件为空');
+    if (sizeBytes > maxBytes) throw new AppError(ErrorCode.VALIDATION_ERROR, `文件超过大小限制（${maxBytes / 1024 / 1024}MB）`);
+    if (!sniffMatchesMime(file.mimetype, file.buffer)) {
+      throw new AppError(ErrorCode.VALIDATION_ERROR, `文件内容与声明类型不符：${file.mimetype}`);
+    }
 
-    const ext = (extname(file.originalname) || DEFAULT_EXT[file.mimetype] || '').toLowerCase();
+    const ext = storageExtensionForMime(file.mimetype);
+    const originalName = sanitizeFilename(file.originalname);
     const now = new Date();
     const storageKey = `${userId}/${now.getFullYear()}/${String(now.getMonth() + 1).padStart(2, '0')}/${randomUUID()}${ext}`;
-    await this.storage.put(storageKey, Readable.from(file.buffer), { contentType: file.mimetype, sizeBytes: file.size });
+    await this.storage.put(storageKey, Readable.from(file.buffer), { contentType: file.mimetype, sizeBytes });
     return this.prisma.attachment.create({
       data: {
         userId, kind: 'upload', type, mimeType: file.mimetype,
-        storageKey, originalName: file.originalname || undefined, sizeBytes: file.size, status: 'ready',
+        storageKey, originalName: originalName ?? undefined, sizeBytes, status: 'ready',
         conversationId: meta?.conversationId, messageId: meta?.messageId,
       },
     });

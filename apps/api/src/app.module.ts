@@ -3,6 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { LoggerModule } from 'nestjs-pino';
 import { randomUUID } from 'node:crypto';
 import { PrismaModule } from './modules/prisma/prisma.module';
+import { SecurityModule } from './modules/security/security.module';
 import { HealthModule } from './modules/health/health.module';
 import { CryptoModule } from './core/crypto/crypto.module';
 import { StorageModule } from './core/storage/storage.module';
@@ -60,6 +61,7 @@ import { GlobalExceptionFilter } from './common/filters/global-exception.filter'
     }),
     PrismaModule,
     CryptoModule,
+    SecurityModule, // M8-P8 安全面（SSRF 防线 / 禁用用户与会话撤销判定）
     AuditModule,
     TracingModule, // M8-P3 可观测性（TraceContext/ObservabilityService/HTTP 传播中间件）
     ObservabilityApiModule, // M8-P3 GET /metrics

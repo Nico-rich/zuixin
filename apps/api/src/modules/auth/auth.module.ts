@@ -6,12 +6,14 @@ import { AuthController } from './auth.controller';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { OrganizationsModule } from '../organizations/organizations.module';
 import { OrganizationsApiModule } from '../organizations/organizations-api.module';
+import { SecurityModule } from '../security/security.module';
 
 @Global()
 @Module({
   imports: [
     OrganizationsModule,
     OrganizationsApiModule,
+    SecurityModule, // M8-P8：JwtAuthGuard 的禁用用户阻断 + 会话撤销判定
     JwtModule.registerAsync({
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({

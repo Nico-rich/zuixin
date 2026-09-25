@@ -19,11 +19,13 @@ import { AgentRunWorkerModule } from './worker/agent-run/agent-run-worker.module
 import { WorkflowWorkerModule } from './worker/workflow/workflow-worker.module';
 import { ExtensionsModule } from './modules/extensions/extensions.module';
 import { SchedulerWorkerModule } from './worker/scheduler/scheduler-worker.module';
+import { SecurityModule } from './modules/security/security.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true, envFilePath: ['.env', '../../.env'] }),
     PrismaModule, CryptoModule, AuditModule, BillingModule, ProvidersModule, CircuitBreakerModule, RouterModule,
+    SecurityModule, // M8-P8 安全面（扩展 provider baseUrl 的 SSRF 解析器注入点）
     StorageModule, UsageModule, QueueModule,
     TracingModule, // M8-P3 可观测性（Worker 侧指标采样/审计 trace 注入）
     QueueDepthWorkerModule, // M8-P3 队列深度采样（仅 Worker 进程）

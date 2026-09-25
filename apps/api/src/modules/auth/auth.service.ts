@@ -1,12 +1,13 @@
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import * as argon2 from 'argon2';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { PrismaService } from '../prisma/prisma.service';
 import { OrganizationsService } from '../organizations/organizations.service';
 import { AuditService, maskEmail } from '../audit/audit.service';
 import { RedisKVService } from '../../core/circuit-breaker/redis-kv.service';
+import { AccessGuardService } from '../security/access-guard.service';
 import { LOGIN_FAIL_WINDOW_SEC, LOGIN_MAX_FAILS, REFRESH_TTL_SEC } from './auth.constants';
 
 export interface RequestMeta { ip: string; userAgent?: string; }
@@ -27,6 +28,8 @@ export class AuthService {
     @Inject(OrganizationsService) private readonly orgs: OrganizationsService,
     // M8-P3 login 审计（@Optional：审计面缺失时登录主流程照常；AppModule/WorkerModule 均注册 @Global AuditModule）
     @Optional() @Inject(AuditService) private readonly audit?: AuditService,
+    // M8-P8 会话缓存（登出后立即失效；@Optional 仅为保持最小可构造性，AppModule 场景由 @Global SecurityModule 提供）
+    @Optional() @Inject(AccessGuardService) private readonly access?: AccessGuardService,
   ) {}
 
   async login(email: string, password: string, meta: RequestMeta): Promise<AuthResult> {
@@ -82,12 +85,33 @@ export class AuthService {
     return this.issueTokens(user, meta);
   }
 
-  async logout(rawRefresh: string | undefined): Promise<void> {
-    if (!rawRefresh) return;
+  /**
+   * M8-P8 登出：撤销 refresh 会话 +（防御纵深）撤销当前 access token 所属会话。
+   * 只靠 refresh cookie 时，若 refresh cookie 缺失/过期则会话不会被撤销、access token 仍可用约 15 分钟；
+   * 传入 access token 的 sid（已验签）后，两种 cookie 任一存在即可完成会话撤销。
+   */
+  async logout(rawRefresh: string | undefined, accessSessionId?: string): Promise<void> {
+    const conditions: Array<{ tokenHash: string } | { id: string }> = [];
+    if (rawRefresh) conditions.push({ tokenHash: this.hash(rawRefresh) });
+    if (accessSessionId) conditions.push({ id: accessSessionId });
+    if (!conditions.length) return;
     await this.prisma.session.updateMany({
-      where: { tokenHash: this.hash(rawRefresh), revokedAt: null },
+      where: { OR: conditions, revokedAt: null },
       data: { revokedAt: new Date() },
     });
+    // 进程内会话缓存立即失效（无需等待 TTL；跨进程仍有 ≤ TTL 窗口，见 AccessGuardService 注释）
+    if (accessSessionId) this.access?.invalidateSession(accessSessionId);
+  }
+
+  /** 从 access token 提取会话 id（仅本地验签，不查库；验签失败/无 sid → null） */
+  async sessionIdFromAccessToken(accessToken: string | undefined): Promise<string | null> {
+    if (!accessToken) return null;
+    try {
+      const payload = await this.jwt.verifyAsync<{ sid?: string }>(accessToken);
+      return payload?.sid ?? null;
+    } catch {
+      return null;
+    }
   }
 
   async me(userId: string) {
@@ -97,15 +121,19 @@ export class AuthService {
   }
 
   private async issueTokens(user: { id: string; email: string; displayName: string | null; role: string }, meta: RequestMeta): Promise<AuthResult> {
-    const accessToken = await this.jwt.signAsync({ sub: user.id, role: user.role });
+    // M8-P8：会话 id 由服务端预生成 → access token 携带 sid（登出/撤销后 access token 立即失效）。
+    // 预生成而非依赖 create 返回值：签发与落库的 id 一致且无竞态。
+    const sessionId = randomUUID();
     const refreshToken = randomBytes(48).toString('base64url');
     await this.prisma.session.create({
       data: {
+        id: sessionId,
         userId: user.id, tokenHash: this.hash(refreshToken),
         expiresAt: new Date(Date.now() + REFRESH_TTL_SEC * 1000),
         userAgent: meta.userAgent, ip: meta.ip,
       },
     });
+    const accessToken = await this.jwt.signAsync({ sub: user.id, role: user.role, sid: sessionId });
     return {
       accessToken, refreshToken,
       user: { id: user.id, email: user.email, displayName: user.displayName, role: user.role },

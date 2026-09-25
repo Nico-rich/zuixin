@@ -303,7 +303,10 @@ describe('M8-P6 Extension SDK (e2e)', () => {
         manifest: {
           manifestVersion: 1, kind: 'provider', permissions: ['provider.call'],
           provider: {
-            name: '扩展推理服务', adapter: 'openai-compatible', baseUrl: 'https://api.example.com/v1',
+            // M8-P8：provider baseUrl 现在会经过 install 时的 DNS 层 SSRF 校验（assertSafeUrl）。
+            // 原 fixture 用 `https://api.example.com/v1`（RFC2606 保留域名，真实环境不可解析）会被
+            // 校验以 dns_unresolvable 拒绝——校验本身不放松，改为公网 IP 字面量（无需 DNS、语义等价）。
+            name: '扩展推理服务', adapter: 'openai-compatible', baseUrl: 'https://93.184.216.34/v1',
             models: [{ name: 'gpt-x', apiModelId: `gpt-x-${stamp}`, type: 'llm' }],
           },
         },
@@ -324,7 +327,7 @@ describe('M8-P6 Extension SDK (e2e)', () => {
 
     const provider = await prisma.provider.findUnique({ where: { id: providerId }, include: { models: true } });
     expect(provider?.adapter).toBe('openai-compatible');
-    expect(provider?.baseUrl).toBe('https://api.example.com/v1');
+    expect(provider?.baseUrl).toBe('https://93.184.216.34/v1');
     expect(provider?.enabled).toBe(true);
     expect(provider?.apiKeyEncrypted).not.toContain('sk-e2e');
     expect(new CryptoService(process.env.ENCRYPTION_KEY ?? '').decrypt(provider!.apiKeyEncrypted)).toBe(`sk-e2e-${stamp}-secret`);

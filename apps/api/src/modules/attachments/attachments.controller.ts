@@ -4,8 +4,33 @@ import { Request, Response } from 'express';
 import { AttachmentsService } from './attachments.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { AuthedUser, JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { MAX_MB_BY_TYPE, MULTIPART_OVERHEAD_BYTES, isAllowedMime, maxBytesForMime } from '../security/upload-guard';
 
-const MAX_UPLOAD_BYTES = 200 * 1024 * 1024; // multer 总闸（按类型细分在 service 层）
+/** multer 总闸 = 最大分类型上限（video 200MB）；分类型上限在 fileFilter 与服务层双重校验 */
+const MAX_UPLOAD_BYTES = Math.max(...Object.values(MAX_MB_BY_TYPE)) * 1024 * 1024;
+
+/**
+ * M8-P8 上传边界（白名单/上限与 service 共用 security/upload-guard 同一份定义）：
+ * 1. 白名单外的 MIME 在进入内存缓冲前即拒绝（fileFilter）；
+ * 2. 按声明 MIME 的分类型上限 + Content-Length 提前拒绝（避免"image 白名单 + 200MB 包"整包进内存）；
+ * 3. 真实字节数/文件头一致性由 service 复核（Content-Length 与声明 MIME 都可被客户端伪造）。
+ */
+const UPLOAD_OPTIONS = {
+  limits: { fileSize: MAX_UPLOAD_BYTES },
+  fileFilter: (req: Request, file: Express.Multer.File, cb: (error: Error | null, acceptFile: boolean) => void) => {
+    if (!isAllowedMime(file.mimetype)) {
+      cb(new AppError(ErrorCode.VALIDATION_ERROR, `不支持的文件类型：${file.mimetype}`), false);
+      return;
+    }
+    const maxBytes = maxBytesForMime(file.mimetype);
+    const declared = Number(req.headers['content-length'] ?? '0');
+    if (Number.isFinite(declared) && declared > maxBytes + MULTIPART_OVERHEAD_BYTES) {
+      cb(new AppError(ErrorCode.VALIDATION_ERROR, `文件超过大小限制（${maxBytes / 1024 / 1024}MB）`), false);
+      return;
+    }
+    cb(null, true);
+  },
+};
 
 @Controller('attachments')
 @UseGuards(JwtAuthGuard)
@@ -13,7 +38,7 @@ export class AttachmentsController {
   constructor(@Inject(AttachmentsService) private readonly attachments: AttachmentsService) {}
 
   @Post()
-  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: MAX_UPLOAD_BYTES } }))
+  @UseInterceptors(FileInterceptor('file', UPLOAD_OPTIONS))
   async upload(@UploadedFile() file: Express.Multer.File | undefined, @Req() req: Request & { user: AuthedUser }) {
     if (!file) throw new AppError(ErrorCode.VALIDATION_ERROR, '缺少文件（字段名 file）');
     return this.attachments.save(req.user.userId, {

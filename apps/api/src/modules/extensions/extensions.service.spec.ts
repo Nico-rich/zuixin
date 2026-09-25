@@ -120,7 +120,10 @@ function makeHarness() {
   };
   const authz = { authorize: vi.fn().mockResolvedValue('owner') };
   const crypto = new CryptoService(PLATFORM_KEY);
-  const svc = new ExtensionsService(prisma as never, authz as never, crypto, registry);
+  // M8-P8：provider baseUrl 安装时增加 DNS 层 SSRF 校验；单测注入确定性解析器（DNS 边界替换点），
+  // 规则本身的覆盖见 src/modules/security/ssrf-guard.spec.ts
+  const dnsResolver = async (): Promise<string[]> => ['93.184.216.34'];
+  const svc = new ExtensionsService(prisma as never, authz as never, crypto, registry, dnsResolver);
   return { svc, prisma, authz, registry, baseExecute };
 }
 

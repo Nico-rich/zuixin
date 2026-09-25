@@ -10,8 +10,13 @@ import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { WorkflowRunsService } from './workflow-runs.service';
 import { WorkflowDefinition } from './workflow-types';
 import { AuditService } from '../audit/audit.service';
+import { WEBHOOK_LIMITS, checkJsonComplexity, isPlainPayload } from '../security/payload-guard';
 
 const WEBHOOK_TIMESTAMP_TOLERANCE_MS = 5 * 60_000;
+/** M8-P8：webhook 载荷体积硬上限（与 main.ts express.raw limit 一致；服务层再校验一次） */
+export const WEBHOOK_MAX_BODY_BYTES = 1024 * 1024;
+/** M8-P8：鉴权失败的统一文案（绝不区分不存在/禁用/签名错/时间戳错——防 token 探测） */
+export const WEBHOOK_REJECT_MESSAGE = 'webhook 鉴权失败';
 
 /**
  * M7-P6 触发器（webhook/schedule/event；manual 由 API 直入）：
@@ -87,19 +92,24 @@ export class WorkflowTriggersService implements OnModuleInit {
 
   /** 签名 + timestamp + 防重放验证（任何失败均不泄露内部细节） */
   async verifyWebhook(token: string, rawBody: Buffer, headers: { signature?: string; timestamp?: string; eventId?: string }): Promise<{ workflowId: string; eventId: string }> {
+    // M8-P8：体积上限（defense in depth —— express.raw limit 之外的二次校验；超限不进入 HMAC/解析/落库）
+    if (rawBody.length > WEBHOOK_MAX_BODY_BYTES) {
+      throw new AppError(ErrorCode.VALIDATION_ERROR, 'webhook 载荷超过大小限制');
+    }
     const webhook = await this.prisma.workflowWebhook.findUnique({ where: { token } });
-    if (!webhook || !webhook.enabled) throw new AppError(ErrorCode.WEBHOOK_SIGNATURE_INVALID, 'webhook 不存在或已禁用');
+    // M8-P8：错误文案统一为单一措辞（不区分"不存在/已禁用/签名错/时间戳错"——防 token 探测与状态枚举）
+    if (!webhook || !webhook.enabled) throw new AppError(ErrorCode.WEBHOOK_SIGNATURE_INVALID, WEBHOOK_REJECT_MESSAGE);
     const secret = this.crypto.decrypt(webhook.secretEncrypted);
     const expected = createHmac('sha256', secret).update(rawBody).digest('hex');
     const provided = headers.signature ?? '';
     const a = Buffer.from(expected, 'utf8');
     const b = Buffer.from(provided, 'utf8');
     if (a.length !== b.length || !timingSafeEqual(a, b)) {
-      throw new AppError(ErrorCode.WEBHOOK_SIGNATURE_INVALID, '签名校验失败');
+      throw new AppError(ErrorCode.WEBHOOK_SIGNATURE_INVALID, WEBHOOK_REJECT_MESSAGE);
     }
     const ts = Number(headers.timestamp);
     if (!Number.isFinite(ts) || Math.abs(Date.now() - ts) > WEBHOOK_TIMESTAMP_TOLERANCE_MS) {
-      throw new AppError(ErrorCode.WEBHOOK_SIGNATURE_INVALID, 'timestamp 超出允许窗口');
+      throw new AppError(ErrorCode.WEBHOOK_SIGNATURE_INVALID, WEBHOOK_REJECT_MESSAGE);
     }
     const eventId = headers.eventId ?? randomUUID();
     // 防重放：同一 eventId 只接受一次（UNIQUE 约束为最终防线）
@@ -133,8 +143,13 @@ export class WorkflowTriggersService implements OnModuleInit {
     let payload: Record<string, unknown> = {};
     try {
       const parsed = JSON.parse(rawBody.toString('utf8'));
-      if (parsed && typeof parsed === 'object') payload = parsed as Record<string, unknown>;
-    } catch {
+      // M8-P8：载荷必须是 JSON 对象（数组/标量拒绝）+ 结构复杂度上限（防深嵌套/超宽对象放大）
+      if (!isPlainPayload(parsed)) throw new AppError(ErrorCode.VALIDATION_ERROR, 'webhook 载荷必须是 JSON 对象');
+      const complexity = checkJsonComplexity(parsed, WEBHOOK_LIMITS);
+      if (!complexity.ok) throw new AppError(ErrorCode.VALIDATION_ERROR, `webhook 载荷被拒绝：${complexity.reason}`);
+      payload = parsed;
+    } catch (err) {
+      if (err instanceof AppError) throw err;
       throw new AppError(ErrorCode.VALIDATION_ERROR, 'webhook 载荷必须是 JSON');
     }
     const wf = await this.prisma.workflow.findUnique({ where: { id: workflowId } });

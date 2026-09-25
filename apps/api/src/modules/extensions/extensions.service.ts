@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
@@ -7,6 +7,7 @@ import { CryptoService } from '../../core/crypto/crypto.service';
 import { ToolRegistry } from '../../core/tools/tool-registry.service';
 import { Tool } from '../../core/tools/tool.types';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
+import { DnsResolver, SSRF_RESOLVER, assertSafeUrl } from '../security/ssrf-guard';
 import {
   EXTENSION_KINDS, ExtensionKind, ExtensionManifest, ExtensionPermissionName, WRAPPABLE_TOOL_PERMISSIONS,
   checkParamConstraints, parseManifest, renderAgentPrompt, signChecksum, verifySignature, zodObjectKeys,
@@ -35,6 +36,8 @@ export class ExtensionsService implements OnModuleInit {
     @Inject(AuthorizationService) private readonly authz: AuthorizationService,
     @Inject(CryptoService) private readonly crypto: CryptoService,
     @Inject(ToolRegistry) private readonly registry: ToolRegistry,
+    // M8-P8：provider baseUrl 的 DNS 层 SSRF 校验（解析器可替换；@Optional 保持最小可构造性）
+    @Optional() @Inject(SSRF_RESOLVER) private readonly dnsResolver?: DnsResolver,
   ) {
     this.platformKey = process.env.ENCRYPTION_KEY ?? '';
   }
@@ -495,6 +498,10 @@ export class ExtensionsService implements OnModuleInit {
     versionId: string, manifest: ExtensionManifest, organizationId: string, installConfig?: Record<string, unknown>,
   ): Promise<string> {
     const block = manifest.provider!;
+    // M8-P8 SSRF：manifest 解析阶段已做同步白名单校验（协议/主机名/IP 字面量）；
+    // 此处补 DNS 解析层校验——公网域名解析到私网/回环/link-local（含 169.254.169.254 metadata）一律拒绝。
+    // 说明：平台不跟随重定向；provider 调用侧不得启用自动重定向（见 docs/security/m8-security-audit.md SSRF 节）。
+    await assertSafeUrl(block.baseUrl, { ...(this.dnsResolver ? { resolve: this.dnsResolver } : {}) });
     const apiKey = typeof installConfig?.apiKey === 'string' ? installConfig.apiKey.trim() : '';
     const orgHash = hashSuffix(organizationId);
     // Provider 表无组织列（平台级资源）→ 以确定性命名隔离各组织安装实例
