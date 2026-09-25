@@ -362,6 +362,8 @@ model UsageRecord {
   id             String      @id @default(uuid())
   userId         String?
   user           User?       @relation(fields: [userId], references: [id])
+  organizationId String      // Pre-M9 T1：组织归属必填（写入时从 run/project/user 事实链解析；事实不可无主）
+  organization   Organization @relation(fields: [organizationId], references: [id])
   conversationId String?
   messageId      String?
   taskId         String?
@@ -383,6 +385,7 @@ model UsageRecord {
   @@index([createdAt])
   @@index([userId, createdAt])
   @@index([runId])
+  @@index([organizationId, createdAt])
 }
 
 // ===== 系统配置 =====
@@ -418,6 +421,7 @@ model Project {
   knowledgeBases KnowledgeBase[]
   documents       Document[]
   @@index([userId, updatedAt])
+  @@index([organizationId])
 }
 
 // ===== M2: Memory（单表，scope 区分 user/project）=====
@@ -568,7 +572,7 @@ model AgentRun {
   messages       AgentRunMessage[]
   @@index([userId, createdAt])
   @@index([conversationId])
-  @@index([status])
+  @@index([status, leaseUntil])
   @@index([retryOfRunId])
   @@index([waitingOnTaskId])
   @@index([waitingOnApprovalId])
@@ -1403,8 +1407,8 @@ model Organization {
   externalActions ExternalAction[]
   subscription Subscription?
   usageLedger  UsageLedgerEntry[]
+  usageRecords UsageRecord[]
   metricSamples MetricSample[]
-  analyticsAggregates AnalyticsAggregate[]
   scheduledJobs ScheduledJob[]
   eventEnvelopes EventEnvelope[]
   extensions Extension[]
@@ -1497,6 +1501,7 @@ model UsageLedgerEntry {
   @@index([organizationId, period])
   @@index([usageRecordId])
   @@index([runId])
+  @@index([organizationId, kind, createdAt])
 }
 
 model QuotaAlert {
@@ -1562,11 +1567,12 @@ model MetricSample {
 }
 
 // ===== P4 Analytics：聚合投影（不破坏事务库；period+kind 幂等刷新）=====
+// Pre-M9 S1：organizationId/userId NOT NULL（'global' 显式哨兵——绝不依赖 NULL 隐式全局，
+// 否则 NULL-distinct 使唯一约束失效、并发刷新双写）
 model AnalyticsAggregate {
   id             String   @id @default(uuid())
-  organizationId String?
-  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
-  userId         String?
+  organizationId String   // 组织 id 或哨兵 'global'（平台级聚合）
+  userId         String   // 用户 id 或哨兵 'global'（组织级跨用户聚合）
   kind           String   // usage | cost | agent | tool | generation | provider | organization | workflow
   period         String   // YYYY-MM-DD（日粒度；month 由日聚合）
   dimensions     Json?    // { agentId, toolName, providerId, workflowId, ... }
