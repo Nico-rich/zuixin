@@ -168,6 +168,8 @@ model User {
   performanceSnapshots PerformanceSnapshot[]
   auditLogs         AuditLog[]
   organizationMemberships OrganizationMember[]
+  scheduledJobs       ScheduledJob[]
+  extensions          Extension[]
   knowledgeBases KnowledgeBase[]
   documents      Document[]
 }
@@ -1361,10 +1363,18 @@ model AuditLog {
   workflowRunId    String?
   connectionId     String?
   metadata         Json?
+  organizationId   String? // M8-P3：租户归属
+  actorId          String? // 实际执行者（可为服务账号）
+  requestId        String? // 全链路请求 ID
+  traceId          String? // 分布式追踪 ID
+  result           String? // success | denied | failed
+  reason           String? // 拒绝/失败原因（脱敏后）
   createdAt        DateTime @default(now())
   @@index([userId, createdAt])
   @@index([action, createdAt])
   @@index([agentRunId])
+  @@index([organizationId, createdAt])
+  @@index([traceId])
 }
 
 // ===== M8-P1: Multi-tenancy / Organization / RBAC =====
@@ -1393,6 +1403,14 @@ model Organization {
   externalActions ExternalAction[]
   subscription Subscription?
   usageLedger  UsageLedgerEntry[]
+  metricSamples MetricSample[]
+  analyticsAggregates AnalyticsAggregate[]
+  scheduledJobs ScheduledJob[]
+  eventEnvelopes EventEnvelope[]
+  extensions Extension[]
+  extensionInstallations ExtensionInstallation[]
+  providerPolicies ProviderPolicy[]
+  routingDecisions RoutingDecision[]
   quotaAlerts  QuotaAlert[]
   invoices     Invoice[]
   paymentEvents PaymentEvent[]
@@ -1525,4 +1543,203 @@ model PaymentEvent {
   createdAt      DateTime @default(now())
   @@unique([provider, providerEventId])
   @@index([organizationId])
+}
+
+// ===== M8-P3~P7 平台层（Coordinator 预整合 schema；各 Phase 并行实现业务）=====
+
+// ===== P3 Observability：AuditLog 增强 + 指标采样 =====
+model MetricSample {
+  id             String   @id @default(uuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  name           String   // request_count | request_latency_ms | error_count | llm_latency_ms | llm_failures | tool_latency_ms | tool_failures | generation_latency_ms | generation_failures | queue_depth | queue_latency_ms | provider_latency_ms | provider_error_rate | agent_run_duration_ms | workflow_duration_ms
+  value          Float    @default(0)
+  unit           String   @default("count") // count | ms | percent
+  labels         Json?    // { userId, providerId, queue, toolName, ... }
+  sampledAt      DateTime @default(now())
+  @@index([name, sampledAt])
+  @@index([organizationId, sampledAt])
+}
+
+// ===== P4 Analytics：聚合投影（不破坏事务库；period+kind 幂等刷新）=====
+model AnalyticsAggregate {
+  id             String   @id @default(uuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  userId         String?
+  kind           String   // usage | cost | agent | tool | generation | provider | organization | workflow
+  period         String   // YYYY-MM-DD（日粒度；month 由日聚合）
+  dimensions     Json?    // { agentId, toolName, providerId, workflowId, ... }
+  metrics        Json     // 事实指标（facts 层；绝不混入 LLM 解读）
+  source         String   // usage_record | usage_ledger | agent_run | workflow_run（可追溯事务源）
+  refreshedAt    DateTime @default(now())
+  @@unique([organizationId, userId, kind, period, source])
+  @@index([organizationId, period])
+  @@index([kind, period])
+}
+
+// ===== P5 Scheduler / Event Platform =====
+model ScheduledJob {
+  id             String   @id @default(uuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  ownerUserId    String
+  owner          User     @relation(fields: [ownerUserId], references: [id], onDelete: Cascade)
+  name           String
+  type           String   @default("one-shot") // one-shot | delayed | recurring
+  cron           String?  // recurring
+  runAt          DateTime? // one-shot/delayed
+  status         String   @default("pending") // pending | scheduled | running | completed | failed | cancelled | dead
+  priority       Int      @default(0)
+  timeoutMs      Int      @default(60000)
+  maxAttempts    Int      @default(3)
+  backoffMs      Int      @default(2000)
+  payload        Json?
+  handler        String   // 消费处理器标识（服务端注册表；绝不执行任意代码）
+  idempotencyKey String?
+  traceId        String?
+  lastError      String?
+  attempts       Int      @default(0)
+  scheduledAt    DateTime?
+  completedAt    DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  @@unique([idempotencyKey])
+  @@index([organizationId, status])
+  @@index([runAt])
+  @@index([status, runAt])
+}
+
+model EventEnvelope {
+  id             String   @id @default(uuid())
+  eventId        String   @unique // 幂等：同 eventId 只入一次
+  eventType      String
+  version        Int      @default(1)
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  projectId      String?
+  actorId        String?
+  aggregateType  String?
+  aggregateId    String?
+  payload        Json?
+  occurredAt     DateTime @default(now())
+  traceId        String?
+  status         String   @default("published") // published | consumed | failed | dead
+  attempts       Int      @default(0)
+  lastError      String?
+  consumedAt     DateTime?
+  createdAt      DateTime @default(now())
+  @@index([eventType, occurredAt])
+  @@index([organizationId, occurredAt])
+  @@index([aggregateType, aggregateId])
+  @@index([status, occurredAt])
+}
+
+// ===== P6 Extension SDK（manifest/权限/安装；绝不执行任意第三方代码）=====
+model Extension {
+  id          String   @id @default(uuid())
+  organizationId String? // 组织私有扩展；null = 平台级
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  ownerUserId String
+  owner       User     @relation(fields: [ownerUserId], references: [id], onDelete: Cascade)
+  name        String
+  slug        String   @unique
+  description String?
+  kind        String   // tool | agent | provider | workflow_step
+  status      String   @default("draft") // draft | published | deprecated | archived
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  versions    ExtensionVersion[]
+  @@index([organizationId, status])
+}
+
+model ExtensionVersion {
+  id          String   @id @default(uuid())
+  extensionId String
+  extension   Extension @relation(fields: [extensionId], references: [id], onDelete: Cascade)
+  version     Int
+  manifest    Json     // 声明式定义（custom tool 参数约束 / agent 模板 / workflow step 声明）——绝不含可执行代码
+  checksum    String   // sha256(manifest)
+  signature   String?  // 签名（预留；校验在服务层）
+  status      String   @default("draft") // draft | published | deprecated | archived
+  createdAt   DateTime @default(now())
+  permissions ExtensionPermission[]
+  @@unique([extensionId, version])
+}
+
+model ExtensionPermission {
+  id        String           @id @default(uuid())
+  versionId String
+  version   ExtensionVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  name      String           // tool.execute | workflow.step | agent.run | provider.call | config.read | config.write
+  scope     String           @default("organization") // organization | project | user
+  description String?
+  @@unique([versionId, name])
+}
+
+model ExtensionInstallation {
+  id          String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  extensionId String
+  versionId   String   // 版本锁定（installation 绝不漂移）
+  status      String   @default("enabled") // enabled | disabled
+  config      Json?
+  installedByUserId String
+  installedAt DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  @@unique([organizationId, extensionId])
+  @@index([organizationId, status])
+}
+
+// ===== P7 Provider Routing（能力/策略/决策审计）=====
+model ProviderCapability {
+  id         String   @id @default(uuid())
+  providerId String
+  capability String   // text_generation | image_generation | video_generation | embedding | function_calling | vision
+  modelIds   Json?    // 支持该能力的模型清单
+  contextWindow Int?
+  features   Json?    // { maxTokens, supportedModes, ... }
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  @@unique([providerId, capability])
+  @@index([capability])
+}
+
+model ProviderPolicy {
+  id          String   @id @default(uuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  providerId  String
+  allow       Boolean  @default(true) // allow/deny list
+  priority    Int      @default(100)  // 偏好排序（低值优先）
+  costCeilingPerRequest Float?
+  costCeilingMonthly    Float?
+  dataPolicy  Json?    // { regions, allowedKinds, ... }
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  @@unique([organizationId, providerId])
+  @@index([organizationId, enabled])
+}
+
+model RoutingDecision {
+  id          String   @id @default(uuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  requestId   String?
+  traceId     String?
+  runId       String?
+  taskId      String?
+  capability  String   // 路由目标能力（text_generation 等）
+  providerId  String?  // 最终选择
+  candidates  Json     // 候选清单（含被拒原因）
+  reasonCode  String   // capability_match | cost_optimal | health_score | policy_allow | fallback | circuit_open | denied
+  policyId    String?
+  estimatedCost Float?
+  actualCost    Float?
+  decidedAt   DateTime @default(now())
+  @@index([organizationId, decidedAt])
+  @@index([runId])
+  @@index([providerId, decidedAt])
 }
