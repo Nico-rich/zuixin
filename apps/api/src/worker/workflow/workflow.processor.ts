@@ -11,6 +11,8 @@ import { WorkflowTriggersService } from '../../modules/workflows/workflow-trigge
 import { EventBusService } from '../../core/events/event-bus.service';
 import { PrismaService } from '../../modules/prisma/prisma.service';
 import { WORKFLOW_CANCEL_CHANNEL } from '../../core/events/workflow-channels';
+import { ObservabilityService } from '../../core/tracing/observability.service';
+import { TraceContext, newTraceId } from '../../core/tracing/trace-context';
 
 export { WORKFLOW_CANCEL_CHANNEL };
 
@@ -33,6 +35,7 @@ export class WorkflowProcessor extends WorkerHost implements OnApplicationShutdo
     @Inject(WorkflowTriggersService) private readonly triggers: WorkflowTriggersService,
     @Inject(EventBusService) private readonly events: EventBusService,
     @Inject(PrismaService) private readonly prisma: PrismaService,
+    @Inject(ObservabilityService) private readonly metrics: ObservabilityService, // M8-P3 指标采样（只读观测面）
   ) {
     super();
   }
@@ -64,9 +67,15 @@ export class WorkflowProcessor extends WorkerHost implements OnApplicationShutdo
     this.active = { runId, workerId };
     const heartbeat = setInterval(() => void this.heartbeatTick(runId, workerId), 15_000);
     this.logger.log({ runId, workerId }, 'workflow claim 成功，开始执行');
+    const startedAtMs = Date.now(); // M8-P3：时长采样起点（仅观测，不参与任何业务判定）
+    const traceId = newTraceId(); // M8-P3：本次 workflow run 的追踪 ID（步内审计同源）
     try {
       for (let i = 0; i < 200; i++) { // 步数上限兜底（definition 校验已限，此处防环）
-        const result = await this.executor.execute(runId, workerId);
+        // 只置 workflowRunId（此处 runId 语义是 workflow run id——绝不冒充 agentRunId）
+        const result = await TraceContext.runWithContext(
+          { workflowRunId: runId, traceId },
+          () => this.executor.execute(runId, workerId),
+        );
         if (result.outcome === 'waiting') {
           // 观察子 AgentRun 实时终态（审批唤醒由全局订阅承担；两类都有 recoverStale 兜底）
           const row = await this.prisma.workflowRun.findUnique({
@@ -81,6 +90,8 @@ export class WorkflowProcessor extends WorkerHost implements OnApplicationShutdo
     } finally {
       clearInterval(heartbeat);
       this.active = null;
+      // M8-P3：workflow 时长采样（best-effort——绝不影响 lease/步进语义）
+      await this.metrics.recordRunDuration('workflow_run', runId, Date.now() - startedAtMs, { workerId });
     }
   }
 

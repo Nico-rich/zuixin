@@ -1,0 +1,125 @@
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import { PrismaService } from '../../modules/prisma/prisma.service';
+import { TraceContext } from './trace-context';
+
+export type MetricUnit = 'count' | 'ms' | 'percent';
+
+export type RunMetricKind = 'agent_run' | 'workflow_run';
+
+export interface MetricFilter {
+  name?: string;
+  organizationId?: string;
+  limit?: number;
+}
+
+export interface RunAttribution {
+  organizationId: string | null;
+  userId: string | null;
+}
+
+/**
+ * M8-P3 指标采样（MetricSample，append-only 观测事实）：
+ * - recordMetric 一律 best-effort：观测写入失败绝不阻断主流程（仅 warn）；
+ * - organizationId 缺省从 TraceContext 取（HTTP/Worker 上下文已建立），HTTP 样本由中间件按 userId 归属；
+ * - 读取见 ObservabilityService.list（userId 首条件；组织维度须先过 membership）。
+ */
+@Injectable()
+export class ObservabilityService {
+  private readonly logger = new Logger('Observability');
+
+  constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
+
+  /**
+   * 采样一次指标（best-effort）。labels 自动补当前 traceId（便于与审计/日志关联）。
+   * organizationId 显式传入优先；未传则取 TraceContext.current()?.organizationId。
+   */
+  async recordMetric(
+    name: string,
+    value: number,
+    unit: MetricUnit = 'count',
+    labels?: Record<string, unknown>,
+    organizationId?: string | null,
+  ): Promise<void> {
+    const ctx = TraceContext.current();
+    const orgId = organizationId !== undefined ? organizationId : (ctx?.organizationId ?? null);
+    const payload: Record<string, unknown> = { ...(labels ?? {}) };
+    if (ctx?.traceId && payload.traceId === undefined) payload.traceId = ctx.traceId;
+    try {
+      await this.prisma.metricSample.create({
+        data: {
+          name, value, unit,
+          labels: (Object.keys(payload).length ? payload : null) as never,
+          organizationId: orgId ?? null,
+        },
+      });
+    } catch (err) {
+      this.logger.warn(`指标写入失败 name=${name}: ${(err as Error).message}`); // best-effort
+    }
+  }
+
+  /**
+   * Worker 侧：run 执行时长采样（agent_run_duration_ms / workflow_duration_ms）。
+   * 归属（organizationId + userId）由 run 行解析——AgentRun/WorkflowRun 无 organizationId 列，
+   * AgentRun 走 project.organizationId，WorkflowRun 走 workflow.organizationId（与 Billing 归因同源）。
+   */
+  async recordRunDuration(kind: RunMetricKind, runId: string, durationMs: number, extra: Record<string, unknown> = {}): Promise<void> {
+    const attribution = await this.attributeRun(kind, runId);
+    const labels: Record<string, unknown> = { runId, ...extra };
+    if (attribution.userId) labels.userId = attribution.userId;
+    await this.recordMetric(
+      kind === 'agent_run' ? 'agent_run_duration_ms' : 'workflow_duration_ms',
+      durationMs, 'ms', labels, attribution.organizationId,
+    );
+  }
+
+  /** run 归属解析（best-effort：解析失败降级为无组织标签，绝不影响采样本身） */
+  private async attributeRun(kind: RunMetricKind, runId: string): Promise<RunAttribution> {
+    try {
+      if (kind === 'agent_run') {
+        const run = await this.prisma.agentRun.findUnique({
+          where: { id: runId },
+          select: { userId: true, project: { select: { organizationId: true } } },
+        });
+        const organizationId = run?.project?.organizationId ?? await this.personalOrganizationId(run?.userId);
+        return { organizationId, userId: run?.userId ?? null };
+      }
+      const run = await this.prisma.workflowRun.findUnique({
+        where: { id: runId },
+        select: { userId: true, workflow: { select: { organizationId: true } } },
+      });
+      const organizationId = run?.workflow?.organizationId ?? await this.personalOrganizationId(run?.userId);
+      return { organizationId, userId: run?.userId ?? null };
+    } catch {
+      return { organizationId: null, userId: null };
+    }
+  }
+
+  /** 个人组织兜底（与 BillingService.organizationFor 同源语义；只读——观测路径绝不写库） */
+  private async personalOrganizationId(userId?: string | null): Promise<string | null> {
+    if (!userId) return null;
+    const org = await this.prisma.organization.findFirst({
+      where: { ownerUserId: userId, isPersonal: true, deletedAt: null },
+      select: { id: true },
+    });
+    return org?.id ?? null;
+  }
+
+  /**
+   * 指标读取（userId 首条件，绝不返回他人样本）：
+   * - 无 organizationId：仅本人在 HTTP/Worker 上下文里产生的样本（labels.userId = 本人）；
+   * - 有 organizationId：调用方必须先过 membership（控制器负责）；返回该组织样本 ∪ 本人样本。
+   */
+  async list(userId: string, filters: MetricFilter = {}) {
+    const take = Math.min(Math.max(filters.limit ?? 100, 1), 500);
+    const own = { labels: { path: ['userId'], equals: userId } };
+    const named = filters.name ? [{ name: filters.name }] : [];
+    const where = filters.organizationId
+      ? { AND: [...named, { OR: [{ organizationId: filters.organizationId }, own] }] }
+      : { AND: [...named, own] };
+    return this.prisma.metricSample.findMany({
+      where: where as never,
+      orderBy: { sampledAt: 'desc' },
+      take,
+    });
+  }
+}

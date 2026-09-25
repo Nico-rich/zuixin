@@ -30,6 +30,8 @@ import { AnalyticsApiModule } from './modules/analytics/analytics-api.module';
 import { AuditModule } from './modules/audit/audit.module';
 import { RateLimitModule } from './core/rate-limit/rate-limit.module';
 import { KnowledgeApiModule } from './modules/knowledge/knowledge.module';
+import { TracingModule } from './core/tracing/tracing.module';
+import { ObservabilityApiModule } from './modules/observability/observability-api.module';
 import { GenerationsModule } from './modules/generations/generations.module';
 import { TasksModule } from './modules/tasks/tasks.module';
 import { ChatModule } from './modules/chat/chat.module';
@@ -55,6 +57,8 @@ import { GlobalExceptionFilter } from './common/filters/global-exception.filter'
     PrismaModule,
     CryptoModule,
     AuditModule,
+    TracingModule, // M8-P3 可观测性（TraceContext/ObservabilityService/HTTP 传播中间件）
+    ObservabilityApiModule, // M8-P3 GET /metrics
     RateLimitModule,
     OrganizationsApiModule,
     BillingApiModule,
