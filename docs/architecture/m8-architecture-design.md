@@ -69,9 +69,36 @@ GET/POST /organizations/:id/invitations；POST /invitations/:token/accept；POST
 
 A→A / B→B PASS；A→B / B→A 404（跨组织不可见）——覆盖 project/workflow/connection/agent 核心资源面。
 
-## 2. M8-P2 Billing / Subscription / Quota
+## 2. M8-P2 Billing / Subscription / Quota（✅ 2026-09-25 完成）
 
-（施工时补全）
+### 2.1 数据模型
+
+Plan（code free/pro/team/enterprise + entitlements）/ Subscription（每组织一条，UNIQUE）/ UsageLedgerEntry（append-only + idempotencyKey UNIQUE + period 月度归集 + usageRecordId 关联）/ Invoice / PaymentEvent（provider+eventId UNIQUE 幂等）/ QuotaAlert（预留）。
+
+### 2.2 计量（复用 UsageRecord，绝不建第二套 Agent Usage）
+
+- 计量入口统一 `BillingService.recordUsage`：agent run 终态（driver）→ agent_run + llm_tokens + llm_cost（从 UsageRecord 聚合，幂等键 = `run:{runId}:*`）；媒体任务终态 → image/video（键 = taskId）；external action 完成 → external_api_call（键 = actionId）；workflow run 创建 → workflow_run（键 = runId）；
+- 组织归属：项目组织 > 个人组织（organizationFor 兜底）；
+- **幂等**：idempotencyKey UNIQUE——崩溃重放/重复触发绝不重复计量（P2002 静默去重）。
+
+### 2.3 配额三态（服务端裁决，LLM 绝不决定是否超额）
+
+- monthly（ledger 当月聚合）/ daily（当日聚合）/ concurrent（org 活跃 run 计数）；
+- 裁决点：agent-run 创建、workflow-run 创建、external_action 执行前；超额 → 429 QUOTA_EXCEEDED；
+- 计划未定义配额（entitlement 缺失）→ 不限；free 默认宽限额（存量行为零漂移）；
+- e2e 用 tiny 计划（月度 2/并发 1）与并发专用计划（月度宽/并发 1）做确定性验证。
+
+### 2.4 订阅/发票/支付（MockBillingProvider，不接真实支付）
+
+- subscribe（billing.write = owner）：upsert 订阅 + 开票 + mock 支付事件；
+- PaymentEvent (provider, providerEventId) UNIQUE——重复支付事件幂等返回，绝不重复入账；
+- API：GET plans/subscription/usage/invoices + POST subscribe（组织 RBAC：billing.read 成员可读；billing.write 仅 owner）。
+
+### 2.5 实测修复
+
+- 组织 id 含 `personal-{uuid}` 前缀——billing schema 的 organizationId 不能用 `z.string().uuid()`（personal 组织订阅 400）；
+- 全量套件历史 run 都归集到 admin 个人组织 ledger——配额 e2e 需先清空该组织 ledger 建立确定性基线；
+- mock LLM 环境 tokens=0（引擎不计量 token）——llm_tokens 断言改为条目存在性。
 
 ## 3. M8-P3 Observability / Audit
 

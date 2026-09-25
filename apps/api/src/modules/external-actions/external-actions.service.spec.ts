@@ -17,7 +17,7 @@ function makeService() {
   const credentials = { getAccessToken: vi.fn().mockResolvedValue({ token: 'ACC', expiresAt: null }) };
   const mockProvider = { name: 'mock', execute: vi.fn().mockResolvedValue({ ok: true, externalId: 'ext-1' }) };
   const providers = { get: vi.fn((n: string) => (n === 'mock' ? mockProvider : undefined)) };
-  const svc = new ExternalActionsService(prisma as never, credentials as never, providers as never, { write: vi.fn().mockResolvedValue(undefined) } as never);
+  const svc = new ExternalActionsService(prisma as never, credentials as never, providers as never, { write: vi.fn().mockResolvedValue(undefined) } as never, { recordUsage: vi.fn().mockResolvedValue(undefined) } as never, { assertQuota: vi.fn().mockResolvedValue({}) } as never);
   return { svc, prisma, credentials, providers, mockProvider };
 }
 

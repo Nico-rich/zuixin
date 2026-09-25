@@ -9,6 +9,8 @@ import { EventBusService } from '../../core/events/event-bus.service';
 import { WORKFLOW_CANCEL_CHANNEL } from '../../core/events/workflow-channels';
 import { WorkflowDefinition } from './workflow-types';
 import { AuditService } from '../audit/audit.service';
+import { BillingService } from '../billing/billing.service';
+import { QuotaService } from '../billing/quota.service';
 
 const TERMINAL = ['completed', 'failed', 'cancelled', 'timeout'] as const;
 const ACTIVE = ['queued', 'running', 'waiting'] as const;
@@ -29,6 +31,8 @@ export class WorkflowRunsService {
     @InjectQueue(WORKFLOW_QUEUE) private readonly workflowQueue: Queue,
     @Inject(EventBusService) private readonly events: EventBusService,
     @Inject(AuditService) private readonly audit: AuditService,
+    @Inject(BillingService) private readonly billing: BillingService,
+    @Inject(QuotaService) private readonly quota: QuotaService,
   ) {}
 
   /** 最新 published 版本（Run 锁定快照） */
@@ -52,6 +56,8 @@ export class WorkflowRunsService {
     payload?: Record<string, unknown>;
     attempt?: number;
   }) {
+    // M8-P2：配额裁决在创建入口（服务端）
+    await this.quota.assertQuota(userId, undefined, 'workflow_run', 1);
     const { wf, version } = await this.publishedVersion(userId, input.workflowId);
     const idempotencyKey = input.idempotencyKey ?? randomUUID();
     const existing = await this.prisma.workflowRun.findFirst({ where: { workflowId: wf.id, idempotencyKey } });
@@ -90,6 +96,11 @@ export class WorkflowRunsService {
       targetType: 'workflow_run', targetId: run.id, workflowRunId: run.id,
       metadata: { workflowId: wf.id, version: version.version, triggerType: input.triggerType },
     });
+    // M8-P2 计量（幂等键 = run id；重复触发/重放绝不重复计量）
+    await this.billing.recordUsage({
+      userId, projectId: wf.projectId, kind: 'workflow_run', quantity: 1,
+      runId: run.id, idempotencyKey: `wf:${run.id}:workflow-run`,
+    }).catch(() => undefined);
     return run;
   }
 

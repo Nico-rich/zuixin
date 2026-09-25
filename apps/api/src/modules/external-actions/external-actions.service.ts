@@ -5,6 +5,8 @@ import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { CredentialService } from '../connections/credentials.service';
 import { ExternalActionProvidersService } from './external-action-providers.service';
 import { AuditService } from '../audit/audit.service';
+import { BillingService } from '../billing/billing.service';
+import { QuotaService } from '../billing/quota.service';
 
 /** M7-P3 风险分级（快照入库；financial/destructive → high，external_action → medium，其余 low） */
 export function classifyRisk(permission: string): 'low' | 'medium' | 'high' {
@@ -47,6 +49,8 @@ export class ExternalActionsService {
     @Inject(CredentialService) private readonly credentials: CredentialService,
     @Inject(ExternalActionProvidersService) private readonly providers: ExternalActionProvidersService,
     @Inject(AuditService) private readonly audit: AuditService,
+    @Inject(BillingService) private readonly billing: BillingService,
+    @Inject(QuotaService) private readonly quota: QuotaService,
   ) {}
 
   /** 审批复核：绝不只信 Engine/LLM——执行前必须存在 approved 的 Approval 且绑定一致（否则抛出，永不返回 null） */
@@ -85,6 +89,9 @@ export class ExternalActionsService {
     const accessToken = await this.credentials.getAccessToken(connection.id);
     if (!accessToken) throw new AppError(ErrorCode.CONNECTION_NOT_ACTIVE, '连接缺少有效凭证');
 
+    // 3.5 M8-P2 配额裁决（服务端；external_api_call）
+    await this.quota.assertQuota(input.userId, input.projectId ?? null, 'external_api_call', 1);
+
     // 4. 行获取/创建 + 执行（executing + startedAt；失败/取消落终态后上抛——Engine/调用方决定后续）
     const actionId = existing?.id
       ?? (await this.createRow(input, approval)).id;
@@ -110,6 +117,11 @@ export class ExternalActionsService {
         connectionId: connection.id,
         metadata: { provider: input.provider, actionType: input.actionType, status: 'completed' },
       });
+      // M8-P2 计量（幂等键 = 动作 id；重放/重试绝不重复计量）
+      await this.billing.recordUsage({
+        userId: input.userId, projectId: input.projectId, kind: 'external_api_call', quantity: 1,
+        runId: input.agentRunId, toolCallId: input.toolCallId, idempotencyKey: `ea:${actionId}`,
+      }).catch(() => undefined);
       return this.toView(done);
     } catch (err) {
       const aborted = input.signal.aborted;

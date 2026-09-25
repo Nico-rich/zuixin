@@ -4,10 +4,11 @@ import { AgentRunTimelineService } from './agent-run-timeline.service';
 import { AgentRunMessagesService } from './agent-run-messages.service';
 import { QueueModule } from '../../core/queue/queue.module';
 import { AgentDelegationModule } from '../agent-delegation/agent-delegation.module';
+import { BillingModule } from '../billing/billing.module';
 
 /** 服务层（API 与 Worker 共用；HTTP 面在 AgentRunsApiModule——Worker 不引入 JWT 守卫） */
 @Module({
-  imports: [QueueModule, AgentDelegationModule],
+  imports: [QueueModule, AgentDelegationModule, BillingModule],
   providers: [AgentRunsService, AgentRunTimelineService, AgentRunMessagesService],
   exports: [AgentRunsService, AgentRunTimelineService, AgentRunMessagesService],
 })

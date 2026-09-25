@@ -1391,6 +1391,11 @@ model Organization {
   workflows   Workflow[]
   connections Connection[]
   externalActions ExternalAction[]
+  subscription Subscription?
+  usageLedger  UsageLedgerEntry[]
+  quotaAlerts  QuotaAlert[]
+  invoices     Invoice[]
+  paymentEvents PaymentEvent[]
   @@index([ownerUserId])
 }
 
@@ -1421,4 +1426,103 @@ model OrganizationInvitation {
   acceptedByUserId String?
   createdAt        DateTime     @default(now())
   @@index([organizationId, status])
+}
+
+// ===== M8-P2: Billing / Subscription / Quota（计量复用 UsageRecord，不建第二套）=====
+model Plan {
+  id          String   @id @default(uuid())
+  code        String   @unique // free | pro | team | enterprise
+  name        String
+  monthlyPrice Float    @default(0)
+  yearlyPrice  Float    @default(0)
+  entitlements Json    // { llmTokensMonthly, imageMonthly, videoSecondsMonthly, externalApiMonthly, agentRunsMonthly, workflowRunsMonthly, storageMb, seats }
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  subscriptions Subscription[]
+}
+
+model Subscription {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  planId         String
+  plan           Plan     @relation(fields: [planId], references: [id], onDelete: Restrict)
+  status         String   @default("active") // active | past_due | cancelled | expired
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+  cancelledAt    DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  @@unique([organizationId]) // 每组织一个订阅
+  @@index([status])
+}
+
+model UsageLedgerEntry {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String?
+  projectId      String?
+  kind           String   // llm_tokens | llm_cost | image_generation | video_seconds | external_api_call | agent_run | workflow_run | storage | seat
+  quantity       Float    @default(0)
+  unit           String   @default("count")
+  runId          String?
+  taskId         String?
+  toolCallId     String?
+  usageRecordId  String?  // 与 UsageRecord 关联（复用既有计量，不重复计费）
+  idempotencyKey String   // 幂等：同键绝不重复计量
+  period         String   // YYYY-MM（月度归集）
+  metadata       Json?
+  createdAt      DateTime @default(now())
+  @@unique([idempotencyKey])
+  @@index([organizationId, period])
+  @@index([usageRecordId])
+  @@index([runId])
+}
+
+model QuotaAlert {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  kind           String   // monthly | daily | concurrent
+  quotaKey       String   // llm_tokens | image_generation | ...
+  thresholdPct   Int      @default(80)
+  lastTriggeredAt DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  @@unique([organizationId, kind, quotaKey, thresholdPct])
+}
+
+model Invoice {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  subscriptionId String?
+  number         String   @unique
+  status         String   @default("draft") // draft | open | paid | void
+  amount         Float    @default(0)
+  currency       String   @default("CNY")
+  periodStart    DateTime
+  periodEnd      DateTime
+  paidAt         DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  @@index([organizationId])
+}
+
+model PaymentEvent {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  provider       String   @default("mock")
+  providerEventId String  // 幂等：同 provider event 只入账一次
+  type           String   // payment.succeeded | payment.failed | refund
+  amount         Float    @default(0)
+  currency       String   @default("CNY")
+  invoiceId      String?
+  metadata       Json?
+  createdAt      DateTime @default(now())
+  @@unique([provider, providerEventId])
+  @@index([organizationId])
 }

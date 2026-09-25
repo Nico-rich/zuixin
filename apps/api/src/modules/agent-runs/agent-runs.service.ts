@@ -8,6 +8,7 @@ import { AGENT_RUN_QUEUE } from '../../core/queue/queue.module';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { EventBusService, agentRunChannel } from '../../core/events/event-bus.service';
 import { DelegationService } from '../agent-delegation/delegation.service';
+import { QuotaService } from '../billing/quota.service';
 import { CreateAgentRunDto } from './agent-runs.dto';
 
 const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled', 'timeout'] as const;
@@ -28,6 +29,7 @@ export class AgentRunsService {
     @InjectQueue(AGENT_RUN_QUEUE) private readonly agentRunQueue: Queue,
     @Inject(EventBusService) private readonly events: EventBusService,
     @Inject(DelegationService) private readonly delegation: DelegationService,
+    @Inject(QuotaService) private readonly quota: QuotaService,
   ) {}
 
   /** SSE 观察端点用：归属校验（userId 首条件，防枚举 404）+ 当前状态 */
@@ -72,6 +74,11 @@ export class AgentRunsService {
    * → seed 初始用户 transcript → 入队（payload {runId}）→ {runId, status:'queued'}。
    */
   async createAsync(userId: string, dto: CreateAgentRunDto) {
+    // M8-P2：配额裁决在创建入口（服务端；LLM 绝不决定是否超额）
+    await this.quota.assertQuota(userId, dto.projectId ?? null, 'agent_run', 1).catch((err) => {
+      if ((err as { code?: string }).code === 'QUOTA_EXCEEDED') throw err;
+      throw err;
+    });
     const conversation = dto.conversationId
       ? await this.requireConversation(userId, dto.conversationId)
       : await this.createConversation(userId, dto.projectId ?? null);

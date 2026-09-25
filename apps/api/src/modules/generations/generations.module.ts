@@ -1,3 +1,4 @@
+import { BillingModule } from '../billing/billing.module';
 import { Module } from '@nestjs/common';
 import { MediaGenerationService } from './media-generation.service';
 import { MediaCleanupService } from './media-cleanup.service';
@@ -10,7 +11,7 @@ import { ModelRouterModule } from '../../core/model-router/model-router.module';
 import { AgentRunResumeModule } from '../../core/agent-run-resume/agent-run-resume.module';
 
 @Module({
-  imports: [QueueModule, EventsModule, ModelRouterModule, AgentRunResumeModule],
+  imports: [QueueModule, EventsModule, ModelRouterModule, AgentRunResumeModule, BillingModule],
   providers: [
     MediaGenerationService,
     MediaCleanupService,

@@ -6,6 +6,7 @@ import { ChatMessage } from '../../providers/llm/llm.types';
 import { AgentRunLeaseService } from '../../core/agent-run-lease/agent-run-lease.service';
 import { EventBusService, agentRunChannel } from '../../core/events/event-bus.service';
 import { planResume } from '../../core/agent-loop/resume-planner';
+import { BillingService } from '../../modules/billing/billing.service';
 
 /**
  * M6-P4 Async Driver（Worker 侧）：
@@ -22,6 +23,7 @@ export class AsyncAgentRunDriver {
     @Inject(ContextAssembler) private readonly context: ContextAssembler,
     @Inject(AgentRunLeaseService) private readonly lease: AgentRunLeaseService,
     @Inject(EventBusService) private readonly events: EventBusService,
+    @Inject(BillingService) private readonly billing: BillingService,
   ) {}
 
   async execute(runId: string, signal: AbortSignal, controls: { active: boolean }): Promise<AgentRunOutcome> {
@@ -97,6 +99,25 @@ export class AsyncAgentRunDriver {
       await this.events.publish(agentRunChannel(runId), value as Record<string, unknown>).catch(() => undefined);
     }
 
+    // M8-P2：run 终态计量（agent_run 一次 + llm 回合/成本聚合；幂等键 = run id——重放绝不重复计量）
+    if (outcome.status !== 'waiting') {
+      const usageRows = await this.prisma.usageRecord.findMany({ where: { runId }, select: { inputTokens: true, outputTokens: true, estimatedCost: true, kind: true } });
+      const llmTokens = usageRows.reduce((s, u) => s + u.inputTokens + u.outputTokens, 0);
+      const llmCost = usageRows.reduce((s, u) => s + u.estimatedCost, 0);
+      await this.billing.recordUsage({
+        userId: run.userId, projectId: run.projectId, kind: 'agent_run', quantity: 1,
+        runId, idempotencyKey: `run:${runId}:agent-run`,
+      }).catch(() => undefined);
+      await this.billing.recordUsage({
+        userId: run.userId, projectId: run.projectId, kind: 'llm_tokens', quantity: llmTokens,
+        runId, idempotencyKey: `run:${runId}:llm-tokens`,
+        metadata: { llmRounds: usageRows.filter((u) => u.kind === 'llm_chat').length },
+      }).catch(() => undefined);
+      await this.billing.recordUsage({
+        userId: run.userId, projectId: run.projectId, kind: 'llm_cost', quantity: llmCost,
+        runId, idempotencyKey: `run:${runId}:llm-cost`,
+      }).catch(() => undefined);
+    }
     if (outcome.status === 'waiting') {
       // P4 waiting：run 仍存活（已落库 waiting+waitingOnTaskId），assistant Message 保持 streaming，无终态写
       const taskId = outcome.taskRefs[0];

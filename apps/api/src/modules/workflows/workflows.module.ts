@@ -8,10 +8,11 @@ import { WorkflowRunsService } from './workflow-runs.service';
 import { WorkflowExecutor } from './workflow-executor.service';
 import { WorkflowTriggersService } from './workflow-triggers.service';
 import { OrganizationsModule } from '../organizations/organizations.module';
+import { BillingModule } from '../billing/billing.module';
 
 /** M7-P6 服务层（API 与 Worker 共用；HTTP 面在 WorkflowsApiModule——Worker 不引入 JWT 守卫） */
 @Module({
-  imports: [QueueModule, ToolsModule, ExternalActionsModule, AgentRunsModule, OrganizationsModule],
+  imports: [QueueModule, ToolsModule, ExternalActionsModule, AgentRunsModule, OrganizationsModule, BillingModule],
   providers: [WorkflowsService, WorkflowRunsService, WorkflowExecutor, WorkflowTriggersService],
   exports: [WorkflowsService, WorkflowRunsService, WorkflowExecutor, WorkflowTriggersService],
 })
