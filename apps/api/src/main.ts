@@ -8,6 +8,7 @@ import { AppModule } from './app.module';
 import { GlobalExceptionFilter } from './common/filters/global-exception.filter';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
 import { csrfProtection } from './modules/auth/csrf.middleware';
+import { TracingMiddleware } from './core/tracing/tracing.middleware';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bufferLogs: true });
@@ -18,6 +19,7 @@ async function bootstrap() {
     credentials: true,
   });
   app.use(cookieParser());
+  app.use(app.get(TracingMiddleware).handler); // M8-P3 追踪传播 + HTTP 指标采样（先于 csrf/路由注册）
   // M7-P6：webhook 端点需要原始字节做 HMAC 验签（先于 JSON parser 注册）
   app.use('/api/v1/hooks', express.raw({ type: '*/*', limit: '1mb' }));
   app.use('/api/v1', csrfProtection);

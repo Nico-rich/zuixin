@@ -7,6 +7,8 @@ import { AGENT_RUN_QUEUE } from '../../core/queue/queue.module';
 import { AgentRunLeaseService } from '../../core/agent-run-lease/agent-run-lease.service';
 import { EventBusService } from '../../core/events/event-bus.service';
 import { AGENT_RUN_CANCEL_CHANNEL } from '../../modules/agent-runs/agent-runs.service';
+import { ObservabilityService } from '../../core/tracing/observability.service';
+import { TraceContext, newTraceId } from '../../core/tracing/trace-context';
 import { AsyncAgentRunDriver } from './async-agent-run.driver';
 
 /**
@@ -26,6 +28,7 @@ export class AgentRunProcessor extends WorkerHost implements OnApplicationShutdo
     @Inject(AgentRunLeaseService) private readonly lease: AgentRunLeaseService,
     @Inject(AsyncAgentRunDriver) private readonly driver: AsyncAgentRunDriver,
     @Inject(EventBusService) private readonly events: EventBusService,
+    @Inject(ObservabilityService) private readonly metrics: ObservabilityService, // M8-P3 指标采样（只读观测面）
   ) {
     super();
   }
@@ -59,11 +62,17 @@ export class AgentRunProcessor extends WorkerHost implements OnApplicationShutdo
     const intervalMs = await this.lease.heartbeatIntervalMs();
     const heartbeat = setInterval(() => void this.heartbeatTick(runId, workerId, abort), intervalMs);
     this.logger.log({ runId, workerId }, 'claim 成功，开始执行');
+    const startedAtMs = Date.now(); // M8-P3：时长采样起点（仅观测，不参与任何业务判定）
     try {
-      await this.driver.execute(runId, abort.signal, controls);
+      // M8-P3：run 作用域内建立 TraceContext（run 内产生的审计自动带 runId/traceId；控制流不变）
+      await TraceContext.runWithContext({ runId, traceId: newTraceId() }, () => this.driver.execute(runId, abort.signal, controls));
     } finally {
       clearInterval(heartbeat);
       this.active = null;
+      // M8-P3：run 时长采样（best-effort——ObservabilityService 内部吞异常，绝不影响 lease/重试语义）
+      await this.metrics.recordRunDuration('agent_run', runId, Date.now() - startedAtMs, {
+        workerId, outcome: controls.active ? 'finished' : 'shutdown',
+      });
       if (!controls.active) {
         // 优雅停机：放弃本次执行（已 release lease + Engine 未写终态）→ job 失败退回，BullMQ attempts 重试（新 worker resume）
         throw new Error('worker shutdown：放弃当前 job，交由重试/恢复接管');
