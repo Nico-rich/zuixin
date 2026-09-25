@@ -18,6 +18,7 @@ import { VideoWorkerModule } from './worker/video/video-worker.module';
 import { AgentRunWorkerModule } from './worker/agent-run/agent-run-worker.module';
 import { WorkflowWorkerModule } from './worker/workflow/workflow-worker.module';
 import { ExtensionsModule } from './modules/extensions/extensions.module';
+import { SchedulerWorkerModule } from './worker/scheduler/scheduler-worker.module';
 
 @Module({
   imports: [
@@ -33,6 +34,7 @@ import { ExtensionsModule } from './modules/extensions/extensions.module';
     MediaCleanupWorkerModule,
     AgentRunWorkerModule,
     WorkflowWorkerModule,
+    SchedulerWorkerModule,
   ],
 })
 export class WorkerModule {}
