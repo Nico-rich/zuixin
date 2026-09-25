@@ -243,6 +243,51 @@ describe('AnalyticsService（M8-P4 确定性聚合投影）', () => {
     expect(res.sources[1].dimensions).toMatchObject({ providers: ['p1'] });
   });
 
+  it('P2 读路径：overview(month) 只补刷当日（1 天 × 17 查询），绝不内联刷新 30 天', async () => {
+    const { svc, prisma } = makeService();
+    prisma.analyticsAggregate.findMany.mockResolvedValue([]);
+    await svc.overview('org-1', 'month');
+    // 每日刷新 = usageLedgerEntry/generationTask/usageRecord/workflowRun 各 1 次 + agentRun 2 次（当日 + 归因回看窗）
+    expect(prisma.usageLedgerEntry.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.generationTask.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.usageRecord.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.workflowRun.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.agentRun.findMany).toHaveBeenCalledTimes(2);
+    // 5 维度各一行（单日）；原实现 month = 30 天 × 5 行 = 150 行
+    expect(prisma.analyticsAggregate.create).toHaveBeenCalledTimes(5);
+    const periods = prisma.analyticsAggregate.create.mock.calls.map((c) => (c as unknown as [{ data: { period: string } }])[0].data.period);
+    expect(new Set(periods)).toEqual(new Set([periodOf(new Date())])); // 只刷当日
+    expect(prisma.analyticsAggregate.findMany).toHaveBeenCalledTimes(1); // 读只读聚合表
+  });
+
+  it('P2 读路径：breakdown(days=366) 仍只补刷当日（5 行），历史日只读已有聚合行', async () => {
+    const { svc, prisma } = makeService();
+    await svc.breakdown('org-1', { kind: 'usage', days: 366 });
+    expect(prisma.analyticsAggregate.create).toHaveBeenCalledTimes(5);
+    expect(prisma.usageLedgerEntry.findMany).toHaveBeenCalledTimes(1);
+    const query = (prisma.analyticsAggregate.findMany.mock.calls[0] as unknown as [{ where: { period: { gte: string; lte: string } } }])[0];
+    expect(query.where.period.gte).toBe(addDays(periodOf(new Date()), -365)); // 读窗口仍是 366 天
+    expect(query.where.period.lte).toBe(periodOf(new Date()));
+  });
+
+  it('P2 刷新语义：refreshOrganization/refreshAll 行为不变（显式入口仍可刷历史区间）；sources/query 保持只读', async () => {
+    const { svc, prisma } = makeService();
+    await svc.refreshOrganization('org-1', '2026-09-01');
+    expect(prisma.analyticsAggregate.create).toHaveBeenCalledTimes(5);
+    expect(prisma.analyticsAggregate.create.mock.calls.map((c) => (c as unknown as [{ data: { period: string } }])[0].data.period))
+      .toEqual(['2026-09-01', '2026-09-01', '2026-09-01', '2026-09-01', '2026-09-01']);
+
+    prisma.analyticsAggregate.create.mockClear();
+    await svc.refreshAll('org-1', '2026-08-30', '2026-08-31');
+    expect(prisma.analyticsAggregate.create).toHaveBeenCalledTimes(10); // 显式刷新仍按天循环
+
+    prisma.analyticsAggregate.create.mockClear();
+    prisma.analyticsAggregate.findMany.mockResolvedValue([]);
+    await svc.query('org-1', { from: '2026-08-27', to: '2026-09-25' });
+    await svc.sources('org-1', '2026-09-25');
+    expect(prisma.analyticsAggregate.create).not.toHaveBeenCalled(); // 只读端点绝不写
+  });
+
   it('mergeMetrics：数字求和、嵌套对象递归（byProvider），非数字原样覆盖', () => {
     expect(mergeMetrics({ a: 1, byProvider: { p1: { calls: 1 } }, tag: 'x' }, { a: 2, byProvider: { p1: { calls: 3 }, p2: { calls: 1 } }, tag: 'y' }))
       .toEqual({ a: 3, byProvider: { p1: { calls: 4 }, p2: { calls: 1 } }, tag: 'y' });

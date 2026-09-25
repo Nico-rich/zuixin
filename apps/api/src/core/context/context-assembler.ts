@@ -41,15 +41,22 @@ export class ContextAssembler {
     return { messages, blocks: budgeted.blocks, truncated: budgeted.truncated };
   }
 
-  /** 预算解析：AgentVersion 配置 > limits.contextBudgetTokens > 8000（服务端配置，Tool/用户不可改） */
-  private async resolveBudget(ctx: AssembleContext): Promise<number> {
-    if (ctx.budgetTokens != null && Number.isInteger(ctx.budgetTokens) && ctx.budgetTokens > 0 && ctx.budgetTokens <= 32000) {
-      return ctx.budgetTokens;
+  /**
+   * 预算解析：AgentVersion 配置 > limits.contextBudgetTokens > 8000（服务端配置，Tool/用户不可改）。
+   * 公开（P3）：resume 重放预算与首跑必须同源——同一配置、同一默认值，绝不各自维护一份默认。
+   */
+  async resolveBudgetTokens(configured?: number): Promise<number> {
+    if (configured != null && Number.isInteger(configured) && configured > 0 && configured <= 32000) {
+      return configured;
     }
     const limits = await this.prisma.systemSetting.findUnique({ where: { key: 'limits' } });
-    const configured = (limits?.value as { contextBudgetTokens?: number } | null)?.contextBudgetTokens;
-    if (configured != null && Number.isInteger(configured) && configured > 0 && configured <= 32000) return configured;
+    const setting = (limits?.value as { contextBudgetTokens?: number } | null)?.contextBudgetTokens;
+    if (setting != null && Number.isInteger(setting) && setting > 0 && setting <= 32000) return setting;
     return DEFAULT_CONTEXT_BUDGET_TOKENS;
+  }
+
+  private resolveBudget(ctx: AssembleContext): Promise<number> {
+    return this.resolveBudgetTokens(ctx.budgetTokens);
   }
 
   /** 内置源：最近会话消息——倒序取 limit 条后反转为时间正序（与 M1 行为逐字一致） */
