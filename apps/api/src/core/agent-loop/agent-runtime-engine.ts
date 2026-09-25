@@ -40,6 +40,8 @@ export interface AgentLoopAgentConfig {
 export interface AgentRuntimeContext {
   userId: string;
   projectId?: string;
+  /** Pre-M9 T1：组织归属（Driver 每 run 解析一次传入；usage 写入直传，绝不重复解析） */
+  organizationId?: string;
   conversationId?: string;
   /** 展示锚点 Message id（usage 归因 + ToolContext.messageId FK——必须真实 Message 行或 undefined，绝不传 runId 冒充） */
   messageId?: string;
@@ -222,6 +224,8 @@ export class AgentRuntimeEngine {
         let toolCalls: Array<{ id: string; name: string; arguments: string }> | undefined;
         let turnText = '';
         let turnError: unknown = null;
+        // Pre-M9 R1：真实 token 计量（adapter 在流末尾产出 usage 块——provider 报告的权威数字，绝不本地估算）
+        let turnUsage: { inputTokens: number; outputTokens: number } | undefined;
         for (let attempt = 0; attempt <= LLM_MAX_RETRIES; attempt++) {
           const contentLenAtAttempt = content.length; // 失败重试回滚本回合部分文本（避免重复计入最终回答）
           const turnLenAtAttempt = turnText.length;
@@ -235,6 +239,7 @@ export class AgentRuntimeEngine {
                 content += chunk.text; turnText += chunk.text;
                 yield { type: 'text.delta', text: chunk.text };
               } else if (chunk.type === 'tool_calls') toolCalls = chunk.toolCalls;
+              else if (chunk.type === 'usage') turnUsage = chunk.usage;
             }
             turnError = null;
             break;
@@ -264,6 +269,7 @@ export class AgentRuntimeEngine {
               providerId: resolved.providerId, modelId: resolved.modelId, runId,
               inputTokens: 0, outputTokens: 0, latencyMs: Date.now() - turnStarted,
               status: 'failed', errorCode: ErrorCode.AGENT_CANCELLED,
+              organizationId: ctx.organizationId,
             });
             break;
           }
@@ -273,13 +279,17 @@ export class AgentRuntimeEngine {
             providerId: resolved.providerId, modelId: resolved.modelId, runId,
             inputTokens: 0, outputTokens: 0, latencyMs: Date.now() - turnStarted,
             status: 'failed', errorCode: appErr.code,
+            organizationId: ctx.organizationId,
           });
           throw turnError;
         }
         await this.persistence.recordChatUsage({
           userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.messageId ?? '',
           providerId: resolved.providerId, modelId: resolved.modelId, runId,
-          inputTokens: 0, outputTokens: 0, latencyMs: Date.now() - turnStarted, status: 'success',
+          // R1：provider 报告的权威用量；报告缺失时记 0（绝不本地估算伪装事实）
+          inputTokens: turnUsage?.inputTokens ?? 0, outputTokens: turnUsage?.outputTokens ?? 0,
+          latencyMs: Date.now() - turnStarted, status: 'success',
+          organizationId: ctx.organizationId,
         });
         lastTurnHadToolCalls = !!toolCalls?.length;
         // transcript checkpoint（CP1）：assistant 回合快照——含 tool_calls 决策事实，resume 不重打 LLM

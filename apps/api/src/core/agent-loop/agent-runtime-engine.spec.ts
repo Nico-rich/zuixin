@@ -115,6 +115,25 @@ describe('AgentRuntimeEngine（M6-P2 抽取后行为冻结 + transcript checkpoi
     expect(outcome).toMatchObject({ runId: 'run-1', status: 'completed', content: '你好' });
   });
 
+  it('Pre-M9 R1：流末尾 usage 块 → usage 记录 provider 报告的真实 token（绝不本地估算）', async () => {
+    const { engine, state, input } = makeEngine({
+      streamFn: async function* () {
+        yield { type: 'text', text: '你好' };
+        yield { type: 'usage', usage: { inputTokens: 1234, outputTokens: 56 } };
+      },
+    });
+    await run(engine, input);
+    expect(state.usage[0]).toMatchObject({ inputTokens: 1234, outputTokens: 56, status: 'success', runId: 'run-1' });
+  });
+
+  it('Pre-M9 R1：provider 未报告 usage → 记 0（事实缺失绝不伪造）', async () => {
+    const { engine, state, input } = makeEngine({
+      streamFn: async function* () { yield { type: 'text', text: '你好' }; },
+    });
+    await run(engine, input);
+    expect(state.usage[0]).toMatchObject({ inputTokens: 0, outputTokens: 0, status: 'success' });
+  });
+
   it('工具调用：LLM 返回 tool_calls → 校验 → 执行 → tool.start/end → 回喂 → 下一轮 final', async () => {
     let turn = 0;
     const { engine, state } = makeEngine({

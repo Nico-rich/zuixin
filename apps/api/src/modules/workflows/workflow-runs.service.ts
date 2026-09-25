@@ -56,15 +56,18 @@ export class WorkflowRunsService {
     payload?: Record<string, unknown>;
     attempt?: number;
   }) {
-    // M8-P2：配额裁决在创建入口（服务端）
-    await this.quota.assertQuota(userId, undefined, 'workflow_run', 1);
     const { wf, version } = await this.publishedVersion(userId, input.workflowId);
     const idempotencyKey = input.idempotencyKey ?? randomUUID();
     const existing = await this.prisma.workflowRun.findFirst({ where: { workflowId: wf.id, idempotencyKey } });
-    if (existing) return existing; // 幂等：同一触发绝不产生第二个 run
+    if (existing) return existing; // 幂等：同一触发绝不产生第二个 run（先查——已存在时绝不预留配额）
+
+    // M8-P2：配额裁决在创建入口（服务端）；Pre-M9 C1：runId 预生成作预留 refId（终态 release；TTL 兜底）
+    const runId = randomUUID();
+    await this.quota.assertQuota(userId, undefined, 'workflow_run', 1, runId);
 
     const create = () => this.prisma.workflowRun.create({
       data: {
+        id: runId,
         workflowId: wf.id, versionId: version.id, userId,
         projectId: wf.projectId,
         triggerType: input.triggerType, triggerId: input.triggerId,
@@ -184,6 +187,8 @@ export class WorkflowRunsService {
       },
     });
     if (done.count === 0) throw new AppError(ErrorCode.WORKFLOW_RUN_NOT_CANCELLABLE, '运行已结束，无法取消');
+    // Pre-M9 C1：取消终态释放配额预留
+    await this.quota.release(runId, 'workflow_run').catch(() => undefined);
     // 附带清理（best-effort；终态绝不复活）
     // 附带清理按 workflowRunId 兜底——覆盖「审批已建但 run.waitingOnApprovalId 未落库」的竞态窗口
     await this.prisma.approval.updateMany({

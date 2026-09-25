@@ -2,6 +2,7 @@ import { Body, Controller, Get, Inject, Param, Post, Query, Req, UseGuards, UseP
 import { Request } from 'express';
 import { z } from 'zod';
 import { BillingService } from './billing.service';
+import { BillingReconciliationService } from './billing-reconciliation.service';
 import { OrganizationsService } from '../organizations/organizations.service';
 import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe';
 import { AuthedUser, JwtAuthGuard } from '../auth/jwt-auth.guard';
@@ -18,6 +19,7 @@ export class BillingController {
   constructor(
     @Inject(BillingService) private readonly billing: BillingService,
     @Inject(OrganizationsService) private readonly orgs: OrganizationsService,
+    @Inject(BillingReconciliationService) private readonly reconciliation: BillingReconciliationService,
   ) {}
 
   @Get('plans')
@@ -37,6 +39,14 @@ export class BillingController {
     const orgId = organizationId ?? (await this.orgs.ensurePersonalOrganization(req.user.userId)).id;
     await this.orgs.requirePermission(req.user.userId, orgId, 'billing.read');
     return this.billing.usage(orgId, period);
+  }
+
+  /** Pre-M9 D1：UsageRecord ↔ UsageLedgerEntry 对账（只读诊断；billing.read） */
+  @Get('reconciliation')
+  async reconcile(@Req() req: Request & { user: AuthedUser }, @Query('organizationId') organizationId?: string, @Query('period') period?: string) {
+    const orgId = organizationId ?? (await this.orgs.ensurePersonalOrganization(req.user.userId)).id;
+    await this.orgs.requirePermission(req.user.userId, orgId, 'billing.read');
+    return this.reconciliation.diagnose(orgId, period);
   }
 
   @Get('invoices')

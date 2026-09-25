@@ -71,6 +71,8 @@ export interface AgentRuntimePersistence {
     userId: string; conversationId?: string; messageId: string; runId: string;
     providerId: string; modelId: string; inputTokens: number; outputTokens: number;
     latencyMs: number; status: 'success' | 'failed'; errorCode?: string;
+    /** Pre-M9 T1：组织归属（Driver 解析直传；缺省由 UsageService 事实链解析） */
+    organizationId?: string;
   }): Promise<void>;
   /** run 终态条件更新（where status=running，禁止终态复活；workerId 传入时追加 fencing 条件） */
   finalizeRun(runId: string, data: { status: string; errorCode?: string | null; errorMessage?: string | null; completedAt: Date; workerId?: string }): Promise<{ count: number }>;

@@ -7,6 +7,12 @@ function makeService() {
     usageLedgerEntry: {
       aggregate: vi.fn().mockResolvedValue({ _sum: { quantity: 0 } }),
     },
+    quotaReservation: {
+      aggregate: vi.fn().mockResolvedValue({ _sum: { quantity: 0 } }),
+      create: vi.fn().mockResolvedValue({ id: 'res-1' }),
+      deleteMany: vi.fn().mockResolvedValue({ count: 1 }),
+      findUnique: vi.fn().mockResolvedValue(null),
+    },
     agentRun: { count: vi.fn().mockResolvedValue(0) },
     workflowRun: { count: vi.fn().mockResolvedValue(0) },
     organization: { findFirst: vi.fn().mockResolvedValue({ ownerUserId: 'u1' }) },
@@ -67,5 +73,35 @@ describe('QuotaService（M8-P2 月度/每日/并发三态；服务端裁决）',
     const { svc, billing } = makeService();
     billing.ensureSubscription.mockResolvedValue({ planId: 'p', status: 'active', entitlements: {} });
     await expect(svc.assertQuota('u1', null, 'storage', 1)).resolves.toMatchObject({ organizationId: 'org-1' });
+  });
+
+  it('Pre-M9 C1：refId 给定时创建预留行（expiresAt 为 TTL 后）', async () => {
+    const { svc, prisma } = makeService();
+    const res = await svc.assertQuota('u1', null, 'agent_run', 1, 'run-1');
+    expect(prisma.quotaReservation.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ organizationId: 'org-1', kind: 'agent_run', refId: 'run-1', quantity: 1 }),
+    }));
+    expect(res.reservationId).toBe('res-1');
+  });
+
+  it('Pre-M9 C1：未过期预留计入消耗（reserved+consumed+quantity 超限 → 拒绝）', async () => {
+    const { svc, prisma } = makeService();
+    prisma.quotaReservation.aggregate.mockResolvedValue({ _sum: { quantity: 9 } }); // 账本 0 + 预留 9
+    prisma.usageLedgerEntry.aggregate.mockResolvedValue({ _sum: { quantity: 2 } });  // 2+9+1 > 10
+    await expect(svc.assertQuota('u1', null, 'agent_run', 1, 'run-1')).rejects.toMatchObject({ code: 'QUOTA_EXCEEDED' });
+  });
+
+  it('Pre-M9 C1：release 删除预留（幂等）', async () => {
+    const { svc, prisma } = makeService();
+    await svc.release('run-1', 'agent_run');
+    expect(prisma.quotaReservation.deleteMany).toHaveBeenCalledWith({ where: { refId: 'run-1', kind: 'agent_run' } });
+  });
+
+  it('Pre-M9 C1：并发同键预留 P2002 → 复用已有行', async () => {
+    const { svc, prisma } = makeService();
+    prisma.quotaReservation.create.mockRejectedValueOnce({ code: 'P2002' });
+    prisma.quotaReservation.findUnique.mockResolvedValue({ id: 'res-existing' });
+    const res = await svc.assertQuota('u1', null, 'agent_run', 1, 'run-1');
+    expect(res.reservationId).toBe('res-existing');
   });
 });

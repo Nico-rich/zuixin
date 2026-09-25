@@ -32,7 +32,8 @@ function makeChat(agentEvents?: () => AsyncIterable<AgentEvent>, agentId = 'gene
   });
   const agent: Agent = { id: agentId, execute: () => events() };
   const agentRegistry = { resolveForIntent: vi.fn().mockResolvedValue(agent) };
-  const svc = new ChatService(prisma as never, kv as never, router as never, context as never, attachmentsService as never, memoryExtractor as never, agentRegistry as never);
+  const quota = { assertQuota: vi.fn().mockResolvedValue({ organizationId: 'personal-test', consumed: 0, total: 1, reservationId: 'r-1' }), release: vi.fn().mockResolvedValue(undefined) };
+  const svc = new ChatService(prisma as never, kv as never, router as never, context as never, attachmentsService as never, memoryExtractor as never, agentRegistry as never, quota as never);
   return { svc, prisma, kv, context, memoryExtractor, agentRegistry, agent };
 }
 

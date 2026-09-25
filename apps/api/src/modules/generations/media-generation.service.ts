@@ -12,7 +12,7 @@ import { UsageService } from '../usage/usage.service';
 import { IMAGE_QUEUE, VIDEO_QUEUE } from '../../core/queue/queue.module';
 import { MediaExecutor, MediaExecResult } from './media-types';
 import { AgentRunResumeTrigger } from '../../core/agent-run-resume/agent-run-resume-trigger.service';
-import { BillingService } from '../billing/billing.service';
+import { QuotaService } from '../billing/quota.service';
 
 export interface PrepareMediaInput {
   userId: string;
@@ -27,8 +27,6 @@ export interface PrepareMediaInput {
   toolCallId?: string;
 }
 
-const DEFAULT_DAILY_IMAGE_LIMIT = 50;
-const DEFAULT_DAILY_VIDEO_LIMIT = 10;
 const MAX_DOWNLOAD_ATTEMPTS = 3;
 
 /**
@@ -54,7 +52,7 @@ export class MediaGenerationService {
     @InjectQueue(VIDEO_QUEUE) private readonly videoQueue: Queue,
     @Inject('MEDIA_EXECUTORS') private readonly executors: Map<string, MediaExecutor>,
     @Inject(AgentRunResumeTrigger) private readonly resume: AgentRunResumeTrigger,
-    @Inject(BillingService) private readonly billing: BillingService,
+    @Inject(QuotaService) private readonly quota: QuotaService,
   ) {}
 
   /** 便捷入口：图片任务（M2 API 兼容） */
@@ -67,20 +65,25 @@ export class MediaGenerationService {
     return this.prepareMediaTask({ ...input, type: 'video' });
   }
 
-  /** 入口 1（HTTP 侧）：限额校验 + 建任务(pending) + 按类型入队 */
+  /** 入口 1（HTTP 侧）：组织配额裁决（Pre-M9 A3：计划权益，绝不读 systemSetting 全局日限）+ 建任务(pending) + 按类型入队 */
   async prepareMediaTask(input: PrepareMediaInput) {
-    const limits = await this.prisma.systemSetting.findUnique({ where: { key: 'limits' } });
-    const value = (limits?.value ?? {}) as { dailyImage?: number; dailyVideo?: number };
-    const dailyLimit = input.type === 'image' ? (value.dailyImage ?? DEFAULT_DAILY_IMAGE_LIMIT) : (value.dailyVideo ?? DEFAULT_DAILY_VIDEO_LIMIT);
-    const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
-    const used = await this.prisma.usageRecord.count({
-      where: { userId: input.userId, kind: input.type, createdAt: { gte: todayStart } },
-    });
-    if (used >= dailyLimit) throw new AppError(ErrorCode.QUOTA_EXCEEDED, `今日${input.type === 'image' ? '生图' : '生视频'}次数已达上限`);
+    // A3：媒体限额并入 Plan entitlements（imageDaily/videoDaily/imageMonthly/videoSecondsMonthly）；
+    // 项目归属经会话解析（个人会话 → 个人组织），与 organizationFor 语义一致
+    const projectId = input.conversationId
+      ? (await this.prisma.conversation.findUnique({ where: { id: input.conversationId }, select: { projectId: true } }).catch(() => null))?.projectId ?? null
+      : null;
+    const params = input.params as { count?: number; n?: number; duration?: number };
+    const quantity = input.type === 'image'
+      ? Math.min(Math.max(Number(params.count ?? params.n ?? 1) || 1, 1), 50)
+      : (Number(params.duration) || 5);
+    // Pre-M9 C1：taskId 预生成作预留 refId（终态释放见 execute/failTask/清扫；TTL 兜底）
+    const taskId = randomUUID();
+    await this.quota.assertQuota(input.userId, projectId, input.type === 'image' ? 'image_generation' : 'video_seconds', quantity, taskId);
 
     try {
       const task = await this.prisma.generationTask.create({
         data: {
+          id: taskId,
           userId: input.userId,
           conversationId: input.conversationId,
           messageId: input.messageId,
@@ -173,14 +176,9 @@ export class MediaGenerationService {
       await this.events.publish('task', { type: 'task.completed', taskId, progress: 100 });
       // M6-P4：任务终态单点 hook → 唤醒 waiting 的 AgentRun（waiting→queued→resume）
       await this.resume.onTaskTerminal(taskId).catch(() => undefined);
-      // M8-P2：媒体计量（image 张数 / video 秒数；幂等键 = task id——重放绝不重复计量）
-      // GenerationTask 无 projectId 列——计量归属经 organizationFor 兜底（个人组织）
-      await this.billing.recordUsage({
-        userId: task.userId, runId: task.runId ?? undefined, taskId,
-        kind: task.type === 'image' ? 'image_generation' : 'video_seconds',
-        quantity: task.type === 'image' ? result.imageCount : result.videoSeconds,
-        idempotencyKey: `task:${taskId}:${task.type}`,
-      }).catch(() => undefined);
+      // Pre-M9 D1：媒体账本行由 UsageService.recordMediaUsage 派生镜像（ur:{recordId} 幂等键）——本处不再直写
+      // Pre-M9 C1：终态释放配额预留
+      await this.quota.release(taskId, task.type === 'image' ? 'image_generation' : 'video_seconds').catch(() => undefined);
       this.logger.log({ taskId, userId: task.userId, type: task.type, provider: result.providerId, latencyMs: Date.now() - startedAt }, '媒体任务完成');
     } catch (err) {
       const appErr = err instanceof AppError ? err : mapProviderError(err as ProviderLikeError);
@@ -205,12 +203,8 @@ export class MediaGenerationService {
     await this.events.publish('task', { type: 'task.progress', taskId, progress: 100, message: '失败' });
     // M6-P4：任务失败也是终态 → 唤醒 run（P4-9：失败回喂模型，由 LLM 决定重试/降级/终态）
     await this.resume.onTaskTerminal(taskId).catch(() => undefined);
-    // M8-P2：失败媒体任务计量（attempt 记 1 次——失败也占用 provider 资源；幂等键 = task id）
-    await this.billing.recordUsage({
-      userId: current!.userId, runId: current!.runId ?? undefined, taskId,
-      kind: current!.type === 'image' ? 'image_generation' : 'video_seconds',
-      quantity: 1, idempotencyKey: `task:${taskId}:${current!.type}:failed`,
-    }).catch(() => undefined);
+    // Pre-M9 C1：失败终态释放配额预留（失败用量 attempt 记 1 次由 usage 镜像覆盖——本处不再直写账本）
+    await this.quota.release(taskId, current!.type === 'image' ? 'image_generation' : 'video_seconds').catch(() => undefined);
     this.logger.warn({ taskId, code, provider: current!.providerId ?? 'unknown' }, `媒体任务失败: ${message}`);
   }
 

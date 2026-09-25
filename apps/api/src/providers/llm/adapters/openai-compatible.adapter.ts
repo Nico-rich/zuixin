@@ -39,6 +39,7 @@ export class OpenAICompatibleAdapter implements LLMProvider {
       const s = await this.streamFn(this.buildBody(params, true), { signal: params.signal });
       // OpenAI 流式 tool_calls 以 delta 分片到达，按 index 聚合，流结束时一次产出内部协议块
       const acc = new Map<number, { id?: string; name?: string; args: string }>();
+      let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
       for await (const chunk of s) {
         const delta = (chunk.choices as Array<{ delta?: { content?: string | null; tool_calls?: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }> } }>)?.[0]?.delta;
         if (delta?.content) yield { type: 'text', text: delta.content };
@@ -49,9 +50,15 @@ export class OpenAICompatibleAdapter implements LLMProvider {
           if (tc.function?.arguments) cur.args += tc.function.arguments;
           acc.set(tc.index, cur);
         }
+        // Pre-M9 R1：usage 在流末 chunk 报告（stream_options.include_usage）——provider 权威数字
+        const u = chunk.usage as { prompt_tokens?: number; completion_tokens?: number } | undefined;
+        if (u) usage = u;
       }
       if (acc.size > 0) {
         yield { type: 'tool_calls', toolCalls: [...acc.values()].map((t) => ({ id: t.id ?? `call_${Math.random()}`, name: t.name ?? '', arguments: t.args })) };
+      }
+      if (usage) {
+        yield { type: 'usage', usage: { inputTokens: usage.prompt_tokens ?? 0, outputTokens: usage.completion_tokens ?? 0 } };
       }
     } catch (err) { throw mapProviderError(err as ProviderLikeError); }
   }
@@ -70,6 +77,7 @@ export class OpenAICompatibleAdapter implements LLMProvider {
       model: p.model,
       messages: p.messages.map((m) => this.mapMessage(m)),
       stream: isStream,
+      ...(isStream ? { stream_options: { include_usage: true } } : {}), // R1：流末 usage 报告
     };
     if (p.temperature != null) body.temperature = p.temperature;
     if (p.maxTokens != null) body.max_tokens = p.maxTokens;

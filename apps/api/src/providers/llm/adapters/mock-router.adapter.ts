@@ -15,6 +15,7 @@ export class MockRouterAdapter implements LLMProvider {
   async *stream(params: ChatParams): AsyncIterable<LLMChunk> {
     const text = JSON.stringify(this.classify(params));
     for (const ch of text) yield { type: 'text', text: ch };
+    yield { type: 'usage', usage: { inputTokens: 4, outputTokens: Math.ceil(text.length / 4) } };
   }
 
   private classify(params: ChatParams): { type: string; confidence: number; parameters: { prompt: string } } {

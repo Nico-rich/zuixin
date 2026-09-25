@@ -4,6 +4,7 @@ import { Queue } from 'bullmq';
 import { PrismaService } from '../../modules/prisma/prisma.service';
 import { WORKFLOW_QUEUE } from '../../core/queue/queue.module';
 import { DEFAULT_LEASE_TTL_MS } from '../../core/agent-run-lease/agent-run-lease.service';
+import { QuotaService } from '../../modules/billing/quota.service';
 
 export const WORKFLOW_DEADLINE_MS = 60 * 60_000; // workflow run 上限 1h（可被 limits.workflowDeadlineMs 覆盖）
 
@@ -20,6 +21,7 @@ export class WorkflowLeaseService {
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @InjectQueue(WORKFLOW_QUEUE) private readonly workflowQueue: Queue,
+    @Inject(QuotaService) private readonly quota: QuotaService,
   ) {}
 
   async deadlineMs(): Promise<number> {
@@ -101,6 +103,8 @@ export class WorkflowLeaseService {
         if (done.count > 0) {
           timedOut++;
           this.logger.warn({ runId: row.id }, 'workflow run 超过 deadline → timeout');
+          // Pre-M9 C1：timeout 终态释放配额预留
+          await this.quota.release(row.id, 'workflow_run').catch(() => undefined);
         }
         continue;
       }

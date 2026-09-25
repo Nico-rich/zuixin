@@ -14,6 +14,7 @@ import { BillingModule } from '../billing/billing.module';
 @Module({
   imports: [QueueModule, ToolsModule, ExternalActionsModule, AgentRunsModule, OrganizationsModule, BillingModule],
   providers: [WorkflowsService, WorkflowRunsService, WorkflowExecutor, WorkflowTriggersService],
-  exports: [WorkflowsService, WorkflowRunsService, WorkflowExecutor, WorkflowTriggersService],
+  // BillingModule 再导出：Worker 侧 WorkflowLeaseService 需注入 QuotaService（C1 预留释放）
+  exports: [WorkflowsService, WorkflowRunsService, WorkflowExecutor, WorkflowTriggersService, BillingModule],
 })
 export class WorkflowsModule {}

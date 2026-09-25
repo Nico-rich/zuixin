@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { LIMITS, ErrorCode } from '@ai-agent/shared';
 import { PrismaService } from '../prisma/prisma.service';
 import { UsageService } from '../usage/usage.service';
+import { QuotaService } from '../billing/quota.service';
 import { AgentRunResumeTrigger } from '../../core/agent-run-resume/agent-run-resume-trigger.service';
 
 const DEFAULT_AGENT_RUN_TIMEOUT_MS = 120_000;
@@ -21,6 +22,7 @@ export class MediaCleanupService {
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(UsageService) private readonly usage: UsageService,
+    @Inject(QuotaService) private readonly quota: QuotaService,
     @Inject(AgentRunResumeTrigger) private readonly resume: AgentRunResumeTrigger,
   ) {}
 
@@ -49,6 +51,8 @@ export class MediaCleanupService {
         imageCount: 0, videoSeconds: 0, latencyMs: now - (row.startedAt?.getTime() ?? now),
         status: 'failed', errorCode: ErrorCode.MEDIA_TASK_TIMEOUT, runId: row.runId ?? undefined,
       }).catch(() => undefined);
+      // Pre-M9 C1：清扫终态释放配额预留
+      await this.quota.release(row.id, row.type === 'image' ? 'image_generation' : 'video_seconds').catch(() => undefined);
       // M6-P4：任务超时也是终态 → 唤醒 run（任务超时 ≠ run 超时；失败回喂模型由 LLM 决策）
       await this.resume.onTaskTerminal(row.id).catch(() => undefined);
       swept++;
@@ -80,6 +84,8 @@ export class MediaCleanupService {
         data: { status: 'timeout', errorCode: ErrorCode.AGENT_RUN_TIMEOUT, errorMessage: '执行超时', completedAt: new Date() },
       });
       if (done.count === 0) continue; // 竞态：已被正常路径终态
+      // Pre-M9 C1：清扫终态释放配额预留
+      await this.quota.release(row.id, 'agent_run').catch(() => undefined);
       swept++;
       this.logger.warn({ runId: row.id, agentId: row.agentId }, '孤儿 AgentRun 已清扫为 timeout');
     }

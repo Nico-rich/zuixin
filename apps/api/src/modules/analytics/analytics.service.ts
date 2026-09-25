@@ -188,7 +188,8 @@ export class AnalyticsService {
     for (const row of rows) {
       await this.upsertAggregate({
         organizationId,
-        userId: null,
+        // Pre-M9 S1：'global' 显式哨兵（NOT NULL + 唯一约束生效——绝不 NULL 隐式全局）
+        userId: 'global',
         kind: row.kind,
         period,
         source: KIND_SOURCE[row.kind],
@@ -222,7 +223,7 @@ export class AnalyticsService {
    */
   private async upsertAggregate(input: {
     organizationId: string;
-    userId: string | null;
+    userId: string;
     kind: AnalyticsKind;
     period: string;
     source: AnalyticsSource;
@@ -329,6 +330,9 @@ export class AnalyticsService {
     let calls = 0;
     let estimatedCost = 0;
     let failed = 0;
+    // Pre-M9 U1：按 kind 拆成本（llm_chat vs image/video）——overview 单源取数，绝不与账本相加双计
+    let llmCost = 0;
+    let mediaCost = 0;
     for (const row of rows) {
       const key = row.providerId ?? 'unknown';
       const bucket = byProvider[key] ?? { calls: 0, estimatedCost: 0, failed: 0 };
@@ -338,10 +342,12 @@ export class AnalyticsService {
       byProvider[key] = bucket;
       calls += 1;
       estimatedCost = round(estimatedCost + row.estimatedCost);
+      if (row.kind === 'llm_chat') llmCost = round(llmCost + row.estimatedCost);
+      else mediaCost = round(mediaCost + row.estimatedCost);
       if (row.status === 'failed') failed += 1;
     }
     return {
-      metrics: { calls, estimatedCost, failed, providers: Object.keys(byProvider).length, byProvider },
+      metrics: { calls, estimatedCost, failed, llmCost, mediaCost, providers: Object.keys(byProvider).length, byProvider },
       dimensions: { providers: Object.keys(byProvider).sort() },
     };
   }
@@ -427,9 +433,12 @@ export class AnalyticsService {
     const workflow = result.facts.workflow ?? {};
 
     const runs = num(agent.runs);
-    const llmCost = num(usage.llm_cost);
-    const providerCost = num(provider.estimatedCost);
-    const totalCost = round(llmCost + providerCost);
+    // Pre-M9 U1：成本单一事实源 = usage_records（provider 维度按 kind 拆分）；
+    // 绝不 llmCost(账本) + providerCost(usage_records) 相加——账本 llm_cost 本身即 usage_records 投影，相加必双计。
+    const llmCost = num(provider.llmCost);
+    const mediaCost = num(provider.mediaCost);
+    const providerCost = round(llmCost + mediaCost);
+    const totalCost = providerCost;
     const members = await this.prisma.organizationMember.count({ where: { organizationId } });
 
     return {
@@ -498,7 +507,7 @@ export class AnalyticsService {
         kind: row.kind,
         source: row.source,
         period: row.period,
-        scope: row.userId ? 'user' : 'organization',
+        scope: row.userId === 'global' ? 'organization' : 'user',
         metricKeys: Object.keys((row.metrics ?? {}) as Record<string, unknown>).sort(),
         dimensions: row.dimensions,
         refreshedAt: row.refreshedAt,

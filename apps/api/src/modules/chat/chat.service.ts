@@ -9,6 +9,7 @@ import { MemoryExtractor, MEMORY_EXTRACTOR } from '../../core/memory/memory-extr
 import { AgentRegistryService } from '../../agents/agent-registry.service';
 import { AttachmentMeta } from '../../agents/agent.types';
 import { ChatMessage } from '../../providers/llm/llm.types';
+import { QuotaService } from '../billing/quota.service';
 import { ChatDto } from './chat.dto';
 import { SSEWriter } from './sse-writer';
 
@@ -32,6 +33,7 @@ export class ChatService {
     @Inject(AttachmentsService) private readonly attachmentsService: AttachmentsService,
     @Inject(MEMORY_EXTRACTOR) private readonly memoryExtractor: MemoryExtractor,
     @Inject(AgentRegistryService) private readonly agentRegistry: AgentRegistryService,
+    @Inject(QuotaService) private readonly quota: QuotaService,
   ) {}
 
   /** 第一步（HTTP 阶段，出错走统一 JSON envelope）：会话/锁/消息/路由/上下文 */
@@ -55,6 +57,10 @@ export class ChatService {
       const assistantMessage = await this.prisma.message.create({
         data: { conversationId: conversation.id, userId, role: 'assistant', content: '', status: 'streaming' },
       });
+      // Pre-M9 R3：sync /chat 进入统一配额体系（llm_tokens；超限 429 于生成前——
+      // 账本镜像由 UsageService 在每条 usage_record 写入时派生，本路径无需另计）。
+      // C1：assistantMessageId 作预留 refId（finalize 释放；TTL 兜底）。
+      await this.quota.assertQuota(userId, conversation.projectId ?? null, 'llm_tokens', 1, assistantMessage.id);
       const attachments = await this.resolveAttachments(userId, dto.attachmentIds);
       // 上下文组装统一走 ContextAssembler（最近消息 + 项目/用户记忆；未来 Summary/RAG 在此扩展）
       const { messages: history, blocks } = await this.context.assemble({
@@ -134,6 +140,8 @@ export class ChatService {
       }
     } finally {
       await this.finalize(ctx, buffer, finalStatus, errorCode, requestId);
+      // Pre-M9 C1：终态释放配额预留（释放丢失由 TTL 兜底）
+      await this.quota.release(ctx.assistantMessageId, 'llm_tokens').catch(() => undefined);
       await this.kv.del(ctx.lockKey).catch(() => undefined);
     }
   }

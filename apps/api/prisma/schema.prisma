@@ -1416,6 +1416,7 @@ model Organization {
   providerPolicies ProviderPolicy[]
   routingDecisions RoutingDecision[]
   quotaAlerts  QuotaAlert[]
+  quotaReservations QuotaReservation[]
   invoices     Invoice[]
   paymentEvents PaymentEvent[]
   @@index([ownerUserId])
@@ -1502,6 +1503,23 @@ model UsageLedgerEntry {
   @@index([usageRecordId])
   @@index([runId])
   @@index([organizationId, kind, createdAt])
+}
+
+// Pre-M9 C1：配额预留（check-then-act 竞态修复——断言时预留、终态释放、TTL 兜底自愈；
+// 多实例安全：预留行是 DB 事实而非进程内状态；过期行被动失效，清扫见可靠性包）
+model QuotaReservation {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  kind           String   // llm_tokens | image_generation | video_seconds | external_api_call | agent_run | workflow_run
+  period         String   // YYYY-MM 月度预留
+  day            String   // YYYY-MM-DD 当日预留
+  quantity       Float    @default(1)
+  refId          String   // runId / assistantMessageId / action idempotencyKey——同键幂等重预留
+  expiresAt      DateTime
+  createdAt      DateTime @default(now())
+  @@unique([organizationId, kind, refId])
+  @@index([expiresAt])
 }
 
 model QuotaAlert {

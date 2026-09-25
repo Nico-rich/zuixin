@@ -10,14 +10,17 @@ import { AGENT_RUN_QUEUE } from '../../core/queue/queue.module';
 /** M8-P9 背压水位（与 HealthService 的 queue.maxDepth 同源同默认值——同一环境变量） */
 const DEFAULT_QUEUE_MAX_DEPTH = 1_000;
 
+/** Pre-M9 C1：预留 TTL（终态释放丢失时兜底自愈；期间保守多计，绝不漏计） */
+const RESERVATION_TTL_MS = 60 * 60_000;
+
 function queueMaxDepth(): number {
   const n = Number(process.env.AGENT_RUN_QUEUE_MAX_DEPTH);
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_QUEUE_MAX_DEPTH;
 }
 
-/** 配额键 → entitlement 键映射 */
-const ENTITLEMENT_KEY: Record<LedgerKind, string> = {
-  llm_tokens: 'llmTokensMonthly', llm_cost: 'llmTokensMonthly',
+/** 配额键 → entitlement 键映射（llm_cost 是派生成本，绝不按 token 配额裁决——故不在映射中） */
+const ENTITLEMENT_KEY: Partial<Record<LedgerKind, string>> = {
+  llm_tokens: 'llmTokensMonthly',
   image_generation: 'imageMonthly', video_seconds: 'videoSecondsMonthly',
   external_api_call: 'externalApiMonthly', agent_run: 'agentRunsMonthly',
   workflow_run: 'workflowRunsMonthly', storage: 'storageMb', seat: 'seats',
@@ -25,6 +28,8 @@ const ENTITLEMENT_KEY: Record<LedgerKind, string> = {
 
 const DAILY_KEY: Record<string, string> = {
   agent_run: 'agentRunsDaily', workflow_run: 'workflowRunsDaily',
+  // Pre-M9 A3：媒体日限读计划权益（imageDaily/videoDaily——套餐升级即放宽）
+  image_generation: 'imageDaily', video_seconds: 'videoDaily',
 };
 
 /**
@@ -46,12 +51,19 @@ export class QuotaService {
     @Optional() @InjectQueue(AGENT_RUN_QUEUE) private readonly agentRunQueue?: Queue,
   ) {}
 
+  /** Pre-M9 A4：UTC 基准（与 Billing/Analytics 一致） */
   private periodOf(d = new Date()): string {
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
   }
 
-  /** 断言配额（超额抛 QUOTA_EXCEEDED；返回 consumed/total 供审计） */
-  async assertQuota(userId: string, projectId: string | null | undefined, kind: LedgerKind, quantity = 1): Promise<{ organizationId: string; consumed: number; total: number }> {
+  private dayOf(d = new Date()): string {
+    return d.toISOString().slice(0, 10);
+  }
+
+  /** 断言配额（超额抛 QUOTA_EXCEEDED；返回 consumed/total 供审计）。
+   *  Pre-M9 C1：refId 给定时创建配额预留行（check-then-act 竞态修复）——并发断言各自预留，
+   *  消耗 = 账本 + 未过期预留；终态必须 release（TTL 1h 兜底自愈）。 */
+  async assertQuota(userId: string, projectId: string | null | undefined, kind: LedgerKind, quantity = 1, refId?: string): Promise<{ organizationId: string; consumed: number; total: number; reservationId: string | null }> {
     // M8-P9 背压先于一切：队列积压已超水位时直接拒绝（最便宜的检查；
     // per-org 并发配额（下方）管"单个租户别占满"，全局队列深度管"整个系统别再收了"）
     if (kind === 'agent_run') await this.assertQueueDepth();
@@ -59,13 +71,16 @@ export class QuotaService {
     const { entitlements } = await this.billing.ensureSubscription(organizationId);
 
     const key = ENTITLEMENT_KEY[kind];
-    const monthlyLimit = entitlements[key];
+    const monthlyLimit = key ? entitlements[key] : undefined;
     if (monthlyLimit != null) {
-      const agg = await this.prisma.usageLedgerEntry.aggregate({
-        where: { organizationId, period: this.periodOf(), kind },
-        _sum: { quantity: true },
-      });
-      const consumed = agg._sum.quantity ?? 0;
+      const [agg, reserved] = await Promise.all([
+        this.prisma.usageLedgerEntry.aggregate({
+          where: { organizationId, period: this.periodOf(), kind },
+          _sum: { quantity: true },
+        }),
+        this.openReservations(organizationId, kind, this.periodOf()),
+      ]);
+      const consumed = (agg._sum.quantity ?? 0) + reserved;
       if (consumed + quantity > monthlyLimit) {
         throw new AppError(ErrorCode.QUOTA_EXCEEDED, `本月 ${kind} 配额已用尽（${consumed}/${monthlyLimit}）`);
       }
@@ -75,14 +90,22 @@ export class QuotaService {
     const dailyLimit = dailyKey ? entitlements[dailyKey] : undefined;
     if (dailyLimit != null) {
       const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
-      const agg = await this.prisma.usageLedgerEntry.aggregate({
-        where: { organizationId, kind, createdAt: { gte: dayStart } },
-        _sum: { quantity: true },
-      });
-      const consumedDaily = agg._sum.quantity ?? 0;
+      const [agg, reservedDaily] = await Promise.all([
+        this.prisma.usageLedgerEntry.aggregate({
+          where: { organizationId, kind, createdAt: { gte: dayStart } },
+          _sum: { quantity: true },
+        }),
+        this.openReservations(organizationId, kind, this.dayOf()),
+      ]);
+      const consumedDaily = (agg._sum.quantity ?? 0) + reservedDaily;
       if (consumedDaily + quantity > dailyLimit) {
         throw new AppError(ErrorCode.QUOTA_EXCEEDED, `今日 ${kind} 配额已用尽（${consumedDaily}/${dailyLimit}）`);
       }
+    }
+
+    let reservationId: string | null = null;
+    if (refId) {
+      reservationId = (await this.reserve(organizationId, kind, quantity, refId)).id;
     }
 
     // concurrent：org 活跃 run 计数（agent/workflow 两域）
@@ -103,7 +126,46 @@ export class QuotaService {
         throw new AppError(ErrorCode.QUOTA_EXCEEDED, `并发 WorkflowRun 配额已用尽（${active}/${entitlements.concurrentWorkflowRuns}）`);
       }
     }
-    return { organizationId, consumed: 0, total: monthlyLimit ?? 0 };
+    return { organizationId, consumed: 0, total: monthlyLimit ?? 0, reservationId };
+  }
+
+  /** 释放预留（run/message 终态调用；幂等——行不存在不报错） */
+  async release(refId: string, kind: LedgerKind): Promise<void> {
+    await this.prisma.quotaReservation.deleteMany({ where: { refId, kind } }).catch(() => undefined);
+  }
+
+  /** 未过期预留量（period 传月 key 或日 key；expiresAt > now 才计入——TTL 兜底自愈） */
+  private async openReservations(organizationId: string, kind: LedgerKind, periodOrDay: string): Promise<number> {
+    const agg = await this.prisma.quotaReservation.aggregate({
+      where: {
+        organizationId, kind, expiresAt: { gt: new Date() },
+        OR: [{ period: periodOrDay }, { day: periodOrDay }],
+      },
+      _sum: { quantity: true },
+    });
+    return agg._sum.quantity ?? 0;
+  }
+
+  /** 创建预留行（UNIQUE(org,kind,refId)；并发同键 P2002 → 复用） */
+  private async reserve(organizationId: string, kind: LedgerKind, quantity: number, refId: string): Promise<{ id: string }> {
+    const now = new Date();
+    try {
+      return await this.prisma.quotaReservation.create({
+        data: {
+          organizationId, kind, quantity, refId,
+          period: this.periodOf(now), day: this.dayOf(now),
+          expiresAt: new Date(now.getTime() + RESERVATION_TTL_MS),
+        },
+      });
+    } catch (err) {
+      if ((err as { code?: string }).code === 'P2002') {
+        const won = await this.prisma.quotaReservation.findUnique({
+          where: { organizationId_kind_refId: { organizationId, kind, refId } },
+        });
+        if (won) return won;
+      }
+      throw err;
+    }
   }
 
   /**

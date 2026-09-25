@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ORG_ID_REGEX } from '@ai-agent/shared';
 import { WorkflowDefinition } from './workflow-types';
 
 const StepSchema = z.strictObject({
@@ -48,7 +49,8 @@ export const CreateWorkflowSchema = z.strictObject({
   name: z.string().min(1).max(100),
   description: z.string().max(2000).optional(),
   projectId: z.string().uuid().optional().nullable(),
-  organizationId: z.string().uuid().optional().nullable(), // M8-P1：组织归属（缺省 = 项目组织或个人组织）
+  // Pre-M9 A2：uuid 或 personal-{uuid}（个人组织 id 非纯 UUID）
+  organizationId: z.string().regex(ORG_ID_REGEX, '组织 id 格式非法').optional().nullable(),
   definition: WorkflowDefinitionSchema,
 });
 

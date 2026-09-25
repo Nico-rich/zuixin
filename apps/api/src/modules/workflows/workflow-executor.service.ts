@@ -8,6 +8,7 @@ import { ExternalActionsService } from '../external-actions/external-actions.ser
 import { AgentRunMessagesService } from '../agent-runs/agent-run-messages.service';
 import { AGENT_RUN_QUEUE } from '../../core/queue/queue.module';
 import { AppError, ErrorCode, RETRYABLE_CODES } from '../../common/errors/app-error';
+import { QuotaService } from '../billing/quota.service';
 import {
   WorkflowContext, WorkflowDefinition, WorkflowStepDef, evaluateCondition, renderTemplate,
 } from './workflow-types';
@@ -33,6 +34,7 @@ export class WorkflowExecutor {
     @Inject(ExternalActionsService) private readonly actions: ExternalActionsService,
     @Inject(AgentRunMessagesService) private readonly messages: AgentRunMessagesService,
     @InjectQueue(AGENT_RUN_QUEUE) private readonly agentRunQueue: Queue,
+    @Inject(QuotaService) private readonly quota: QuotaService,
   ) {}
 
   async execute(runId: string, workerId: string): Promise<{ outcome: 'continue' | 'waiting' | 'done' }> {
@@ -281,6 +283,8 @@ export class WorkflowExecutor {
       },
     });
     if (done.count === 0) this.logger.warn({ runId }, 'workflow 终态条件更新 count=0（外部已终态）');
+    // Pre-M9 C1：终态释放配额预留（释放丢失由 TTL 兜底——期间保守多计）
+    await this.quota.release(runId, 'workflow_run').catch(() => undefined);
   }
 
   private async upsertStep(runId: string, stepIndex: number, stepId: string, stepType: string, data: Record<string, unknown>): Promise<void> {

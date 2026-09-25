@@ -44,7 +44,7 @@ describe('AnalyticsService（M8-P4 确定性聚合投影）', () => {
     expect(rangeOf('month', DAY_START)).toMatchObject({ from: '2026-08-27', to: '2026-09-25', days: 30 });
   });
 
-  it('refreshOrganization：五维度各一行，source 标注事务来源，period=指定日，userId=组织级 null', async () => {
+  it('refreshOrganization：五维度各一行，source 标注事务来源，period=指定日，userId=组织级 global 哨兵（Pre-M9 S1）', async () => {
     const { svc, prisma } = makeService();
     const res = await svc.refreshOrganization('org-1', '2026-09-25');
     expect(res).toMatchObject({ organizationId: 'org-1', period: '2026-09-25' });
@@ -56,7 +56,7 @@ describe('AnalyticsService（M8-P4 确定性聚合投影）', () => {
     ]);
     for (const row of rows) {
       expect(row.period).toBe('2026-09-25');
-      expect(row.userId).toBeNull();
+      expect(row.userId).toBe('global');
       expect(row.organizationId).toBe('org-1');
     }
   });
@@ -215,12 +215,15 @@ describe('AnalyticsService（M8-P4 确定性聚合投影）', () => {
     prisma.analyticsAggregate.findMany.mockResolvedValue([
       { kind: 'usage', period: '2026-09-25', metrics: { llm_cost: 3.5, agent_run: 4 }, dimensions: null, source: 'usage_ledger', refreshedAt: new Date('2026-09-25T10:00:00.000Z') },
       { kind: 'agent', period: '2026-09-25', metrics: { runs: 4, completed: 3, durationMsTotal: 400, durationSamples: 4 }, dimensions: null, source: 'agent_run', refreshedAt: new Date('2026-09-25T10:00:00.000Z') },
-      { kind: 'provider', period: '2026-09-25', metrics: { calls: 5, estimatedCost: 1.5 }, dimensions: null, source: 'usage_record', refreshedAt: new Date('2026-09-25T10:00:00.000Z') },
+      // Pre-M9 U1：provider 维度按 kind 拆成本（llmChat/media）——成本单一事实源 = usage_records
+      { kind: 'provider', period: '2026-09-25', metrics: { calls: 5, estimatedCost: 1.5, llmCost: 1.2, mediaCost: 0.3 }, dimensions: null, source: 'usage_record', refreshedAt: new Date('2026-09-25T10:00:00.000Z') },
     ]);
     const res = await svc.overview('org-1', 'day');
+    // Pre-M9 U1 回归证明：usage.llm_cost(账本)=3.5 绝不与 provider(usage_records)=1.5 相加（相加必双计=5）；
+    // totalCost 单一源 = llmCost 1.2 + mediaCost 0.3 = 1.5
     expect(res.derived).toMatchObject({
-      totalCost: 5, llmCost: 3.5, providerCost: 1.5,
-      runSuccessRate: 0.75, avgRunDurationMs: 100, costPerRun: 1.25, costPerMember: 1.25, costPerDay: 5, runsPerDay: 4,
+      totalCost: 1.5, llmCost: 1.2, providerCost: 1.5,
+      runSuccessRate: 0.75, avgRunDurationMs: 100, costPerRun: 0.375, costPerMember: 0.375, costPerDay: 1.5, runsPerDay: 4,
     });
     expect(res.context.members).toBe(4);
     expect(res.meta.layering).toMatchObject({ facts: 'deterministic-projection', derived: 'service-computed', interpretation: 'none' });
@@ -230,8 +233,8 @@ describe('AnalyticsService（M8-P4 确定性聚合投影）', () => {
   it('sources：聚合行 source 追溯（kind → 事务表 + 指标键 + 刷新时间）', async () => {
     const { svc, prisma } = makeService();
     prisma.analyticsAggregate.findMany.mockResolvedValue([
-      { kind: 'agent', source: 'agent_run', period: '2026-09-25', userId: null, dimensions: null, metrics: { runs: 2, completed: 2 }, refreshedAt: new Date('2026-09-25T10:00:00.000Z') },
-      { kind: 'provider', source: 'usage_record', period: '2026-09-25', userId: null, dimensions: { providers: ['p1'] }, metrics: { calls: 1 }, refreshedAt: new Date('2026-09-25T10:00:00.000Z') },
+      { kind: 'agent', source: 'agent_run', period: '2026-09-25', userId: 'global', dimensions: null, metrics: { runs: 2, completed: 2 }, refreshedAt: new Date('2026-09-25T10:00:00.000Z') },
+      { kind: 'provider', source: 'usage_record', period: '2026-09-25', userId: 'global', dimensions: { providers: ['p1'] }, metrics: { calls: 1 }, refreshedAt: new Date('2026-09-25T10:00:00.000Z') },
     ]);
     const res = await svc.sources('org-1', '2026-09-25');
     expect(res.count).toBe(2);

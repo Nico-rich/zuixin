@@ -7,6 +7,7 @@ import { AgentRunLeaseService } from '../../core/agent-run-lease/agent-run-lease
 import { EventBusService, agentRunChannel } from '../../core/events/event-bus.service';
 import { planResume } from '../../core/agent-loop/resume-planner';
 import { BillingService } from '../../modules/billing/billing.service';
+import { QuotaService } from '../../modules/billing/quota.service';
 
 /**
  * M6-P4 Async Driver（Worker 侧）：
@@ -24,6 +25,7 @@ export class AsyncAgentRunDriver {
     @Inject(AgentRunLeaseService) private readonly lease: AgentRunLeaseService,
     @Inject(EventBusService) private readonly events: EventBusService,
     @Inject(BillingService) private readonly billing: BillingService,
+    @Inject(QuotaService) private readonly quota: QuotaService,
   ) {}
 
   async execute(runId: string, signal: AbortSignal, controls: { active: boolean }): Promise<AgentRunOutcome> {
@@ -65,6 +67,8 @@ export class AsyncAgentRunDriver {
     const ctx: AgentRuntimeContext = {
       userId: run.userId,
       projectId: run.projectId ?? undefined,
+      // Pre-M9 T1：组织归属每 run 解析一次（项目组织 > 个人组织），usage 写入直传
+      organizationId: await this.billing.organizationFor(run.userId, run.projectId),
       conversationId: run.conversationId ?? undefined,
       messageId: metadata.assistantMessageId, // 真实 Message 行或 undefined——绝不传 runId 冒充（GenerationTask.messageId FK）
       userMessage,
@@ -99,24 +103,15 @@ export class AsyncAgentRunDriver {
       await this.events.publish(agentRunChannel(runId), value as Record<string, unknown>).catch(() => undefined);
     }
 
-    // M8-P2：run 终态计量（agent_run 一次 + llm 回合/成本聚合；幂等键 = run id——重放绝不重复计量）
+    // M8-P2 + Pre-M9 D1：run 终态计量只剩离散事件 agent_run（幂等键 = run id——重放绝不重复计量）；
+    // llm_tokens/llm_cost/image/video 账本行由 UsageService 在每条 UsageRecord 写入时派生镜像（严格投影，杜绝漂移）。
     if (outcome.status !== 'waiting') {
-      const usageRows = await this.prisma.usageRecord.findMany({ where: { runId }, select: { inputTokens: true, outputTokens: true, estimatedCost: true, kind: true } });
-      const llmTokens = usageRows.reduce((s, u) => s + u.inputTokens + u.outputTokens, 0);
-      const llmCost = usageRows.reduce((s, u) => s + u.estimatedCost, 0);
       await this.billing.recordUsage({
         userId: run.userId, projectId: run.projectId, kind: 'agent_run', quantity: 1,
         runId, idempotencyKey: `run:${runId}:agent-run`,
       }).catch(() => undefined);
-      await this.billing.recordUsage({
-        userId: run.userId, projectId: run.projectId, kind: 'llm_tokens', quantity: llmTokens,
-        runId, idempotencyKey: `run:${runId}:llm-tokens`,
-        metadata: { llmRounds: usageRows.filter((u) => u.kind === 'llm_chat').length },
-      }).catch(() => undefined);
-      await this.billing.recordUsage({
-        userId: run.userId, projectId: run.projectId, kind: 'llm_cost', quantity: llmCost,
-        runId, idempotencyKey: `run:${runId}:llm-cost`,
-      }).catch(() => undefined);
+      // Pre-M9 C1：终态释放配额预留（释放丢失由 TTL 兜底——期间保守多计，绝不漏计）
+      await this.quota.release(runId, 'agent_run').catch(() => undefined);
     }
     if (outcome.status === 'waiting') {
       // P4 waiting：run 仍存活（已落库 waiting+waitingOnTaskId），assistant Message 保持 streaming，无终态写

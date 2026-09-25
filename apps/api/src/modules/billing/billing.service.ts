@@ -18,7 +18,27 @@ export interface RecordUsageInput {
   usageRecordId?: string;
   idempotencyKey: string;
   metadata?: Record<string, unknown>;
+  /** Pre-M9 T1：调用方已知的组织归属（UsageRecord 镜像直传——绝不运行时重解析产生归属漂移） */
+  organizationId?: string;
 }
+
+/**
+ * Pre-M9 R1 价格目录（模型默认价，单位：LLM=CNY/百万 token；媒体=CNY/单张或 CNY/秒）。
+ * 只在"三价格字段全为 0"的初始行上写入——后台改价后的行绝不覆盖。
+ */
+const PRICE_CATALOG: Record<string, { input?: number; output?: number; unit?: number }> = {
+  'mock-echo': { input: 2, output: 6 },
+  'mock-router-1': { input: 2, output: 6 },
+  'qwen-turbo': { input: 2, output: 6 },
+  'qwen-plus': { input: 4, output: 12 },
+  'qwen-max': { input: 40, output: 120 },
+  'mock-image-1': { unit: 0.15 },
+  'gpt-image-1': { unit: 0.5 },
+  'cogview-4': { unit: 0.15 },
+  'wanx2.1-t2i-turbo': { unit: 0.2 },
+  'mock-video-1': { unit: 0.05 },
+  'wanx2.1-t2v-turbo': { unit: 0.3 },
+};
 
 const DEFAULT_ENTITLEMENTS = {
   agentRunsMonthly: 100_000, agentRunsDaily: 50_000, concurrentAgentRuns: 50,
@@ -26,6 +46,8 @@ const DEFAULT_ENTITLEMENTS = {
   llmTokensMonthly: 1_000_000_000, imageMonthly: 1_000_000,
   videoSecondsMonthly: 1_000_000, externalApiMonthly: 1_000_000,
   storageMb: 100_000, seats: 100,
+  // Pre-M9 A3：媒体日限并入计划权益（原 systemSetting 全局日限 50/10 语义保留为 free 默认）
+  imageDaily: 50, videoDaily: 10,
 };
 
 const PLANS = [
@@ -51,7 +73,7 @@ export class BillingService implements OnModuleInit {
     @Inject(OrganizationsService) private readonly orgs: OrganizationsService,
   ) {}
 
-  /** 种子计划（幂等 upsert） */
+  /** 种子计划（幂等 upsert）+ 模型初始价格目录（仅全零行；后台改价绝不覆盖） */
   async onModuleInit(): Promise<void> {
     for (const plan of PLANS) {
       await this.prisma.plan.upsert({
@@ -60,11 +82,22 @@ export class BillingService implements OnModuleInit {
         update: { entitlements: plan.entitlements as never },
       }).catch(() => undefined);
     }
-    this.logger.log('Billing 计划已就绪');
+    for (const [apiModelId, price] of Object.entries(PRICE_CATALOG)) {
+      await this.prisma.model.updateMany({
+        where: { apiModelId, inputPrice: 0, outputPrice: 0, unitPrice: 0 },
+        data: {
+          ...(price.input != null ? { inputPrice: price.input } : {}),
+          ...(price.output != null ? { outputPrice: price.output } : {}),
+          ...(price.unit != null ? { unitPrice: price.unit } : {}),
+        },
+      }).catch(() => undefined);
+    }
+    this.logger.log('Billing 计划与价格目录已就绪');
   }
 
+  /** Pre-M9 A4：period 统一 UTC 基准（与 Analytics 一致——绝不本地时区漂移） */
   private periodOf(d = new Date()): string {
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
   }
 
   /** 每组织一订阅（缺省 free）；expired/cancelled → 免费额度语义 */
@@ -94,9 +127,9 @@ export class BillingService implements OnModuleInit {
     return (await this.orgs.ensurePersonalOrganization(userId)).id;
   }
 
-  /** 计量入账（append-only + 幂等键唯一——P2002 重复键绝不重复计量） */
+  /** 计量入账（append-only + 幂等键唯一——P2002 重复键绝不重复计量；organizationId 已解析时直传） */
   async recordUsage(input: RecordUsageInput): Promise<void> {
-    const organizationId = await this.organizationFor(input.userId, input.projectId);
+    const organizationId = input.organizationId ?? await this.organizationFor(input.userId, input.projectId);
     try {
       await this.prisma.usageLedgerEntry.create({
         data: {

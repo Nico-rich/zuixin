@@ -1,4 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { AgentRunStatus } from '@prisma/client';
@@ -100,8 +101,10 @@ export class AgentRunsService {
    * → seed 初始用户 transcript → 入队（payload {runId}）→ {runId, status:'queued'}。
    */
   async createAsync(userId: string, dto: CreateAgentRunDto) {
-    // M8-P2：配额裁决在创建入口（服务端；LLM 绝不决定是否超额）
-    await this.quota.assertQuota(userId, dto.projectId ?? null, 'agent_run', 1).catch((err) => {
+    // M8-P2：配额裁决在创建入口（服务端；LLM 绝不决定是否超额）；
+    // Pre-M9 C1：runId 预生成作预留 refId（Driver 终态 release；TTL 兜底）
+    const runId = randomUUID();
+    await this.quota.assertQuota(userId, dto.projectId ?? null, 'agent_run', 1, runId).catch((err) => {
       if ((err as { code?: string }).code === 'QUOTA_EXCEEDED') throw err;
       throw err;
     });
@@ -133,6 +136,7 @@ export class AgentRunsService {
 
     const run = await this.prisma.agentRun.create({
       data: {
+        id: runId, // Pre-M9 C1：配额预留 refId 与 run 同 id（终态 release 精确对应）
         userId, agentId: agent.id, agentVersionId: version.id,
         projectId, conversationId: conversation.id,
         status: 'queued',
@@ -171,6 +175,8 @@ export class AgentRunsService {
       data: { status: 'cancelled', completedAt: new Date() },
     });
     if (done.count === 0) throw new AppError(ErrorCode.RUN_NOT_CANCELLABLE, '运行已结束，无法取消');
+    // Pre-M9 C1：取消终态释放配额预留（waiting 态取消无活跃 worker 走 Driver 释放路径）
+    await this.quota.release(runId, 'agent_run').catch(() => undefined);
 
     // 等待中的生成任务：pending → cancelled（best-effort 取消意图；任务终态 hook 不会复活已 cancelled 的 run）
     if (run.status === 'waiting' && run.waitingOnTaskId) {

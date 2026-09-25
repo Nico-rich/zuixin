@@ -22,8 +22,9 @@ function makeService(opts: { staleCount?: number; freshCount?: number; timeoutMs
     },
   };
   const usage = { recordMediaUsage: vi.fn().mockResolvedValue(undefined) };
+  const quota = { release: vi.fn().mockResolvedValue(undefined) };
   const resume = { onTaskTerminal: vi.fn().mockResolvedValue(undefined) };
-  const svc = new MediaCleanupService(prisma as never, usage as never, resume as never);
+  const svc = new MediaCleanupService(prisma as never, usage as never, quota as never, resume as never);
   return { svc, prisma, resume };
 }
 

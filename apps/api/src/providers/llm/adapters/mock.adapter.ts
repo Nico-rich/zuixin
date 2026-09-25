@@ -14,6 +14,8 @@ export class MockLLMAdapter implements LLMProvider {
     const toolCall = this.maybeToolCall(params);
     if (toolCall) {
       yield { type: 'tool_calls', toolCalls: [toolCall] };
+      // Pre-M9 R1：替身确定性用量（4 字符/token 近似——仅 dev/e2e 可见，绝不冒充生产事实）
+      yield { type: 'usage', usage: { inputTokens: 4, outputTokens: Math.ceil(toolCall.arguments.length / 4) } };
       return;
     }
     const text = this.reply(params);
@@ -22,6 +24,7 @@ export class MockLLMAdapter implements LLMProvider {
       yield { type: 'text', text: ch };
       if (this.chunkDelayMs > 0) await new Promise((r) => setTimeout(r, this.chunkDelayMs));
     }
+    yield { type: 'usage', usage: { inputTokens: 4, outputTokens: Math.ceil(text.length / 4) } };
   }
 
   private maybeToolCall(params: ChatParams) {

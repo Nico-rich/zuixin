@@ -8,6 +8,9 @@ import { AuditService } from '../audit/audit.service';
 import { BillingService } from '../billing/billing.service';
 import { QuotaService } from '../billing/quota.service';
 
+/** Pre-M9 C2：claim 失败轮询赢家终态的时长上限 */
+const EXECUTING_POLL_MS = 20_000;
+
 /** M7-P3 风险分级（快照入库；financial/destructive → high，external_action → medium，其余 low） */
 export function classifyRisk(permission: string): 'low' | 'medium' | 'high' {
   if (permission === 'financial' || permission === 'destructive') return 'high';
@@ -76,7 +79,7 @@ export class ExternalActionsService {
     // 1. 审批复核（防线 1：服务端事实，不信任调用方）；风险分级快照 = Approval.riskLevel（P1 审批门分类结果）
     const approval = await this.verifyApproval(input.userId, input);
 
-    // 2. 幂等裁决：completed → 复用结果（绝不重复执行）；executing/failed 残留 → 复用行 + 同一 externalRequestId 继续
+    // 2. 幂等裁决：completed → 复用结果（绝不重复执行）
     const existing = await this.prisma.externalAction.findUnique({
       where: { userId_provider_idempotencyKey: { userId: input.userId, provider: input.provider, idempotencyKey: input.idempotencyKey } },
     });
@@ -89,26 +92,43 @@ export class ExternalActionsService {
     const accessToken = await this.credentials.getAccessToken(connection.id);
     if (!accessToken) throw new AppError(ErrorCode.CONNECTION_NOT_ACTIVE, '连接缺少有效凭证');
 
-    // 3.5 M8-P2 配额裁决（服务端；external_api_call）
-    await this.quota.assertQuota(input.userId, input.projectId ?? null, 'external_api_call', 1);
+    // 3.5 M8-P2 配额裁决（服务端；external_api_call）；Pre-M9 C1：幂等键作预留 refId（终态释放）
+    const quota = await this.quota.assertQuota(input.userId, input.projectId ?? null, 'external_api_call', 1, input.idempotencyKey);
 
-    // 4. 行获取/创建 + 执行（executing + startedAt；失败/取消落终态后上抛——Engine/调用方决定后续）
+    // 4. 行获取/创建（创建时即生成稳定 externalRequestId——崩溃重试同一键传给 provider 去重）
     const actionId = existing?.id
-      ?? (await this.createRow(input, approval)).id;
-    const externalRequestId = existing?.externalRequestId ?? randomUUID();
-    await this.prisma.externalAction.update({
-      where: { id: actionId },
-      data: { status: 'executing', startedAt: new Date(), externalRequestId, approvalId: approval.id, connectionId: connection.id },
+      ?? (await this.createRow(input, approval, quota.organizationId)).id;
+    const row = await this.prisma.externalAction.findUnique({ where: { id: actionId } });
+    if (!row) throw new AppError(ErrorCode.NOT_FOUND, '外部动作不存在');
+    if (row.status === 'cancelled') throw new AppError(ErrorCode.APPROVAL_CANCELLED, '外部动作已取消');
+
+    // 5. Pre-M9 C2 claim-then-execute（(status, startedAt) 双字段乐观 CAS——真正的互斥）：
+    //    WHERE 在 UPDATE 时刻求值：赢家把 startedAt 改成 now，输家的旧 startedAt 条件立刻失配 → count=0。
+    //    可 claim 态：pending_approval（首执行）/ failed（tool retryPolicy 重试）/ executing（崩溃续跑——
+    //    run lease 已过期意味着原执行者已死；provider 侧以同一 externalRequestId 去重，副作用依然 exactly-once）。
+    const claim = await this.prisma.externalAction.updateMany({
+      where: {
+        id: actionId,
+        status: row.status as never,
+        startedAt: row.startedAt, // null（pending）或旧值（failed/executing）——CAS 令牌
+      },
+      data: { status: 'executing', startedAt: new Date(), approvalId: approval.id, connectionId: connection.id },
     });
+    if (claim.count === 0) {
+      return this.awaitExistingOutcome(actionId, input);
+    }
+    const externalRequestId = row.externalRequestId ?? randomUUID();
+
     try {
       const result = await provider.execute({
         provider: input.provider, actionType: input.actionType, payload: input.payload,
         externalRequestId, connectionId: connection.id, accessToken: accessToken.token, signal: input.signal,
       });
-      const done = await this.prisma.externalAction.update({
-        where: { id: actionId },
+      const done = await this.prisma.externalAction.updateMany({
+        where: { id: actionId, status: 'executing' },
         data: { status: 'completed', completedAt: new Date(), result: result as never },
       });
+      if (done.count === 0) return this.awaitExistingOutcome(actionId, input); // 被接管/外部终态 → 读事实
       this.logger.log({ actionId, provider: input.provider, actionType: input.actionType }, '外部动作完成');
       await this.audit.write({
         userId: input.userId, action: 'external_action.executed', projectId: input.projectId,
@@ -122,12 +142,14 @@ export class ExternalActionsService {
         userId: input.userId, projectId: input.projectId, kind: 'external_api_call', quantity: 1,
         runId: input.agentRunId, toolCallId: input.toolCallId, idempotencyKey: `ea:${actionId}`,
       }).catch(() => undefined);
-      return this.toView(done);
+      await this.quota.release(input.idempotencyKey, 'external_api_call').catch(() => undefined);
+      const completed = await this.prisma.externalAction.findUnique({ where: { id: actionId } });
+      return this.toView(completed ?? { ...row, status: 'completed', result: result as never });
     } catch (err) {
       const aborted = input.signal.aborted;
       const appErr = err instanceof AppError ? err : new AppError(ErrorCode.PROVIDER_UNKNOWN, (err as Error).message);
-      const row = await this.prisma.externalAction.update({
-        where: { id: actionId },
+      await this.prisma.externalAction.updateMany({
+        where: { id: actionId, status: 'executing' },
         data: aborted
           ? { status: 'cancelled', completedAt: new Date(), errorCode: ErrorCode.AGENT_CANCELLED, error: '执行已取消' }
           : { status: 'failed', completedAt: new Date(), errorCode: appErr.code, error: appErr.message },
@@ -139,10 +161,30 @@ export class ExternalActionsService {
         connectionId: connection.id,
         metadata: { provider: input.provider, actionType: input.actionType, status: aborted ? 'cancelled' : 'failed', errorCode: appErr.code },
       });
+      await this.quota.release(input.idempotencyKey, 'external_api_call').catch(() => undefined);
       this.logger.warn({ actionId, errorCode: appErr.code }, '外部动作失败/取消');
       if (aborted) throw err; // AbortError 上抛：Engine 识别为取消
       throw appErr;
     }
+  }
+
+  /**
+   * Pre-M9 C2：claim 失败（并发执行者 / 残留行被接管）→ 有界轮询赢家终态。
+   * 绝不自行执行 provider 副作用——同键动作的副作用有且只有赢家一次。
+   */
+  private async awaitExistingOutcome(actionId: string, input: ExecuteExternalActionInput): Promise<Record<string, unknown>> {
+    const deadline = Date.now() + EXECUTING_POLL_MS;
+    while (Date.now() < deadline) {
+      const row = await this.prisma.externalAction.findUnique({ where: { id: actionId } });
+      if (row?.status === 'completed' && row.result != null) return this.toView(row);
+      if (row?.status === 'failed' || row?.status === 'cancelled') {
+        throw new AppError(ErrorCode.PROVIDER_UNKNOWN, row.error ?? '外部动作已失败');
+      }
+      if (!row) throw new AppError(ErrorCode.NOT_FOUND, '外部动作不存在');
+      if (input.signal.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    throw new AppError(ErrorCode.EXTERNAL_ACTION_IN_PROGRESS, '外部动作正在执行中，请稍后重试');
   }
 
   /** 连接解析：显式 connectionId（归属校验）或该 provider 的第一个 active 连接 */
@@ -159,15 +201,18 @@ export class ExternalActionsService {
     return connection;
   }
 
-  private async createRow(input: ExecuteExternalActionInput, approval: { id: string; riskLevel: string }) {
+  private async createRow(input: ExecuteExternalActionInput, approval: { id: string; riskLevel: string }, organizationId: string) {
     try {
       return await this.prisma.externalAction.create({
         data: {
           userId: input.userId, projectId: input.projectId ?? null,
+          organizationId, // Pre-M9 T1：组织归属写入（配额裁决返回的权威归属）
           agentRunId: input.agentRunId ?? null, toolCallId: input.toolCallId ?? null,
           approvalId: approval.id, provider: input.provider, actionType: input.actionType,
           permission: input.permission, riskLevel: approval.riskLevel,
           input: input.payload as never, status: 'pending_approval', idempotencyKey: input.idempotencyKey,
+          // Pre-M9 C2：稳定远端幂等键在行创建时生成（崩溃重试同一键 → provider 去重）
+          externalRequestId: randomUUID(),
         },
       });
     } catch (err) {

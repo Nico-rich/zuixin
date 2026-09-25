@@ -80,6 +80,7 @@ export class PrismaRuntimePersistence implements AgentRuntimePersistence {
       providerId: input.providerId, modelId: input.modelId, runId: input.runId,
       inputTokens: input.inputTokens, outputTokens: input.outputTokens,
       latencyMs: input.latencyMs, status: input.status, errorCode: input.errorCode,
+      organizationId: input.organizationId,
     }).catch(() => undefined);
   }
 

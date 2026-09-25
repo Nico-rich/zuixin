@@ -62,6 +62,8 @@ describe('M8-P2 Billing / Subscription / Quota (e2e)', () => {
     orgId = org!.id;
     // 独立计量基线：清空该组织历史 ledger（全量套件其他 spec 的 run 也归集于此——配额测试需要确定性起点）
     await prisma.usageLedgerEntry.deleteMany({ where: { organizationId: orgId } });
+    // Pre-M9 C1：同样清空该组织历史配额预留（其他 spec 的 run 预留残留会污染消耗计数）
+    await prisma.quotaReservation.deleteMany({ where: { organizationId: orgId } });
 
     // 极小额度计划（配额测试专用）：月度 2 + 并发 1
     const tiny = await prisma.plan.create({

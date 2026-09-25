@@ -34,7 +34,7 @@ function makeService() {
   const svc = new MediaGenerationService(
     prisma as never, storage as never, events as never, usage as never,
     queue as never, queue as never, executors as never, resume as never,
-    { recordUsage: vi.fn().mockResolvedValue(undefined) } as never);
+    { assertQuota: vi.fn().mockResolvedValue({ organizationId: 'org-1', reservationId: 'r' }), release: vi.fn().mockResolvedValue(undefined) } as never);
   return { svc, prisma, usage, resume };
 }
 
