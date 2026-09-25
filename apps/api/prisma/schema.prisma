@@ -538,6 +538,15 @@ model AgentRun {
   approvals           Approval[]   // 本 run 产生的审批
   commerceAnalyses    CommerceAnalysis[]
   creativeBriefs      CreativeBrief[]
+  // ===== M7-P7: 委派血缘（父/发起者/深度；child 权限 ⊆ parent 权限由服务层保证）=====
+  parentRunId         String?
+  parentRun           AgentRun?   @relation("DelegationParent", fields: [parentRunId], references: [id], onDelete: SetNull)
+  children            AgentRun[]  @relation("DelegationParent")
+  delegatedByRunId    String?     // 发起委派的 run（直接父）
+  depth               Int         @default(0) // root=0；每层委派 +1（上限 limits.delegationMaxDepth）
+  waitingOnDelegationId String?   // waiting 时等待的 AgentDelegation（子 run 终态唤醒）
+  delegationsAsParent AgentDelegation[] @relation("DelegationParent")
+  delegationsAsChild  AgentDelegation[] @relation("DelegationChild")
   retryOfRunId    String?      // Retry = 新 Run 血缘（不重新打开 terminal run）
   retryOf         AgentRun?  @relation("RetryChain", fields: [retryOfRunId], references: [id], onDelete: SetNull)
   retries         AgentRun[] @relation("RetryChain")
@@ -552,6 +561,9 @@ model AgentRun {
   @@index([retryOfRunId])
   @@index([waitingOnTaskId])
   @@index([waitingOnApprovalId])
+  @@index([parentRunId])
+  @@index([delegatedByRunId])
+  @@index([waitingOnDelegationId])
 }
 
 // ===== M7-P1: Approval（Human-in-the-loop；M6 waiting 的第二种等待目标）=====
@@ -1241,4 +1253,25 @@ model WebhookDelivery {
   status      String           @default("accepted") // accepted | duplicate | rejected
   createdAt   DateTime         @default(now())
   @@unique([webhookId, eventId])
+}
+
+// ===== M7-P7: Multi-Agent / Delegation（安全委派：深度/子数上限 + 环检测 + 权限子集继承 + 级联取消）=====
+model AgentDelegation {
+  id                String      @id @default(uuid())
+  parentRunId       String
+  parentRun         AgentRun    @relation("DelegationParent", fields: [parentRunId], references: [id], onDelete: Cascade)
+  delegatedByRunId  String      // 发起委派的 run（直接父；链式 = 各层直接父）
+  childRunId        String      @unique
+  childRun          AgentRun    @relation("DelegationChild", fields: [childRunId], references: [id], onDelete: Cascade)
+  agentId           String      // 子 Agent
+  task              String      @db.Text
+  idempotencyKey    String      @unique // ToolCall 级幂等：resume 重放绝不产生第二个子 run
+  status            String      @default("queued") // queued | running | waiting | completed | failed | cancelled | timeout
+  depth             Int         @default(1) // 子 run 的深度（root=0）
+  resultSummary     String?     // 结构化结果摘要（终端时写；绝不含内部推理）
+  errorCode         String?
+  createdAt         DateTime    @default(now())
+  completedAt       DateTime?
+  @@index([parentRunId])
+  @@index([delegatedByRunId])
 }

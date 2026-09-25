@@ -28,7 +28,7 @@ export class AsyncAgentRunDriver {
     const run = await this.prisma.agentRun.findUnique({ where: { id: runId }, include: { agentVersion: true } });
     if (!run || run.status !== 'running') {
       // 已被取消/终态/他人处理 → 幂等退出
-      return { runId, status: run?.status === 'cancelled' ? 'cancelled' : 'failed', content: '', taskRefs: [], approvalRefs: [] };
+      return { runId, status: run?.status === 'cancelled' ? 'cancelled' : 'failed', content: '', taskRefs: [], approvalRefs: [], delegationRefs: [] };
     }
     const version = run.agentVersion;
     if (!version) throw new Error(`run ${runId} 无 agentVersion 快照`);
@@ -69,7 +69,9 @@ export class AsyncAgentRunDriver {
       history,
       agent: {
         id: run.agentId, systemPrompt: version.systemPrompt, modelId: version.modelId,
-        tools: (version.tools as string[]) ?? [], temperature: version.temperature,
+        // M7-P7：委派子 run 的权限子集快照（child ⊆ parent，服务端计算）；无则原版本清单
+        tools: ((metadata as { delegationTools?: string[] }).delegationTools ?? version.tools as string[]) ?? [],
+        temperature: version.temperature,
         maxTokens: version.maxTokens ?? undefined, maxSteps: cfg.maxSteps,
         requiresTools: cfg.requiresTools,
         versionId: version.id,
@@ -99,7 +101,8 @@ export class AsyncAgentRunDriver {
       // P4 waiting：run 仍存活（已落库 waiting+waitingOnTaskId），assistant Message 保持 streaming，无终态写
       const taskId = outcome.taskRefs[0];
       const approvalId = outcome.approvalRefs[0]; // M7-P1：审批等待（与任务等待互斥）
-      await this.events.publish(agentRunChannel(runId), { type: 'run.waiting', runId, taskId, approvalId }).catch(() => undefined);
+      const delegationId = outcome.delegationRefs[0]; // M7-P7：委派等待
+      await this.events.publish(agentRunChannel(runId), { type: 'run.waiting', runId, taskId, approvalId, delegationId }).catch(() => undefined);
     } else {
       await this.finalizeAssistantMessage(run, metadata.assistantMessageId, outcome);
     }

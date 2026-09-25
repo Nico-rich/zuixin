@@ -7,6 +7,7 @@ import { AgentRunMessagesService } from './agent-run-messages.service';
 import { AGENT_RUN_QUEUE } from '../../core/queue/queue.module';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { EventBusService, agentRunChannel } from '../../core/events/event-bus.service';
+import { DelegationService } from '../agent-delegation/delegation.service';
 import { CreateAgentRunDto } from './agent-runs.dto';
 
 const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled', 'timeout'] as const;
@@ -26,6 +27,7 @@ export class AgentRunsService {
     @Inject(AgentRunMessagesService) private readonly messages: AgentRunMessagesService,
     @InjectQueue(AGENT_RUN_QUEUE) private readonly agentRunQueue: Queue,
     @Inject(EventBusService) private readonly events: EventBusService,
+    @Inject(DelegationService) private readonly delegation: DelegationService,
   ) {}
 
   /** SSE 观察端点用：归属校验（userId 首条件，防枚举 404）+ 当前状态 */
@@ -156,6 +158,8 @@ export class AgentRunsService {
         data: { status: 'cancelled', cancelledAt: new Date() },
       }).catch(() => undefined);
     }
+    // M7-P7：委派级联取消（子及后代条件取消；已终态容忍）
+    await this.delegation.cancelChildren(runId).catch(() => undefined);
     // 快速通道：worker 收到提示立即 abort（heartbeat 15s 仍是 DB 事实兜底）
     await this.events.publish(AGENT_RUN_CANCEL_CHANNEL, { runId }).catch(() => undefined);
     // M6-P6 观察通道：SSE 订阅者实时看到取消终态（并收流）

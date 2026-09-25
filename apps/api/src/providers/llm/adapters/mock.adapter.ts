@@ -71,6 +71,9 @@ export class MockLLMAdapter implements LLMProvider {
     if (/发布|外部操作|publish/i.test(text) && has('external_action.demo')) {
       return { id: 'call_mock_external', name: 'external_action.demo', arguments: JSON.stringify({ title: text.slice(0, 40), content: text }) };
     }
+    if (/委派|交给.*处理|delegate/i.test(text) && has('agent.delegate')) {
+      return { id: 'call_mock_delegate', name: 'agent.delegate', arguments: JSON.stringify({ task: '请确认创意方向：黑金质感' }) };
+    }
     if (/记住|记下/i.test(text) && has('memory.create_candidate')) {
       return { id: 'call_mock_memory', name: 'memory.create_candidate', arguments: JSON.stringify({ content: text, category: 'preference', importance: 70, confidence: 0.9 }) };
     }

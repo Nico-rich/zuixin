@@ -41,6 +41,8 @@ function makePersistence() {
     enterWaitingApproval: vi.fn(async () => ({ count: 1 })),
     createApproval: vi.fn(async () => ({ id: 'approval-1' })),
     getApprovalForToolCall: vi.fn(async () => null),
+    enterWaitingDelegation: vi.fn(async () => ({ count: 1 })),
+    getDelegation: vi.fn(async () => null),
   };
   return { persistence, state };
 }
@@ -851,5 +853,73 @@ describe('AgentRuntimeEngine（M7-P1 Approval 审批门）', () => {
     const { outcome } = await run(engine, asyncInput({ resume: planTools() }, [approvalTool]));
     expect(outcome.status).toBe('completed');
     expect(approvalTool.execute).not.toHaveBeenCalled();
+  });
+});
+
+describe('AgentRuntimeEngine（M7-P7 Delegation 委派等待）', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  const delegateTool: Tool = {
+    name: 'agent.delegate', description: '委派', permission: 'write',
+    inputSchema: z.strictObject({ task: z.string().min(1) }),
+    execute: vi.fn().mockResolvedValue({ __waiting_delegation: true, delegationId: 'del-1', childRunId: 'child-1' }),
+  };
+
+  it('P7 委派等待：工具返回 waiting 标记 → enterWaitingDelegation → outcome waiting（delegationRefs + delegation.waiting 事件）', async () => {
+    const streamFn = vi.fn(async function* () {
+      yield { type: 'tool_calls', toolCalls: [{ id: 'c1', name: 'agent.delegate', arguments: '{"task":"x"}' }] };
+    });
+    const { engine, persistence, state } = makeEngine({ tools: [delegateTool], streamFn });
+    const { events, outcome } = await run(engine, asyncInput({}, [delegateTool]));
+    expect(outcome.status).toBe('waiting');
+    expect(outcome.delegationRefs).toEqual(['del-1']);
+    expect(persistence.enterWaitingDelegation).toHaveBeenCalledWith('run-existing', 'del-1', 'worker-A');
+    expect(events.some((e) => e.type === 'delegation.waiting')).toBe(true);
+    expect(state.finalize).toHaveLength(0); // waiting 无终态写
+    expect(state.messages.some((m) => m.role === 'tool')).toBe(false);
+  });
+
+  it('P7 委派 resume：子 run 已终态 → 工具返回结构化结果 → 回喂 LLM → completed（usage 单回合）', async () => {
+    // resume-tools 先执行已持久化决策（不调 LLM），随后的 LLM 回合直接给最终回答
+    const streamFn = vi.fn(async function* () {
+      yield { type: 'text', text: '收到子任务结果' };
+    });
+    delegateTool.execute = vi.fn().mockResolvedValue({ childRunId: 'child-1', status: 'completed', content: '子任务完成' });
+    const { engine, persistence, state } = makeEngine({ tools: [delegateTool], streamFn });
+    (persistence.findToolCall as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ id: 'tc-1', status: 'running', output: null })
+      .mockResolvedValue({ id: 'tc-1', status: 'completed', output: { childRunId: 'child-1', status: 'completed' } });
+    const plan = {
+      mode: 'tools' as const, startStep: 0,
+      pendingCalls: [{ llmCallId: 'c1', name: 'agent.delegate', arguments: '{"task":"x"}', toolIndex: 0 }],
+      lastToolSignature: null,
+    };
+    const { outcome } = await run(engine, asyncInput({ resume: plan }, [delegateTool]));
+    expect(outcome.status).toBe('completed');
+    expect(state.messages.some((m) => m.role === 'tool' && m.content.includes('子任务完成'))).toBe(true);
+    expect(state.usage).toHaveLength(1); // 被恢复回合不重记
+  });
+
+  it('P7 复用行刷新（实测修复）：completed 行内 waiting 标记 + 子已终态 → 刷新为结构化结果，绝不无限重入 waiting', async () => {
+    const streamFn = vi.fn(async function* () { yield { type: 'text', text: '完成' }; });
+    const { engine, persistence, state } = makeEngine({ tools: [delegateTool], streamFn });
+    // 首次执行后行即 completed（输出为 waiting 标记）——resume 走复用路径
+    (persistence.findToolCall as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'tc-1', status: 'completed', output: { __waiting_delegation: true, delegationId: 'del-1', childRunId: 'child-1' },
+    });
+    (persistence.getDelegation as ReturnType<typeof vi.fn>).mockResolvedValue({
+      childRunId: 'child-1', childStatus: 'completed', resultSummary: '子任务完成', errorCode: null,
+    });
+    const plan = {
+      mode: 'tools' as const, startStep: 0,
+      pendingCalls: [{ llmCallId: 'c1', name: 'agent.delegate', arguments: '{"task":"x"}', toolIndex: 0 }],
+      lastToolSignature: null,
+    };
+    const { outcome } = await run(engine, asyncInput({ resume: plan }, [delegateTool]));
+    expect(outcome.status).toBe('completed'); // 绝不 re-waiting
+    expect(state.messages.some((m) => m.role === 'tool' && m.content.includes('子任务完成'))).toBe(true);
+    expect(persistence.enterWaitingDelegation).not.toHaveBeenCalled();
+    // 行内输出被刷新为结构化结果（标记不再残留）
+    expect(state.toolCallUpdates.some((u) => u.id === 'tc-1' && !(u.data.output as { __waiting_delegation?: boolean })?.__waiting_delegation)).toBe(true);
   });
 });

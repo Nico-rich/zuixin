@@ -156,4 +156,22 @@ export class PrismaRuntimePersistence implements AgentRuntimePersistence {
     });
     return row ? { id: row.id, status: row.status } : null;
   }
+
+  async enterWaitingDelegation(runId: string, delegationId: string, workerId?: string): Promise<{ count: number }> {
+    // M7-P7：与 enterWaiting(task/approval) 同构——父 run 释放 lease 等待子 run 终态
+    return this.prisma.agentRun.updateMany({
+      where: { id: runId, status: 'running', ...(workerId ? { workerId } : {}) },
+      data: { status: 'waiting', waitingOnDelegationId: delegationId, workerId: null, leaseUntil: null, heartbeatAt: null },
+    });
+  }
+
+  async getDelegation(delegationId: string) {
+    const row = await this.prisma.agentDelegation.findUnique({
+      where: { id: delegationId },
+      select: { childRunId: true, status: true, resultSummary: true, errorCode: true },
+    });
+    return row
+      ? { childRunId: row.childRunId, childStatus: row.status, resultSummary: row.resultSummary, errorCode: row.errorCode }
+      : null;
+  }
 }

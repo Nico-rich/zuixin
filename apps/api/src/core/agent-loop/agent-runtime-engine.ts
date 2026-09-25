@@ -73,6 +73,8 @@ export interface AgentRunOutcome {
   taskRefs: string[];
   /** M7-P1：本次 run 进入 waiting 的审批引用（driver 发 run.waiting 事件用） */
   approvalRefs: string[];
+  /** M7-P7：本次 run 进入 waiting 的委派引用 */
+  delegationRefs: string[];
 }
 
 const DEFAULT_MAX_STEPS = 8;
@@ -156,6 +158,7 @@ export class AgentRuntimeEngine {
     let content = ctx.resume?.finalContent ?? '';
     const taskRefs: string[] = [];
     const approvalRefs: string[] = []; // M7-P1：approval waiting 引用
+    const delegationRefs: string[] = []; // M7-P7：delegation waiting 引用
     const isAsync = !!ctx.runId && !!ctx.workerId;
     /** 外部终态竞争（cancel/timeout 先落库）→ Engine 以 DB 为事实停止，不覆盖外部结果 */
     let externalTerminal: string | undefined;
@@ -170,7 +173,7 @@ export class AgentRuntimeEngine {
         const resumeResult = yield* this.executeToolList(
           ctx, runId, stepRow.id,
           ctx.resume.pendingCalls.map((c) => ({ id: c.llmCallId, name: c.name, arguments: c.arguments, toolIndex: c.toolIndex })),
-          isAsync, deadline, taskRefs, approvalRefs, messages,
+          isAsync, deadline, taskRefs, approvalRefs, delegationRefs, messages,
         );
         if (resumeResult.waiting) {
           finalStatus = 'waiting';
@@ -298,7 +301,7 @@ export class AgentRuntimeEngine {
         // B1 修复：assistant tool_calls 消息每回合 push 一次（非逐工具重复）
         messages.push({ role: 'assistant', content: '', tool_calls: toolCalls });
 
-        const toolListResult = yield* this.executeToolList(ctx, runId, stepRow.id, toolCalls, isAsync, deadline, taskRefs, approvalRefs, messages);
+        const toolListResult = yield* this.executeToolList(ctx, runId, stepRow.id, toolCalls, isAsync, deadline, taskRefs, approvalRefs, delegationRefs, messages);
         if (toolListResult.stop) {
           if (toolListResult.waiting) {
             finalStatus = 'waiting'; // enterWaiting 已落库（waiting 不占用 Worker）
@@ -368,6 +371,7 @@ export class AgentRuntimeEngine {
       errorMessage: errorCode ? this.messageFor(errorCode) : undefined,
       taskRefs,
       approvalRefs,
+      delegationRefs,
     };
   }
 
@@ -401,9 +405,11 @@ export class AgentRuntimeEngine {
 
     // 幂等查重：同一 (runStepId, idempotencyKey) 已完成 → 复用输出，不重复执行。
     // P4-4 resume：生成类工具的 completed 行刷新任务终态结果（任务结果 = 工具事实，行内 output 保持真实）。
+    // M7-P7：委派工具的 completed 行刷新子 run 终态结果（waiting 标记绝不作为结果回喂——否则无限重入 waiting）。
     const existing = await this.persistence.findToolCall(stepId, idempotencyKey);
     if (existing?.status === 'completed' && existing.output != null) {
-      const refreshed = await this.refreshGenerationOutput(call.name, existing.output, existing.id);
+      const refreshed = await this.refreshGenerationOutput(call.name, existing.output, existing.id)
+        ?? await this.refreshDelegationOutput(call.name, existing.output, existing.id);
       if (refreshed) {
         return { status: 'completed', output: refreshed, outputSummary: this.summarize(call.name, refreshed) };
       }
@@ -442,7 +448,8 @@ export class AgentRuntimeEngine {
       if ((err as { code?: string }).code === 'P2002') {
         const existingRow = await this.persistence.findToolCall(stepId, idempotencyKey);
         if (existingRow?.status === 'completed' && existingRow.output != null) {
-          const refreshed = await this.refreshGenerationOutput(call.name, existingRow.output, existingRow.id);
+          const refreshed = await this.refreshGenerationOutput(call.name, existingRow.output, existingRow.id)
+            ?? await this.refreshDelegationOutput(call.name, existingRow.output, existingRow.id);
           if (refreshed) {
             return { status: 'completed', output: refreshed, outputSummary: this.summarize(call.name, refreshed) };
           }
@@ -619,7 +626,7 @@ export class AgentRuntimeEngine {
   private async *executeToolList(
     ctx: AgentRuntimeContext, runId: string, stepRowId: string,
     calls: Array<{ id: string; name: string; arguments: string; toolIndex?: number }>,
-    isAsync: boolean, deadline: number, taskRefs: string[], approvalRefs: string[], messages: ChatMessage[],
+    isAsync: boolean, deadline: number, taskRefs: string[], approvalRefs: string[], delegationRefs: string[], messages: ChatMessage[],
   ): AsyncGenerator<AgentEvent, { stop: boolean; waiting?: boolean; external?: string }, void> {
     for (const [index, call] of calls.entries()) {
       if (ctx.signal.aborted) return { stop: true };
@@ -634,6 +641,18 @@ export class AgentRuntimeEngine {
         approvalRefs.push(result.approvalWaiting.approvalId);
         yield { type: 'approval.requested', approvalId: result.approvalWaiting.approvalId, runId, toolName: call.name };
         return { stop: true, waiting: true };
+      }
+      // M7-P7 delegation waiting：父 run 等待子 run 终态（条件更新 + 释放 worker）
+      const delegationMarker = (result.output as { __waiting_delegation?: boolean; delegationId?: string; childRunId?: string } | undefined);
+      if (result.status === 'completed' && delegationMarker?.__waiting_delegation && delegationMarker.delegationId) {
+        const entered = await this.persistence.enterWaitingDelegation(runId, delegationMarker.delegationId, ctx.workerId);
+        if (entered.count > 0) {
+          delegationRefs.push(delegationMarker.delegationId);
+          yield { type: 'delegation.waiting', delegationId: delegationMarker.delegationId, runId, childRunId: delegationMarker.childRunId ?? '' };
+          return { stop: true, waiting: true };
+        }
+        // 外部终态竞争 → 以 DB 为事实停止
+        return { stop: true, external: (await this.persistence.getRunStatus(runId))?.status };
       }
       // P4-5 waiting：异步 run + 生成任务未终态 → running→waiting + waitingOnTaskId + 释放 worker
       const decision = await this.resolveGenerationTask(ctx, runId, call.name, result, isAsync);
@@ -693,6 +712,27 @@ export class AgentRuntimeEngine {
     if (entered.count > 0) return { action: 'waiting', waitingTaskId: taskId };
     const run = await this.persistence.getRunStatus(runId);
     return { action: 'terminated', status: run?.status };
+  }
+
+  /**
+   * M7-P7 委派工具 completed 行的输出刷新：
+   * 行内 output 为 waiting 标记（首次执行即落库）——resume 复用行时若子 run 已终态，
+   * 用结构化子结果替换标记（绝不把 waiting 标记作为结果回喂，否则 delegation 分支无限重入 waiting）；
+   * 子 run 未终态 → 返回 null（标记保留，delegation 分支重新进入 waiting——崩溃窗口收敛）。
+   */
+  private async refreshDelegationOutput(toolName: string, output: unknown, toolCallRowId: string): Promise<unknown | null> {
+    if (toolName !== 'agent.delegate') return null;
+    const o = output as { __waiting_delegation?: boolean; delegationId?: string } | undefined;
+    if (!o?.__waiting_delegation || !o.delegationId) return null;
+    const delegation = await this.persistence.getDelegation(o.delegationId);
+    if (!delegation || !['completed', 'failed', 'cancelled', 'timeout'].includes(delegation.childStatus)) return null;
+    const refreshed = {
+      childRunId: delegation.childRunId, status: delegation.childStatus,
+      content: delegation.resultSummary ?? '', errorCode: delegation.errorCode ?? undefined,
+      delegationId: o.delegationId,
+    };
+    await this.persistence.updateToolCall(toolCallRowId, { output: refreshed }).catch(() => undefined);
+    return refreshed;
   }
 
   /** 生成工具 completed 行的输出刷新（P4-4：resume 时任务结果 = 工具事实；同步更新行内 output）。无刷新 → null */

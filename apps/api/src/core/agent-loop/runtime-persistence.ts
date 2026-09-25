@@ -51,6 +51,12 @@ export interface AgentRuntimePersistence {
   enterWaiting(runId: string, taskId: string, workerId?: string): Promise<{ count: number }>;
   /** M7-P1：进入 approval waiting（running+workerId → waiting + waitingOnApprovalId，释放 lease；count=0 = 外部终态竞争） */
   enterWaitingApproval(runId: string, approvalId: string, workerId?: string): Promise<{ count: number }>;
+  /** M7-P7：进入 delegation waiting（父 run 等待子 run 终态；条件更新同构） */
+  enterWaitingDelegation(runId: string, delegationId: string, workerId?: string): Promise<{ count: number }>;
+  /** M7-P7：读委派事实（resume 复用行刷新：子终态 → 结构化结果替换 waiting 标记） */
+  getDelegation(delegationId: string): Promise<{
+    childRunId: string; childStatus: string; resultSummary: string | null; errorCode: string | null;
+  } | null>;
   /** M7-P1：创建 Approval（requested；身份全部服务端注入） */
   createApproval(data: {
     userId: string; projectId?: string; agentRunId?: string; toolCallId?: string;

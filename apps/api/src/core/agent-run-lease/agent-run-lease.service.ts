@@ -119,7 +119,7 @@ export class AgentRunLeaseService {
     const deadlineMs = await this.runDeadlineMs();
     const rows = await this.prisma.agentRun.findMany({
       where: { status: { in: ['queued', 'running', 'waiting'] } },
-      select: { id: true, status: true, startedAt: true, workerId: true, leaseUntil: true, waitingOnTaskId: true, waitingOnApprovalId: true },
+      select: { id: true, status: true, startedAt: true, workerId: true, leaseUntil: true, waitingOnTaskId: true, waitingOnApprovalId: true, waitingOnDelegationId: true },
     });
     let reEnqueued = 0;
     let timedOut = 0;
@@ -214,6 +214,35 @@ export class AgentRunLeaseService {
             );
             reEnqueued++;
             this.logger.warn({ runId: row.id, approvalId }, 'waiting 且审批已终态/过期（hook 丢失）→ 兜底唤醒');
+          }
+        }
+        continue;
+      }
+      if (row.status === 'waiting' && row.waitingOnDelegationId) {
+        // M7-P7 委派等待兜底：子 run 已终态（唤醒事件丢失）→ 唤醒父 run
+        const delegation = await this.prisma.agentDelegation.findUnique({
+          where: { id: row.waitingOnDelegationId }, select: { childRunId: true, status: true },
+        });
+        const child = delegation
+          ? await this.prisma.agentRun.findUnique({ where: { id: delegation.childRunId }, select: { status: true } })
+          : null;
+        if (child && ['completed', 'failed', 'cancelled', 'timeout'].includes(child.status)) {
+          const woken = await this.prisma.agentRun.updateMany({
+            where: { id: row.id, status: 'waiting', waitingOnDelegationId: row.waitingOnDelegationId },
+            data: { status: 'queued', waitingOnDelegationId: null, workerId: null, leaseUntil: null, heartbeatAt: null },
+          });
+          if (woken.count > 0) {
+            await this.agentRunQueue.add(
+              'execute',
+              { runId: row.id },
+              {
+                jobId: `run-${row.id}-recover-${now.getTime()}`,
+                attempts: 2, backoff: { type: 'exponential', delay: 2000 },
+                removeOnComplete: true, removeOnFail: { count: 500 },
+              },
+            );
+            reEnqueued++;
+            this.logger.warn({ runId: row.id, delegationId: row.waitingOnDelegationId }, 'waiting 且子 run 已终态（唤醒丢失）→ 兜底唤醒');
           }
         }
         continue;

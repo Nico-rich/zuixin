@@ -304,4 +304,33 @@ Workflow 列表 / 详情（版本 + 发布/归档 + 手动触发 + webhook 凭�
 5. CSRF 中间件豁免 `/hooks/` 路径（公开 webhook 端点无 Cookie/X-Requested-With，鉴权 = HMAC + timestamp + eventId）；main.ts 注册 hooks 路径 raw-body 中间件（验签需要原始字节）。
 6. 工作流工具步骤仅允许 `permission='read'` 工具——写副作用必须走 agent 步骤（ToolCall 追溯体系），保持"Tool 有追溯、Workflow 无旁路"边界。
 
+## 7. M7-P7 Multi-Agent / Delegation（✅ 2026-09-25 完成）
+
+### 7.1 数据模型与约束
+
+- `AgentRun` 增加 parentRunId/delegatedByRunId/depth（root=0）/waitingOnDelegationId（自关系 DelegationParent）；
+- `AgentDelegation`：parentRunId/delegatedByRunId/childRunId(unique)/agentId/task/idempotencyKey(unique)/status/depth/resultSummary/errorCode。
+- 上限（limits.delegationMaxDepth=3 / delegationMaxChildren=5，system_settings 可覆盖）；
+- **环检测**：目标 Agent 不得出现在血缘链（A→A、A→B→A、A→B→C→A 全阻断，上限 10 层防异常环）；
+- **权限继承**：child tools = childVersion.tools ∩ parentTools（⊆ 保证）；执行快照入 run.metadata.delegationTools，driver 优先读取（引擎 allowlist 二次强制）；
+- **级联取消**：父 cancelled → 子及后代条件取消（visited 防环；已终态容忍）。
+
+### 7.2 执行链（复用 M6 waiting + 唤醒原语集）
+
+```
+父 Agent → agent.delegate 工具 → DelegationService（深度/子数/环/权限子集）
+→ 子 run（血缘+depth+权限快照，transcript 种子）→ 父 enterWaitingDelegation（waiting + 释放 lease）
+→ 子终态（EventBus 订阅 + recoverStale 兜底双通道）→ 父 waiting→queued + 唯一 jobId
+→ resume：结构化子结果（childRunId/status/content≤2000/errorCode——绝不含内部推理）回喂父 LLM
+```
+
+### 7.3 实测修复（重要）
+
+- **waiting 标记残留 → 无限重入 waiting**：ToolCall 行首次执行即 completed（输出 = waiting 标记对象）；
+  resume 复用行时若原样回喂，delegation 分支再次 enterWaitingDelegation → 父 run 永久 waiting。
+  修复：`refreshDelegationOutput`（复用路径 + P2002 路径）——子已终态 → 结构化结果替换行内标记；
+  子未终态 → 标记保留（崩溃窗口重入 waiting 收敛）。与 P4 `refreshGenerationOutput` 同构。
+- **身份/权限从 DB 解析**：DelegateInput 不携带 parentTools/parentAgentId（调用方不可信）——服务层从父 run 行 + agentVersion 解析（M6 红线延续）。
+- AgentRun 自关系生成递归类型 → TS 推断自引用（TS7022），血缘查询显式类型标注。
+
 **✅ 续接点（2026-09-25）**：① `prisma migrate dev` 应用未迁移的 schema 增量（Approval.workflowRunId + WorkflowWebhook.secretEncrypted，当前仅磁盘编辑）；② 按 §6 实现 worker/workflow + modules/workflows + queue 注册 + Approval.decide 经 EventBus 唤醒 workflow + 部分唯一索引 + web UI + 测试。详见 memory m7-progress。
