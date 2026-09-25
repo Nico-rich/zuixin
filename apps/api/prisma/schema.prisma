@@ -1183,6 +1183,7 @@ model WorkflowRun {
   heartbeatAt        DateTime?
   waitingOnApprovalId String?
   waitingOnAgentRunId String? // agent 步骤的子 AgentRun 终态唤醒
+  approvals           Approval[]
   startedAt          DateTime          @default(now())
   completedAt        DateTime?
   createdAt          DateTime          @default(now())

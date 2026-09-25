@@ -266,7 +266,7 @@ Commerce Data → commerce.analysis.generate（facts/derived/anomalies 服务端
 - 单测 4：规则异常（双源）/分层标注/证据快照/Artifact 镜像/非法类型。
 - e2e 3：分析（营收-14%/访问-25%/ROAS-37.5% 三异常 + DB 分层断言）→ 简报（自动关联证据 + 镜像制品）→ 闭环（简报方向进入既有 Image Agent 管线，waiting→resume 全复用）。
 
-## 6. M7-P6 Workflow Engine（⏳ 施工中——2026-09-24 下班暂停，续接点见 §6.1 末尾）
+## 6. M7-P6 Workflow Engine（✅ 2026-09-25 完成）
 
 ### 6.1 数据模型与状态机
 
@@ -293,6 +293,15 @@ POST /hooks/workflows/:token（公开端点：HMAC 签名 + timestamp ±5min + e
 
 ### 6.3 最小 UI（apps/web）
 
-Workflow 列表 / 详情（版本）/ Run 列表 / Run Timeline（不做 React Flow IDE）。
+Workflow 列表 / 详情（版本 + 发布/归档 + 手动触发 + webhook 凭据一次展示）/ Run 列表 / Run Timeline（不做 React Flow IDE）。
 
-**⏳ 续接点（2026-09-25）**：① `prisma migrate dev` 应用未迁移的 schema 增量（Approval.workflowRunId + WorkflowWebhook.secretEncrypted，当前仅磁盘编辑）；② 按 §6 实现 worker/workflow + modules/workflows + queue 注册 + Approval.decide 经 EventBus 唤醒 workflow + 部分唯一索引 + web UI + 测试。详见 memory m7-progress。
+### 6.4 实施差异与实测修复
+
+1. **通道常量下沉 core 层**（`core/events/workflow-channels.ts`）：初版 workflow-runs.service 从 worker/workflow.processor 导入 WORKFLOW_CANCEL_CHANNEL，形成 modules↔worker 模块循环 → Nest DI 解析失败（UndefinedDependencyException）。常量一律 core 层定义。
+2. **webhook secret 存储 = AES-GCM 密文**（非摘要）：HMAC 校验需要还原密钥，纯 hash 不可行——与 §0 凭证原则一致（at rest 加密，校验时服务端解密 + timingSafeEqual）。
+3. **retry 的 attempt 由 createRun 透传**（部分唯一索引仅约束 attempt=1，retry 用带后缀幂等键）。
+4. **步骤行按需创建**（执行时才 upsert）——未执行到的步骤无行；断言"绝不执行"= 行不存在 + 副作用表零行。
+5. CSRF 中间件豁免 `/hooks/` 路径（公开 webhook 端点无 Cookie/X-Requested-With，鉴权 = HMAC + timestamp + eventId）；main.ts 注册 hooks 路径 raw-body 中间件（验签需要原始字节）。
+6. 工作流工具步骤仅允许 `permission='read'` 工具——写副作用必须走 agent 步骤（ToolCall 追溯体系），保持"Tool 有追溯、Workflow 无旁路"边界。
+
+**✅ 续接点（2026-09-25）**：① `prisma migrate dev` 应用未迁移的 schema 增量（Approval.workflowRunId + WorkflowWebhook.secretEncrypted，当前仅磁盘编辑）；② 按 §6 实现 worker/workflow + modules/workflows + queue 注册 + Approval.decide 经 EventBus 唤醒 workflow + 部分唯一索引 + web UI + 测试。详见 memory m7-progress。

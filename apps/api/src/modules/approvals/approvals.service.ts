@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { AgentRunResumeTrigger } from '../../core/agent-run-resume/agent-run-resume-trigger.service';
 import { EventBusService, agentRunChannel } from '../../core/events/event-bus.service';
+import { WORKFLOW_APPROVAL_DECIDED_CHANNEL } from '../../core/events/workflow-channels';
 
 const DECIDED = ['approved', 'rejected', 'expired', 'cancelled'] as const;
 
@@ -115,6 +116,11 @@ export class ApprovalsService {
       await this.events.publish(agentRunChannel(a.agentRunId), { type: 'approval.decided', approvalId: id, runId: a.agentRunId, status: target })
         .catch(() => undefined);
       await this.resume.wakeWaitingRunByApproval(a.agentRunId, id);
+    }
+    // M7-P6：workflow 审批步骤 → 全局通道唤醒（Worker 侧 WorkflowWakeService 订阅；recoverStale 兜底）
+    if (a.workflowRunId) {
+      await this.events.publish(WORKFLOW_APPROVAL_DECIDED_CHANNEL, { approvalId: id, workflowRunId: a.workflowRunId, status: target })
+        .catch(() => undefined);
     }
     this.logger.log({ id, target }, 'Approval 已决断');
     return this.prisma.approval.findFirst({ where: { id, userId } });

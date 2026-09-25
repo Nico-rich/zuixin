@@ -12,6 +12,7 @@ import { ImageWorkerModule } from './worker/image/image-worker.module';
 import { MediaCleanupWorkerModule } from './worker/media-cleanup/media-cleanup-worker.module';
 import { VideoWorkerModule } from './worker/video/video-worker.module';
 import { AgentRunWorkerModule } from './worker/agent-run/agent-run-worker.module';
+import { WorkflowWorkerModule } from './worker/workflow/workflow-worker.module';
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { AgentRunWorkerModule } from './worker/agent-run/agent-run-worker.module
     VideoWorkerModule,
     MediaCleanupWorkerModule,
     AgentRunWorkerModule,
+    WorkflowWorkerModule,
   ],
 })
 export class WorkerModule {}

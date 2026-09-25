@@ -46,6 +46,10 @@ export class GlobalExceptionFilter implements ExceptionFilter {
       case 'APPROVAL_NOT_PENDING': case 'APPROVAL_EXPIRED': return HttpStatus.CONFLICT; // M7-P1：审批已决/已过期
       case 'CONNECTION_NOT_REFRESHABLE': case 'CONNECTION_REVOKED': return HttpStatus.CONFLICT; // M7-P2
       case 'CONNECTION_NOT_ACTIVE': return HttpStatus.CONFLICT; // M7-P3
+      case 'WORKFLOW_NOT_PUBLISHED': return HttpStatus.CONFLICT; // M7-P6
+      case 'WORKFLOW_RUN_NOT_CANCELLABLE': case 'WORKFLOW_RUN_NOT_RETRYABLE': return HttpStatus.CONFLICT; // M7-P6
+      case 'WEBHOOK_REPLAY': return HttpStatus.CONFLICT; // M7-P6
+      case 'WEBHOOK_SIGNATURE_INVALID': return HttpStatus.UNAUTHORIZED; // M7-P6
       case 'OAUTH_STATE_INVALID': case 'OAUTH_STATE_EXPIRED': return HttpStatus.BAD_REQUEST; // M7-P2
       case 'PROVIDER_UNSUPPORTED': return HttpStatus.NOT_FOUND; // M7-P2
       case 'UNSUPPORTED_PARAMETER': return HttpStatus.BAD_REQUEST;

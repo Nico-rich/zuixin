@@ -3,6 +3,7 @@ import { NestFactory } from '@nestjs/core';
 import { Logger } from 'nestjs-pino';
 import helmet from 'helmet';
 import cookieParser from 'cookie-parser';
+import express from 'express';
 import { AppModule } from './app.module';
 import { GlobalExceptionFilter } from './common/filters/global-exception.filter';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
@@ -17,6 +18,8 @@ async function bootstrap() {
     credentials: true,
   });
   app.use(cookieParser());
+  // M7-P6：webhook 端点需要原始字节做 HMAC 验签（先于 JSON parser 注册）
+  app.use('/api/v1/hooks', express.raw({ type: '*/*', limit: '1mb' }));
   app.use('/api/v1', csrfProtection);
   app.setGlobalPrefix('api/v1');
   app.useGlobalFilters(app.get(GlobalExceptionFilter));
