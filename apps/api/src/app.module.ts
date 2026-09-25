@@ -37,6 +37,7 @@ import { GenerationsModule } from './modules/generations/generations.module';
 import { TasksModule } from './modules/tasks/tasks.module';
 import { ChatModule } from './modules/chat/chat.module';
 import { UsageApiModule } from './modules/usage/usage-api.module';
+import { ProviderRoutingApiModule } from './modules/provider-routing/provider-routing-api.module';
 import { GlobalExceptionFilter } from './common/filters/global-exception.filter';
 
 @Module({
@@ -89,6 +90,7 @@ import { GlobalExceptionFilter } from './common/filters/global-exception.filter'
     TasksModule,
     ChatModule,
     UsageApiModule,
+    ProviderRoutingApiModule,
     HealthModule,
   ],
   providers: [GlobalExceptionFilter],
