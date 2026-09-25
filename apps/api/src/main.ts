@@ -9,6 +9,7 @@ import { GlobalExceptionFilter } from './common/filters/global-exception.filter'
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
 import { csrfProtection } from './modules/auth/csrf.middleware';
 import { TracingMiddleware } from './core/tracing/tracing.middleware';
+import { registerGracefulShutdown } from './lifecycle/graceful-shutdown';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bufferLogs: true });
@@ -29,5 +30,6 @@ async function bootstrap() {
   const port = Number(process.env.API_PORT ?? 3001);
   await app.listen(port);
   console.log(`API 已启动: http://localhost:${port}/api/v1/health`);
+  registerGracefulShutdown(app); // M8-P9 优雅停机：SIGTERM/SIGINT → 停收新请求 → 等在途收尾 → 30s 兜底强退
 }
 bootstrap();
