@@ -52,6 +52,7 @@ export class GlobalExceptionFilter implements ExceptionFilter {
       case 'WEBHOOK_SIGNATURE_INVALID': return HttpStatus.UNAUTHORIZED; // M7-P6
       case 'OAUTH_STATE_INVALID': case 'OAUTH_STATE_EXPIRED': return HttpStatus.BAD_REQUEST; // M7-P2
       case 'PROVIDER_UNSUPPORTED': return HttpStatus.NOT_FOUND; // M7-P2
+      case 'PROVIDER_UNAVAILABLE': return HttpStatus.SERVICE_UNAVAILABLE; // M8-P7：无可用 provider（服务端裁决，非客户端错误）
       case 'UNSUPPORTED_PARAMETER': return HttpStatus.BAD_REQUEST;
       default: return HttpStatus.BAD_GATEWAY; // provider 类错误
     }
