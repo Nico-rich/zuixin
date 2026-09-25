@@ -13,7 +13,8 @@ export class DashScopeVideoAdapter implements VideoProvider {
   private readonly fetchFn: FetchFn;
 
   constructor(private readonly cfg: DashScopeVideoConfig, injected?: { fetch?: FetchFn }) {
-    this.fetchFn = injected?.fetch ?? ((url, init) => fetch(url, init));
+    // Pre-M9 F3-B：redirect: 'manual' —— 3xx 不自动跟随
+    this.fetchFn = injected?.fetch ?? ((url, init) => fetch(url, { ...(init as object), redirect: 'manual' } as never));
   }
 
   async submit(params: VideoGenerationParams): Promise<{ remoteTaskId: string }> {

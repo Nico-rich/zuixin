@@ -13,6 +13,8 @@ import { IMAGE_QUEUE, VIDEO_QUEUE } from '../../core/queue/queue.module';
 import { MediaExecutor, MediaExecResult } from './media-types';
 import { AgentRunResumeTrigger } from '../../core/agent-run-resume/agent-run-resume-trigger.service';
 import { QuotaService } from '../billing/quota.service';
+import { SafeRemoteFetcher } from '../security/safe-remote-fetcher.service';
+import { normalizeHostname } from '../security/ssrf-guard';
 
 export interface PrepareMediaInput {
   userId: string;
@@ -53,6 +55,8 @@ export class MediaGenerationService {
     @Inject('MEDIA_EXECUTORS') private readonly executors: Map<string, MediaExecutor>,
     @Inject(AgentRunResumeTrigger) private readonly resume: AgentRunResumeTrigger,
     @Inject(QuotaService) private readonly quota: QuotaService,
+    // Pre-M9 F3-A：结果下载唯一出口（逐跳 SSRF/白名单/超时/大小上限）；默认值仅为非 DI 上下文（单测）可用
+    @Inject(SafeRemoteFetcher) private readonly fetcher: SafeRemoteFetcher = new SafeRemoteFetcher(),
   ) {}
 
   /** 便捷入口：图片任务（M2 API 兼容） */
@@ -213,8 +217,10 @@ export class MediaGenerationService {
     const attachments = [];
     const defaultMime = task.type === 'video' ? 'video/mp4' : 'image/png';
     const ext = task.type === 'video' ? '.mp4' : '.png';
+    // Pre-M9 F3-A：仅当全部文件都通过安全取回器后才落 Attachment（绝不让任意 URL 变成可信附件）
+    const allowedHosts = await this.downloadAllowedHosts(result.providerId);
     for (const file of result.files) {
-      const buffer = await this.download(file.url);
+      const buffer = await this.download(file.url, task.id, allowedHosts);
       const mimeType = file.mimeType ?? defaultMime;
       const now = new Date();
       const storageKey = `${task.userId}/${now.getFullYear()}/${String(now.getMonth() + 1).padStart(2, '0')}/${randomUUID()}${ext}`;
@@ -237,17 +243,39 @@ export class MediaGenerationService {
     return attachments;
   }
 
-  private async download(url: string): Promise<Buffer> {
-    if (url.startsWith('data:')) return Buffer.from(url.split(',')[1], 'base64');
+  /**
+   * Pre-M9 F3-A：结果下载唯一出口 —— 一律经 SafeRemoteFetcher（逐跳 SSRF 校验 + 域名白名单 + 超时 + 大小上限）。
+   * 此前直接用 `fetch(url)` 会自动跟随 3xx 且无任何校验（可被导向内网/metadata），下载结果随后被写成可信 Attachment。
+   */
+  private async download(url: string, taskId: string, allowedHosts: string[]): Promise<Buffer> {
     for (let attempt = 1; attempt <= MAX_DOWNLOAD_ATTEMPTS; attempt++) {
       try {
-        const res = await fetch(url);
-        if (!res.ok) throw new Error(`下载失败: ${res.status}`);
-        return Buffer.from(await res.arrayBuffer());
+        const { buffer } = await this.fetcher.fetchBuffer(url, { allowedHosts, purpose: `media-download:${taskId}` });
+        return buffer;
       } catch (err) {
-        if (attempt === MAX_DOWNLOAD_ATTEMPTS) throw new AppError(ErrorCode.PROVIDER_UNKNOWN, `结果下载失败: ${(err as Error).message}`);
+        const code = err instanceof AppError ? err.code : ErrorCode.PROVIDER_UNKNOWN;
+        // 安全策略类失败绝不重试（重试不会变安全），且必须保留明确错误码向上归因（SSRF_BLOCKED）
+        if (code === ErrorCode.SSRF_BLOCKED || code === ErrorCode.VALIDATION_ERROR) throw err;
+        if (attempt === MAX_DOWNLOAD_ATTEMPTS) throw err;
+        this.logger.warn({ taskId, code, attempt }, `结果下载失败，将重试: ${(err as Error).message}`);
       }
     }
     throw new AppError(ErrorCode.PROVIDER_UNKNOWN, '结果下载失败');
+  }
+
+  /** 下载域名白名单 = 环境配置（MEDIA_DOWNLOAD_ALLOWED_HOSTS）∪ 结果 provider 的 baseUrl 主机 */
+  private async downloadAllowedHosts(providerId?: string | null): Promise<string[]> {
+    const envHosts = SafeRemoteFetcher.envAllowedHosts();
+    if (!providerId) return envHosts;
+    const provider = await this.prisma.provider
+      .findUnique({ where: { id: providerId }, select: { baseUrl: true } })
+      .catch(() => null);
+    const baseUrl = provider?.baseUrl;
+    if (!baseUrl) return envHosts;
+    try {
+      return [...envHosts, normalizeHostname(new URL(baseUrl).hostname)];
+    } catch {
+      return envHosts; // baseUrl 非法 → 只用环境白名单（SSRF 防线仍然逐跳生效）
+    }
   }
 }

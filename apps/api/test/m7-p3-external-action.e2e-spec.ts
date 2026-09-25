@@ -10,6 +10,7 @@ import { GlobalExceptionFilter } from '../src/common/filters/global-exception.fi
 import { TransformInterceptor } from '../src/common/interceptors/transform.interceptor';
 import { csrfProtection } from '../src/modules/auth/csrf.middleware';
 import { PrismaService } from '../src/modules/prisma/prisma.service';
+import { bindPayload } from '../src/modules/approvals/approval-binding';
 
 const XRW = { 'X-Requested-With': 'XMLHttpRequest' };
 
@@ -109,7 +110,7 @@ describe('M7-P3 External Action (e2e, 真实 Queue + Worker + mock provider)', (
   });
 
   /** 崩溃现场：transcript 已含 assistant(tool_calls) + waiting_approval ToolCall 行 + approved Approval（resume 直通执行） */
-  async function fabricateRun(actionType: string, extraArgs: Record<string, unknown> = {}): Promise<{ runId: string; idempotencyKey: string }> {
+  async function fabricateRun(actionType: string, extraArgs: Record<string, unknown> = {}, tamper = false): Promise<{ runId: string; idempotencyKey: string }> {
     const run = await prisma.agentRun.create({
       data: { userId, agentId: demoAgentId, agentVersionId: demoVersionId, status: 'queued', startedAt: new Date(), maxSteps: 8, metadata: {} },
     });
@@ -129,7 +130,14 @@ describe('M7-P3 External Action (e2e, 真实 Queue + Worker + mock provider)', (
       data: { runStepId: step.id, toolName: 'external_action.execute', idempotencyKey, input: JSON.parse(callArgs) as never, status: 'waiting_approval' },
     });
     await prisma.approval.create({
-      data: { userId, agentRunId: run.id, toolCallId: toolCall.id, status: 'approved', riskLevel: 'high', reason: '测试', approvedAt: new Date() },
+      data: {
+        userId, agentRunId: run.id, toolCallId: toolCall.id, status: 'approved', riskLevel: 'high', reason: '测试', approvedAt: new Date(),
+        // Pre-M9 Approval Binding：引擎审批门落库时按 (工具名, 工具入参) 绑定 —— 崩溃现场必须与生产同形，
+        // 否则执行链会（正确地）以 APPROVAL_BINDING_MISMATCH 拒绝执行。tamper=true 模拟"审批被绑定到别的动作"。
+        payload: (tamper
+          ? bindPayload({ toolName: 'external_action.execute', input: { actionType, payload: { title: '别的载荷' } } }, 'external_action.execute', { actionType, payload: { title: '别的载荷' } })
+          : bindPayload({ toolName: 'external_action.execute', input: JSON.parse(callArgs) }, 'external_action.execute', JSON.parse(callArgs))) as never,
+      },
     });
     return { runId: run.id, idempotencyKey };
   }
@@ -189,6 +197,18 @@ describe('M7-P3 External Action (e2e, 真实 Queue + Worker + mock provider)', (
     await request(app.getHttpServer()).post(`/api/v1/approvals/${approval!.id}/reject`).set(XRW).set('Cookie', cookie).expect(201);
     expect(await waitForStatus(prisma, runId, ['completed', 'failed'], 30_000)).toBe('completed');
     expect(await prisma.externalAction.count({ where: { agentRunId: runId } })).toBe(0);
+  });
+
+  it('Pre-M9 Binding：审批绑定到别的动作（批准 A、执行 B）→ 拒绝执行 + 零 ExternalAction 行', async () => {
+    const { runId } = await fabricateRun('success', {}, true); // tamper：审批的 __binding 绑定的是另一个载荷
+    await enqueue(runId);
+    expect(await waitForStatus(prisma, runId, ['completed', 'failed'], 30_000)).toBe('completed');
+    // 零副作用：绝无 ExternalAction 行（既未创建也未执行）
+    expect(await prisma.externalAction.count({ where: { agentRunId: runId } })).toBe(0);
+    // 失败事实回喂：ToolCall 行 failed(APPROVAL_BINDING_MISMATCH)
+    const toolRow = await prisma.toolCall.findFirst({ where: { runStep: { runId } } });
+    expect(toolRow?.status).toBe('failed');
+    expect(toolRow?.errorCode).toBe('APPROVAL_BINDING_MISMATCH');
   });
 
   it('P3 failure 向量：resume 直通执行 → Adapter 失败 → 行 failed(PROVIDER_UNKNOWN) → 失败回喂 LLM（run 不直接 failed）', async () => {

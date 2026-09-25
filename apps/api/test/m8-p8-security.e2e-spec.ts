@@ -471,6 +471,13 @@ describe('M8-P8 Enterprise Security (e2e, 真实基础设施)', () => {
   // ─────────────────────────── ⑤ Webhook ───────────────────────────
 
   describe('⑤ Webhook Hardening', () => {
+    /** Pre-M9：签名串 = timestamp + eventId + rawBody（顺序固定；未覆盖这两个头则可在窗口内无限重放） */
+    const hookSign = (timestamp: string, eventId: string, body: string) =>
+      createHmac('sha256', webhook!.secret!).update(`${timestamp}${eventId}`).update(body).digest('hex');
+    const hookHeaders = (signature: string, timestamp: string, eventId: string) => ({
+      'X-Hook-Signature': signature, 'X-Hook-Timestamp': timestamp, 'X-Hook-Event-Id': eventId,
+    });
+
     it('超大载荷（> 1MB）→ 413 统一 JSON 信封，且不进入验签/业务逻辑', async () => {
       expect(webhook?.token).toBeTruthy();
       const res = await request(app.getHttpServer()).post(`/api/v1/hooks/workflows/${webhook!.token}`)
@@ -486,34 +493,66 @@ describe('M8-P8 Enterprise Security (e2e, 真实基础设施)', () => {
       let nested: Record<string, unknown> = { leaf: 1 };
       for (let i = 0; i < 60; i++) nested = { a: nested };
       const body = JSON.stringify(nested);
+      const deepTs = String(Date.now());
       const res = await request(app.getHttpServer()).post(`/api/v1/hooks/workflows/${webhook!.token}`)
         .set('Content-Type', 'application/json')
-        .set({
-          'X-Hook-Signature': createHmac('sha256', webhook!.secret!).update(body).digest('hex'),
-          'X-Hook-Timestamp': String(Date.now()),
-          'X-Hook-Event-Id': `m8p8-deep-${STAMP}`,
-        })
+        .set(hookHeaders(hookSign(deepTs, `m8p8-deep-${STAMP}`, body), deepTs, `m8p8-deep-${STAMP}`))
         .send(body);
       expect(res.status).toBe(400);
       expect(res.body.error.message).toContain('webhook 载荷被拒绝');
       expect(await prisma.workflowRun.count({ where: { workflowId, triggerType: 'webhook' } })).toBe(0);
     });
 
-    it('鉴权失败文案统一（未知 token / 坏签名 / 过期时间戳不可区分 → 不可枚举）', async () => {
+    it('鉴权失败文案统一（未知 token / 坏签名不可区分 → 不可枚举）＋ 签名覆盖 timestamp/eventId', async () => {
       const body = JSON.stringify({ orderId: 'x' });
-      const sign = (secret: string) => createHmac('sha256', secret).update(body).digest('hex');
-      const headers = (sig: string, ts: string, evt: string) => ({ 'X-Hook-Signature': sig, 'X-Hook-Timestamp': ts, 'X-Hook-Event-Id': evt });
-      const unknown = await request(app.getHttpServer()).post('/api/v1/hooks/workflows/unknown-token-m8p8')
-        .set('Content-Type', 'application/json').set(headers(sign('whatever'), String(Date.now()), `m8p8-u-${STAMP}`)).send(body).expect(401);
-      const badSig = await request(app.getHttpServer()).post(`/api/v1/hooks/workflows/${webhook!.token}`)
-        .set('Content-Type', 'application/json').set(headers('deadbeef', String(Date.now()), `m8p8-b-${STAMP}`)).send(body).expect(401);
-      const stale = await request(app.getHttpServer()).post(`/api/v1/hooks/workflows/${webhook!.token}`)
-        .set('Content-Type', 'application/json').set(headers(sign(webhook!.secret!), String(Date.now() - 10 * 60_000), `m8p8-s-${STAMP}`)).send(body).expect(401);
-      const messages = [unknown.body.error.message, badSig.body.error.message, stale.body.error.message];
-      expect(new Set(messages).size).toBe(1);
-      expect(messages[0]).toBe('webhook 鉴权失败');
+      const post = (sig: string, ts: string, evt: string, token: string = webhook!.token) =>
+        request(app.getHttpServer()).post(`/api/v1/hooks/workflows/${token}`)
+          .set('Content-Type', 'application/json').set(hookHeaders(sig, ts, evt)).send(body);
+      // ① 未持密钥者（未知 token / 坏签名）一律同一文案，不可枚举
+      const uTs = String(Date.now());
+      const unknown = await post(createHmac('sha256', 'whatever').update(`${uTs}m8p8-u-${STAMP}`).update(body).digest('hex'), uTs, `m8p8-u-${STAMP}`, 'unknown-token-m8p8').expect(401);
+      const bTs = String(Date.now());
+      const badSig = await post('deadbeef', bTs, `m8p8-b-${STAMP}`).expect(401);
+      expect(unknown.body.error.code).toBe('WEBHOOK_SIGNATURE_INVALID');
+      expect(unknown.body.error.message).toBe('webhook 鉴权失败');
+      expect(badSig.body.error.message).toBe('webhook 鉴权失败');
+      // ② Pre-M9 回归：signature 覆盖 eventId —— 换个 eventId 旧签名即失效（旧格式可"新 eventId + 老签名"无限重放）
+      const rTs = String(Date.now());
+      const res = await post(hookSign(rTs, `m8p8-orig-${STAMP}`, body), rTs, `m8p8-other-${STAMP}`).expect(401);
+      expect(res.body.error.code).toBe('WEBHOOK_SIGNATURE_INVALID');
+      // ③ Pre-M9 回归：signature 覆盖 timestamp —— 旧签名换个时间戳即失效（旧格式可把过期载荷"重签"回窗口内）
+      // 两个时间戳必须不同（同毫秒会让用例变成空断言）；tB 仍在容忍窗内，故只有签名不匹配能拦下它
+      const tA = String(Date.now());
+      const tB = String(Date.now() + 5_000);
+      const shifted = await post(hookSign(tA, `m8p8-t-${STAMP}`, body), tB, `m8p8-t-${STAMP}`).expect(401);
+      expect(shifted.body.error.code).toBe('WEBHOOK_SIGNATURE_INVALID');
+      // ④ 签名有效但超窗 → 独立错误码（仅持密钥者可达 → 不构成枚举信道；与未持密钥者文案必须不同）
+      const staleTs = String(Date.now() - 10 * 60_000);
+      const stale = await post(hookSign(staleTs, `m8p8-s-${STAMP}`, body), staleTs, `m8p8-s-${STAMP}`).expect(401);
+      expect(stale.body.error.code).toBe('WEBHOOK_TIMESTAMP_STALE');
+      expect(stale.body.error.message).not.toBe('webhook 鉴权失败');
       // 文案里不含 token/签名/工作流内部信息
       expect(JSON.stringify(unknown.body)).not.toContain(webhook!.token);
+      expect(JSON.stringify(stale.body)).not.toContain(webhook!.token);
+    });
+
+    it('Pre-M9：eventId 重放拒收（已消费的 eventId 再次投递 → 409 WEBHOOK_REPLAY，绝不产生第二个 run）', async () => {
+      const body = JSON.stringify({ orderId: 'replay' });
+      const evt = `m8p8-replay-${STAMP}`;
+      const hook = await prisma.workflowWebhook.findFirst({ where: { workflowId } });
+      expect(hook).toBeTruthy();
+      // 预置"该 eventId 已消费"的投递行（等价于首次投递成功后的 UNIQUE 行）——本用例不必真的触发一次工作流
+      await prisma.webhookDelivery.create({
+        data: { webhookId: hook!.id, eventId: evt, payloadHash: 'preconsumed', status: 'accepted' },
+      });
+      const ts = String(Date.now());
+      const res = await request(app.getHttpServer()).post(`/api/v1/hooks/workflows/${webhook!.token}`)
+        .set('Content-Type', 'application/json')
+        .set(hookHeaders(hookSign(ts, evt, body), ts, evt)).send(body).expect(409);
+      expect(res.body.error.code).toBe('WEBHOOK_REPLAY');
+      expect(await prisma.workflowRun.count({ where: { workflowId, triggerType: 'webhook' } })).toBe(0);
+      await prisma.webhookDelivery.deleteMany({ where: { webhookId: hook!.id, eventId: { startsWith: evt } } });
+      expect(await prisma.webhookDelivery.count({ where: { webhookId: hook!.id, eventId: { startsWith: evt } } })).toBe(0);
     });
   });
 

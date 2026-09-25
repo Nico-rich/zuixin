@@ -1,10 +1,18 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Logger } from '@nestjs/common';
 import { z } from 'zod';
 import { ExtensionsService } from './extensions.service';
 import { ToolRegistry } from '../../core/tools/tool-registry.service';
 import { Tool, ToolContext } from '../../core/tools/tool.types';
 import { CryptoService } from '../../core/crypto/crypto.service';
 import { checksumOf, parseManifest, signChecksum } from './manifest';
+import { resolveEffectiveAgentTools } from './effective-agent-tools';
+
+// Pre-M9 F4：唯一实现 resolveEffectiveAgentTools 的调用可观测（包装真实实现 → 既有用例行为不变）
+vi.mock('./effective-agent-tools', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./effective-agent-tools')>();
+  return { ...actual, resolveEffectiveAgentTools: vi.fn(actual.resolveEffectiveAgentTools) };
+});
 
 // 平台签名/加密同源密钥（ENCRYPTION_KEY）；缺失时补一个合法 32 字节 base64（不覆盖真实配置）
 if (!process.env.ENCRYPTION_KEY) process.env.ENCRYPTION_KEY = 'dGVzdC1rZXktMzItYnl0ZXMtbG9uZy1hYmNkZWZnaGk=';
@@ -33,6 +41,12 @@ function agentManifest(slug: string) {
       tools: ['knowledge.search'],
     },
   };
+}
+
+/** F4：指定 agent 工具清单（用于越权/未知工具用例） */
+function agentManifestWith(slug: string, tools: string[]) {
+  const m = agentManifest(slug);
+  return { ...m, agent: { ...m.agent, tools } };
 }
 
 function providerManifest(slug: string) {
@@ -67,6 +81,19 @@ function makeHarness() {
     name: 'external_action.execute', description: '外部副作用', permission: 'destructive',
     inputSchema: z.strictObject({ action: z.string() }),
     execute: vi.fn(),
+  });
+  // F4：可包装权限面（generate/write）+ 不可包装权限面（financial）各一，用于交集断言
+  registry.register({
+    name: 'image.generate', description: '生成', permission: 'generate',
+    inputSchema: z.strictObject({ prompt: z.string() }), execute: vi.fn(),
+  });
+  registry.register({
+    name: 'billing.charge', description: '财务', permission: 'financial',
+    inputSchema: z.strictObject({ amount: z.number() }), execute: vi.fn(),
+  });
+  registry.register({
+    name: 'artifact.create', description: '制品', permission: 'write',
+    inputSchema: z.strictObject({ title: z.string() }), execute: vi.fn(),
   });
 
   const prisma = {
@@ -392,5 +419,163 @@ describe('M8-P6 安装 / 版本锁定 / 物化', () => {
     const updateArg = prisma.provider.update.mock.calls.at(-1)![0] as { data: { apiKeyEncrypted: string; enabled: boolean } };
     expect(updateArg.data.enabled).toBe(true);
     expect(updateArg.data.apiKeyEncrypted).toBe(stored); // 原样复用密文（绝不回显/重签明文）
+  });
+});
+
+/**
+ * Pre-M9 F4：kind=agent 工具白名单（权限提升）。
+ * effective = 请求清单 ∩ 平台注册表 ∩ 可包装权限面 ∩ 扩展/组织策略面（交集，绝不并集）；
+ * 声明期 fail-closed 拒绝 + 物化期剔除兜底（审计日志 + AgentVersion.config 持久化剔除清单），
+ * 三条路径（install 声明校验 / setEnabled 重放 / materializeAgent 物化）共用唯一实现。
+ */
+describe('Pre-M9 F4 agent 工具白名单（effective tools 交集）', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  /** agent 类扩展安装/启用视图（锁定版本含指定工具清单） */
+  function withAgentInstall(harness: ReturnType<typeof makeHarness>, tools: string[]) {
+    const { prisma } = harness;
+    const version = publishedVersion(agentManifestWith('brand', tools), 'brand');
+    const ext = { id: 'e2', organizationId: 'org1', slug: 'brand', name: '品牌助手', description: 'd', kind: 'agent', status: 'published' };
+    prisma.extension.findUnique.mockResolvedValue(ext);
+    prisma.extensionVersion.findFirst.mockResolvedValue(version);
+    prisma.extensionVersion.findUnique.mockResolvedValue(version); // setEnabled 以锁定版本重新物化
+    prisma.extensionInstallation.upsert.mockResolvedValue({ id: 'i2', organizationId: 'org1', extensionId: 'e2', versionId: 'v1', status: 'enabled' });
+    prisma.agent.findUnique.mockResolvedValue(null);
+    return { ext, version };
+  }
+
+  it('声明期：install 的 parse 校验走同一 helper → 越权工具直接拒绝（VALIDATION_ERROR），且不产生任何物化/落库', async () => {
+    const harness = makeHarness();
+    const { svc, prisma } = harness;
+    withAgentInstall(harness, ['external_action.execute', 'knowledge.search']);
+
+    await expect(svc.install('u1', 'e2', { organizationId: 'org1' })).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      message: expect.stringContaining('agent.tools 含不可获得的工具：external_action.execute'),
+    });
+    // 拒绝发生在物化之前：安装行/Agent/AgentVersion 一律未写
+    expect(prisma.extensionInstallation.upsert).not.toHaveBeenCalled();
+    expect(prisma.agent.create).not.toHaveBeenCalled();
+    expect(prisma.agentVersion.create).not.toHaveBeenCalled();
+    // 拒绝由唯一实现裁决（同一函数被调用），而不是别处的复制判断
+    expect(resolveEffectiveAgentTools).toHaveBeenCalled();
+  });
+
+  it('物化期（setEnabled 重放历史清单）：越权工具被剔除、合法工具保留 + logger.warn 审计 + 剔除清单落 AgentVersion.config', async () => {
+    const harness = makeHarness();
+    const { svc, prisma } = harness;
+    // 历史数据：启用时从已锁定版本重新物化（不重解析），清单里含 external_action.execute / billing.charge / 未知工具
+    withAgentInstall(harness, ['external_action.execute', 'billing.charge', 'nope.tool', 'knowledge.search', 'image.generate']);
+    prisma.extensionInstallation.findUnique.mockResolvedValue({ id: 'i2', organizationId: 'org1', extensionId: 'e2', versionId: 'v1', status: 'disabled' });
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+
+    await svc.setEnabled('u1', 'e2', 'org1', true);
+
+    const createArg = prisma.agentVersion.create.mock.calls.at(-1)![0] as {
+      data: { tools: string[]; config: { extensionId: string; toolPolicy?: { dropped: Array<{ name: string; reason: string }> } } };
+    };
+    // 交集：read/generate 保留；external_action/financial/未知工具全部剔除
+    expect(createArg.data.tools).toEqual(['knowledge.search', 'image.generate']);
+    expect(createArg.data.tools).not.toContain('external_action.execute');
+    // 剔除清单持久化在既有 JSON 列（AgentVersion.config），不新增列
+    expect(createArg.data.config.toolPolicy?.dropped).toEqual([
+      { name: 'external_action.execute', reason: 'tool_permission_not_wrappable' },
+      { name: 'billing.charge', reason: 'tool_permission_not_wrappable' },
+      { name: 'nope.tool', reason: 'platform_tool_not_registered' },
+    ]);
+    // 审计日志：含扩展标识 / 工具名 / 原因
+    const messages = warn.mock.calls.map((c) => String(c[0]));
+    expect(messages.some((m) => m.includes('e2') && m.includes('external_action.execute') && m.includes('tool_permission_not_wrappable'))).toBe(true);
+    expect(messages.some((m) => m.includes('billing.charge') && m.includes('financial'))).toBe(true);
+    warn.mockRestore();
+  });
+
+  it('物化期修复：已存版本行含越权工具（历史/被篡改）→ 重新物化生成修复版本，绝不沿用越权清单', async () => {
+    const harness = makeHarness();
+    const { svc, prisma } = harness;
+    withAgentInstall(harness, ['knowledge.search']);
+    prisma.extensionInstallation.findUnique.mockResolvedValue({ id: 'i2', organizationId: 'org1', extensionId: 'e2', versionId: 'v1', status: 'disabled' });
+    // 已发布版本行的 tools 被写入越权工具（模拟修复前的物化结果）
+    prisma.agent.findUnique.mockResolvedValue({
+      id: 'a1', slug: 'ext-brand-00000000', activeVersion: {
+        id: 'av1', tools: ['external_action.execute', 'knowledge.search'],
+        config: { extensionId: 'e2', extensionVersion: 'v1' },
+      },
+    });
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+
+    await svc.setEnabled('u1', 'e2', 'org1', true);
+
+    const createArg = prisma.agentVersion.create.mock.calls.at(-1)![0] as { data: { tools: string[]; version: number } };
+    expect(createArg.data.tools).toEqual(['knowledge.search']); // 修复：越权工具被剔除
+    expect(createArg.data.version).toBe(1);                     // 与既有 activeVersion 无关，生成新版本行（aggregate 默认 _max=0 → 1）
+    expect(prisma.agentVersion.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: { status: 'archived' } }));
+    warn.mockRestore();
+  });
+
+  it('物化期幂等：同一锁定版本 + 已存工具集与求交结果一致 → 不新建版本行（无谓漂移）', async () => {
+    const harness = makeHarness();
+    const { svc, prisma } = harness;
+    withAgentInstall(harness, ['knowledge.search']);
+    prisma.extensionInstallation.findUnique.mockResolvedValue({ id: 'i2', organizationId: 'org1', extensionId: 'e2', versionId: 'v1', status: 'disabled' });
+    prisma.agent.findUnique.mockResolvedValue({
+      id: 'a1', slug: 'ext-brand-00000000', activeVersion: {
+        id: 'av1', tools: ['knowledge.search'], config: { extensionId: 'e2', extensionVersion: 'v1' },
+      },
+    });
+
+    await svc.setEnabled('u1', 'e2', 'org1', true);
+
+    expect(prisma.agentVersion.create).not.toHaveBeenCalled();
+    expect(prisma.agent.update).toHaveBeenCalledWith({ where: { id: 'a1' }, data: { enabled: true } });
+  });
+
+  it('三条路径共用唯一实现：install（声明校验 + 物化）与 setEnabled（重放）均调用同一 helper，且输入同源', async () => {
+    const harness = makeHarness();
+    const { svc, prisma } = harness;
+    withAgentInstall(harness, ['knowledge.search', 'external_action.execute'].slice(0, 1));
+    const mocked = vi.mocked(resolveEffectiveAgentTools);
+    mocked.mockClear();
+
+    await svc.install('u1', 'e2', { organizationId: 'org1' });   // 路径①声明校验 + 路径②物化
+    const afterInstall = mocked.mock.calls.length;
+    expect(afterInstall).toBe(2); // parse 校验一次 + materializeAgent 一次
+
+    prisma.extensionInstallation.findUnique.mockResolvedValue({ id: 'i2', organizationId: 'org1', extensionId: 'e2', versionId: 'v1', status: 'disabled' });
+    await svc.setEnabled('u1', 'e2', 'org1', true);               // 路径③重放已存清单
+    expect(mocked.mock.calls.length).toBe(afterInstall + 1);
+
+    // 同一实现、同一 extensionId、同一请求清单（三条路径的输入同源）
+    expect(new Set(mocked.mock.calls.map((c) => c[0].extensionId))).toEqual(new Set(['e2']));
+    expect(mocked.mock.calls.every((c) => JSON.stringify(c[0].requested) === JSON.stringify(['knowledge.search']))).toBe(true);
+    expect(mocked.mock.calls.every((c) => JSON.stringify(c[0].declaredPermissions) === JSON.stringify(['agent.run']))).toBe(true);
+  });
+
+  it('交集语义：清单声明更多 permissions 不扩大工具集（工具面由平台注册表 + 可包装权限面决定）', async () => {
+    const harness = makeHarness();
+    const { svc, prisma } = harness;
+    const version = publishedVersion(
+      { ...agentManifestWith('brand', ['knowledge.search']), permissions: ['agent.run', 'config.read', 'config.write'] },
+      'brand',
+    );
+    const ext = { id: 'e2', organizationId: 'org1', slug: 'brand', name: '品牌助手', description: 'd', kind: 'agent', status: 'published' };
+    prisma.extension.findUnique.mockResolvedValue(ext);
+    prisma.extensionVersion.findFirst.mockResolvedValue(version);
+    prisma.extensionInstallation.upsert.mockResolvedValue({ id: 'i2', organizationId: 'org1', extensionId: 'e2', versionId: 'v1', status: 'enabled' });
+    prisma.agent.findUnique.mockResolvedValue(null);
+    const mocked = vi.mocked(resolveEffectiveAgentTools);
+    mocked.mockClear();
+
+    await svc.install('u1', 'e2', { organizationId: 'org1' });
+
+    const createArg = prisma.agentVersion.create.mock.calls.at(-1)![0] as { data: { tools: string[] } };
+    expect(createArg.data.tools).toEqual(['knowledge.search']); // 多声明 config.* 不带来任何工具
+    // 声明权限是"上限面"，不是"扩张源"：三个权限一并进入求交，结果仍只有注册表内 read 面工具
+    expect(mocked.mock.calls.every((c) => JSON.stringify(c[0].declaredPermissions) === JSON.stringify(['agent.run', 'config.read', 'config.write']))).toBe(true);
+    // 财务/外部副作用面与权限声明无关：清单里没有也拿不到（helper 层面已断言 billing.charge 属不可获得面）
+    expect(harness.registry.get('billing.charge')).toBeTruthy();
+    expect(resolveEffectiveAgentTools({
+      extensionId: 'e2', requested: ['billing.charge'], declaredPermissions: ['agent.run', 'config.read', 'config.write'], lookup: (n) => harness.registry.get(n),
+    }).tools).toEqual([]);
   });
 });

@@ -15,14 +15,19 @@ function makeRow(over: Record<string, unknown> = {}) {
 
 /**
  * 内存态 prisma 替身：updateMany 真实实现条件更新语义（where.status 不匹配 → count 0），
- * 否则"条件更新"这条核心不变式在单测里根本不成立。
+ * findFirst 真实实现 where 等值过滤（幂等命中必须限定 scope——不做过滤这条不变式在单测里不成立），
+ * 否则"条件更新/scope 内幂等"这些核心不变式在单测里根本不成立。
  */
 function makeService(initialRow?: Record<string, unknown>) {
   // 未指定初始行 = 空库（schedule 的幂等前置查重必须查不到，否则失去"首次创建"语义）
   const state: { row: Record<string, unknown> | null } = { row: initialRow === undefined ? null : makeRow(initialRow) };
+  /** where 等值过滤（null 与 undefined 归一化——organizationId 的"个人 scope"即 null） */
+  const filter = (where: Record<string, unknown>) =>
+    state.row && Object.entries(where).every(([k, v]) => (state.row![k] ?? null) === (v ?? null)) ? state.row : null;
   const prisma = {
     scheduledJob: {
       findUnique: vi.fn(async () => state.row),
+      findFirst: vi.fn(async ({ where }: { where: Record<string, unknown> }) => filter(where)),
       create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
         state.row = makeRow({ ...data, id: 'job-1' });
         return state.row;
@@ -84,16 +89,38 @@ describe('SchedulerService（M8-P5 调度：幂等/状态机/队列投递）', (
     expect(prisma.scheduledJob.create).toHaveBeenCalledTimes(1);
   });
 
-  it('schedule：并发同键 → create P2002 → 复用赢家行（幂等）', async () => {
+  it('schedule：并发同键 → create P2002 → 按 scope 复取赢家行（幂等）', async () => {
     const { svc, prisma, queue } = makeService();
-    prisma.scheduledJob.findUnique
-      .mockResolvedValueOnce(null) // 查重未命中
-      .mockResolvedValueOnce(makeRow({ id: 'winner', idempotencyKey: 'k2' })); // P2002 后取赢家
+    prisma.scheduledJob.findFirst
+      .mockResolvedValueOnce(null) // 前置查重未命中（同 scope 无行）
+      .mockResolvedValueOnce(makeRow({ id: 'winner', idempotencyKey: 'k2' })); // P2002 后按 scope 复取赢家
     prisma.scheduledJob.create.mockRejectedValueOnce({ code: 'P2002' });
     const res = await svc.schedule({ ...BASE, idempotencyKey: 'k2' });
     expect(res.created).toBe(false);
     expect(res.job.id).toBe('winner');
     expect(queue.add).not.toHaveBeenCalled();
+  });
+
+  it('schedule：幂等命中查询限定 scope（idempotencyKey + organizationId + ownerUserId）', async () => {
+    const { svc, prisma } = makeService();
+    await svc.schedule({ ...BASE, organizationId: 'org-1', idempotencyKey: 'k-scope' });
+    expect(prisma.scheduledJob.findFirst).toHaveBeenCalledWith({
+      where: { idempotencyKey: 'k-scope', organizationId: 'org-1', ownerUserId: 'u1' },
+    });
+    // 个人 scope（无 organizationId）→ 按 null 匹配，绝不落到"只按键查"
+    await svc.schedule({ ...BASE, idempotencyKey: 'k-personal' });
+    expect(prisma.scheduledJob.findFirst).toHaveBeenLastCalledWith({
+      where: { idempotencyKey: 'k-personal', organizationId: null, ownerUserId: 'u1' },
+    });
+  });
+
+  it('schedule：跨 scope 撞全局唯一键 → 404 反枚举（绝不返回他人行/绝不泄漏 payload）', async () => {
+    const { svc, prisma, queue } = makeService();
+    prisma.scheduledJob.findFirst.mockResolvedValue(null); // scope 内始终查不到（键属于别的组织/用户）
+    prisma.scheduledJob.create.mockRejectedValueOnce({ code: 'P2002' }); // 全局唯一键冲突（对方行已存在）
+    await expect(svc.schedule({ ...BASE, organizationId: 'org-2', idempotencyKey: 'stolen' }))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(queue.add).not.toHaveBeenCalled(); // 既不返回对方行，也不抢占
   });
 
   it('schedule：入队失败 → 回滚行（不留下永不执行的孤儿事实）', async () => {

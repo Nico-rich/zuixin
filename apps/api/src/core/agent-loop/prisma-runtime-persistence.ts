@@ -3,6 +3,19 @@ import { PrismaService } from '../../modules/prisma/prisma.service';
 import { UsageService } from '../../modules/usage/usage.service';
 import { AgentRunMessagesService } from '../../modules/agent-runs/agent-run-messages.service';
 import { AgentRuntimePersistence, CreateRunInput, ToolCallRecord } from './runtime-persistence';
+import { bindPayload, readBinding } from '../../modules/approvals/approval-binding';
+
+/**
+ * Pre-M9 Approval Binding 兜底：payload 内已有 `__binding` 则原样保留（引擎/工作流已按同一 helper 绑定），
+ * 否则按约定字段补写（actionType ← actionType|toolName，动作 ← input|payload 去掉 __binding）。
+ */
+function withApprovalBinding(payload: Record<string, unknown>): Record<string, unknown> {
+  if (readBinding(payload)) return payload;
+  const actionType = typeof payload.actionType === 'string' ? payload.actionType
+    : typeof payload.toolName === 'string' ? payload.toolName : 'unknown';
+  const action = payload.input !== undefined ? payload.input : payload;
+  return bindPayload(payload, actionType, action);
+}
 
 /** AgentRuntimePersistence 的 Prisma 实现（P2：sync 路径；P3 的 claim/resume 复用同一批原语） */
 @Injectable()
@@ -139,23 +152,28 @@ export class PrismaRuntimePersistence implements AgentRuntimePersistence {
   }
 
   async createApproval(data: Parameters<AgentRuntimePersistence['createApproval']>[0]) {
+    const payload = (data.payload ?? {}) as Record<string, unknown>;
     const row = await this.prisma.approval.create({
       data: {
         userId: data.userId, projectId: data.projectId ?? null, agentRunId: data.agentRunId ?? null,
         toolCallId: data.toolCallId ?? null, status: 'requested', riskLevel: data.riskLevel,
-        reason: data.reason, payload: (data.payload ?? {}) as never, expiresAt: data.expiresAt ?? null,
+        reason: data.reason,
+        // Pre-M9 Approval Binding：持久化边界兜底——调用方未显式绑定动作时，按 payload 约定的
+        // actionType/toolName + input 字段补写 __binding（与引擎同一 helper，保证摘要口径一致）。
+        payload: withApprovalBinding(payload) as never,
+        expiresAt: data.expiresAt ?? null,
       },
     });
     return { id: row.id };
   }
 
-  async getApprovalForToolCall(toolCallId: string): Promise<{ id: string; status: string } | null> {
+  async getApprovalForToolCall(toolCallId: string): Promise<{ id: string; status: string; payload?: unknown } | null> {
     const row = await this.prisma.approval.findFirst({
       where: { toolCallId },
       orderBy: { createdAt: 'desc' },
-      select: { id: true, status: true },
+      select: { id: true, status: true, payload: true }, // Pre-M9：Binding 校验需要审批载荷
     });
-    return row ? { id: row.id, status: row.status } : null;
+    return row ? { id: row.id, status: row.status, payload: row.payload } : null;
   }
 
   async enterWaitingDelegation(runId: string, delegationId: string, workerId?: string): Promise<{ count: number }> {

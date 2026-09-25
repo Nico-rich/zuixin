@@ -1,7 +1,9 @@
-import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
 import { PrismaService } from '../../modules/prisma/prisma.service';
 import { CryptoService } from '../../core/crypto/crypto.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
+import { assertProviderBaseUrlSafe } from '../../modules/security/provider-base-url.guard';
+import { DnsResolver, nodeDnsResolver, SSRF_RESOLVER } from '../../modules/security/ssrf-guard';
 import { EmbeddingProvider } from './embedding.types';
 import { MockEmbeddingProvider } from './adapters/mock-embedding.adapter';
 import { OpenAIEmbeddingProvider } from './adapters/openai-embedding.adapter';
@@ -20,6 +22,8 @@ export class EmbeddingManagerService implements OnModuleInit {
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(CryptoService) private readonly crypto: CryptoService,
+    // Pre-M9 F3-B：调用期 baseUrl 校验用的 DNS 解析器
+    @Optional() @Inject(SSRF_RESOLVER) private readonly resolver: DnsResolver = nodeDnsResolver,
   ) {}
 
   async onModuleInit() { await this.refresh(); }
@@ -56,6 +60,11 @@ export class EmbeddingManagerService implements OnModuleInit {
     if (!model || !model.enabled || !model.provider.enabled) throw new AppError(ErrorCode.PROVIDER_UNKNOWN, 'embedding 模型不可用');
     const provider = this.providers.get(model.providerId);
     if (!provider) throw new AppError(ErrorCode.PROVIDER_UNKNOWN, `embedding provider 未加载: ${model.providerId}`);
+    // Pre-M9 F3-B：调用前按"当前"baseUrl 重跑 SSRF 判定（fail-closed；mock adapter 跳过）
+    await assertProviderBaseUrlSafe({
+      providerId: model.providerId, providerName: model.provider.name,
+      adapter: model.provider.adapter, baseUrl: model.provider.baseUrl, resolver: this.resolver,
+    });
     return {
       providerId: model.providerId, providerName: model.provider.name,
       modelId: model.id, apiModelId: model.apiModelId,

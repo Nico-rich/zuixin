@@ -1,5 +1,6 @@
 import OpenAI from 'openai';
 import { ImageGenerationParams, ImageGenerationResult, ImageProvider } from '../image.types';
+import { manualRedirectFetch } from '../../../modules/security/provider-base-url.guard';
 
 export interface OpenAICompatibleImageConfig { baseUrl: string; apiKey: string; timeoutMs: number; }
 
@@ -11,7 +12,8 @@ export class OpenAIImageAdapter implements ImageProvider {
   private readonly genFn: ImageGenFn;
 
   constructor(cfg: OpenAICompatibleImageConfig, injected?: { generate?: ImageGenFn }) {
-    const client = new OpenAI({ baseURL: cfg.baseUrl, apiKey: cfg.apiKey, timeout: cfg.timeoutMs, maxRetries: 0 });
+    // Pre-M9 F3-B：禁止自动跟随重定向
+    const client = new OpenAI({ baseURL: cfg.baseUrl, apiKey: cfg.apiKey, timeout: cfg.timeoutMs, maxRetries: 0, fetch: manualRedirectFetch });
     this.genFn = injected?.generate ?? (async (body) => (await client.images.generate(body as never)) as unknown as Record<string, unknown>);
   }
 

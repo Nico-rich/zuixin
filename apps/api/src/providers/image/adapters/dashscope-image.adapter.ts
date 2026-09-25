@@ -13,7 +13,8 @@ export class DashScopeImageAdapter implements ImageProvider {
   private readonly fetchFn: FetchFn;
 
   constructor(private readonly cfg: DashScopeImageConfig, injected?: { fetch?: FetchFn }) {
-    this.fetchFn = injected?.fetch ?? ((url, init) => fetch(url, init));
+    // Pre-M9 F3-B：redirect: 'manual' —— 3xx 不自动跟随（否则可被 302 到内网/元数据地址）
+    this.fetchFn = injected?.fetch ?? ((url, init) => fetch(url, { ...(init as object), redirect: 'manual' } as never));
   }
 
   async submit(params: ImageGenerationParams): Promise<{ remoteTaskId: string }> {

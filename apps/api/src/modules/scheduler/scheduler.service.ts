@@ -99,15 +99,19 @@ export class SchedulerService {
   // ===== 调度 =====
 
   /**
-   * 创建调度作业（幂等：同 idempotencyKey → 返回已有行，**不重复入队**）。
+   * 创建调度作业（幂等：**同 scope（organizationId + ownerUserId）**同 idempotencyKey → 返回已有行，**不重复入队**）。
    * 幂等命中不重新投递是刻意选择：已有活跃行可能正处在重投（jobId 变体）中，
    * 再补一条首次投递会产生第二次执行——宁可让调用方显式走 resume/cancel 重建。
+   *
+   * 幂等键是**全局唯一**约束（schema 不可改）：若只按键查行，任何登录用户猜到/复用他人的键
+   * 就能拿到他人的作业行（含 payload）并收到 created:false —— 跨租户越权读 + 事实上的键抢占。
+   * 因此命中查询一律限定在调用方 scope 内；scope 外撞键（含并发 P2002）→ 404 反枚举。
    */
   async schedule(input: ScheduleJobInput): Promise<{ job: ScheduledJob; created: boolean }> {
     const normalized = this.validate(input);
 
     if (normalized.idempotencyKey) {
-      const existing = await this.prisma.scheduledJob.findUnique({ where: { idempotencyKey: normalized.idempotencyKey } });
+      const existing = await this.findIdempotent(normalized);
       if (existing) return { job: existing, created: false };
     }
 
@@ -134,10 +138,12 @@ export class SchedulerService {
         },
       });
     } catch (err) {
-      // 并发同键 → P2002：复用赢家行（幂等语义；绝不第二个作业）
+      // 并发同键 → P2002：先按 scope 复取赢家行（幂等语义；绝不第二个作业）；
+      // scope 内查不到 = 该键属于别的组织/用户 → 404 反枚举（绝不返回、绝不泄漏对方行任何字段）
       if ((err as { code?: string }).code === 'P2002' && normalized.idempotencyKey) {
-        const won = await this.prisma.scheduledJob.findUnique({ where: { idempotencyKey: normalized.idempotencyKey } });
+        const won = await this.findIdempotent(normalized);
         if (won) return { job: won, created: false };
+        throw new AppError(ErrorCode.NOT_FOUND, '作业不存在');
       }
       throw err;
     }
@@ -152,6 +158,24 @@ export class SchedulerService {
     }
     this.logger.log({ jobId: row.id, type: row.type, handler: row.handler }, '调度作业已创建');
     return { job: row, created: true };
+  }
+
+  /**
+   * 幂等键命中查询（**必须限定调用方 scope**）：ScheduledJob.idempotencyKey 是全局唯一索引，
+   * 只按键查 = 跨租户越权读（返回他人行含 payload/name/handler/traceId）。故按
+   * (idempotencyKey, organizationId, ownerUserId) 三元组在 scope 内查找；查不到即视为
+   * "该键不属于调用方"（调用方转 404，绝不区分"键不存在"与"键属于别人"）。
+   */
+  private findIdempotent(n: NormalizedSchedule): Promise<ScheduledJob | null> {
+    // 无键 = 无幂等语义：直接视为"无命中"（绝不退化成按 idempotencyKey: null 的全表匹配）
+    if (!n.idempotencyKey) return Promise.resolve(null);
+    return this.prisma.scheduledJob.findFirst({
+      where: {
+        idempotencyKey: n.idempotencyKey,
+        organizationId: n.organizationId ?? null,
+        ownerUserId: n.ownerUserId,
+      },
+    });
   }
 
   /** 投递到 BullMQ：one-shot/delayed → delayed job；recurring → repeatable job */

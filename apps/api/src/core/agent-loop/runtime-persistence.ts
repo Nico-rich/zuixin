@@ -62,8 +62,8 @@ export interface AgentRuntimePersistence {
     userId: string; projectId?: string; agentRunId?: string; toolCallId?: string;
     riskLevel: string; reason: string; payload?: Record<string, unknown>; expiresAt?: Date | null;
   }): Promise<{ id: string }>;
-  /** M7-P1：按 ToolCall 行查关联 Approval（resume 决策事实） */
-  getApprovalForToolCall(toolCallId: string): Promise<{ id: string; status: string } | null>;
+  /** M7-P1：按 ToolCall 行查关联 Approval（resume 决策事实）；Pre-M9：payload 用于 Approval Binding 校验 */
+  getApprovalForToolCall(toolCallId: string): Promise<{ id: string; status: string; payload?: unknown } | null>;
   /** 读 run 当前状态（外部终态竞争时以 DB 为事实） */
   getRunStatus(runId: string): Promise<{ status: string } | null>;
   /** LLM 回合用量（成功/失败每轮必记） */

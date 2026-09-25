@@ -1,6 +1,8 @@
-import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
 import { PrismaService } from '../../modules/prisma/prisma.service';
 import { CryptoService } from '../../core/crypto/crypto.service';
+import { assertProviderBaseUrlSafe } from '../../modules/security/provider-base-url.guard';
+import { DnsResolver, nodeDnsResolver, SSRF_RESOLVER } from '../../modules/security/ssrf-guard';
 import { ImageProvider } from './image.types';
 import { OpenAIImageAdapter } from './adapters/openai-image.adapter';
 import { DashScopeImageAdapter } from './adapters/dashscope-image.adapter';
@@ -20,6 +22,8 @@ export class ImageManagerService implements OnModuleInit {
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(CryptoService) private readonly crypto: CryptoService,
+    // Pre-M9 F3-B：调用期 baseUrl 校验用的 DNS 解析器
+    @Optional() @Inject(SSRF_RESOLVER) private readonly resolver: DnsResolver = nodeDnsResolver,
   ) {}
 
   async onModuleInit() { await this.refresh(); }
@@ -42,6 +46,11 @@ export class ImageManagerService implements OnModuleInit {
   async resolve(modelId: string): Promise<ResolvedImage> {
     const model = await this.prisma.model.findUnique({ where: { id: modelId }, include: { provider: true } });
     if (!model || !model.enabled || !model.provider.enabled) throw new Error(`生图模型不可用: ${modelId}`);
+    // Pre-M9 F3-B：调用前按"当前"baseUrl 重跑 SSRF 判定（fail-closed；mock adapter 跳过）
+    await assertProviderBaseUrlSafe({
+      providerId: model.providerId, providerName: model.provider.name,
+      adapter: model.provider.adapter, baseUrl: model.provider.baseUrl, resolver: this.resolver,
+    });
     const adapter = this.providers.get(model.providerId);
     if (!adapter) throw new Error(`生图 provider 未加载: ${model.providerId}`);
     return {

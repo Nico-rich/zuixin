@@ -66,6 +66,9 @@ export class GlobalExceptionFilter implements ExceptionFilter {
       case 'WORKFLOW_RUN_NOT_CANCELLABLE': case 'WORKFLOW_RUN_NOT_RETRYABLE': return HttpStatus.CONFLICT; // M7-P6
       case 'WEBHOOK_REPLAY': return HttpStatus.CONFLICT; // M7-P6
       case 'WEBHOOK_SIGNATURE_INVALID': return HttpStatus.UNAUTHORIZED; // M7-P6
+      case 'WEBHOOK_TIMESTAMP_STALE': return HttpStatus.UNAUTHORIZED; // Pre-M9：时间戳超窗（签名有效才可达）
+      case 'SSRF_BLOCKED': return HttpStatus.BAD_REQUEST; // Pre-M9 F3：目标地址未通过安全校验
+      case 'APPROVAL_BINDING_MISMATCH': return HttpStatus.CONFLICT; // Pre-M9：审批绑定与实际执行不一致
       case 'OAUTH_STATE_INVALID': case 'OAUTH_STATE_EXPIRED': return HttpStatus.BAD_REQUEST; // M7-P2
       case 'PROVIDER_UNSUPPORTED': return HttpStatus.NOT_FOUND; // M7-P2
       case 'PROVIDER_UNAVAILABLE': return HttpStatus.SERVICE_UNAVAILABLE; // M8-P7：无可用 provider（服务端裁决，非客户端错误）

@@ -27,16 +27,16 @@ export const PLATFORM_PERMISSION_WHITELIST = [
 ] as const;
 export type ExtensionPermissionName = (typeof PLATFORM_PERMISSION_WHITELIST)[number];
 
-/** 每个 kind 允许声明的权限域（最小权限：tool 类不能声明 provider.call 等） */
-const KIND_PERMISSION_SCOPE: Record<ExtensionKind, ExtensionPermissionName[]> = {
+/** 每个 kind 允许声明的权限域（最小权限：tool 类不能声明 provider.call 等）。Pre-M9 F4：导出供 effective-agent-tools 复核 */
+export const KIND_PERMISSION_SCOPE: Record<ExtensionKind, ExtensionPermissionName[]> = {
   tool: ['tool.execute', 'config.read', 'config.write'],
   agent: ['agent.run', 'config.read', 'config.write'],
   provider: ['provider.call', 'config.read', 'config.write'],
   workflow_step: ['workflow.step', 'config.read', 'config.write'],
 };
 
-/** 每个 kind 必须声明的核心权限（声明缺失 → 拒绝） */
-const KIND_REQUIRED_PERMISSION: Record<ExtensionKind, ExtensionPermissionName> = {
+/** 每个 kind 必须声明的核心权限（声明缺失 → 拒绝）。Pre-M9 F4：导出供 effective-agent-tools 复核 */
+export const KIND_REQUIRED_PERMISSION: Record<ExtensionKind, ExtensionPermissionName> = {
   tool: 'tool.execute',
   agent: 'agent.run',
   provider: 'provider.call',
