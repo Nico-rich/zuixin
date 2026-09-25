@@ -66,7 +66,9 @@ export class EmbeddingManagerService implements OnModuleInit {
   private buildAdapter(adapter: string, baseUrl: string, apiKey: string, timeoutMs: number): EmbeddingProvider {
     switch (adapter) {
       case 'mock-embedding':
-        return new MockEmbeddingProvider(Number(process.env.MOCK_EMBEDDING_DIMS ?? 64));
+        // Pre-M9 P4：平台固定嵌入维度 1536（与 DocumentChunk.embedding vector(1536) + HNSW 索引一致；
+        // 真实 adapter 必须产出同维度——混合维度无法建 ANN 索引）
+        return new MockEmbeddingProvider(Number(process.env.MOCK_EMBEDDING_DIMS ?? 1536));
       case 'openai-embedding':
         return new OpenAIEmbeddingProvider({ baseUrl, apiKey, timeoutMs }, 'text-embedding-3-small', 1536);
       default:
