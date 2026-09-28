@@ -18,8 +18,22 @@ import { boundedRedisOptions, redisCallDeadlineMs, withDeadline } from '../../co
  * ## 2) jti 黑名单（主动轮换/登出全部）
  * 撤销会话靠 DB 的 `revokedAt` 判定；但 access token 是无状态的，且缓存层可能有陈旧肯定结论。
  * 于是额外维护 **jti 粒度**的第二道闸：签发时把 jti 记入 `auth:jti:{userId}`（ZSET，score = 过期时刻），
- * `revokeAll` 时把仍在有效期内的 jti 逐个写入 `auth:jti:blacklist:{jti}`（TTL ≤ 剩余寿命，
+ * `revokeAll` 时把仍在有效期内的 jti 批量写入 `auth:jti:blacklist:{jti}`（TTL ≤ 剩余寿命，
  * **绝不**把短命 token 的墓碑留得比 token 本身更久），AccessGuard 校验时先查黑名单。
+ *
+ * M11-P2（D1-11）两处补强（M10 审计：ZSET 成员无逐条过期 + 逐条 SET 串行）：
+ * - **懒触发清理**：`trackJti` 在每次签发顺手 `ZREMRANGEBYSCORE -inf now` 删掉已过期成员。
+ *   ZSET 成员没有逐条 TTL，而集合 key 的 TTL 每次签发都被刷新（活跃用户恒不过期）——
+ *   不清理则过期成员**永久堆积**；清理后集合规模 = "最近 ACCESS_TTL 窗口内的签发数"（有界），摊还 O(1)。
+ * - **批量写入**：`blacklistAllUserJtis` 的 N 条墓碑由"N 次串行 await"改为**单次 pipeline**，
+ *   把尾部延迟从 N×RTT 收敛到 1×RTT（pipeline 非事务，故逐条检查返回项、只对成功条目计数）。
+ *
+ * ## 3) 设备下线原因标记（M11-P2 D1-01，**只用于细化错误码**）
+ * 按设备下线时给每个被撤销会话写 `auth:session:device-revoked:{sessionId}`（TTL = access token 上限寿命）。
+ * 它的**唯一**用途：`AccessGuardService.isSessionLive(sid) === false` 时把随后的 401 从 UNAUTHORIZED
+ * 细化为 `DEVICE_REVOKED`（客户端据此提示"该设备已被下线"，而不是笼统的"登录已过期"）。
+ * **它不是鉴权依据**：撤销的权威判定恒为 DB `session.revokedAt`；标记丢失/Redis 故障只降级错误码，
+ * 绝不放行（守卫的拒绝结论来自 DB）。
  *
  * ## 降级口径（每条都显式，绝不静默）
  * - **发布失败**：warn。撤销仍在本实例立即生效（本地 dispatch），跨实例退化为 ≤ TTL 窗口。
@@ -28,6 +42,8 @@ import { boundedRedisOptions, redisCallDeadlineMs, withDeadline } from '../../co
  *   撤销的权威判定在 DB 的 `session.revokedAt`（`AccessGuardService.isSessionLive`）——Redis 抖动时
  *   放行一次黑名单查询不会让已撤销会话复活，但 fail-closed 会把全站鉴权打死。
  * - **jti 记账失败**：warn。仅影响"登出全部能覆盖到哪些历史 access token"，会话撤销本身不受影响。
+ * - **设备标记读写失败**：warn + fail-open（无标记 = 普通 UNAUTHORIZED）。仅影响 401 的**文案细度**，
+ *   不影响放行/拒绝（拒绝由 DB 会话状态决定，与标记是否存在无关）。
  */
 export const SESSION_EVENTS_CHANNEL = 'session-events';
 
@@ -51,6 +67,8 @@ export type SessionEventListener = (event: SessionEvent) => void;
 function userJtiKey(userId: string): string { return `auth:jti:${userId}`; }
 /** jti 墓碑 key（值无意义；存在即已撤销） */
 function jtiBlacklistKey(jti: string): string { return `auth:jti:blacklist:${jti}`; }
+/** M11-P2：设备下线原因标记 key（值无意义；**只用于把 401 细化为 DEVICE_REVOKED**，不是鉴权依据） */
+function deviceRevokedKey(sessionId: string): string { return `auth:session:device-revoked:${sessionId}`; }
 
 @Injectable()
 export class SessionEventsService implements OnModuleInit, OnModuleDestroy {
@@ -119,14 +137,22 @@ export class SessionEventsService implements OnModuleInit, OnModuleDestroy {
     this.dispatch(event);
   }
 
-  /** M10-P1 SA-4：记账——签发 access token 时登记 jti（ZSET score = 过期时刻，秒） */
+  /**
+   * M10-P1 SA-4：记账——签发 access token 时登记 jti（ZSET score = 过期时刻，秒）。
+   * M11-P2（D1-11）：ZADD + **过期成员清理** + TTL 合并为一次 pipeline（1 个 RTT）；
+   * 清理是懒触发的（每次签发顺手做，摊还 O(1)），把集合规模钉在"最近 ACCESS_TTL 内签发数"。
+   */
   async trackJti(userId: string, jti: string, expEpochSec: number): Promise<void> {
     try {
       const key = userJtiKey(userId);
-      await withDeadline(this.command.zadd(key, expEpochSec, jti), this.deadlineMs, 'session-events:zadd');
-      // 集合整体 TTL = 最晚 token 过期 + 60s 余量（不逐条清理，过期即自灭）
-      const ttl = Math.max(1, expEpochSec - Math.floor(Date.now() / 1000) + 60);
-      await withDeadline(this.command.expire(key, ttl), this.deadlineMs, 'session-events:expire');
+      const nowSec = Math.floor(Date.now() / 1000);
+      // 集合整体 TTL = 最晚 token 过期 + 60s 余量（逐条成员无 TTL，故必须配合上面的 zremrangebyscore）
+      const ttl = Math.max(1, expEpochSec - nowSec + 60);
+      const pipe = this.command.pipeline();
+      pipe.zadd(key, expEpochSec, jti);
+      pipe.zremrangebyscore(key, '-inf', nowSec); // score ≤ now = 已过期 token：无需再计入"待拉黑"集合
+      pipe.expire(key, ttl);
+      await withDeadline(pipe.exec(), this.deadlineMs, 'session-events:track-jti');
     } catch (err) {
       // 记账失败只影响"登出全部"能覆盖到的历史 token 范围；会话撤销（DB）不受影响
       this.logger.warn(`jti 记账失败（登出全部将无法覆盖该 token；会话撤销仍生效）: ${(err as Error).message}`);
@@ -146,6 +172,8 @@ export class SessionEventsService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * 拉黑某用户**当前仍在有效期内**的全部 jti（登出全部/管理员踢出），并清空记账集合。
+   * M11-P2（D1-11）：墓碑写入由"N 次串行 await"改为**单次 pipeline**（尾部延迟 N×RTT → 1×RTT）。
+   * pipeline 不是事务（连接中断可部分应用），因此**逐条核对返回项**、只对成功条目计数 —— 绝不乐观上报。
    * @returns 实际拉黑条数（0 也正常：可能从未签发过 access token 或 Redis 故障降级）
    */
   async blacklistAllUserJtis(userId: string): Promise<number> {
@@ -153,19 +181,30 @@ export class SessionEventsService implements OnModuleInit, OnModuleDestroy {
     const key = userJtiKey(userId);
     try {
       // 只取 score > now 的 member（已过期的 token 本就无效，无需墓碑）
-      const stale = await withDeadline(
+      const live = await withDeadline(
         this.command.zrangebyscore(key, `(${nowSec}`, '+inf', 'WITHSCORES'),
         this.deadlineMs,
         'session-events:zrange',
       );
-      let count = 0;
-      for (let i = 0; i + 1 < stale.length; i += 2) {
-        const jti = stale[i];
-        const exp = Number(stale[i + 1]);
-        await this.blacklistJti(jti, exp - nowSec);
-        count += 1;
+      const entries: Array<{ jti: string; ttl: number }> = [];
+      for (let i = 0; i + 1 < live.length; i += 2) {
+        entries.push({ jti: live[i], ttl: Number(live[i + 1]) - nowSec });
       }
-      await withDeadline(this.command.del(key), this.deadlineMs, 'session-events:del');
+      if (entries.length === 0) {
+        await withDeadline(this.command.del(key), this.deadlineMs, 'session-events:del');
+        return 0;
+      }
+      const pipe = this.command.pipeline();
+      for (const e of entries) pipe.set(jtiBlacklistKey(e.jti), '1', 'EX', e.ttl); // TTL = 剩余寿命
+      pipe.del(key);
+      const results = await withDeadline(pipe.exec(), this.deadlineMs, 'session-events:blacklist-all');
+      let count = 0;
+      for (let i = 0; i < entries.length; i += 1) {
+        const r = results?.[i];
+        if (!r) continue;
+        if (r[0]) this.logger.warn(`jti 墓碑写入失败（该 token 仅剩 DB 会话层防线）: ${String(r[0])}`);
+        else count += 1;
+      }
       return count;
     } catch (err) {
       this.logger.warn(`用户全部 jti 拉黑失败（尽力而为，会话撤销仍生效）: ${(err as Error).message}`);
@@ -179,6 +218,35 @@ export class SessionEventsService implements OnModuleInit, OnModuleDestroy {
       return (await withDeadline(this.command.exists(jtiBlacklistKey(jti)), this.deadlineMs, 'session-events:exists')) > 0;
     } catch (err) {
       this.logger.warn(`jti 黑名单查询失败（降级放行，交由 DB 会话状态裁决）: ${(err as Error).message}`);
+      return false;
+    }
+  }
+
+  /**
+   * M11-P2：标记"这些会话是被**设备下线**撤销的"（TTL = 调用方给出的 access token 上限寿命）。
+   * 单次 pipeline 批量写入；失败只 warn —— 标记仅决定 401 的**错误码细度**，不参与放行/拒绝裁决。
+   */
+  async markDeviceRevoked(sessionIds: string[], ttlSec: number): Promise<void> {
+    const ttl = Math.floor(ttlSec);
+    if (!Number.isFinite(ttl) || ttl <= 0 || sessionIds.length === 0) return;
+    try {
+      const pipe = this.command.pipeline();
+      for (const id of sessionIds) pipe.set(deviceRevokedKey(id), '1', 'EX', ttl);
+      await withDeadline(pipe.exec(), this.deadlineMs, 'session-events:mark-device-revoked');
+    } catch (err) {
+      this.logger.warn(`设备下线标记写入失败（撤销仍生效；随后 401 将显示为通用"登录已失效"）: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * M11-P2：该会话是否由"设备下线"撤销（仅用于把 401 细化为 DEVICE_REVOKED）。
+   * Redis 故障/无标记 → false（退化回 UNAUTHORIZED）：**绝不**因为查不到标记而改变放行/拒绝结论。
+   */
+  async isSessionDeviceRevoked(sessionId: string): Promise<boolean> {
+    try {
+      return (await withDeadline(this.command.exists(deviceRevokedKey(sessionId)), this.deadlineMs, 'session-events:exists-device-revoked')) > 0;
+    } catch (err) {
+      this.logger.warn(`设备下线标记查询失败（降级为通用 401 文案）: ${(err as Error).message}`);
       return false;
     }
   }

@@ -1,4 +1,4 @@
-import { Inject, Injectable, OnModuleInit, Optional } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { SessionEventsService } from './session-events.service';
 import type { SessionEvent } from './session-events.service';
@@ -17,12 +17,26 @@ import type { SessionEvent } from './session-events.service';
  * - **跨进程（多实例部署）：M10-P1 起不再是"≤ TTL 窗口"** —— `SessionEventsService` 订阅 Redis pub/sub
  *   `session-events`，撤销/禁用事件到达即清本实例肯定缓存，撤销**立即**全实例生效；
  *   仅当 Redis pub/sub 不可用时退化为 ≤ TTL 窗口（TTL 由 SECURITY_GUARD_CACHE_TTL_MS 控制，默认 5000ms）。
+ * - **容量有界（M11-P2 D1-11 收口）**：三个缓存都有条目上限（默认 5000，env SECURITY_GUARD_CACHE_MAX_ENTRIES）。
+ *   M10 审计结论是"只受 TTL 约束、无条数上限"——而 TTL 只影响**命中**，不影响**驻留**：
+ *   条目过期后仍留在 Map 里（只有再次访问该 key 或收到事件才会被删/覆盖），
+ *   于是一个长期在线、用户基数大的实例上，缓存会随**历史用户/会话/jti 总量**单调增长。
  */
 const DEFAULT_TTL_MS = 5000;
+/** 每个进程内缓存的条目上限（env SECURITY_GUARD_CACHE_MAX_ENTRIES 可覆盖） */
+const DEFAULT_MAX_ENTRIES = 5000;
+
+function positiveInt(raw: string | undefined, fallback: number): number {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : fallback;
+}
 
 @Injectable()
 export class AccessGuardService implements OnModuleInit {
+  private readonly logger = new Logger('AccessGuard');
   private readonly ttlMs = Number(process.env.SECURITY_GUARD_CACHE_TTL_MS ?? DEFAULT_TTL_MS);
+  /** 三个缓存的容量上限（构造期读取；测试可注入 env 覆盖） */
+  readonly maxEntries = positiveInt(process.env.SECURITY_GUARD_CACHE_MAX_ENTRIES, DEFAULT_MAX_ENTRIES);
   private readonly userStatusCache = new Map<string, { active: boolean; at: number }>();
   private readonly sessionCache = new Map<string, { live: boolean; at: number }>();
   /** jti 未拉黑（肯定结论）缓存；key = jti */
@@ -46,7 +60,7 @@ export class AccessGuardService implements OnModuleInit {
     if (cached && now - cached.at < this.ttlMs) return cached.active;
     const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { status: true } });
     const active = user?.status === 'active';
-    if (active) this.userStatusCache.set(userId, { active: true, at: now });
+    if (active) this.setBounded(this.userStatusCache, userId, { active: true, at: now });
     else this.userStatusCache.delete(userId);
     return active;
   }
@@ -60,7 +74,7 @@ export class AccessGuardService implements OnModuleInit {
       where: { id: sessionId }, select: { revokedAt: true, expiresAt: true },
     });
     const live = session != null && session.revokedAt == null && session.expiresAt > new Date();
-    if (live) this.sessionCache.set(sessionId, { live: true, at: now });
+    if (live) this.setBounded(this.sessionCache, sessionId, { live: true, at: now });
     else this.sessionCache.delete(sessionId);
     return live;
   }
@@ -76,8 +90,34 @@ export class AccessGuardService implements OnModuleInit {
     if (cachedAt !== undefined && now - cachedAt < this.ttlMs) return false;
     const blocked = (await this.events?.isJtiBlacklisted(jti)) ?? false;
     if (blocked) this.jtiOkCache.delete(jti);
-    else this.jtiOkCache.set(jti, now);
+    else this.setBounded(this.jtiOkCache, jti, now);
     return blocked;
+  }
+
+  /**
+   * M11-P2（D1-01）：该会话是否由"设备下线"撤销——**仅供 JwtAuthGuard 细化 401 的错误码**
+   * （通用"登录已失效" vs "该设备已被下线"）。调用点在 `isSessionLive === false` 之后，
+   * 即"已经要拒绝"的路径上，因此这里只回答"原因"，绝不参与放行/拒绝裁决。
+   * Redis 故障/无标记/安全面缺失 → false（退化回 UNAUTHORIZED）。
+   */
+  async isSessionDeviceRevoked(sessionId: string): Promise<boolean> {
+    return (await this.events?.isSessionDeviceRevoked(sessionId)) ?? false;
+  }
+
+  /**
+   * M11-P2（D1-11）有界写入：达到条目上限时**整表清空**再写入。
+   * 取舍（简单有界 > 精确淘汰）：
+   * - 三个缓存只存**肯定结论**，丢失的代价 = 一次重新查库/查 Redis（幂等且廉价）；
+   * - O(1) 且**绝无 OOM 面**：不做 LRU（Map 的插入序 ≠ 访问序，"最旧"不等于"最冷"，
+   *   维护成本换不来可解释性），也不逐条淘汰（清表已给出硬上界）；
+   * - 触发即清空会让**整个实例**短暂回到冷态（一次突发 DB 读），因此上限取 5000（远大于稳态工作集）。
+   */
+  private setBounded<K, V>(map: Map<K, V>, key: K, value: V): void {
+    if (map.size >= this.maxEntries && !map.has(key)) {
+      this.logger.warn(`访问判定缓存达到上限（${this.maxEntries} 条）→ 整表清空重建（冷态一次，不影响正确性）`);
+      map.clear();
+    }
+    map.set(key, value);
   }
 
   /** 用户状态变更（禁用/启用）后调用 */
