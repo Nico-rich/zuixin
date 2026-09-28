@@ -10,13 +10,16 @@ export type OrgPermission =
   | 'agent.read' | 'agent.write'
   | 'workflow.read' | 'workflow.write'
   | 'connection.read' | 'connection.write'
-  | 'billing.read' | 'billing.write';
+  | 'billing.read' | 'billing.write'
+  // M9-P1：Evaluation / Experimentation（写 = owner/admin；读 = 全部成员）
+  | 'evaluation.read' | 'evaluation.write';
 
 const ALL: OrgPermission[] = [
   'organization.read', 'organization.write', 'member.read', 'member.write',
   'project.read', 'project.write', 'agent.read', 'agent.write',
   'workflow.read', 'workflow.write', 'connection.read', 'connection.write',
   'billing.read', 'billing.write',
+  'evaluation.read', 'evaluation.write',
 ];
 
 /** M8-P1 RBAC 矩阵（deny-by-default：未列出的权限一律拒绝） */
@@ -30,8 +33,9 @@ const ROLE_PERMISSIONS: Record<OrganizationRole, OrgPermission[]> = {
     'workflow.read', 'workflow.write',
     'connection.read', 'connection.write',
     'billing.read',
+    'evaluation.read',
   ],
-  viewer: ['organization.read', 'project.read', 'agent.read', 'workflow.read', 'connection.read'],
+  viewer: ['organization.read', 'project.read', 'agent.read', 'workflow.read', 'connection.read', 'evaluation.read'],
 };
 
 /**

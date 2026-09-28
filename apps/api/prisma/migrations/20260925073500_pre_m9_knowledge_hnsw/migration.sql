@@ -4,5 +4,3 @@
 -- 过滤条件（userId/projectId）由 HNSW 候选集后过滤（相似度阈值 + scope 校验在 SQL 层，绝不信任调用方）。
 ALTER TABLE "DocumentChunk" ALTER COLUMN embedding TYPE vector(1536) USING embedding::vector(1536);
 CREATE INDEX "DocumentChunk_embedding_hnsw_idx" ON "DocumentChunk" USING hnsw (embedding vector_cosine_ops);
--- 注：migrate diff 会报告 "Removed index on columns (embedding)"——Prisma 无法内省 Unsupported 列上的
--- 自定义索引（与 vector 列本身同属已知限制）；本索引为数据库事实，diff 差异为已知无害漂移。

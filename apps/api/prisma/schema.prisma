@@ -172,6 +172,11 @@ model User {
   extensions          Extension[]
   knowledgeBases KnowledgeBase[]
   documents      Document[]
+  memoryCandidates MemoryCandidate[]
+  evaluationDatasets EvaluationDataset[]
+  evaluationRuns EvaluationRun[]
+  evaluators Evaluator[]
+  experiments Experiment[]
 }
 
 model Session {
@@ -420,6 +425,7 @@ model Project {
   workflows        Workflow[]
   knowledgeBases KnowledgeBase[]
   documents       Document[]
+  memoryCandidates MemoryCandidate[]
   @@index([userId, updatedAt])
   @@index([organizationId])
 }
@@ -453,12 +459,21 @@ model Memory {
 // ===== M2: ConversationSummary（仅结构，M6 自动摘要）=====
 model ConversationSummary {
   id                        String       @id @default(uuid())
-  conversationId            String       @unique
+  conversationId            String
   conversation              Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   summary                   String       @db.Text
   summarizedThroughMessageId String?
+  // ===== M9-P2 Advanced Memory：增量摘要版本链（每会话多行；消息 id 锚定来源区间）=====
+  sourceStartMessageId      String?      // 本段摘要覆盖的第一条消息（不含即从头）
+  sourceEndMessageId        String?      // 覆盖的最后一条消息（增量链的拼接锚点）
+  tokenCount                Int          @default(0)
+  parentSummaryId           String?      // 版本链：本段摘要在前版基础上增量生成
+  parentSummary             ConversationSummary? @relation("SummaryChain", fields: [parentSummaryId], references: [id], onDelete: SetNull)
+  children                  ConversationSummary[] @relation("SummaryChain")
+  stale                     Boolean      @default(false) // 覆盖区间内消息被编辑/删除 → 待重算
   createdAt                 DateTime     @default(now())
   updatedAt                 DateTime     @updatedAt
+  @@index([conversationId, createdAt])
 }
 
 // ===== M2: Artifact（制品层，仅结构，不做 Workflow）=====
@@ -1417,6 +1432,10 @@ model Organization {
   routingDecisions RoutingDecision[]
   quotaAlerts  QuotaAlert[]
   quotaReservations QuotaReservation[]
+  evaluationDatasets EvaluationDataset[]
+  evaluationRuns EvaluationRun[]
+  evaluators Evaluator[]
+  experiments Experiment[]
   invoices     Invoice[]
   paymentEvents PaymentEvent[]
   @@index([ownerUserId])
@@ -1566,6 +1585,154 @@ model PaymentEvent {
   createdAt      DateTime @default(now())
   @@unique([provider, providerEventId])
   @@index([organizationId])
+}
+
+// ===== M9-P1 Evaluation / Experimentation（Coordinator 预整合；dataset 版本化 + run 锁定版本 + 可复现）=====
+model EvaluationDataset {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name           String
+  description    String?
+  version        Int      @default(1) // 编辑 bump；run 锁定 (datasetId, datasetVersion)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  cases          EvaluationCase[]
+  runs           EvaluationRun[]
+  @@index([organizationId])
+}
+
+model EvaluationCase {
+  id        String   @id @default(uuid())
+  datasetId String
+  dataset   EvaluationDataset @relation(fields: [datasetId], references: [id], onDelete: Cascade)
+  version   Int      // 所属 dataset 版本（编辑 bump 后旧版本行保留——不可变历史）
+  input     Json     // 标准输入
+  expected  Json?    // 期望输出（exact/schema 评测用）
+  tags      Json?    // 分类标签数组
+  createdAt DateTime @default(now())
+  @@index([datasetId, version])
+}
+
+model EvaluationRun {
+  id               String   @id @default(uuid())
+  organizationId   String
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId           String
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  datasetId        String
+  dataset          EvaluationDataset @relation(fields: [datasetId], references: [id], onDelete: Cascade)
+  datasetVersion   Int      // 锁定版本（绝不随 dataset 后续编辑漂移）
+  agentId          String
+  agentVersionId   String   // 锁定 Agent 版本（AgentVersion 不可变）
+  configSnapshot   Json     // model/provider/temperature/tools 全量快照——可复现
+  status           String   @default("pending") // pending|running|completed|failed|cancelled
+  totalCases       Int      @default(0)
+  completedCases   Int      @default(0)
+  baselineRunId    String?  // 对比：baseline vs candidate（regression comparison）
+  createdAt        DateTime @default(now())
+  completedAt      DateTime?
+  caseRuns         EvaluationCaseRun[]
+  @@index([organizationId, createdAt])
+}
+
+model EvaluationCaseRun {
+  id              String   @id @default(uuid())
+  runId           String
+  run             EvaluationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  caseId          String
+  status          String   @default("pending") // pending|running|completed|failed|skipped
+  input           Json
+  output          Json?
+  latencyMs       Int?
+  promptTokens    Int      @default(0)
+  completionTokens Int     @default(0)
+  cost            Float    @default(0)
+  toolCalls       Json?    // [{name, arguments, output}] 事实
+  errorCode       String?
+  createdAt       DateTime @default(now())
+  completedAt     DateTime?
+  results         EvaluationResult[]
+  @@unique([runId, caseId])
+  @@index([runId])
+}
+
+model Evaluator {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name           String
+  type           String   // exact_match | json_schema | rule | llm_judge
+  config         Json     // schema/rules/judge prompt 模板 + judgeModelId
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  results        EvaluationResult[]
+  @@index([organizationId])
+}
+
+model EvaluationResult {
+  id          String   @id @default(uuid())
+  caseRunId   String
+  caseRun     EvaluationCaseRun @relation(fields: [caseRunId], references: [id], onDelete: Cascade)
+  evaluatorId String
+  evaluator   Evaluator @relation(fields: [evaluatorId], references: [id], onDelete: Cascade)
+  score       Float    @default(0) // 0~1
+  passed      Boolean  @default(false)
+  evidence    Json?    // judge 引用/规则命中——只读事实（LLM judge 输出只进这里，绝不决定权限）
+  createdAt   DateTime @default(now())
+  @@unique([caseRunId, evaluatorId])
+}
+
+model Experiment {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name           String
+  status         String   @default("draft") // draft|running|completed|archived
+  hypothesis     Json?    // 实验假设文本（业务记录，非判定依据）
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  variants       ExperimentVariant[]
+  @@index([organizationId])
+}
+
+model ExperimentVariant {
+  id               String   @id @default(uuid())
+  experimentId     String
+  experiment       Experiment @relation(fields: [experimentId], references: [id], onDelete: Cascade)
+  name             String
+  agentId          String?
+  agentVersionId   String?
+  configSnapshot   Json
+  isBaseline       Boolean  @default(false)
+  trafficPercent   Int      @default(0)
+  metrics          Json?    // 由 evaluation run 聚合的对照事实
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+// ===== M9-P2 Advanced Memory（记忆候选三态；sourceSummary 来源追溯）=====
+model MemoryCandidate {
+  id              String   @id @default(uuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId       String?
+  project         Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  sourceSummaryId String?  // 提炼来源（摘要行；仅真实对话提炼——绝不从摘要循环污染）
+  content         String   @db.Text
+  category        MemoryCategory
+  importance      Int      @default(50)
+  confidence      Float    @default(0.5)
+  status          String   @default("candidate") // candidate|active|rejected
+  createdAt       DateTime @default(now())
+  promotedAt      DateTime?
+  @@index([userId, status])
 }
 
 // ===== M8-P3~P7 平台层（Coordinator 预整合 schema；各 Phase 并行实现业务）=====
