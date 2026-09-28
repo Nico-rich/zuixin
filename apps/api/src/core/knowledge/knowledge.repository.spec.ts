@@ -1,5 +1,8 @@
-import { describe, it, expect, vi } from 'vitest';
-import { KnowledgeRepository, EMBEDDING_DIMENSIONS, buildSimilaritySearchSql } from './knowledge.repository';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import {
+  KnowledgeRepository, EMBEDDING_DIMENSIONS, buildSimilaritySearchSql,
+  HNSW_EF_SEARCH_ENV, HNSW_RANDOM_PAGE_COST_ENV, parseHnswSetting, resolveHnswEfSearch, resolveHnswRandomPageCost,
+} from './knowledge.repository';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 
 interface Captured {
@@ -8,7 +11,11 @@ interface Captured {
   tagged: boolean;
 }
 
-/** 捕获 raw SQL 调用的假 Prisma（同时支持 `$queryRaw(sql对象)` 与 tagged template 两种调用形态） */
+/**
+ * 捕获 raw SQL 调用的假 Prisma（同时支持 `$queryRaw(sql对象)` 与 tagged template 两种调用形态）。
+ * P14：检索走**显式事务**（事务内 SET LOCAL 检索期 GUC）——假 `$transaction` 把回调直接跑在同一个
+ * 假客户端上，并记录事务开启次数（用于断言"GUC 限定在事务内、不泄漏到连接池"）。
+ */
 function makePrisma(rows: unknown[] = []) {
   const executeRaw: Captured[] = [];
   const queryRaw: Captured[] = [];
@@ -23,9 +30,15 @@ function makePrisma(rows: unknown[] = []) {
       }
       return Promise.resolve(rows);
     };
-  const prisma = { $executeRaw: vi.fn(capture(executeRaw)), $queryRaw: vi.fn(capture(queryRaw)) };
-  return { prisma: prisma as never, executeRaw, queryRaw };
+  const client = { $executeRaw: vi.fn(capture(executeRaw)), $queryRaw: vi.fn(capture(queryRaw)) };
+  const transaction = vi.fn(async (fn: (tx: typeof client) => Promise<unknown>) => fn(client));
+  const prisma = { ...client, $transaction: transaction };
+  return { prisma: prisma as never, executeRaw, queryRaw, transaction };
 }
+
+/** 检索语句（剔除事务内的 GUC 设置语句）；GUC 语句单独由 gucsOf 断言 */
+const searchCalls = (calls: Captured[]) => calls.filter((c) => c.sql.includes('ORDER BY c.embedding'));
+const gucCall = (calls: Captured[]) => calls.find((c) => c.sql.includes('set_config'))!;
 
 const vector = (dims: number, fill = 0.1) => new Array(dims).fill(fill);
 const chunks = (n: number) =>
@@ -81,8 +94,8 @@ describe('KnowledgeRepository（P4：批量写入 + 维度守卫 + 索引化检�
       userId: 'u1', projectId: null, queryEmbedding: vector(EMBEDDING_DIMENSIONS, 0.2), topK: 5, similarityThreshold: 0.3,
     });
 
-    expect(queryRaw).toHaveLength(1);
-    const { sql, values } = queryRaw[0];
+    expect(searchCalls(queryRaw)).toHaveLength(1); // 检索只发一条语句（另一条是事务内 GUC 设置）
+    const { sql, values } = searchCalls(queryRaw)[0];
     expect(sql).toContain('ORDER BY c.embedding <=> '); // 索引排序表达式（HNSW 可用前提）
     expect(sql).not.toContain('ORDER BY similarity'); // 旧形状：计算列排序 → 必然 Sort
     expect(values).toContain(0.7); // 距离上界 = 1 - threshold(0.3)，落在同一条索引表达式上
@@ -100,7 +113,7 @@ describe('KnowledgeRepository（P4：批量写入 + 维度守卫 + 索引化检�
     await new KnowledgeRepository(prisma).searchSimilarChunks({
       userId: 'u1', projectId: 'p9', queryEmbedding: vector(EMBEDDING_DIMENSIONS), topK: 3, similarityThreshold: 0.9,
     });
-    const { values } = queryRaw[0];
+    const { values } = searchCalls(queryRaw)[0];
     expect(values).toContain(1 - 0.9); // 距离上界（浮点结果与实现一致）
     expect(values.filter((v) => v === 'p9')).toHaveLength(2); // IS NULL 判定 + 等值判定（同一绑定值）
   });
@@ -110,7 +123,60 @@ describe('KnowledgeRepository（P4：批量写入 + 维度守卫 + 索引化检�
     const params = { userId: 'u1', projectId: null, queryEmbedding: vector(EMBEDDING_DIMENSIONS), topK: 4, similarityThreshold: 0.5 };
     await new KnowledgeRepository(prisma).searchSimilarChunks(params);
     const built = buildSimilaritySearchSql(params);
-    expect(queryRaw[0].values).toEqual(built.values);
-    expect(queryRaw[0].sql).toContain('ORDER BY c.embedding <=> ');
+    expect(searchCalls(queryRaw)[0].values).toEqual(built.values);
+    expect(searchCalls(queryRaw)[0].sql).toContain('ORDER BY c.embedding <=> ');
+  });
+
+  // ── M11-P14：检索期 GUC（显式事务 + SET LOCAL）─────────────────────────────
+  describe('M11-P14 检索期 GUC（HNSW 交叉点结论落地）', () => {
+    afterEach(() => {
+      delete process.env[HNSW_EF_SEARCH_ENV];
+      delete process.env[HNSW_RANDOM_PAGE_COST_ENV];
+    });
+
+    it('检索在显式事务内先钉死 GUC（is_local=true）再执行同一份 SQL——作用域=事务，绝不泄漏到连接池', async () => {
+      const { prisma, queryRaw, transaction } = makePrisma([]);
+      await new KnowledgeRepository(prisma).searchSimilarChunks({
+        userId: 'u1', projectId: null, queryEmbedding: vector(EMBEDDING_DIMENSIONS), topK: 5, similarityThreshold: 0.3,
+      });
+
+      expect(transaction).toHaveBeenCalledTimes(1); // 只有一个显式事务（不会出现"SET 泄漏到会话"的路径）
+      const guc = gucCall(queryRaw);
+      expect(guc.sql).toContain('set_config'); // set_config(...) 而非 SET LOCAL 字面量——支持参数绑定
+      expect(guc.sql).toContain("'hnsw.ef_search'");
+      expect(guc.sql).toContain("'random_page_cost'");
+      expect(guc.values).toEqual(['40', '1.1']); // 默认：pgvector 默认 ef_search + SSD 口径 rpc
+      expect((guc.sql.match(/true/g) ?? []).length).toBe(2); // is_local=true ×2 → 事务级
+      // GUC 语句在检索语句之前（同一事务内、同一连接）
+      expect(queryRaw.findIndex((c) => c.sql.includes('set_config'))).toBeLessThan(
+        queryRaw.findIndex((c) => c.sql.includes('ORDER BY c.embedding')),
+      );
+    });
+
+    it('env 可配：两个 GUC 都随 env 覆盖（不同磁盘/不同召回要求）', async () => {
+      process.env[HNSW_EF_SEARCH_ENV] = '100';
+      process.env[HNSW_RANDOM_PAGE_COST_ENV] = '2.5';
+      const { prisma, queryRaw } = makePrisma([]);
+      await new KnowledgeRepository(prisma).searchSimilarChunks({
+        userId: 'u1', projectId: null, queryEmbedding: vector(EMBEDDING_DIMENSIONS), topK: 5, similarityThreshold: 0.3,
+      });
+      expect(gucCall(queryRaw).values).toEqual(['100', '2.5']);
+    });
+
+    it('env 非法 → 回退默认并仍能检索（绝不因一次调参把检索打挂）', async () => {
+      process.env[HNSW_EF_SEARCH_ENV] = 'abc';
+      process.env[HNSW_RANDOM_PAGE_COST_ENV] = '-3';
+      const { prisma, queryRaw } = makePrisma([]);
+      await new KnowledgeRepository(prisma).searchSimilarChunks({
+        userId: 'u1', projectId: null, queryEmbedding: vector(EMBEDDING_DIMENSIONS), topK: 5, similarityThreshold: 0.3,
+      });
+      expect(gucCall(queryRaw).values).toEqual(['40', '1.1']);
+      expect(parseHnswSetting('99999', 40, 1, 1000, 'X')).toBe(40); // 越界同样回退
+      expect(parseHnswSetting('', 40, 1, 1000, 'X')).toBe(40); // 空串 = 未设置
+      expect(parseHnswSetting(undefined, 1.1, 0, 100, 'X')).toBe(1.1);
+      expect(resolveHnswEfSearch({})).toBe(40);
+      expect(resolveHnswRandomPageCost({})).toBe(1.1);
+      expect(resolveHnswEfSearch({ [HNSW_EF_SEARCH_ENV]: '200' })).toBe(200);
+    });
   });
 });
