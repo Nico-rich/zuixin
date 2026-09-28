@@ -1,0 +1,256 @@
+/**
+ * M9-P5 洞察服务（Performance 事实聚合 + LLM 解读分层隔离）。
+ *
+ * 事实来源（**全部复用既有系统，绝不新建第二套**）：
+ * - 绩效回流：M7-P8 `Feedback`（评分）+ `CreativePerformance`（曝光/点击/花费/转化/营收/订单原始事实）——
+ *   只读聚合，事实层 = 窗口内行的求和（规则层由 insight-rules.ts 纯函数计算）；
+ * - 评测事实：M9-P1 `EvaluationRunsService`（列出组织内 run + 读其 `scores` 摘要——聚合口径由 P1 的
+ *   `summarizeScores` 独家提供，本模块**不重算**评测分数）；
+ * - 解读层：LLM 文本（可选）经 `attachInterpretation` 独立字段写入，**绝不触碰 facts/derived**
+ *   （写入前 `assertFactsUnchanged` 断言 + `factsHash` 条件更新双保险）。
+ *
+ * 分层标注（消费方按 layering 字段区分；与 M7-P5 CommerceAnalysis 同一口径）：
+ *   facts=service-computed / derived=service-computed / interpretation=llm-interpretation。
+ */
+
+import { Inject, Injectable } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { EvaluationRunsService } from '../evaluation/evaluation-runs.service';
+import { AppError, ErrorCode } from '../../common/errors/app-error';
+import { CreativeLoopAccessService } from './creative-loop-access.service';
+import { InsightDoc, InsightStore, StoredDoc } from './creative-loop-store';
+import {
+  ComparisonEntry, RatingFacts, assertFactsUnchanged, comparePeriods, derivePerfMetrics,
+  factsHashOf, sumPerfFacts, summarizeRatings,
+} from './insight-rules';
+
+/** 洞察窗口默认跨度（天） */
+export const DEFAULT_INSIGHT_DAYS = 30;
+/** 单次洞察聚合的评测 run 上限（读路径有界） */
+const EVALUATION_RUN_LIMIT = 5;
+
+export interface InsightView extends InsightDoc {
+  id: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface BuildInsightInput {
+  organizationId?: string;
+  projectId?: string;
+  days?: number;
+  /** 限定单个创意（artifactId）/ 广告（campaignId）；缺省 = 项目/用户全量 */
+  artifactId?: string;
+  campaignId?: string;
+  /** 是否聚合评测事实（默认 true；关掉 = 纯绩效事实，便于最小读） */
+  includeEvaluation?: boolean;
+}
+
+@Injectable()
+export class InsightService {
+  constructor(
+    @Inject(PrismaService) private readonly prisma: PrismaService,
+    @Inject(InsightStore) private readonly store: InsightStore,
+    @Inject(CreativeLoopAccessService) private readonly access: CreativeLoopAccessService,
+    @Inject(EvaluationRunsService) private readonly evaluationRuns: EvaluationRunsService,
+  ) {}
+
+  /**
+   * 生成洞察快照（当期 vs 前一期；事实/派生/解读三层，解读留空）。
+   * 窗口口径：以 `capturedAt` 落窗（回流事实的捕获时间）——[now-days, now] 为当期，[now-2*days, now-days) 为前一期。
+   */
+  async build(userId: string, input: BuildInsightInput): Promise<InsightView> {
+    const scope = await this.access.resolveScope(userId, {
+      organizationId: input.organizationId,
+      projectId: input.projectId,
+    });
+    await this.access.requireRead(userId, scope.organizationId);
+
+    const days = input.days ?? DEFAULT_INSIGHT_DAYS;
+    const now = new Date();
+    const dayMs = 86400_000;
+    const currentStart = new Date(now.getTime() - days * dayMs);
+    const previousStart = new Date(now.getTime() - 2 * days * dayMs);
+
+    const perfWhere = {
+      userId,
+      ...(scope.projectId ? { projectId: scope.projectId } : {}),
+      ...(input.artifactId ? { artifactId: input.artifactId } : {}),
+      ...(input.campaignId ? { campaignId: input.campaignId } : {}),
+    };
+
+    const [currentRows, previousRows, feedbackRows] = await Promise.all([
+      this.prisma.creativePerformance.findMany({ where: { ...perfWhere, capturedAt: { gte: currentStart } } }),
+      this.prisma.creativePerformance.findMany({ where: { ...perfWhere, capturedAt: { gte: previousStart, lt: currentStart } } }),
+      this.prisma.feedback.findMany({
+        where: {
+          userId,
+          ...(scope.projectId ? { projectId: scope.projectId } : {}),
+          subjectType: { in: ['artifact', 'creativeBrief', 'generationTask'] },
+          createdAt: { gte: currentStart },
+        },
+        select: { rating: true },
+      }),
+    ]);
+
+    const currentFacts = sumPerfFacts(currentRows);
+    const previousFacts = sumPerfFacts(previousRows);
+    const currentDerived = derivePerfMetrics(currentFacts);
+    const previousDerived = derivePerfMetrics(previousFacts);
+    const ratings: RatingFacts = summarizeRatings(feedbackRows.map((f) => f.rating));
+    const comparison: ComparisonEntry[] = comparePeriods(
+      currentDerived as unknown as Record<string, number>,
+      previousDerived as unknown as Record<string, number>,
+      ['ctr', 'cvr', 'roas', 'cpc'],
+    );
+    const evaluation = input.includeEvaluation === false
+      ? { runs: [], aggregate: null }
+      : await this.evaluationFacts(scope.organizationId);
+
+    const facts: Record<string, unknown> = {
+      window: { start: currentStart.toISOString(), end: now.toISOString(), days },
+      performance: {
+        current: currentFacts,
+        previous: previousFacts,
+        sources: { current: currentRows.length, previous: previousRows.length },
+        rule: 'server-sum',
+      },
+      ratings: { ...ratings, rule: 'server-sum' },
+      evaluation: { runs: evaluation.runs, rule: 'evaluation-run-summary' },
+    };
+    const derived: Record<string, unknown> = {
+      metrics: currentDerived,
+      baseline: previousDerived,
+      comparison,
+      ratingSummary: { avgRating: ratings.avgRating, positiveRate: ratings.positiveRate, negativeRate: ratings.negativeRate },
+      evaluation: evaluation.aggregate,
+      rule: 'server-comparison',
+    };
+
+    const doc: InsightDoc = {
+      kind: 'creative_insight',
+      organizationId: scope.organizationId,
+      projectId: scope.projectId,
+      window: { start: currentStart.toISOString(), end: now.toISOString(), days },
+      filters: {
+        artifactId: input.artifactId ?? null,
+        campaignId: input.campaignId ?? null,
+        projectId: scope.projectId,
+      },
+      facts,
+      derived,
+      factsHash: factsHashOf(facts, derived),
+      interpretation: null,
+      layering: {
+        facts: 'service-computed',
+        derived: 'service-computed',
+        interpretation: 'llm-interpretation',
+      },
+    };
+    const stored = await this.store.create(userId, doc);
+    return this.toView(stored);
+  }
+
+  async list(userId: string, query: { organizationId?: string; projectId?: string; limit?: number }): Promise<{ insights: InsightView[] }> {
+    const scope = await this.access.resolveScope(userId, {
+      organizationId: query.organizationId,
+      projectId: query.projectId,
+    });
+    await this.access.requireRead(userId, scope.organizationId);
+    const rows = await this.store.list({
+      organizationId: scope.organizationId,
+      projectId: scope.projectId ?? undefined,
+      take: query.limit ?? 50,
+    });
+    return { insights: rows.map((r) => this.toView(r)) };
+  }
+
+  async get(userId: string, id: string): Promise<InsightView> {
+    const stored = await this.requireReadable(userId, id);
+    return this.toView(stored);
+  }
+
+  /**
+   * 写入 LLM 解读（**隔离不变量**：facts/derived 逐字节不变 + factsHash 条件更新）。
+   * 事实层在本方法内**只读**（复制自存储行，绝不接收调用方传入的 facts/derived）。
+   */
+  async attachInterpretation(
+    userId: string,
+    id: string,
+    input: { items: string[]; model?: string | null },
+  ): Promise<InsightView> {
+    const stored = await this.requireWritable(userId, id);
+    const attachedAt = new Date().toISOString();
+    const next: InsightDoc = {
+      ...stored.doc,
+      interpretation: {
+        source: 'llm-interpretation',
+        items: input.items,
+        model: input.model ?? null,
+        attachedAt,
+      },
+    };
+    // 双保险①：事实层不变断言（违反 → INTERNAL，绝不落库）
+    assertFactsUnchanged(stored.doc, next);
+    // 双保险②：factsHash 条件更新（事实已变 → 拒写，解读必须基于最新事实重生成）
+    const count = await this.store.saveInterpretation(id, stored.doc.factsHash, next);
+    if (count === 0) {
+      throw new AppError(ErrorCode.VALIDATION_ERROR, '洞察事实层已更新，解读需基于最新事实重新生成');
+    }
+    return this.toView({ ...stored, doc: next });
+  }
+
+  /** 读路径（服务层内部用；loop 编排按 id 引用洞察事实） */
+  async requireReadable(userId: string, id: string): Promise<StoredDoc<InsightDoc>> {
+    const stored = await this.store.get(id);
+    if (!stored) throw new AppError(ErrorCode.NOT_FOUND, '洞察不存在');
+    await this.access.authorizeResource(userId, { organizationId: stored.doc.organizationId, userId: stored.userId }, 'workflow.read');
+    return stored;
+  }
+
+  private async requireWritable(userId: string, id: string): Promise<StoredDoc<InsightDoc>> {
+    const stored = await this.store.get(id);
+    if (!stored) throw new AppError(ErrorCode.NOT_FOUND, '洞察不存在');
+    await this.access.authorizeResource(userId, { organizationId: stored.doc.organizationId, userId: stored.userId }, 'workflow.write');
+    return stored;
+  }
+
+  /** 评测事实聚合（**只读 P1 摘要**：avgScore/passRate 由 EvaluationRunsService 独家计算） */
+  private async evaluationFacts(organizationId: string): Promise<{
+    runs: Array<Record<string, unknown>>;
+    aggregate: Record<string, unknown> | null;
+  }> {
+    const runs = await this.evaluationRuns.list(organizationId, { limit: EVALUATION_RUN_LIMIT });
+    const completed = runs.filter((r) => r.status === 'completed');
+    const rows: Array<Record<string, unknown>> = [];
+    for (const run of completed.slice(0, EVALUATION_RUN_LIMIT)) {
+      const detail = await this.evaluationRuns.get(organizationId, run.id);
+      rows.push({
+        runId: run.id,
+        datasetId: run.datasetId,
+        datasetVersion: run.datasetVersion,
+        agentId: run.agentId,
+        baselineRunId: run.baselineRunId,
+        completedAt: run.completedAt,
+        overall: detail.scores.overall,
+        rule: 'evaluation-run-summary',
+      });
+    }
+    const withScores = rows.filter((r) => (r.overall as { evaluated?: number } | null)?.evaluated);
+    const avg = (pick: (r: Record<string, unknown>) => number) => {
+      if (withScores.length === 0) return null;
+      return Math.round((withScores.reduce((s, r) => s + pick(r), 0) / withScores.length) * 1e6) / 1e6;
+    };
+    const aggregate = withScores.length === 0 ? null : {
+      runs: withScores.length,
+      avgScore: avg((r) => (r.overall as { avgScore: number }).avgScore),
+      passRate: avg((r) => (r.overall as { passRate: number }).passRate),
+      rule: 'server-mean',
+    };
+    return { runs: rows, aggregate };
+  }
+
+  private toView(stored: StoredDoc<InsightDoc>): InsightView {
+    return { ...stored.doc, id: stored.id, createdAt: stored.createdAt, updatedAt: stored.updatedAt };
+  }
+}

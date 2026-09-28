@@ -35,6 +35,7 @@ import { AuditModule } from './modules/audit/audit.module';
 import { RateLimitModule } from './core/rate-limit/rate-limit.module';
 import { KnowledgeApiModule } from './modules/knowledge/knowledge.module';
 import { EvaluationApiModule } from './modules/evaluation/evaluation-api.module'; // M9-P1 Evaluation
+import { CreativeLoopApiModule } from './modules/creative-loop/creative-loop-api.module'; // M9-P5 Creative Performance Loop
 import { TracingModule } from './core/tracing/tracing.module';
 import { ObservabilityApiModule } from './modules/observability/observability-api.module';
 import { GenerationsModule } from './modules/generations/generations.module';
@@ -93,6 +94,7 @@ import { SseModule } from './core/sse/sse.module';
     AuditApiModule,
     KnowledgeApiModule,
     EvaluationApiModule, // M9-P1 Evaluation / Experimentation
+    CreativeLoopApiModule, // M9-P5 创意闭环（洞察/假设/loop 编排）
     GenerationsModule,
     TasksModule,
     ChatModule,
