@@ -1,4 +1,5 @@
 import { BillingModule } from '../billing/billing.module';
+import { ExternalActionsModule } from '../external-actions/external-actions.module';
 import { Module } from '@nestjs/common';
 import { MediaGenerationService } from './media-generation.service';
 import { MediaCleanupService } from './media-cleanup.service';
@@ -11,7 +12,8 @@ import { ModelRouterModule } from '../../core/model-router/model-router.module';
 import { AgentRunResumeModule } from '../../core/agent-run-resume/agent-run-resume.module';
 
 @Module({
-  imports: [QueueModule, EventsModule, ModelRouterModule, AgentRunResumeModule, BillingModule],
+  // Pre-M9 G7：清扫周期同时恢复外部动作域（executing 残留行按远端真实状态落终态）
+  imports: [QueueModule, EventsModule, ModelRouterModule, AgentRunResumeModule, BillingModule, ExternalActionsModule],
   providers: [
     MediaGenerationService,
     MediaCleanupService,

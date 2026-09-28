@@ -101,6 +101,43 @@ describe('EventPlatformService（M8-P5 事件平台：幂等/重试/死信/重�
     expect(bus.unsubscribe).toHaveBeenCalledTimes(1);
   });
 
+  it('G10 冻结：生产进程禁止注册消费者（抛 FORBIDDEN，绝不挂总线）', async () => {
+    const { svc, bus } = makeService();
+    const prev = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      await expect(svc.subscribe({ name: 'c1', eventTypes: ['order.created'], handler: vi.fn() }))
+        .rejects.toMatchObject({ code: 'FORBIDDEN' });
+      expect(bus.subscribe).not.toHaveBeenCalled();
+    } finally {
+      process.env.NODE_ENV = prev;
+    }
+  });
+
+  it('G10 冻结：Coordinator 批准的显式豁免（EVENT_PLATFORM_ALLOW_SUBSCRIBE=1）才放行', async () => {
+    const { svc, bus } = makeService();
+    const prevEnv = process.env.NODE_ENV;
+    const prevFlag = process.env.EVENT_PLATFORM_ALLOW_SUBSCRIBE;
+    process.env.NODE_ENV = 'production';
+    process.env.EVENT_PLATFORM_ALLOW_SUBSCRIBE = '1';
+    try {
+      await svc.subscribe({ name: 'c-approved', eventTypes: ['order.created'], handler: vi.fn() });
+      expect(bus.subscribe).toHaveBeenCalledTimes(1);
+    } finally {
+      process.env.NODE_ENV = prevEnv;
+      if (prevFlag === undefined) delete process.env.EVENT_PLATFORM_ALLOW_SUBSCRIBE;
+      else process.env.EVENT_PLATFORM_ALLOW_SUBSCRIBE = prevFlag;
+    }
+  });
+
+  it('G10 冻结：无消费者的事件仍幂等落库（facts 优先），仅通知通道无接收方', async () => {
+    const { svc, prisma } = makeService();
+    const res = await svc.publish({ eventId: 'evt-frozen', eventType: 'scheduler.job.completed', organizationId: 'org-1' });
+    expect(res).toMatchObject({ created: true, consumers: 0 }); // 冻结期不做中继：行长期停留在 published
+    expect(prisma.eventEnvelope.create).toHaveBeenCalledTimes(1);
+    expect(res.event.status).toBe('published');
+  });
+
   it('redeliver：dead → published（attempts 归零）+ 重新投递成功 → consumed', async () => {
     const { svc, prisma } = makeService();
     const handler = vi.fn().mockResolvedValue(undefined);

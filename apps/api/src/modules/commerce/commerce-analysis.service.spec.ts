@@ -1,7 +1,22 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Prisma } from '@prisma/client';
 import { CommerceAnalysisService } from './commerce-analysis.service';
 
-function makeService() {
+function makeService(ledgerOutput: unknown = null) {
+  // Pre-M9 G11：ToolCall 幂等账本替身（output 非空即"首次执行已提交"）
+  const ledger = { output: ledgerOutput as unknown };
+  const tx = {
+    toolCall: {
+      findUnique: vi.fn(async () => ({ output: ledger.output })),
+      updateMany: vi.fn(async ({ where, data }: { where: { output?: { equals?: unknown } }; data: { output: unknown } }) => {
+        if (where.output?.equals === Prisma.DbNull && ledger.output !== null) return { count: 0 };
+        ledger.output = data.output;
+        return { count: 1 };
+      }),
+    },
+    commerceAnalysis: { create: vi.fn(async (args: { data: Record<string, unknown> }) => ({ id: 'an-tx', createdAt: new Date(), ...args.data })) },
+    creativeBrief: { create: vi.fn(async (args: { data: Record<string, unknown> }) => ({ id: 'cb-tx', ...args.data })) },
+  };
   const prisma = {
     commerceAnalysis: {
       create: vi.fn(async (args: { data: Record<string, unknown> }) => ({ id: 'an-1', createdAt: new Date(), ...args.data })),
@@ -13,6 +28,7 @@ function makeService() {
       update: vi.fn().mockResolvedValue({}),
     },
     memory: { findMany: vi.fn().mockResolvedValue([]) },
+    $transaction: vi.fn(async (fn: (t: unknown) => Promise<unknown>) => fn(tx)),
   };
   const commerce = {
     resolveTimeRange: vi.fn((input?: { start?: string; end?: string; days?: number }) => {
@@ -30,7 +46,7 @@ function makeService() {
   };
   const artifacts = { create: vi.fn().mockResolvedValue({ id: 'art-1', status: 'ready' }) };
   const svc = new CommerceAnalysisService(prisma as never, commerce as never, artifacts as never);
-  return { svc, prisma, commerce, artifacts };
+  return { svc, prisma, commerce, artifacts, tx, ledger };
 }
 
 describe('CommerceAnalysisService（M7-P5 事实/推测分层）', () => {
@@ -99,5 +115,40 @@ describe('CommerceAnalysisService（M7-P5 事实/推测分层）', () => {
   it('generateAnalysis：非法 analysisType → VALIDATION_ERROR', async () => {
     const { svc } = makeService();
     await expect(svc.generateAnalysis('u1', { analysisType: 'magic' })).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+
+  it('G11 generateAnalysis（ToolCall）：分析事实与账本同事务提交', async () => {
+    const { svc, prisma, tx, ledger } = makeService();
+    const res = await svc.generateAnalysis('u1', { analysisType: 'sales' }, { agentRunId: 'run-1', toolCallId: 'tc-an' });
+    expect(res).toMatchObject({ analysisId: 'an-tx', layering: { facts: 'service-computed' } });
+    expect(prisma.commerceAnalysis.create).not.toHaveBeenCalled(); // 走 tx（同事务）
+    expect(tx.commerceAnalysis.create).toHaveBeenCalledTimes(1);
+    expect(tx.toolCall.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'tc-an', output: { equals: Prisma.DbNull } },
+      data: { output: expect.objectContaining({ analysisId: 'an-tx' }) }, // 账本值 = 工具返回值（LLM 所见逐字一致）
+    }));
+    expect(ledger.output).toMatchObject({ analysisId: 'an-tx' });
+  });
+
+  it('G11 generateAnalysis 崩溃重放：账本命中 → 复用首次分析，绝不产生第二份', async () => {
+    const recorded = { analysisId: 'an-first', facts: { revenue: 800 }, layering: { facts: 'service-computed' } };
+    const { svc, tx } = makeService(recorded);
+    const res = await svc.generateAnalysis('u1', { analysisType: 'sales' }, { toolCallId: 'tc-an' });
+    expect(res).toEqual(recorded);
+    expect(tx.commerceAnalysis.create).not.toHaveBeenCalled();
+  });
+
+  it('G11 createBrief（ToolCall）：简报行经账本事务；重放复用首次结果（制品镜像另有一重幂等键）', async () => {
+    const { svc, prisma, tx } = makeService();
+    const res = await svc.createBrief('u1', { problem: 'p', objective: 'o' }, { toolCallId: 'tc-cb', idempotencyKey: 'idem-9' });
+    expect(res).toMatchObject({ briefId: 'cb-tx', artifactId: 'art-1' });
+    expect(prisma.creativeBrief.create).not.toHaveBeenCalled();
+    expect(tx.creativeBrief.create).toHaveBeenCalledTimes(1);
+
+    const recorded = { id: 'cb-first', problem: 'p', objective: 'o', status: 'ready', platform: null };
+    const replay = makeService(recorded);
+    const res2 = await replay.svc.createBrief('u1', { problem: 'p', objective: 'o' }, { toolCallId: 'tc-cb', idempotencyKey: 'idem-9' });
+    expect(res2.briefId).toBe('cb-first'); // 复用首次简报行，绝不重复建
+    expect(replay.tx.creativeBrief.create).not.toHaveBeenCalled();
   });
 });

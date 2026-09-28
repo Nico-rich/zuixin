@@ -25,7 +25,8 @@ export function createAnalysisTools(analysis: CommerceAnalysisService): Tool[] {
       }),
       execute: async (raw, ctx) => {
         const input = raw as Parameters<CommerceAnalysisService['generateAnalysis']>[1];
-        return analysis.generateAnalysis(ctx.userId, input, { agentRunId: ctx.agentRunId, projectId: ctx.projectId });
+        // G11：分析事实写入带 ToolCall 幂等账本（崩溃重放绝不产生第二份分析）
+        return analysis.generateAnalysis(ctx.userId, input, { agentRunId: ctx.agentRunId, projectId: ctx.projectId, toolCallId: ctx.toolCallId });
       },
     },
     {
@@ -50,6 +51,7 @@ export function createAnalysisTools(analysis: CommerceAnalysisService): Tool[] {
           agentRunId: ctx.agentRunId, projectId: ctx.projectId,
           conversationId: ctx.conversationId, messageId: ctx.messageId,
           idempotencyKey: ctx.idempotencyKey, // ToolCall 级幂等：resume 重放绝不重复建制品
+          toolCallId: ctx.toolCallId,         // G11：简报行本身也走幂等账本（制品镜像之外的第二重保护）
         });
       },
     },

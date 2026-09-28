@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { MemoryService } from '../../core/memory/memory.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
+import { withToolCallLedger } from '../../core/tools/tool-call-ledger';
 
 const SUBJECT_TYPES = ['artifact', 'creativeBrief', 'product', 'campaign', 'ad', 'generationTask', 'agentRun', 'analysis'] as const;
 /** 绩效记忆阈值（服务端规则，非 LLM）：好/差两档 */
@@ -17,6 +18,10 @@ const BAD_ROAS = 1;
  *   达标/不达标 → 记忆候选（source=performance）；PerformanceSnapshot 为通用快照层；
  * - insights：绩效记忆 + 近期绩效事实（labeled：service-computed 事实 vs memory 候选）；
  * - 记忆去重：同一 (subjectType, subjectId) 只产一条候选（metadata 判定，幂等）。
+ *
+ * Pre-M9 G11：作为 Agent 写副作用工具（feedback.submit / performance.capture）的落点，
+ * 两处事实写入均走 ToolCall 幂等账本（`withToolCallLedger`）——执行中崩溃后 resume 重放
+ * 绝不产生第二条 Feedback / CreativePerformance 事实（HTTP 直调路径无 toolCallId，行为不变）。
  */
 @Injectable()
 export class FeedbackService {
@@ -31,20 +36,21 @@ export class FeedbackService {
     projectId?: string | null;
     subjectType: string; subjectId: string;
     rating: number; comment?: string;
-  }) {
+  }, opts: { toolCallId?: string | null } = {}) {
     if (!(SUBJECT_TYPES as readonly string[]).includes(input.subjectType)) {
       throw new AppError(ErrorCode.VALIDATION_ERROR, '不支持的反馈对象类型');
     }
     if (!Number.isInteger(input.rating) || input.rating < 1 || input.rating > 5) {
       throw new AppError(ErrorCode.VALIDATION_ERROR, '评分必须为 1~5');
     }
-    const row = await this.prisma.feedback.create({
+    // G11：Feedback 事实 + ToolCall 账本同事务（崩溃重放复用账本，绝不产生第二条反馈）
+    const row = await withToolCallLedger(this.prisma, opts.toolCallId, (tx) => tx.feedback.create({
       data: {
         userId, projectId: input.projectId ?? null,
         subjectType: input.subjectType, subjectId: input.subjectId,
         rating: input.rating, comment: input.comment,
       },
-    });
+    }));
     // 学习闭环：高分/低分 → 记忆候选（元数据幂等——同一对象只产一条）
     if (input.rating >= 4 || input.rating <= 2) {
       await this.upsertPerformanceMemory(userId, input.projectId ?? null, {
@@ -72,7 +78,7 @@ export class FeedbackService {
     artifactId?: string; campaignId?: string; adId?: string;
     platform?: string; periodStart?: string; periodEnd?: string;
     metrics: { impressions: number; clicks: number; spend: number; conversions: number; revenue: number; orders: number };
-  }) {
+  }, opts: { toolCallId?: string | null } = {}) {
     if (input.artifactId) {
       const a = await this.prisma.artifact.findFirst({ where: { id: input.artifactId, userId } });
       if (!a) throw new AppError(ErrorCode.NOT_FOUND, '制品不存在');
@@ -80,47 +86,52 @@ export class FeedbackService {
     const m = input.metrics;
     const periodEnd = input.periodEnd ? new Date(input.periodEnd) : new Date();
     const periodStart = input.periodStart ? new Date(input.periodStart) : new Date(periodEnd.getTime() - 30 * 86400_000);
-    const row = await this.prisma.creativePerformance.create({
-      data: {
-        userId, projectId: input.projectId ?? null,
-        artifactId: input.artifactId, campaignId: input.campaignId, adId: input.adId,
-        platform: input.platform ?? 'mock', periodStart, periodEnd,
-        impressions: m.impressions, clicks: m.clicks, spend: m.spend,
-        conversions: m.conversions, revenue: m.revenue, orders: m.orders,
-      },
-    });
-    // 通用快照层（多源回流统一入口）
-    await this.prisma.performanceSnapshot.create({
-      data: {
-        userId, projectId: input.projectId ?? null,
-        source: 'mock', periodStart, periodEnd,
-        metrics: { ...m, derived: this.derive(m), subject: { artifactId: input.artifactId, campaignId: input.campaignId, adId: input.adId } } as never,
-      },
-    }).catch(() => undefined);
-
     const derived = this.derive(m);
-    // 阈值记忆：好/差（服务端规则；learning = Memory，不改模型）
+    // G11：绩效事实 + 通用快照 + ToolCall 账本同事务。
+    // 快照原为 best-effort（吞错）——事务内吞错会让整个事务进入 aborted 状态，故改为同生同死：
+    // 事实与快照要么都写入，要么都不写入（重放时账本命中，绝不产生第二行事实/快照）。
+    const result = await withToolCallLedger(this.prisma, opts.toolCallId, async (tx) => {
+      const row = await tx.creativePerformance.create({
+        data: {
+          userId, projectId: input.projectId ?? null,
+          artifactId: input.artifactId, campaignId: input.campaignId, adId: input.adId,
+          platform: input.platform ?? 'mock', periodStart, periodEnd,
+          impressions: m.impressions, clicks: m.clicks, spend: m.spend,
+          conversions: m.conversions, revenue: m.revenue, orders: m.orders,
+        },
+      });
+      await tx.performanceSnapshot.create({
+        data: {
+          userId, projectId: input.projectId ?? null,
+          source: 'mock', periodStart, periodEnd,
+          metrics: { ...m, derived, subject: { artifactId: input.artifactId, campaignId: input.campaignId, adId: input.adId } } as never,
+        },
+      });
+      return {
+        performanceId: row.id,
+        facts: { impressions: m.impressions, clicks: m.clicks, spend: m.spend, conversions: m.conversions, revenue: m.revenue, orders: m.orders },
+        derived,
+        layering: { facts: 'reported', derived: 'service-computed', memory: 'service-rule' },
+      };
+    });
+
+    // 阈值记忆：好/差（服务端规则；learning = Memory，不改模型）——metadata 幂等，重放再走也不产第二条
     if (derived.ctr >= GOOD_CTR || derived.roas >= GOOD_ROAS) {
       await this.upsertPerformanceMemory(userId, input.projectId ?? null, {
         kind: 'performance',
-        subjectType: 'creativePerformance', subjectId: row.id,
+        subjectType: 'creativePerformance', subjectId: result.performanceId,
         content: `创意${input.artifactId ? ` ${input.artifactId}` : ''}近一期 CTR ${(derived.ctr * 100).toFixed(1)}% ROAS ${derived.roas}（表现好）`,
         importance: 70,
       });
     } else if (derived.ctr <= BAD_CTR || derived.roas <= BAD_ROAS) {
       await this.upsertPerformanceMemory(userId, input.projectId ?? null, {
         kind: 'performance',
-        subjectType: 'creativePerformance', subjectId: row.id,
+        subjectType: 'creativePerformance', subjectId: result.performanceId,
         content: `创意${input.artifactId ? ` ${input.artifactId}` : ''}近一期 CTR ${(derived.ctr * 100).toFixed(1)}% ROAS ${derived.roas}（表现差，建议调整方向）`,
         importance: 70,
       });
     }
-    return {
-      performanceId: row.id,
-      facts: { impressions: m.impressions, clicks: m.clicks, spend: m.spend, conversions: m.conversions, revenue: m.revenue, orders: m.orders },
-      derived,
-      layering: { facts: 'reported', derived: 'service-computed', memory: 'service-rule' },
-    };
+    return result;
   }
 
   async listPerformance(userId: string, filters: { artifactId?: string; campaignId?: string } = {}) {

@@ -19,12 +19,16 @@ const doneRow = { ...baseRow, status: 'completed', result: { ok: true, externalI
 function makeService(opts: {
   findUniqueSeq?: Array<Record<string, unknown> | null>;
   claimCount?: number;
+  /** Pre-M9 G7：provider 的远端状态查询（缺省 = 平台不支持状态查询） */
+  remoteStatus?: (req: <T>() => T) => Promise<unknown>;
+  connectionStatus?: string;
+  token?: { token: string } | null;
 } = {}) {
   const prisma = {
     approval: { findFirst: vi.fn().mockResolvedValue({ id: 'a1', status: 'approved', userId: 'u1', riskLevel: 'high', payload: approvedPayload }) },
     // Pre-M9：引擎路径的绑定校验以 ToolCall 行为事实源（toolName + 工具入参）
     toolCall: { findUnique: vi.fn().mockResolvedValue({ toolName: TOOL_NAME, input: toolInput }) },
-    connection: { findFirst: vi.fn().mockResolvedValue({ id: 'conn-1', status: 'active', provider: 'mock' }) },
+    connection: { findFirst: vi.fn().mockResolvedValue({ id: 'conn-1', status: opts.connectionStatus ?? 'active', provider: 'mock' }) },
     externalAction: {
       // 调用序：①幂等查重 ②建行后行读取 ③完成后行读取（或轮询）
       findUnique: opts.findUniqueSeq
@@ -37,8 +41,12 @@ function makeService(opts: {
       findMany: vi.fn().mockResolvedValue([]),
     },
   };
-  const credentials = { getAccessToken: vi.fn().mockResolvedValue({ token: 'ACC', expiresAt: null }) };
-  const mockProvider = { name: 'mock', execute: vi.fn().mockResolvedValue({ ok: true, externalId: 'ext-1' }) };
+  const credentials = { getAccessToken: vi.fn().mockResolvedValue(opts.token === undefined ? { token: 'ACC', expiresAt: null } : opts.token) };
+  const mockProvider = {
+    name: 'mock',
+    execute: vi.fn().mockResolvedValue({ ok: true, externalId: 'ext-1' }),
+    ...(opts.remoteStatus ? { remoteStatus: vi.fn(opts.remoteStatus as never) } : {}),
+  };
   const providers = { get: vi.fn((n: string) => (n === 'mock' ? mockProvider : undefined)) };
   const quota = {
     assertQuota: vi.fn().mockResolvedValue({ organizationId: 'org-1', consumed: 0, total: 1, reservationId: 'res-1' }),
@@ -220,5 +228,98 @@ describe('ExternalActionsService（M7-P3 审批复核 + Pre-M9 C2 claim-then-exe
     await expect(svc.execute(input({ toolCallId: undefined, approvalId: 'a1', actionType: 'shop.publish', payload: { title: '被替换' } })))
       .rejects.toMatchObject({ code: ErrorCode.APPROVAL_BINDING_MISMATCH });
     expect(mockProvider.execute).not.toHaveBeenCalled();
+  });
+});
+
+describe('Pre-M9 G7：ExternalAction executing 残留行按远端真实状态恢复', () => {
+  const executingRow = {
+    ...baseRow, userId: 'u1', projectId: 'proj-1', idempotencyKey: 'key-1',
+    status: 'executing', externalRequestId: 'req-stable', startedAt: new Date(Date.now() - 20 * 60_000),
+  };
+  const staleOnly = (opts: Parameters<typeof makeService>[0] = {}) => {
+    const h = makeService(opts);
+    h.prisma.externalAction.findUnique.mockReset().mockResolvedValue(executingRow);
+    return h;
+  };
+
+  it('远端已完成 → 落 completed + 审计 + 计量（同一把 ea:{id} 幂等键）+ 配额释放，绝不重复执行副作用', async () => {
+    const { svc, prisma, mockProvider, quota } = staleOnly({
+      remoteStatus: async () => ({ status: 'completed', result: { ok: true, externalId: 'req-stable-done' } }),
+    });
+    await expect(svc.recoverExecutingAction('ea-1')).resolves.toBe('completed');
+
+    expect(mockProvider.execute).not.toHaveBeenCalled(); // 远端是既成事实：绝不重放
+    expect(prisma.externalAction.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'ea-1', status: 'executing' },
+      data: expect.objectContaining({ status: 'completed', result: { ok: true, externalId: 'req-stable-done' } }),
+    }));
+    expect(quota.release).toHaveBeenCalledWith('key-1', 'external_api_call');
+  });
+
+  it('远端已失败 → 落 failed（错误码/文案来自 provider）+ 配额释放，不计量', async () => {
+    const { svc, prisma, quota } = staleOnly({
+      remoteStatus: async () => ({ status: 'failed', errorCode: 'FORBIDDEN', error: '远端拒绝' }),
+    });
+    await expect(svc.recoverExecutingAction('ea-1')).resolves.toBe('failed');
+    expect(prisma.externalAction.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'ea-1', status: 'executing' },
+      data: expect.objectContaining({ status: 'failed', errorCode: 'FORBIDDEN', error: '远端拒绝' }),
+    }));
+    expect(quota.release).toHaveBeenCalledWith('key-1', 'external_api_call');
+  });
+
+  it('远端仍在执行/无结论 → 保持 executing（绝不伪造终态）', async () => {
+    const { svc, prisma } = staleOnly({ remoteStatus: async () => ({ status: 'processing' }) });
+    await expect(svc.recoverExecutingAction('ea-1')).resolves.toBe('processing');
+    expect(prisma.externalAction.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('provider 未实现 remoteStatus（平台不支持状态查询）→ unknown，不介入', async () => {
+    const { svc, prisma } = staleOnly();
+    await expect(svc.recoverExecutingAction('ea-1')).resolves.toBe('unknown');
+    expect(prisma.externalAction.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('状态查询抛错（provider 不可达）→ unknown：保持 executing，绝不把"查不到"当失败', async () => {
+    const { svc, prisma } = staleOnly({ remoteStatus: async () => { throw new AppError(ErrorCode.PROVIDER_TIMEOUT, '超时'); } });
+    await expect(svc.recoverExecutingAction('ea-1')).resolves.toBe('unknown');
+    expect(prisma.externalAction.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('连接不可用 / 凭证取不到 → unknown（不带着空凭证去查远端）', async () => {
+    const revoked = staleOnly({ connectionStatus: 'revoked', remoteStatus: async () => ({ status: 'completed' }) });
+    await expect(revoked.svc.recoverExecutingAction('ea-1')).resolves.toBe('unknown');
+    expect(revoked.prisma.externalAction.updateMany).not.toHaveBeenCalled();
+
+    const noToken = staleOnly({ token: null, remoteStatus: async () => ({ status: 'completed' }) });
+    await expect(noToken.svc.recoverExecutingAction('ea-1')).resolves.toBe('unknown');
+    expect(noToken.prisma.externalAction.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('非 executing 行（已终态/审批中）→ unknown，绝不复活', async () => {
+    const { svc, prisma } = makeService({ remoteStatus: async () => ({ status: 'completed' }) });
+    prisma.externalAction.findUnique.mockReset().mockResolvedValue({ ...baseRow, status: 'cancelled', userId: 'u1' });
+    await expect(svc.recoverExecutingAction('ea-1')).resolves.toBe('unknown');
+    expect(prisma.externalAction.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('竞态：远端完成写入时已被正常路径终态（count=0）→ unknown，不重复计量', async () => {
+    const { svc, prisma } = staleOnly({ remoteStatus: async () => ({ status: 'completed', result: { ok: true } }) });
+    prisma.externalAction.updateMany.mockResolvedValue({ count: 0 });
+    await expect(svc.recoverExecutingAction('ea-1')).resolves.toBe('unknown');
+  });
+
+  it('recoverStaleExecutingActions：只扫静默超阈值的 executing 行，按结果计数，单行失败不中断', async () => {
+    const { svc, prisma } = makeService({ remoteStatus: async () => ({ status: 'completed', result: { ok: true } }) });
+    prisma.externalAction.findMany.mockResolvedValue([{ id: 'ea-1' }, { id: 'ea-2' }]);
+    prisma.externalAction.findUnique.mockReset()
+      .mockResolvedValueOnce(executingRow)
+      .mockRejectedValueOnce(new Error('查询异常'));
+
+    const r = await svc.recoverStaleExecutingActions(60_000);
+    expect(r).toEqual({ scanned: 2, recovered: 1 }); // 一行恢复、一行异常不影响整批
+    expect(prisma.externalAction.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { status: 'executing', startedAt: { lt: expect.any(Date) } },
+    }));
   });
 });

@@ -10,6 +10,7 @@ import { AGENT_RUN_CANCEL_CHANNEL } from '../../modules/agent-runs/agent-runs.se
 import { ObservabilityService } from '../../core/tracing/observability.service';
 import { TraceContext, newTraceId } from '../../core/tracing/trace-context';
 import { AsyncAgentRunDriver } from './async-agent-run.driver';
+import { ShutdownStep } from '../../lifecycle/lifecycle-registry';
 
 /**
  * M6-P3 AgentRun Worker：
@@ -106,5 +107,10 @@ export class AgentRunProcessor extends WorkerHost implements OnApplicationShutdo
     await this.lease.release(a.runId, a.workerId).catch(() => undefined); // 释放 → 新 worker 立即可接管
     a.abort.abort();
     this.logger.log({ runId: a.runId }, '优雅停机：已释放 lease 并中止当前执行');
+  }
+
+  /** Pre-M9 G3：有序停机阶段接线（finalizeLeases = 释放 lease + 中止在途执行；幂等，Nest 钩子会再调一次为 no-op） */
+  async onLifecycleStep(step: ShutdownStep): Promise<void> {
+    if (step === 'finalizeLeases') await this.onApplicationShutdown();
   }
 }

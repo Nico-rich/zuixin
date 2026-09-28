@@ -200,21 +200,40 @@ export class BillingService implements OnModuleInit {
     };
   }
 
-  /** 支付事件入账（Mock provider；provider+eventId 唯一 → 重复事件幂等） */
+  /**
+   * 支付事件入账（Mock provider；provider+eventId 唯一 → 重复事件幂等）。
+   *
+   * Pre-M9 G8：支付事件与发票终态**必须同生同死**。原实现是两次独立写：
+   * ①崩在两次写之间（或发票更新失败）→ 事件已入账而发票永远停在 open（用户已付款却显示欠费，
+   *   且重投的 P2002 分支只返回 duplicate、**从不补齐发票** → 漂移永久化）；
+   * ②事务化后：事件写入与发票 paid 原子提交；任一失败整体回滚（事件不落库，重试可重入）。
+   * 重复投递（P2002：并发双投 / 崩溃后重放 / provider 重复回调）→ 幂等返回，并**幂等补齐**发票终态
+   * （只动 open 行，绝不覆盖 void/draft 等其它状态）。
+   */
   async applyPayment(organizationId: string, invoiceId: string, amount: number): Promise<{ paymentEventId: string; duplicate: boolean }> {
     const eventId = `mock-pay-${invoiceId}-${amount}`;
+    const paidAt = new Date();
     try {
-      const event = await this.prisma.paymentEvent.create({
-        data: { organizationId, provider: 'mock', providerEventId: eventId, type: 'payment.succeeded', amount, currency: 'CNY', invoiceId },
+      const event = await this.prisma.$transaction(async (tx) => {
+        const created = await tx.paymentEvent.create({
+          data: { organizationId, provider: 'mock', providerEventId: eventId, type: 'payment.succeeded', amount, currency: 'CNY', invoiceId },
+        });
+        const paid = await tx.invoice.updateMany({ where: { id: invoiceId, status: 'open' }, data: { status: 'paid', paidAt } });
+        // 发票不存在/非 open：整体回滚（绝不留"已收款但无发票终态"的事件）
+        if (paid.count === 0) throw new AppError(ErrorCode.NOT_FOUND, `发票不可支付（不存在或非 open）: ${invoiceId}`);
+        return created;
       });
-      await this.prisma.invoice.update({ where: { id: invoiceId }, data: { status: 'paid', paidAt: new Date() } });
       return { paymentEventId: event.id, duplicate: false };
     } catch (err) {
-      if ((err as { code?: string }).code === 'P2002') {
-        // 重复支付事件：幂等返回（绝不重复入账）
-        return { paymentEventId: eventId, duplicate: true };
-      }
-      throw err;
+      if ((err as { code?: string }).code !== 'P2002') throw err;
+      // 重复支付事件：绝不重复入账，但必须把发票补齐（幂等：只动 open 行）
+      const existing = await this.prisma.paymentEvent
+        .findUnique({ where: { provider_providerEventId: { provider: 'mock', providerEventId: eventId } } })
+        .catch(() => null);
+      await this.prisma.invoice.updateMany({ where: { id: invoiceId, status: 'open' }, data: { status: 'paid', paidAt } })
+        .catch((e) => this.logger.warn({ invoiceId, err: (e as Error).message }, '支付事件已入账但发票补齐失败（重试/对账可修复）'));
+      this.logger.warn({ invoiceId, eventId }, '支付事件重复投递：幂等返回并补齐发票终态');
+      return { paymentEventId: existing?.id ?? eventId, duplicate: true };
     }
   }
 

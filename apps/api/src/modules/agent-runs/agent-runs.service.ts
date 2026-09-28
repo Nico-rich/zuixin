@@ -6,6 +6,7 @@ import { AgentRunStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AgentRunMessagesService } from './agent-run-messages.service';
 import { AGENT_RUN_QUEUE } from '../../core/queue/queue.module';
+import { addJobBounded } from '../../core/queue/bounded-add';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { EventBusService, agentRunChannel } from '../../core/events/event-bus.service';
 import { DelegationService } from '../agent-delegation/delegation.service';
@@ -156,7 +157,7 @@ export class AgentRunsService {
     // P1：单次 createMany（原 append = requireRun + max(seq) + create 三次往返；单行场景 3 → 1）
     await this.messages.seed(userId, run.id, [{ role: 'user', content: dto.message }]);
 
-    await this.agentRunQueue.add(
+    await addJobBounded(this.agentRunQueue,
       'execute',
       { runId: run.id }, // payload 最小化：不含身份/transcript/prompt——Worker 以 DB 为唯一事实来源
       {
@@ -286,7 +287,7 @@ export class AgentRunsService {
     // transcript seed：旧用户消息复制（seq 0；retry 上下文由 worker 首次执行时重新组装）
     // P1：单次 createMany（run 由本调用刚创建，归属自明）
     await this.messages.seed(userId, run.id, [{ role: 'user', content: retryMessage }]);
-    await this.agentRunQueue.add(
+    await addJobBounded(this.agentRunQueue,
       'execute',
       { runId: run.id },
       {

@@ -3,7 +3,7 @@ import { AppError, ErrorCode } from '@ai-agent/shared';
 import { ModelResolverService } from '../../../providers/llm/model-resolver.service';
 import { VideoManagerService, ResolvedVideo } from '../../../providers/video/video-manager.service';
 import { ModelRouterService } from '../../../core/model-router/model-router.service';
-import { MediaExecContext, MediaExecResult, MediaExecutor } from '../media-types';
+import { MediaExecContext, MediaExecResult, MediaExecutor, MediaRemoteQuery, MediaRemoteStatus } from '../media-types';
 
 interface VideoTaskInput {
   prompt: string;
@@ -45,6 +45,34 @@ export class VideoExecutor implements MediaExecutor {
     };
   }
 
+  /**
+   * Pre-M9 G7：按 remoteTaskId 反查远端真实状态（恢复路径专用，不轮询、不重试）。
+   * 结果 url/duration 归因与正常执行完全一致（metadata.duration 取自任务入参）。
+   */
+  async queryRemoteStatus(query: MediaRemoteQuery): Promise<MediaRemoteStatus | null> {
+    if (!query.modelId) return null;
+    const { adapter } = await this.videoManager.resolve(query.modelId);
+    if (!adapter.getStatus) return null; // 防御：视频适配器契约要求 getStatus，未实现视为不可恢复
+    const signal = AbortSignal.timeout(Math.max(query.deadline - Date.now(), 1));
+    const status = await adapter.getStatus(query.remoteTaskId, { signal });
+    if (status.status === 'completed') {
+      if (!status.resultUrl) return { status: 'failed', error: '视频完成但无结果' };
+      const input = (query.input ?? {}) as VideoTaskInput;
+      return {
+        status: 'completed',
+        result: {
+          files: [{ url: status.resultUrl, mimeType: 'video/mp4', metadata: { duration: input.duration } }],
+          imageCount: 0,
+          videoSeconds: input.duration ?? 0,
+          providerId: query.providerId ?? '',
+          modelId: query.modelId,
+        },
+      };
+    }
+    if (status.status === 'failed') return { status: 'failed', error: status.error ?? '视频生成失败' };
+    return { status: 'processing' };
+  }
+
   /** 参数能力校验：不支持 → UNSUPPORTED_PARAMETER（不可重试 → 不触发 Provider 回退，绝不静默改写参数） */
   private assertCapabilities(resolved: ResolvedVideo, input: VideoTaskInput): void {
     const caps = resolved.capabilities;
@@ -64,6 +92,9 @@ export class VideoExecutor implements MediaExecutor {
   }
 
   private async runGeneration(resolved: ResolvedVideo, input: VideoTaskInput, ctx: MediaExecContext): Promise<{ url: string }> {
+    // Pre-M9 G5：本次尝试的**整体截止信号**（一个信号贯穿 submit + 每轮 getStatus）——
+    // 适配器将其与单请求超时组合后交给 fetch，deadline 到点会真正中止在途 HTTP（原实现是死代码）。
+    const deadlineSignal = AbortSignal.timeout(Math.max(ctx.deadline - Date.now(), 1));
     const { remoteTaskId } = await resolved.adapter.submit({
       prompt: input.prompt,
       model: resolved.apiModelId,
@@ -71,14 +102,14 @@ export class VideoExecutor implements MediaExecutor {
       duration: input.duration,
       aspectRatio: input.aspectRatio,
       resolution: input.resolution,
-      signal: AbortSignal.timeout(ctx.deadline - Date.now()),
+      signal: deadlineSignal,
     });
     await ctx.setRemoteTaskId(remoteTaskId);
     const totalWindow = Math.max(ctx.deadline - Date.now(), 1);
     for (let i = 0; i < POLL_INTERVALS_MS.length; i++) {
       if (Date.now() >= ctx.deadline) throw new AppError(ErrorCode.MEDIA_TASK_TIMEOUT, '视频生成超时');
       await new Promise((r) => setTimeout(r, POLL_INTERVALS_MS[i]));
-      const status = await resolved.adapter.getStatus(remoteTaskId);
+      const status = await resolved.adapter.getStatus(remoteTaskId, { signal: deadlineSignal });
       if (status.status === 'completed') {
         if (!status.resultUrl) throw new AppError(ErrorCode.PROVIDER_UNKNOWN, '视频完成但无结果');
         return { url: status.resultUrl };

@@ -6,6 +6,7 @@ import { Tool } from '../tools/tool.types';
 import { AgentRuntimePersistence } from './runtime-persistence';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { assertApprovalBinding, bindPayload } from '../../modules/approvals/approval-binding';
+import { CircuitBreakerService } from '../circuit-breaker/circuit-breaker.service';
 
 function makeRegistry(tools: Tool[] = []) {
   const registry = new ToolRegistry();
@@ -55,6 +56,7 @@ function makeEngine(opts: {
   capabilities?: Record<string, unknown>;
   deadlineMs?: number;
   history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+  breaker?: CircuitBreakerService;
 } = {}) {
   const { persistence, state } = makePersistence();
   const registry = makeRegistry(opts.tools ?? []);
@@ -64,7 +66,12 @@ function makeEngine(opts: {
   const capabilities = opts.capabilities ?? {};
   const modelResolver = { resolveDefaultLLM: vi.fn().mockResolvedValue({ adapter, apiModelId: 'm', providerId: 'p1', modelId: 'm1', providerName: 'Mock', timeoutMs: 1000, capabilities }) };
   const llmManager = { resolve: vi.fn().mockResolvedValue({ adapter, apiModelId: 'm', providerId: 'p1', modelId: 'm1', providerName: 'Mock', timeoutMs: 1000, capabilities }) };
-  const engine = new AgentRuntimeEngine(persistence, registry as never, modelResolver as never, llmManager as never);
+  // Pre-M9 G1/G2：熔断器（内存 KV 替身，永不熔断 → 对既有断言零影响）；opts.breaker 可注入观测替身
+  const breaker = opts.breaker ?? new CircuitBreakerService({
+    incr: async () => 1, get: async () => null, set: async () => undefined,
+    setNX: async () => true, del: async () => undefined,
+  } as never, () => 0);
+  const engine = new AgentRuntimeEngine(persistence, registry as never, modelResolver as never, llmManager as never, breaker as never);
   const input: AgentRuntimeContext = {
     userId: 'u1', projectId: undefined, conversationId: 'c1', messageId: 'm1',
     userMessage: '你好', history: opts.history ?? [],
@@ -658,6 +665,55 @@ describe('AgentRuntimeEngine（M6-P5 LLM 瞬时重试 + tool retryPolicy）', ()
     expect(streamFn).toHaveBeenCalledTimes(3);
     expect(state.usage).toHaveLength(1);
     expect(state.usage[0]).toMatchObject({ status: 'failed', errorCode: ErrorCode.PROVIDER_OVERLOADED });
+  });
+
+  it('Pre-M9 G1/G2：回合失败 → 熔断计数（5 次触发 open）；取消不计入熔断', async () => {
+    const kv = new Map<string, string>();
+    const store = {
+      incr: async (k: string) => { const n = Number(kv.get(k) ?? 0) + 1; kv.set(k, String(n)); return n; },
+      get: async (k: string) => kv.get(k) ?? null,
+      set: async (k: string, v: string) => { kv.set(k, v); },
+      setNX: async (k: string, v: string) => { if (kv.has(k)) return false; kv.set(k, v); return true; },
+      del: async (k: string) => { kv.delete(k); },
+    };
+    const breaker = new CircuitBreakerService(store, () => 0);
+    const streamFn = vi.fn(async function* () {
+      throw new AppError(ErrorCode.PROVIDER_OVERLOADED, 'overloaded');
+    });
+    for (let i = 0; i < 5; i++) {
+      const { engine } = makeEngine({ streamFn, breaker });
+      const { outcome } = await run(engine, makeEngine().input);
+      expect(outcome.status).toBe('failed');
+    }
+    expect(kv.get('cb:p1:consecutiveFailures')).toBe('5');
+    expect(await breaker.state('p1')).toBe('open'); // 5 次回合失败 → 熔断
+
+    // 取消（用户中断）不是 provider 故障：不计入熔断，也不复位已有计数
+    const ac = new AbortController();
+    const cancelStream = vi.fn(async function* () { throw new AppError(ErrorCode.AGENT_CANCELLED, 'cancelled'); });
+    const { engine } = makeEngine({ streamFn: cancelStream, breaker });
+    ac.abort();
+    const { outcome } = await run(engine, { ...makeEngine().input, signal: ac.signal });
+    expect(outcome.status).toBe('cancelled');
+    expect(kv.get('cb:p1:consecutiveFailures')).toBe('5');
+  });
+
+  it('Pre-M9 G1/G2：回合成功 → 熔断复位（清 openedAt + 失败计数清零）', async () => {
+    const kv = new Map<string, string>();
+    const store = {
+      incr: async (k: string) => { const n = Number(kv.get(k) ?? 0) + 1; kv.set(k, String(n)); return n; },
+      get: async (k: string) => kv.get(k) ?? null,
+      set: async (k: string, v: string) => { kv.set(k, v); },
+      setNX: async (k: string, v: string) => { if (kv.has(k)) return false; kv.set(k, v); return true; },
+      del: async (k: string) => { kv.delete(k); },
+    };
+    const breaker = new CircuitBreakerService(store, () => 0);
+    kv.set('cb:p1:openedAt', '0'); // 模拟已熔断（半开探测）
+    const { engine } = makeEngine({ breaker });
+    const { outcome } = await run(engine, makeEngine().input);
+    expect(outcome.status).toBe('completed');
+    expect(kv.has('cb:p1:openedAt')).toBe(false); // 探测成功 → 复位
+    expect(await breaker.state('p1')).toBe('healthy');
   });
 
   it('P5-3 退避期间 cancel → 立即停止，不重试已取消回合，usage = AGENT_CANCELLED', async () => {

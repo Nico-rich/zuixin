@@ -65,7 +65,8 @@ export class VideoManagerService implements OnModuleInit {
   private buildAdapter(name: string, cfg: { baseUrl: string; apiKey: string; timeoutMs: number }): VideoProvider {
     switch (name) {
       case 'dashscope-video':
-        return new DashScopeVideoAdapter({ baseUrl: cfg.baseUrl, apiKey: cfg.apiKey });
+        // Pre-M9 G5：透传 provider.timeoutMs 作为**单请求超时**（原实现丢弃该配置）
+        return new DashScopeVideoAdapter({ baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, timeoutMs: cfg.timeoutMs });
       case 'mock-video':
         return new MockVideoAdapter();
       default:

@@ -6,6 +6,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CryptoService } from '../../core/crypto/crypto.service';
 import { EventBusService } from '../../core/events/event-bus.service';
 import { WORKFLOW_QUEUE } from '../../core/queue/queue.module';
+import { addJobBestEffort } from '../../core/queue/bounded-add';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { WorkflowRunsService } from './workflow-runs.service';
 import { WorkflowDefinition } from './workflow-types';
@@ -190,11 +191,13 @@ export class WorkflowTriggersService implements OnModuleInit {
   }
 
   async registerSchedule(workflowId: string, cron: string): Promise<void> {
-    await this.workflowQueue.add(
+    // Pre-M9 G4：schedule 注册是 best-effort（发布/更新流程不应因队列抖动失败，可重新发布重试）；
+    // 有界 2s + 失败告警（原实现无超时：Redis 半开时 add 会永久挂住发布接口）。
+    await addJobBestEffort(this.workflowQueue,
       'scheduled',
       { kind: 'scheduled', workflowId },
       { jobId: `wf-sched-${workflowId}`, repeat: { pattern: cron }, removeOnComplete: true, removeOnFail: true },
-    ).catch((err) => this.logger.warn({ workflowId, cron }, `schedule 注册失败: ${(err as Error).message}`));
+      `register-schedule:${workflowId}`);
     this.logger.log({ workflowId, cron }, 'schedule 触发器已注册');
   }
 

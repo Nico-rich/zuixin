@@ -4,6 +4,7 @@ import { Queue } from 'bullmq';
 import { createHash, randomUUID } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { WORKFLOW_QUEUE } from '../../core/queue/queue.module';
+import { addJobBounded } from '../../core/queue/bounded-add';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { EventBusService } from '../../core/events/event-bus.service';
 import { WORKFLOW_CANCEL_CHANNEL } from '../../core/events/workflow-channels';
@@ -87,8 +88,7 @@ export class WorkflowRunsService {
       }
       throw err;
     }
-    await this.workflowQueue.add(
-      'execute', { runId: run.id },
+    await addJobBounded(this.workflowQueue, 'execute', { runId: run.id },
       {
         jobId: `wf-${run.id}`, attempts: 2, backoff: { type: 'exponential', delay: 2000 },
         removeOnComplete: true, removeOnFail: { count: 500 },

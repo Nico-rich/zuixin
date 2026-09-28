@@ -7,6 +7,7 @@ import { ToolRegistry } from '../../core/tools/tool-registry.service';
 import { ExternalActionsService } from '../external-actions/external-actions.service';
 import { AgentRunMessagesService } from '../agent-runs/agent-run-messages.service';
 import { AGENT_RUN_QUEUE } from '../../core/queue/queue.module';
+import { addJobBounded } from '../../core/queue/bounded-add';
 import { AppError, ErrorCode, RETRYABLE_CODES } from '../../common/errors/app-error';
 import { QuotaService } from '../billing/quota.service';
 import { bindPayload } from '../approvals/approval-binding';
@@ -38,7 +39,14 @@ export class WorkflowExecutor {
     @Inject(QuotaService) private readonly quota: QuotaService,
   ) {}
 
-  async execute(runId: string, workerId: string): Promise<{ outcome: 'continue' | 'waiting' | 'done' }> {
+  /**
+   * 执行一步（单步推进；调用方循环）。
+   * Pre-M9 D5：可选 `signal`（worker 的 lease fencing 中止信号）——
+   * 步骤内调用（工具 / external_action）收到该信号可被立即中止；已中止 → 直接返回 done 且**不写任何状态**
+   * （原实现用 `new AbortController().signal` 占位，步骤内调用永不可中止）。
+   */
+  async execute(runId: string, workerId: string, signal?: AbortSignal): Promise<{ outcome: 'continue' | 'waiting' | 'done' }> {
+    if (signal?.aborted) return { outcome: 'done' }; // 已被 fencing：绝不执行、绝不写状态
     const run = await this.prisma.workflowRun.findUnique({
       where: { id: runId },
       include: { version: true, steps: { orderBy: { stepIndex: 'asc' } } },
@@ -62,8 +70,13 @@ export class WorkflowExecutor {
     const ctx = this.buildContext(run.input, run.steps);
 
     try {
-      return await this.executeStep(run, step, stepRow, ctx, workerId, steps);
+      return await this.executeStep(run, step, stepRow, ctx, workerId, steps, signal);
     } catch (err) {
+      // D5：已被 fencing 中止 → 不落任何步骤/终态事实（该 run 已归新 worker 所有）
+      if (signal?.aborted) {
+        this.logger.warn({ runId }, '执行已中止（lease fencing）：跳过步骤/终态写入');
+        return { outcome: 'done' };
+      }
       const appErr = err instanceof AppError ? err : new AppError(ErrorCode.INTERNAL, (err as Error).message);
       const maxAttempts = step.maxAttempts ?? 0;
       const attempt = (stepRow?.attempt ?? 0) + 1;
@@ -98,6 +111,7 @@ export class WorkflowExecutor {
     ctx: WorkflowContext,
     workerId: string,
     steps: WorkflowStepDef[],
+    signal?: AbortSignal,
   ): Promise<{ outcome: 'continue' | 'waiting' | 'done' }> {
     switch (step.type) {
       case 'condition': {
@@ -130,7 +144,7 @@ export class WorkflowExecutor {
         const output = await tool.execute(args, {
           userId: run.userId, projectId: run.projectId ?? undefined,
           agentRunId: '', agentRunStepId: '', toolCallId: '', // 工作流工具步骤无 ToolCall 追溯（只读工具不使用这些 FK）
-          idempotencyKey, signal: new AbortController().signal,
+          idempotencyKey, signal: signal ?? new AbortController().signal, // D5：lease fencing 可中止在途只读工具
         });
         await this.upsertStep(run.id, run.currentStep, step.id, 'tool', {
           status: 'completed', output, completedAt: new Date(), attempt: (stepRow?.attempt ?? 0) + 1,
@@ -168,10 +182,9 @@ export class WorkflowExecutor {
           },
         });
         await this.messages.append(run.userId, childRun.id, { role: 'user', content: message });
-        await this.agentRunQueue.add(
-          'execute', { runId: childRun.id },
+        await addJobBounded(this.agentRunQueue, 'execute', { runId: childRun.id },
           { jobId: `run-${childRun.id}`, attempts: 2, backoff: { type: 'exponential', delay: 2000 }, removeOnComplete: true, removeOnFail: { count: 500 } },
-        );
+          'workflow-agent-step');
         await this.upsertStep(run.id, run.currentStep, step.id, 'agent', {
           status: 'waiting', agentRunId: childRun.id, output: { childRunId: childRun.id }, attempt: (stepRow?.attempt ?? 0) + 1,
         });
@@ -239,7 +252,7 @@ export class WorkflowExecutor {
           payload,
           permission: 'external_action',
           idempotencyKey: `wf:${run.id}:${run.currentStep}`,
-          signal: new AbortController().signal,
+          signal: signal ?? new AbortController().signal, // D5：lease fencing 可中止在途外部动作（残留 executing 由 G7 恢复兜底）
         });
         await this.upsertStep(run.id, run.currentStep, step.id, 'external_action', {
           status: 'completed', output: result, completedAt: new Date(), attempt: (stepRow?.attempt ?? 0) + 1,

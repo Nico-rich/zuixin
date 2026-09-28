@@ -3,6 +3,7 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { PrismaService } from '../../modules/prisma/prisma.service';
 import { WORKFLOW_QUEUE } from '../../core/queue/queue.module';
+import { addJobBestEffort } from '../../core/queue/bounded-add';
 import { EventBusService, agentRunChannel } from '../../core/events/event-bus.service';
 import { WORKFLOW_APPROVAL_DECIDED_CHANNEL } from '../../core/events/workflow-channels';
 
@@ -64,7 +65,8 @@ export class WorkflowWakeService implements OnModuleInit {
   }
 
   private enqueueWake(runId: string): Promise<void> {
-    return this.workflowQueue.add(
+    // Pre-M9 G4：唤醒投递 best-effort（行已回到 queued，recoverStale 巡检兜底）；有界 2s，失败告警不冒泡
+    return addJobBestEffort(this.workflowQueue,
       'execute', { runId },
       {
         // 唯一键：不得复用创建时的 jobId（BullMQ 同键去重吞 job——M6 教训）
@@ -72,7 +74,7 @@ export class WorkflowWakeService implements OnModuleInit {
         attempts: 2, backoff: { type: 'exponential', delay: 2000 },
         removeOnComplete: true, removeOnFail: { count: 500 },
       },
-    ).then(() => undefined);
+      `wake:${runId}`).then(() => undefined);
   }
 
   /** 订阅特定子 AgentRun 的观察通道（processor 进入 waiting 时调用；driver 事件实时触发 wakeByAgentRun） */

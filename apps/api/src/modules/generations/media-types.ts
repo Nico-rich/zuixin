@@ -20,6 +20,30 @@ export interface MediaExecContext {
 }
 
 /**
+ * Pre-M9 G7：远端任务**真实状态**（provider 权威）。恢复路径只认这三种结论：
+ * - `completed`：远端已完成 → 取回结果并按正常完成一致的方式落库（转存/用量/事件/配额/resume）；
+ * - `failed`：远端已失败 → 落失败终态（错误来自 provider）；
+ * - `processing`：远端仍在执行 → **保持非终态**（由超时兜底裁决，绝不提前判死）。
+ */
+export type MediaRemoteStatus =
+  | { status: 'processing' }
+  | { status: 'completed'; result: MediaExecResult }
+  | { status: 'failed'; error: string };
+
+/** Pre-M9 G7：恢复查询入参（执行器按 type 各自解析适配器；`input` 为任务原始入参，用于用量归因） */
+export interface MediaRemoteQuery {
+  taskId: string;
+  remoteTaskId: string;
+  /** 平台 Model.id（execute 时由 setProviderAttempt 写入；缺失 → 无法解析适配器） */
+  modelId: string | null;
+  providerId: string | null;
+  /** 任务原始入参（Json） */
+  input: unknown;
+  /** 查询截止时间戳（毫秒）：调用方给上限，适配器据此构造 signal，绝不无限期挂着 */
+  deadline: number;
+}
+
+/**
  * 媒体执行器策略接口：image / video 各自独立实现（不互相继承）。
  * MediaGenerationService 只负责统一任务生命周期（claim/超时/转存/用量/事件/清扫），
  * 具体的 Provider 调用逻辑全部在各自 executor。
@@ -27,4 +51,11 @@ export interface MediaExecContext {
 export interface MediaExecutor {
   readonly type: TaskType;
   execute(ctx: MediaExecContext): Promise<MediaExecResult>;
+  /**
+   * Pre-M9 G7：**远端状态查询**（仅恢复路径使用）——进程崩溃/重启后本地执行者已死，
+   * 但 provider 侧任务可能已完成；按 `remoteTaskId` 问 provider 才是权威。
+   * 未实现（同步型 provider 无远端任务概念）或无法解析适配器 → 返回 `null`，
+   * 调用方按"无法恢复"兜底（绝不把 null 当成失败）。
+   */
+  queryRemoteStatus?(query: MediaRemoteQuery): Promise<MediaRemoteStatus | null>;
 }

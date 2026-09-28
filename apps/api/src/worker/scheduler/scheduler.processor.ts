@@ -7,6 +7,7 @@ import { SCHEDULER_QUEUE } from '../../core/queue/scheduler-queue.module';
 import { SchedulerService, SCHEDULED_ACTIVE_STATUSES } from '../../modules/scheduler/scheduler.service';
 import { EventPlatformService } from '../../modules/events/event-platform.service';
 import { PrismaService } from '../../modules/prisma/prisma.service';
+import { ShutdownStep } from '../../lifecycle/lifecycle-registry';
 
 /** M8-P9 stalled 判定：running 行 updatedAt 落后超过 timeoutMs × 该系数（且不短于 3×心跳）判 stalled */
 const STALL_FACTOR = 3;
@@ -230,6 +231,11 @@ export class SchedulerProcessor extends WorkerHost implements OnApplicationShutd
     } else {
       this.logger.log('优雅停机：在途调度作业已全部收尾');
     }
+  }
+
+  /** Pre-M9 G3：有序停机阶段接线（finalizeLeases；幂等——Nest 钩子会再调一次，此时在途集合已空即返回） */
+  async onLifecycleStep(step: ShutdownStep): Promise<void> {
+    if (step === 'finalizeLeases') await this.onApplicationShutdown();
   }
 }
 

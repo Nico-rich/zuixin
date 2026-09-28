@@ -20,6 +20,7 @@ import { WorkflowWorkerModule } from './worker/workflow/workflow-worker.module';
 import { ExtensionsModule } from './modules/extensions/extensions.module';
 import { SchedulerWorkerModule } from './worker/scheduler/scheduler-worker.module';
 import { SecurityModule } from './modules/security/security.module';
+import { LifecycleModule } from './lifecycle/lifecycle.module';
 
 @Module({
   imports: [
@@ -37,6 +38,7 @@ import { SecurityModule } from './modules/security/security.module';
     AgentRunWorkerModule,
     WorkflowWorkerModule,
     SchedulerWorkerModule,
+    LifecycleModule, // Pre-M9 G3：有序停机阶段（pause → lease finalization → 等在途 job → 关 BullMQ）
   ],
 })
 export class WorkerModule {}

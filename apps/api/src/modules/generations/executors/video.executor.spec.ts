@@ -3,7 +3,7 @@ import { VideoExecutor } from './video.executor';
 import { ModelRouterService } from '../../../core/model-router/model-router.service';
 import { CircuitBreakerService } from '../../../core/circuit-breaker/circuit-breaker.service';
 import { KVStore } from '../../../core/circuit-breaker/kv-store.interface';
-import { MediaExecContext } from '../media-types';
+import { MediaExecContext, MediaRemoteQuery } from '../media-types';
 
 const kv: KVStore = { incr: async () => 1, get: async () => null, set: async () => undefined, setNX: async () => true, del: async () => undefined };
 const cb = new CircuitBreakerService(kv, () => 0);
@@ -79,4 +79,49 @@ describe('VideoExecutor', () => {
     // 改为直接验证 submit 后 provider failed 的传播：将轮询间隔交给真实等待成本太高，改用 provider 抛错路径
     await expect(executor.execute(ctx)).rejects.toMatchObject({ code: 'PROVIDER_UNKNOWN' });
   }, 20000);
+});
+
+describe('Pre-M9 G7：VideoExecutor.queryRemoteStatus（远端恢复查询，不轮询、不重试）', () => {
+  const query = (over: Partial<MediaRemoteQuery> = {}): MediaRemoteQuery => ({
+    taskId: 't1', remoteTaskId: 'r1', modelId: 'm1', providerId: 'p1', input: { duration: 5 }, deadline: Date.now() + 5_000, ...over,
+  });
+
+  it('远端已完成 → completed（结果归因 provider/model/duration 与正常执行一致）', async () => {
+    const { executor, videoManager } = makeExecutor();
+    await expect(executor.queryRemoteStatus(query())).resolves.toEqual({
+      status: 'completed',
+      result: {
+        files: [{ url: 'data:video/mp4;base64,AAAA', mimeType: 'video/mp4', metadata: { duration: 5 } }],
+        imageCount: 0, videoSeconds: 5, providerId: 'p1', modelId: 'm1',
+      },
+    });
+    expect(videoManager.resolve).toHaveBeenCalledWith('m1');
+  });
+
+  it('远端完成但无结果 url → failed（绝不产生空附件/假完成）', async () => {
+    const { executor, videoManager } = makeExecutor();
+    const resolved = await videoManager.resolve('m1');
+    (resolved.adapter.getStatus as ReturnType<typeof vi.fn>).mockResolvedValue({ status: 'completed', progress: 100 });
+    await expect(executor.queryRemoteStatus(query())).resolves.toEqual({ status: 'failed', error: '视频完成但无结果' });
+  });
+
+  it('远端已失败 → failed（文案来自 provider）', async () => {
+    const { executor, videoManager } = makeExecutor();
+    const resolved = await videoManager.resolve('m1');
+    (resolved.adapter.getStatus as ReturnType<typeof vi.fn>).mockResolvedValue({ status: 'failed', error: '平台终止' });
+    await expect(executor.queryRemoteStatus(query())).resolves.toEqual({ status: 'failed', error: '平台终止' });
+  });
+
+  it('远端仍在执行 → processing（保持非终态，绝不提前判死）', async () => {
+    const { executor, videoManager } = makeExecutor();
+    const resolved = await videoManager.resolve('m1');
+    (resolved.adapter.getStatus as ReturnType<typeof vi.fn>).mockResolvedValue({ status: 'processing', progress: 40 });
+    await expect(executor.queryRemoteStatus(query())).resolves.toEqual({ status: 'processing' });
+  });
+
+  it('无 modelId（无 provider 归因）→ null 且不解析适配器（调用方按不可恢复兜底）', async () => {
+    const { executor, videoManager } = makeExecutor();
+    await expect(executor.queryRemoteStatus(query({ modelId: null }))).resolves.toBeNull();
+    expect(videoManager.resolve).not.toHaveBeenCalled();
+  });
 });

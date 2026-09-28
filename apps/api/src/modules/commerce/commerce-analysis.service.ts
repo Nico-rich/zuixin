@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { CommerceService, TimeRangeInput } from './commerce.service';
 import { ArtifactService } from '../artifacts/artifact.service';
+import { withToolCallLedger } from '../../core/tools/tool-call-ledger';
 
 export interface AnalysisToolInput {
   provider?: string;
@@ -75,7 +76,7 @@ export class CommerceAnalysisService {
     return anomalies;
   }
 
-  async generateAnalysis(userId: string, input: AnalysisToolInput, ctx: { agentRunId?: string; projectId?: string } = {}) {
+  async generateAnalysis(userId: string, input: AnalysisToolInput, ctx: { agentRunId?: string; projectId?: string; toolCallId?: string | null } = {}) {
     if (!ANALYSIS_TYPES.has(input.analysisType)) throw new AppError(ErrorCode.VALIDATION_ERROR, '不支持的分析类型');
     const timeRange = this.commerce.resolveTimeRange(input.timeRange);
     const base = { provider: input.provider, connectionId: input.connectionId, timeRange };
@@ -88,25 +89,28 @@ export class CommerceAnalysisService {
     ]);
     const anomalies = prevSummary ? this.detectAnomalies(summary, prevSummary) : [];
 
-    const row = await this.prisma.commerceAnalysis.create({
-      data: {
-        userId, projectId: ctx.projectId ?? null, agentRunId: ctx.agentRunId ?? null,
-        connectionId: input.connectionId ?? null, analysisType: input.analysisType,
-        timeRange: { start: timeRange.start.toISOString(), end: timeRange.end.toISOString() } as never,
-        facts: summary.facts as never,
-        derived: summary.derived as never,
-        anomalies: anomalies as never,
-        // LLM 推测独立存储：source 标注，绝不写入 facts/derived/anomalies
-        possibleCauses: (input.possibleCauses?.length
-          ? { source: 'llm-interpretation', items: input.possibleCauses }
-          : null) as never,
-        recommendations: (input.recommendations?.length
-          ? { source: 'llm-recommendation', items: input.recommendations }
-          : null) as never,
-        status: 'ready',
-      },
+    // G11：分析事实写入走 ToolCall 幂等账本（崩溃重放复用首次结果，绝不产生第二份分析事实）
+    return withToolCallLedger(this.prisma, ctx.toolCallId, async (tx) => {
+      const row = await tx.commerceAnalysis.create({
+        data: {
+          userId, projectId: ctx.projectId ?? null, agentRunId: ctx.agentRunId ?? null,
+          connectionId: input.connectionId ?? null, analysisType: input.analysisType,
+          timeRange: { start: timeRange.start.toISOString(), end: timeRange.end.toISOString() } as never,
+          facts: summary.facts as never,
+          derived: summary.derived as never,
+          anomalies: anomalies as never,
+          // LLM 推测独立存储：source 标注，绝不写入 facts/derived/anomalies
+          possibleCauses: (input.possibleCauses?.length
+            ? { source: 'llm-interpretation', items: input.possibleCauses }
+            : null) as never,
+          recommendations: (input.recommendations?.length
+            ? { source: 'llm-recommendation', items: input.recommendations }
+            : null) as never,
+          status: 'ready',
+        },
+      });
+      return this.view(row);
     });
-    return this.view(row);
   }
 
   /** 按分析类型聚合事实（全部来自 CommerceService，服务端计算） */
@@ -163,7 +167,7 @@ export class CommerceAnalysisService {
    * （service-computed 标注）+ 绩效记忆候选（M7-P8 学习闭环：历史创意表现沉淀，performance-memory 标注）；
    * LLM 创意方向字段原样存储（llm-suggestion 标注）；镜像 Artifact(creative_brief)。
    */
-  async createBrief(userId: string, input: BriefToolInput, ctx: { agentRunId?: string; projectId?: string; conversationId?: string; messageId?: string; idempotencyKey?: string } = {}) {
+  async createBrief(userId: string, input: BriefToolInput, ctx: { agentRunId?: string; projectId?: string; conversationId?: string; messageId?: string; idempotencyKey?: string; toolCallId?: string | null } = {}) {
     let analysis: { id: string; facts: unknown; derived: unknown; anomalies: unknown } | null = null;
     if (input.analysisId) {
       const a = await this.prisma.commerceAnalysis.findFirst({ where: { id: input.analysisId, userId } });
@@ -180,7 +184,8 @@ export class CommerceAnalysisService {
       take: 5,
     });
 
-    const row = await this.prisma.creativeBrief.create({
+    // G11：简报事实写入走 ToolCall 幂等账本（崩溃重放复用首次结果，绝不产生第二份简报）
+    const row = await withToolCallLedger(this.prisma, ctx.toolCallId, (tx) => tx.creativeBrief.create({
       data: {
         userId, projectId: ctx.projectId ?? null, agentRunId: ctx.agentRunId ?? null,
         commerceAnalysisId: analysis?.id ?? null,
@@ -200,7 +205,7 @@ export class CommerceAnalysisService {
           : null) as never,
         status: 'ready',
       },
-    });
+    }));
 
     // Artifact 镜像（creative_brief 制品；幂等键 = ToolCall 级，resume 重放绝不重复建）
     let artifactId: string | null = null;

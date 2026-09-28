@@ -109,6 +109,14 @@ describe('ChatService.prepareChat', () => {
       .rejects.toMatchObject({ code: 'CONCURRENT_CHAT' });
   });
 
+  it('Pre-M9 G4：会话锁 Redis 不可用/超时 → fail-closed（显式 INTERNAL，绝不放行并发生成）', async () => {
+    const { svc, kv, prisma } = makeChat();
+    kv.setNX.mockRejectedValue(new Error('Redis 操作超时（kv:setNX，>1500ms）'));
+    await expect(svc.prepareChat('u1', { conversationId: 'c1', message: 'hi' }, 'req1'))
+      .rejects.toMatchObject({ code: 'INTERNAL', message: expect.stringContaining('会话锁服务暂不可用') });
+    expect(prisma.message.create).not.toHaveBeenCalled(); // 未产生任何副作用（不写消息/不占配额）
+  });
+
   it('prepareChat 中途失败会释放锁', async () => {
     const { svc, kv, prisma } = makeChat();
     prisma.message.create.mockRejectedValueOnce(new Error('db down'));

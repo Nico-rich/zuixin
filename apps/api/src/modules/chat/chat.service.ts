@@ -44,7 +44,16 @@ export class ChatService {
       : await this.createConversation(userId, dto.projectId);
 
     const lockKey = `chat:lock:${conversation.id}`;
-    const locked = await this.kv.setNX(lockKey, requestId, 120);
+    // Pre-M9 G4 降级（**fail-closed**）：会话锁是**正确性面**（同一会话单写者：并发生成会双写 assistant 消息、
+    // 双扣配额、上下文错乱）。Redis 不可用/超时时无法证明互斥 → 显式拒绝（500 + 明确文案），
+    // 绝不"以为拿到锁"放行。取舍：Redis 故障期间该会话不可用（优于静默数据错乱）。
+    let locked: boolean;
+    try {
+      locked = await this.kv.setNX(lockKey, requestId, 120);
+    } catch (err) {
+      this.logger.error(`会话锁获取失败（Redis 不可用/超时 → 拒绝本次生成）: ${(err as Error).message}`);
+      throw new AppError(ErrorCode.INTERNAL, '会话锁服务暂不可用，请稍后重试');
+    }
     if (!locked) throw new AppError(ErrorCode.CONCURRENT_CHAT, '上一条消息仍在生成中，请稍候');
 
     try {
