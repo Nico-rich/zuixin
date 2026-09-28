@@ -1,0 +1,101 @@
+# M10-P9 运维交付：API 无状态副本。
+#
+# 与 Worker 的**唯一区别**在于形态，不在于代码：同一镜像、同一 ConfigMap/Secret，
+# 只是入口命令不同（`node dist/main.js` vs `node dist/worker.js`）——两边的停机语义完全一致
+# （lifecycle/graceful-shutdown.ts 单文件共用）。
+#
+# 探针语义（勿凭直觉改，理由见 docs/operations/m8-production-readiness.md §1）：
+#   liveness  → /api/v1/live   **零 I/O**：依赖抖动绝不触发重启（重启治不好下游，只会雪崩）
+#   readiness → /api/v1/ready  DB/Redis critical；非关键依赖（对象存储）故障**不摘流量**
+#   startup   → /api/v1/live   抢在 readiness 之前给冷启动留时间（Prisma/ioredis 建连）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: agent-platform
+  labels:
+    app.kubernetes.io/name: agent-platform
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: agent-platform
+spec:
+  replicas: 2                       # 无本地会话状态（JWT 无状态 + Redis 承载队列/事件总线）⇒ 可直接横向扩
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }   # 先起新副本再摘旧副本：滚动期间不掉容量
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agent-platform
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agent-platform
+        app.kubernetes.io/component: api
+        app.kubernetes.io/part-of: agent-platform
+    spec:
+      # 硬底线 35s（应用侧 30s 兜底 + 缓冲）；取 45 是为了覆盖 LB 摘流与连接排空。
+      # 小于 35 会让 kubelet 的 SIGKILL 绕过收尾 ⇒ 在途请求被硬切、租约来不及释放。
+      terminationGracePeriodSeconds: 45
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: api
+      containers:
+        - name: api
+          # 当前仓库**没有 Dockerfile**（本 Phase 不新增；见 docs/operations/m10-runbook.md §6 依赖项）：
+          # 镜像需先由 CI 构建并推到 registry。下面的镜像名/标签是占位符，apply 前必须替换。
+          # 构建要点：pnpm build → node dist/main.js；USER 非 root；.dockerignore 必须排除 .env。
+          image: registry.example.com/agent-platform-api:0.1.0
+          imagePullPolicy: IfNotPresent
+          # 入口路径是 dist/**src**/main.js —— 这不是笔误：tsconfig.json 的 include 含 src/scripts/prisma，
+          # 于是 rootDir 被提升到 apps/api，`nest build` 的产物是 dist/src/main.js（实测 2026-09-28）。
+          # ⚠️ 已发现的既有不一致：apps/api/package.json 的 `start` 写的是 `node dist/main.js`，
+          # 在当前构建布局下**不存在该文件**（package.json 不属本 Phase 所有权，未改）。
+          # 构建镜像时以实际产物为准，并顺手修 start 脚本（否则本地 `pnpm start` 会 MODULE_NOT_FOUND）。
+          command: ["node", "dist/src/main.js"]
+          ports:
+            - { name: http, containerPort: 3001 }
+          envFrom:
+            - configMapRef: { name: agent-platform-config }
+            - secretRef: { name: agent-platform-secrets }
+          # 兜底摘流：K8s 摘 endpoints 与 kubelet 发 SIGTERM 是并发的，二者到达顺序不保证。
+          # sleep 会给 kube-proxy/Ingress 一点时间把本副本从负载均衡里摘掉，避免"停机瞬间的 502"。
+          # 预算：45s(grac) − 5s(preStop) = 40s > 应用侧 30s 兜底 ⇒ 仍有余量。
+          # 注意：基础镜像若是 distroless/slim 可能没有 sleep 二进制 ⇒ 那就在 Dockerfile 里
+          # 加 `sleep`（busybox）或删掉本钩子（删掉只是增加少量 502 风险，不会破坏停机正确性）。
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "5"] }
+          livenessProbe:
+            httpGet: { path: /api/v1/live, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet: { path: /api/v1/ready, port: http }
+            periodSeconds: 5
+            failureThreshold: 2
+            timeoutSeconds: 3        # 探测内部 1s 硬超时；给 3s 容忍 GC/事件循环抖动
+          startupProbe:
+            httpGet: { path: /api/v1/live, port: http }
+            periodSeconds: 2
+            failureThreshold: 30     # 最长 60s 冷启动预算；起步期间 liveness 不生效
+            timeoutSeconds: 2
+          resources:
+            # 依据 Pre-M9 性能包与 m8 §6 的本机基线给的**起手值**，非生产容量结论（P17 压测后调整）。
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { cpu: "1",    memory: "1Gi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            # 说明：镜像尚不存在（无 Dockerfile），readOnlyRootFilesystem 需与镜像的 /tmp 挂载
+            # 一起验证后再打开；先按最小权限基线给到 capabilities/提权两项。
+      securityContext:
+        runAsNonRoot: true          # 需要镜像里的 USER 非 root，否则 Pod 会被拒绝启动
+        seccompProfile: { type: RuntimeDefault }

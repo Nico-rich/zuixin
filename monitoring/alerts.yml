@@ -1,0 +1,185 @@
+# M10-P9 运维交付：Prometheus 告警规则（来源：审计 PR-9/PR-10 + DR-6，规格见 m8-production-readiness.md §1）
+#
+# ===================== 先读：本仓库**没有** Prometheus 导出器 =====================
+# 应用的可观测事实在 MetricSample 表里（apps/api/src/core/tracing/observability.service.ts），
+# 读取面是 JWT 保护的 JSON API（GET /api/v1/metrics，modules/observability）——
+# 既不是 Prometheus 文本格式，也不该给 Prometheus 直接抓（会绕开鉴权）。
+# 所以本文件分两类规则，每条规则头部都标了 `现状:`：
+#   [可用]   —— 表达式只依赖**标准 exporter**（blackbox_exporter / kube-state-metrics），今天就能生效；
+#   [待导出] —— 表达式依赖应用内指标（名字与 MetricSample 对齐），**在导出器落地前不会生效**（评估为 no data）。
+#               它们是有价值的"缺口清单"：谁来做导出（暴露 /metrics 文本格式，或让 otel-collector 转）都能直接用。
+# 在导出器落地前，[待导出] 类信号的**人工替代判据**见 docs/operations/m10-runbook.md §4 告警响应表。
+#
+# 加载：rules_files 指向本文件（Prometheus 2.x `rule_files:` 接受任意 .yml）。
+#   校验：promtool check rules monitoring/alerts.yml
+#
+# 依赖的 blackbox_exporter module（exporter 侧配置，不在本文件）：
+#   modules:
+#     http_2xx_ready:                 # 用于 job=blackbox-api-ready 抓 /api/v1/ready
+#       prober: http
+#       timeout: 5s
+#       http:
+#         valid_status_codes: [200]   # /ready 在 DB/Redis down 时返回 503 ⇒ 探测失败 ⇒ probe_success=0
+#         preferred_ip_protocol: ip4
+# 语义提醒（别把非关键依赖也当致命）：/ready **只**反映 DB/Redis（critical）。
+# 对象存储故障时 /ready 仍是 200、status=degraded —— 这是**有意设计**（见 m8 §1 分级规则），
+# 不要为了"让告警亮"而把 storage 塞进 /ready 判定；degraded 单独告警。
+groups:
+  # ---------------------------------------------------------------------------
+  # 1) API 可用性：/ready 503 持续 1min ⇒ 负载均衡已在摘流量，等同"服务不可用"
+  # ---------------------------------------------------------------------------
+  - name: m10-api-availability
+    rules:
+      - alert: ApiReadyUnavailable
+        # 现状: [可用] 依赖 blackbox_exporter（探针）——无需应用改动。
+        #       等价替代（没有 blackbox 时）：kube_pod_container_status_ready{namespace="agent-platform"} == 0
+        #       （但那只能看到 Pod 层，看不到"Pod ready 但 /ready 返回 503"的中间态，故首选探针）
+        expr: probe_success{job="blackbox-api-ready"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "API /ready 持续 1min 不可用（DB 或 Redis critical 依赖故障）"
+          description: >-
+            blackbox 探针连续 1 分钟拿不到 /api/v1/ready 的 200。
+            处置顺序：① curl 任一 Pod 的 /api/v1/health 看 `checks[].critical` 与 `status`
+            （unavailable=关键依赖故障；degraded=仅非关键依赖，不应触发本条）；
+            ② 再看 `db.state`/`redis.state` 与 latencyMs 定位是哪一个；
+            ③ 若为 DB/Redis 真实故障，按 runbook §4 的「DB 不可用」「Redis 丢失」行处置。
+            注意：**不要**因为这条告警就去重启 API Pod——重启治不好下游依赖，只会丢在途请求。
+
+      - alert: ApiPodRestartLoop
+        # 现状: [可用] 依赖 kube-state-metrics（集群标配）。
+        # 为什么单独告警：liveness 打的是零 I/O 的 /live，依赖抖动不会触发重启（设计如此），
+        # 所以"有重启"一定是**进程级**问题（OOM、未捕获异常、启动失败），值得人看。
+        expr: increase(kube_pod_container_status_restarts_total{namespace="agent-platform"}[15m]) > 2
+        for: 0m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "Pod 15min 内重启 >2 次：{{ $labels.pod }}"
+          description: >-
+            查 `kubectl -n agent-platform describe pod {{ $labels.pod }}` 的 Last State：
+            OOMKilled ⇒ 提 memory limits（见 k8s/api-deployment.yaml resources）；
+            Error 且退出码 1 且日志末尾有「优雅停机超时」⇒ 见 GracefulShutdownTimeout 的处置；
+            启动期失败 ⇒ 看 ConfigMap/Secret 是否齐（CreateContainerConfigError 属配置问题，不是代码问题）。
+
+  # ---------------------------------------------------------------------------
+  # 2) 停机收尾：phase:timeout（应用记 error 日志 + exit(1)）
+  # ---------------------------------------------------------------------------
+  - name: m10-shutdown
+    rules:
+      - alert: GracefulShutdownTimeout
+        # 现状: [可用] 用**退出码**做近似信号（kube-state-metrics）。为什么可信：
+        #       lifecycle/graceful-shutdown.ts 在超时路径上 `exitCode: 1` 且日志打
+        #       `[role] 优雅停机超时（>30s），强制退出——请检查是否有钩子挂住`。
+        #       局限：exit 1 也可能是别的崩溃 ⇒ 需结合日志确认（见 description）。
+        #       [待导出] 精确信号是 `increase(graceful_shutdown_timeout_total[10m]) > 0`
+        #       （在 shutdown emit 处打点，一次改动；落地前用下面的近似 + 日志）。
+        expr: kube_pod_container_status_last_terminated_exitcode{namespace="agent-platform"} == 1
+        for: 0m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "容器以退出码 1 终止：{{ $labels.pod }}（可能是优雅停机超时）"
+          description: >-
+            先在日志里搜「优雅停机超时」或 30s 窗口相关的 phase=timeout（JSON 日志 msg 字段）。
+            确认是超时的话，含义是**有钩子挂住**（Prisma/ioredis/BullMQ close 未在窗口内返回），
+            后果：kubelet 用 SIGKILL 收尾 ⇒ 在途 job 被打断、lease 只能靠 recoverStale 兜底（有延迟）。
+            排查：① 是否 Redis/PG 半开导致 close 挂住（runbook §4「Redis 丢失」行）；
+            ② 20 秒级长任务是否远超 GRACEFUL_SHUTDOWN_TIMEOUT_MS；
+            ③ 不要靠调大 terminationGracePeriodSeconds 掩盖——先找到挂住的钩子。
+
+  # ---------------------------------------------------------------------------
+  # 3) 队列背压：depth/maxDepth > 0.5 持续 5min（提前于 429 触发前介入）
+  # ---------------------------------------------------------------------------
+  - name: m10-queue-backpressure
+    rules:
+      - alert: AgentRunQueueBackpressure
+        # 现状: [待导出] 指标名对齐应用 MetricSample：`queue_depth`（labels {queue}，单位 count，
+        #       由 core/tracing/queue-depth.sampler.ts 每 60s 采样 waiting+active+delayed）。
+        #       除数 1000 = 环境变量 AGENT_RUN_QUEUE_MAX_DEPTH 的默认值（health.service.ts DEFAULT_QUEUE_MAX_DEPTH）；
+        #       **集群若改过该 env，必须同步改这里的除数**，否则阈值静默偏移（比没有告警更危险）。
+        #       今天的人工替代判据：GET /api/v1/health 里的 queue.depth / queue.maxDepth > 0.5。
+        expr: (queue_depth{queue="agent-run"} / 1000) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "agent-run 队列积压超过水位 50%（{{ $value | humanizePercentage }}）"
+          description: >-
+            含义：消费速度跟不上生产速度，再涨到 maxDepth 就会对用户返回 429 QUOTA_EXCEEDED（quota.service.ts 的
+            assertQueueDepth）。5min 窗口是为了滤掉瞬时尖峰。
+            处置顺序：① Worker 副本数与 CPU 是否被 HPA 顶到 max（k8s/worker-hpa.yaml）；
+            ② 是否有 job 长尾（单 run 卡在 provider 超时/重试）⇒ 查 run 时长与 provider 错误率；
+            ③ 下游 provider 限流/熔断 ⇒ runbook §4「Provider 故障」行；
+            ④ 最后才考虑临时抬高 AGENT_RUN_QUEUE_MAX_DEPTH —— 那只是把 429 推迟，不解决吞吐。
+
+      - alert: AgentRunQueueSaturated
+        # 现状: [待导出] 同 AgentRunQueueBackpressure（同一指标）。
+        expr: queue_depth{queue="agent-run"} >= 1000
+        for: 1m
+        labels:
+          severity: critical
+          component: worker
+        annotations:
+          summary: "agent-run 队列已满：新请求正在被 429 拒绝"
+          description: >-
+            depth ≥ maxDepth ⇒ 用户侧已可见失败（这是**已发生**的用户影响，不是预警）。
+            先止血再找根因：评估是否临时扩容 Worker（kubectl scale deploy/worker）或临时抬高水位，
+            同时按 runbook §4 找积压来源。
+
+  # ---------------------------------------------------------------------------
+  # 4) Scheduler 作业死亡：dead 不自动重投（一致性优先）⇒ 必须人工介入
+  # ---------------------------------------------------------------------------
+  - name: m10-scheduler
+    rules:
+      - alert: SchedulerJobDead
+        # 现状: [待导出] 应用只把 `scheduler.job.dead` 写成**事件**（EventEnvelope 落库 +
+        #       scheduler.processor.ts 的 logger.error），**没有** Prometheus 计数器。
+        #       两个触发路径（worker/scheduler/scheduler.processor.ts）：
+        #         a. stalled 巡检：running 期间心跳中断超阈值 → dead（日志「调度作业心跳中断 → 判 dead」）
+        #         b. 重试超限：attempts >= maxAttempts → dead（日志「调度作业失败次数超限 → dead」）
+        #       今天的人工替代判据（SQL）：
+        #         SELECT count(*) FROM "ScheduledJob" WHERE status='dead'
+        #           AND "completedAt" > now() - interval '1 day';
+        #       或按事件表：SELECT count(*) FROM "EventEnvelope"
+        #           WHERE "eventType"='scheduler.job.dead' AND "createdAt" > now() - interval '1 day';
+        expr: increase(scheduler_job_dead_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: scheduler
+        annotations:
+          summary: "10min 内有调度作业被判 dead（不自动重投）"
+          description: >-
+            dead 是终态：该作业对应的周期性工作**已经停摆**，不会自愈。
+            处置：① 查 ScheduledJob.lastError 区分是心跳中断（worker 失联/长任务超时）还是重试超限；
+            ② 若是 worker 自身问题（OOM/被 SIGKILL），先修 worker，再用人工显式路径重投（runbook §4「调度作业 dead」）。
+
+  # ---------------------------------------------------------------------------
+  # 5) 非关键依赖降级（对象存储）：/ready 仍 200，但生成类能力受损
+  # ---------------------------------------------------------------------------
+  - name: m10-degraded-dependency
+    rules:
+      - alert: StorageDependencyDegraded
+        # 现状: [待导出] 依据 /api/v1/health 的 `status=degraded`（以及 `storage.state != up`）。
+        #       为什么不能靠 /ready：storage 是 critical:false —— 故障时 /ready 仍 200 且**不应摘流量**
+        #       （摘流量只会放大故障，见 m8 §1）。所以这条只能从 /health 的 JSON 取。
+        #       [待导出] 建议导出 `health_status_degraded{component="storage"}` 或 `storage_state_up`。
+        #       今天的人工替代判据：GET /api/v1/health → storage.state / status 字段。
+        expr: storage_state_up == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "对象存储非关键依赖降级 5min（生成/上传路径受影响，核心路径仍可用）"
+          description: >-
+            影响面：附件上传、生成产物读写会失败；对话/查询不受影响（因此**不要**摘 API 流量）。
+            处置：检查 MinIO/S3 端点可达性与凭证（Secret 里的 STORAGE_*）；
+            若是桶被误删，按 runbook §3.3 用 mc mirror 回灌到新桶再切。

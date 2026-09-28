@@ -1,0 +1,23 @@
+# M10-P9 运维交付：apply 顺序与入口。
+#
+#   kubectl apply -k k8s/          （演练/预发；生产建议经 GitOps，并把镜像 tag 由 CI 注入）
+#
+# 顺序注意：Secret **不在** resources 里——它需要真实密钥值，必须由运维/External Secrets 单独创建，
+# 绝不能从 Git apply（secret.example.yaml 只是键名清单，值是 REPLACE_ME）。
+# 在 Secret 存在之前 apply 其余对象，Pod 会停在 CreateContainerConfigError（这是**期望行为**：
+# 宁可起不来，也不要静默以空密钥启动）。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: agent-platform
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - api-deployment.yaml
+  - api-service.yaml
+  - worker-deployment.yaml
+  - worker-hpa.yaml
+  - ingress.yaml
+# 常见覆盖（用 overlay 而不是改这里）：
+#   - 镜像 tag：     images: [{ name: registry.example.com/agent-platform-api, newTag: "<git-sha>" }]
+#   - 环境差异：     configMapGenerator / patches（如 STORAGE_ENDPOINT、CORS_ORIGINS、副本数）
+#   - 演练环境：     把 api/worker replicas 降到 1，Ingress 换成内部域名
