@@ -1,18 +1,33 @@
 import { describe, it, expect, vi } from 'vitest';
 import { VideoExecutor } from './video.executor';
-import { ModelRouterService } from '../../../core/model-router/model-router.service';
-import { CircuitBreakerService } from '../../../core/circuit-breaker/circuit-breaker.service';
-import { KVStore } from '../../../core/circuit-breaker/kv-store.interface';
 import { MediaExecContext, MediaRemoteQuery } from '../media-types';
+import { RouteResult, RouteTarget } from '../../provider-routing/provider-routing.types';
 
-const kv: KVStore = { incr: async () => 1, get: async () => null, set: async () => undefined, setNX: async () => true, del: async () => undefined };
-const cb = new CircuitBreakerService(kv, () => 0);
-const noSleep = async () => undefined;
+/** 单候选路由决策桩（M9-P3：执行器只消费链 + invoke 句柄；排序/策略由 RoutingService 决定） */
+function makeRoute(target: Partial<RouteTarget> = {}): RouteResult {
+  const full: RouteTarget = {
+    providerId: 'p1', providerName: 'Mock', adapter: 'mock-video',
+    modelId: 'm1', modelName: 'm', apiModelId: 'mock-video-1', estimatedCost: 0,
+    policyId: null, allowListed: false, policyPriority: 100, providerPriority: 100,
+    healthStatus: 'healthy', breakerState: 'healthy',
+    modelCapabilities: {}, capabilityFit: 0, healthScore: 100, latencyMs: null,
+    ...target,
+  };
+  return {
+    decisionId: 'd1', capability: 'video_generation',
+    providerId: full.providerId, providerName: full.providerName,
+    modelId: full.modelId, apiModelId: full.apiModelId, adapter: full.adapter,
+    reasonCode: 'capability_match', estimatedCost: full.estimatedCost, policyId: null,
+    chain: [full], candidates: [],
+    // 单候选链：invoke 直接执行首个候选并向上抛出错误（不可重试语义在单候选下等价于停止回退）
+    invoke: async (fn) => fn(full, 0),
+  };
+}
 
 function makeCtx(taskInput: Record<string, unknown>): MediaExecContext {
   return {
     task: {
-      id: 't1', input: taskInput as never,
+      id: 't1', userId: 'u1', runId: null, input: taskInput as never,
     } as never,
     deadline: Date.now() + 30 * 60_000,
     publishProgress: vi.fn().mockResolvedValue(undefined),
@@ -34,10 +49,11 @@ function makeExecutor(caps: Record<string, unknown> = {}) {
     }),
   };
   const modelResolver = {
-    listVideoCandidates: vi.fn().mockResolvedValue([{ modelId: 'm1', providerId: 'p1', priority: 1, cost: 0, latencyMs: 0 }]),
+    resolveMediaRoute: vi.fn().mockResolvedValue(makeRoute()),
   };
-  const executor = new VideoExecutor(modelResolver as never, videoManager as never, new ModelRouterService(cb, noSleep));
-  return { executor, videoManager };
+  const usage = { resolveOrganizationId: vi.fn().mockResolvedValue('org-1') };
+  const executor = new VideoExecutor(modelResolver as never, videoManager as never, usage as never);
+  return { executor, videoManager, modelResolver, usage };
 }
 
 describe('VideoExecutor', () => {
@@ -63,7 +79,7 @@ describe('VideoExecutor', () => {
     await expect(executor.execute(ctx)).rejects.toMatchObject({ code: 'UNSUPPORTED_PARAMETER' });
   });
 
-  it('provider 失败 → PROVIDER_UNKNOWN（可重试 → 回退语义由 ModelRouter 处理）', async () => {
+  it('provider 失败 → PROVIDER_UNKNOWN（可重试 → 回退语义由 RoutingService.invoke 处理）', async () => {
     const { executor, videoManager } = makeExecutor();
     videoManager.resolve.mockResolvedValue({
       providerId: 'p1', providerName: 'Mock', modelId: 'm1', apiModelId: 'mock-video-1', timeoutMs: 1000,

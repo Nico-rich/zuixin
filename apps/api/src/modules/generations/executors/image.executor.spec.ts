@@ -1,15 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
 import { ImageExecutor } from './image.executor';
-import { ModelRouterService } from '../../../core/model-router/model-router.service';
-import { CircuitBreakerService } from '../../../core/circuit-breaker/circuit-breaker.service';
-import { KVStore } from '../../../core/circuit-breaker/kv-store.interface';
 import { MediaRemoteQuery } from '../media-types';
 
-/** Pre-M9 G7：图片执行器的**远端恢复查询**（工作进程崩溃后按 remoteTaskId 反查 provider 真实状态） */
-const kv: KVStore = { incr: async () => 1, get: async () => null, set: async () => undefined, setNX: async () => true, del: async () => undefined };
-const cb = new CircuitBreakerService(kv, () => 0);
-const noSleep = async () => undefined;
-
+/**
+ * Pre-M9 G7：图片执行器的**远端恢复查询**（工作进程崩溃后按 remoteTaskId 反查 provider 真实状态）。
+ * M9-P3：执行路径的候选/回退改由 RoutingService 决策（ModelResolverService.resolveMediaRoute），
+ * 本文件只覆盖不涉及选模的恢复查询路径（路由接线由 routing.service.spec / media executor 集成断言覆盖）。
+ */
 function makeExecutor(adapter: Record<string, unknown> | null) {
   const imageManager = {
     resolve: vi.fn(async (modelId: string) => {
@@ -18,7 +15,7 @@ function makeExecutor(adapter: Record<string, unknown> | null) {
     }),
   };
   const executor = new ImageExecutor(
-    { listImageCandidates: vi.fn() } as never, imageManager as never, new ModelRouterService(cb, noSleep), {} as never,
+    { resolveMediaRoute: vi.fn() } as never, imageManager as never, {} as never, {} as never,
   );
   return { executor, imageManager };
 }

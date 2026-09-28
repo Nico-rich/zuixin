@@ -46,6 +46,26 @@ export class CircuitBreakerService {
     return 'healthy';
   }
 
+  /**
+   * M9-P3 只读窗口统计（路由评分输入）：当前 KV 窗口内的连续失败数与成功数。
+   * **纯读取，绝不写入/复位计数**（熔断计数的唯一写入者是 recordSuccess/recordFailure）；
+   * KV 不可用 → 返回零值（评分退化为「无窗口事实」，绝不因观测面故障改变路由准入）。
+   */
+  async windowStats(providerId: string): Promise<{ failures: number; successes: number }> {
+    try {
+      const [failures, successes] = await Promise.all([
+        this.kv.get(this.key(providerId, 'consecutiveFailures')),
+        this.kv.get(this.key(providerId, 'success')),
+      ]);
+      return {
+        failures: Math.max(0, Number(failures ?? 0) || 0),
+        successes: Math.max(0, Number(successes ?? 0) || 0),
+      };
+    } catch {
+      return { failures: 0, successes: 0 };
+    }
+  }
+
   /** 判定该 provider 当前是否允许调用（open 拒绝；half_open 只放行探测请求） */
   async canCall(providerId: string, cfg: BreakerConfig = {}, isProbe = false): Promise<boolean> {
     const s = await this.state(providerId, cfg);

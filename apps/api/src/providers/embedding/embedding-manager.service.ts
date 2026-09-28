@@ -4,6 +4,7 @@ import { CryptoService } from '../../core/crypto/crypto.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { assertProviderBaseUrlSafe } from '../../modules/security/provider-base-url.guard';
 import { DnsResolver, nodeDnsResolver, SSRF_RESOLVER } from '../../modules/security/ssrf-guard';
+import { RoutingService } from '../../modules/provider-routing/routing.service';
 import { EmbeddingProvider } from './embedding.types';
 import { MockEmbeddingProvider } from './adapters/mock-embedding.adapter';
 import { OpenAIEmbeddingProvider } from './adapters/openai-embedding.adapter';
@@ -22,6 +23,8 @@ export class EmbeddingManagerService implements OnModuleInit {
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(CryptoService) private readonly crypto: CryptoService,
+    // M9-P3：provider 选择权收口到 RoutingService（capability/组织策略/健康/延迟/成本/熔断排序）
+    @Inject(RoutingService) private readonly routing: RoutingService,
     // Pre-M9 F3-B：调用期 baseUrl 校验用的 DNS 解析器
     @Optional() @Inject(SSRF_RESOLVER) private readonly resolver: DnsResolver = nodeDnsResolver,
   ) {}
@@ -43,19 +46,20 @@ export class EmbeddingManagerService implements OnModuleInit {
     this.logger.log(`Embedding providers 已加载: ${this.providers.size} 个`);
   }
 
-  /** 默认 embedding 模型解析：routingPolicy.defaults.embedding → isDefault → priority */
+  /**
+   * 默认 embedding 模型解析（M9-P3：与 LLM/媒体同一条 RoutingService 管道，capability=embedding）：
+   * 组织策略/健康/延迟/成本/熔断事实排序；routingPolicy.defaults.embedding 仅作**偏好排序**（不做硬过滤）。
+   * 无可用候选 → PROVIDER_UNAVAILABLE（路由层裁决并留审计），模型行缺失/停用 → PROVIDER_UNKNOWN。
+   */
   async resolveDefault(): Promise<ResolvedEmbedding> {
     const settings = await this.prisma.systemSetting.findUnique({ where: { key: 'routingPolicy' } });
     const defaults = (settings?.value as { defaults?: Record<string, string | null> } | null)?.defaults;
-    let modelId = defaults?.embedding ?? null;
-    if (!modelId) {
-      const fallback = await this.prisma.model.findFirst({
-        where: { type: 'embedding', enabled: true },
-        orderBy: [{ isDefault: 'desc' }, { priority: 'asc' }],
-      });
-      modelId = fallback?.id ?? null;
-    }
-    if (!modelId) throw new AppError(ErrorCode.PROVIDER_UNKNOWN, '没有可用的 embedding 模型，请在后台配置');
+    const preferredModelId = defaults?.embedding ?? null;
+    const route = await this.routing.route({
+      capability: 'embedding',
+      preferredModelIds: preferredModelId ? [preferredModelId] : [],
+    });
+    const modelId: string = route.modelId;
     const model = await this.prisma.model.findUnique({ where: { id: modelId }, include: { provider: true } });
     if (!model || !model.enabled || !model.provider.enabled) throw new AppError(ErrorCode.PROVIDER_UNKNOWN, 'embedding 模型不可用');
     const provider = this.providers.get(model.providerId);

@@ -73,7 +73,7 @@ export interface CostBudget {
   units?: number;
 }
 
-/** route() 入参 */
+/** route() 入参（**全部是服务端事实**：调用方只提供需求与上下文，绝不指定 provider） */
 export interface RouteInput {
   organizationId?: string | null;
   capability: RoutingCapability;
@@ -82,9 +82,25 @@ export interface RouteInput {
   runId?: string;
   taskId?: string;
   budget?: CostBudget;
+  /**
+   * 运营者偏好模型（有序；来源：systemSetting.routingPolicy.defaults.<类型>）。
+   * **只做排序优先组，不做硬过滤**——被偏好的 provider 若被策略拒绝/不健康/熔断 open，仍按常规候选链回退。
+   */
+  preferredModelIds?: string[];
+  /**
+   * 软能力偏好（如 function_calling）：仅作为排序因子（命中多者优先），不是硬过滤。
+   * 硬过滤会让「全平台无模型显式声明工具能力」的部署直接不可用；调用方（引擎）保留能力降级语义。
+   */
+  preferCapabilities?: RoutingCapability[];
+  /**
+   * 稳定哈希 tie-break 键（如 runId）：候选在前述所有维度完全同质时，
+   * 按 hash(stickyKey + providerId) 排序——同键恒定同序（可复现），不同键稳定分摊。
+   * 不提供 → 按 providerId 字典序（与 M8-P7 冻结语义一致）。
+   */
+  stickyKey?: string;
 }
 
-/** 一个可调用目标（provider + 模型 + 价格 + 句柄所需字段） */
+/** 一个可调用目标（provider + 模型 + 价格 + 事实评分 + 句柄所需字段） */
 export interface RouteTarget {
   providerId: string;
   providerName: string;
@@ -99,6 +115,14 @@ export interface RouteTarget {
   providerPriority: number;
   healthStatus: string;
   breakerState: string;
+  /** models.capabilities 原样透传（引擎 MUST-3 工具能力降级判断用；路由只转发事实，不做能力裁决） */
+  modelCapabilities: Record<string, unknown>;
+  /** 软能力命中数（preferCapabilities 命中数，排序用） */
+  capabilityFit: number;
+  /** 健康分（health-score.ts；排序用，越高越优） */
+  healthScore: number;
+  /** 最近平均延迟（usage_records 只读聚合）；null = 无样本 */
+  latencyMs: number | null;
 }
 
 /** 候选审计记录（RoutingDecision.candidates 的每一行） */
@@ -114,6 +138,15 @@ export interface RoutingCandidateRecord {
   providerPriority: number;
   healthStatus: string;
   breakerState: string;
+  /** 健康分（审计可复现：为什么是它而不是同价同优先级的另一个） */
+  healthScore: number;
+  /** 最近平均延迟（只读事实；null = 无样本） */
+  latencyMs: number | null;
+  /** 熔断窗口内失败/成功计数（只读事实，决策可回溯） */
+  windowFailures: number;
+  windowSuccesses: number;
+  /** 软能力命中数 */
+  capabilityFit: number;
   accepted: boolean;
   reasonCode: CandidateReasonCode;
 }
@@ -136,8 +169,14 @@ export interface RouteResult {
   /**
    * adapter 调用句柄：首选失败自动重试链上下一个（最多 2 次 fallback），
    * 同时把成功/失败喂给熔断器；回退成功 → 决策行改写为实际使用的 provider（reasonCode=fallback）。
+   *
+   * `opts.retryableOnly=true`：不可重试错误（参数/鉴权类）立即停止回退链——换 provider 也救不回来，
+   * 继续打只会污染熔断计数并放大延迟（媒体执行器沿用 ModelRouter 的既有语义）。
    */
-  invoke<T>(fn: (target: RouteTarget, attempt: number) => Promise<T>, opts?: { maxFallbacks?: number }): Promise<T>;
+  invoke<T>(
+    fn: (target: RouteTarget, attempt: number) => Promise<T>,
+    opts?: { maxFallbacks?: number; retryableOnly?: boolean },
+  ): Promise<T>;
 }
 
 export const DEFAULT_POLICY_PRIORITY = 100;
