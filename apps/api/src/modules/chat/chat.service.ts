@@ -6,6 +6,8 @@ import { RedisKVService } from '../../core/circuit-breaker/redis-kv.service';
 import { RouterService } from '../../core/router/router.service';
 import { ContextAssembler } from '../../core/context/context-assembler';
 import { MemoryExtractor, MEMORY_EXTRACTOR } from '../../core/memory/memory-extractor';
+import { SummaryRefinerService } from '../../core/memory/summary-refiner.service';
+import { MemoryCandidateService } from '../../core/memory/memory-candidate.service';
 import { AgentRegistryService } from '../../agents/agent-registry.service';
 import { AttachmentMeta } from '../../agents/agent.types';
 import { ChatMessage } from '../../providers/llm/llm.types';
@@ -34,6 +36,8 @@ export class ChatService {
     @Inject(MEMORY_EXTRACTOR) private readonly memoryExtractor: MemoryExtractor,
     @Inject(AgentRegistryService) private readonly agentRegistry: AgentRegistryService,
     @Inject(QuotaService) private readonly quota: QuotaService,
+    @Inject(SummaryRefinerService) private readonly summaryRefiner: SummaryRefinerService,
+    @Inject(MemoryCandidateService) private readonly memoryCandidates: MemoryCandidateService,
   ) {}
 
   /** 第一步（HTTP 阶段，出错走统一 JSON envelope）：会话/锁/消息/路由/上下文 */
@@ -167,12 +171,27 @@ export class ChatService {
         userId: ctx.userId, conversationId: ctx.conversationId, projectId: ctx.projectId ?? undefined,
         userMessage: ctx.userMessage, assistantReply: content, sourceMessageId: ctx.assistantMessageId,
       }).catch(() => undefined);
+      // M9-P2：增量摘要 + 候选提炼（同一 fire-and-forget 语义；两个服务内部各自兜底，绝不抛错）
+      void this.advanceMemory(ctx).catch(() => undefined);
     }
     // 结构化日志（LLM 用量由 AgentLoop 记录并关联 runId；本行只记录会话维度）
     this.logger.log({
       requestId, userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.assistantMessageId,
       intentType: ctx.intent.type, latencyMs, status, errorCode,
     }, 'chat 完成');
+  }
+
+  /**
+   * M9-P2 记忆推进（fire-and-forget）：增量摘要达到阈值 → 新建版本段 → 从**该段真实对话行**提炼候选。
+   * 顺序固定：先摘要后提炼（候选需 sourceSummaryId 追溯）；任一步失败静默（不阻塞/不影响聊天）。
+   */
+  private async advanceMemory(ctx: ChatRunContext): Promise<void> {
+    const refined = await this.summaryRefiner.maybeRefine(ctx.conversationId, {
+      userId: ctx.userId, projectId: ctx.projectId ?? undefined,
+    });
+    for (const version of refined.created) {
+      await this.memoryCandidates.extractFromSummary(version.id).catch(() => undefined);
+    }
   }
 
   /** 解析消息附件：M2 仅图片进入 Agent 上下文（vision/参考图，base64 data URL）；其他文件仅可下载 */

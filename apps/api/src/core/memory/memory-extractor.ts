@@ -3,10 +3,13 @@ import { z } from 'zod';
 import { PrismaService } from '../../modules/prisma/prisma.service';
 import { ModelResolverService } from '../../providers/llm/model-resolver.service';
 
-const ExtractedCandidatesSchema = z.object({
+/** 记忆分类唯一事实源（M9-P2 候选提炼复用，绝不各自硬编码枚举） */
+export const MEMORY_CATEGORIES = ['preference', 'profile', 'instruction', 'project_context', 'workflow', 'other'] as const;
+
+export const ExtractedCandidatesSchema = z.object({
   memories: z.array(z.object({
     content: z.string().min(1).max(2000),
-    category: z.enum(['preference', 'profile', 'instruction', 'project_context', 'workflow', 'other']),
+    category: z.enum(MEMORY_CATEGORIES),
     importance: z.number().int().min(0).max(100),
     confidence: z.number().min(0).max(1),
   })),

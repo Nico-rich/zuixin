@@ -7,8 +7,10 @@ function make() {
     message: { findMany: vi.fn() },
     project: { findFirst: vi.fn().mockResolvedValue({ id: 'p1', userId: 'u1' }) },
   };
-  const svc = new ConversationsService(prisma as never);
-  return { svc, prisma };
+  // M9-P2：会话删除的摘要清理走记忆域（不在此重复摘要生命周期语义）
+  const summaries = { purgeConversation: vi.fn().mockResolvedValue({ summaries: 0, candidates: 0 }) };
+  const svc = new ConversationsService(prisma as never, summaries as never);
+  return { svc, prisma, summaries };
 }
 
 describe('ConversationsService', () => {
@@ -79,9 +81,29 @@ describe('ConversationsService', () => {
     expect(prisma.message.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { conversationId: 'c1' }, orderBy: { createdAt: 'asc' } }));
   });
 
-  it('软删除：先校验归属再置 deletedAt', async () => {
-    const { svc, prisma } = make();
+  it('软删除：非本人会话 → NOT_FOUND，且无任何副作用（不清理摘要）', async () => {
+    const { svc, prisma, summaries } = make();
     prisma.conversation.findFirst.mockResolvedValue(null);
     await expect(svc.softDelete('u1', 'c-other')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(prisma.conversation.update).not.toHaveBeenCalled();
+    expect(summaries.purgeConversation).not.toHaveBeenCalled();
+  });
+
+  it('软删除成功：置 deletedAt 后传播清理会话摘要/未提升候选（隐私删除传播）', async () => {
+    const { svc, prisma, summaries } = make();
+    prisma.conversation.findFirst.mockResolvedValue({ id: 'c1', userId: 'u1' });
+    prisma.conversation.update.mockResolvedValue({ id: 'c1' });
+    await svc.softDelete('u1', 'c1');
+    expect(prisma.conversation.update).toHaveBeenCalledWith({ where: { id: 'c1' }, data: { deletedAt: expect.any(Date) } });
+    expect(summaries.purgeConversation).toHaveBeenCalledWith('c1');
+  });
+
+  it('软删除：摘要清理失败不回滚会话删除（清理是级联副作用，删除本身已生效）', async () => {
+    const { svc, prisma, summaries } = make();
+    prisma.conversation.findFirst.mockResolvedValue({ id: 'c1', userId: 'u1' });
+    prisma.conversation.update.mockResolvedValue({ id: 'c1' });
+    summaries.purgeConversation.mockRejectedValue(new Error('db down'));
+    await expect(svc.softDelete('u1', 'c1')).resolves.toBeUndefined();
+    expect(prisma.conversation.update).toHaveBeenCalled();
   });
 });

@@ -5,8 +5,9 @@ import { ChatMessage } from '../../providers/llm/llm.types';
  * M1 仅使用 'conversation'（最近会话消息）；
  * 未来按审查报告 §4 扩展：'system'（Agent System Prompt）、
  * 'user'（User Memory）、'project'（Project Memory）、'knowledge'（KB/RAG 检索）。
+ * M9-P2 已实现：'summary'（对话摘要版本段——超预算时裁掉最早版本段）。
  */
-export type MemoryScope = 'system' | 'conversation' | 'user' | 'project' | 'knowledge';
+export type MemoryScope = 'system' | 'conversation' | 'user' | 'project' | 'knowledge' | 'summary';
 
 export interface MemoryBlock {
   scope: MemoryScope;
