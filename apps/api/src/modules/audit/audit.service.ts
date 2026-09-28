@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { TraceContext } from '../../core/tracing/trace-context';
 
@@ -65,6 +65,8 @@ export function maskEmail(email: string): string {
  */
 @Injectable()
 export class AuditService {
+  private readonly logger = new Logger('Audit');
+
   constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
 
   async write(input: AuditInput): Promise<void> {
@@ -85,7 +87,11 @@ export class AuditService {
         reason: input.reason ?? null,
         metadata: maskSensitive(input.metadata ?? null) as never,
       },
-    }).catch(() => undefined); // best-effort
+    }).catch((err: Error) => {
+      // M10-P1 D13：best-effort ≠ 静默。审计写失败必须**可见**（此前是 `.catch(() => undefined)` 完全吞掉，
+      // 运行期无法从日志发现"审计面已经失灵"）。只记 action 与错误消息——绝不复述 metadata（可能含尚未脱敏的输入）。
+      this.logger.warn(`审计写入失败（业务不受影响；审计面已降级）: action=${input.action} err=${err.message}`);
+    });
   }
 
   async list(userId: string, filters: { action?: string; targetType?: string; take?: number } = {}) {

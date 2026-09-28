@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import type { ErrorCodeType } from '../../common/errors/app-error';
 import { assertSafeUrl, DnsResolver, nodeDnsResolver, normalizeHostname, SSRF_RESOLVER } from './ssrf-guard';
+import { nodePinnedTransport, PINNED_TRANSPORT, PinnedTransport } from './pinned-transport';
 
 /**
  * Pre-M9 F3-A：统一"服务端代表自己去下载远端资源"的安全取回器（唯一入口）。
@@ -12,16 +13,20 @@ import { assertSafeUrl, DnsResolver, nodeDnsResolver, normalizeHostname, SSRF_RE
  * 命中即等于把内网内容以附件形式交付给攻击者。
  *
  * 防线（逐跳，绝不放行 3xx 自动跟随）：
- * 1. `redirect: 'manual'` + 手写重定向循环：**每一跳**都重跑 ssrf-guard（协议/主机名/IP 字面量 + DNS 解析 + 全地址分类）；
+ * 1. **逐跳**重跑 ssrf-guard（协议/主机名/IP 字面量 + DNS 解析 + 全地址分类），且 3xx 一律手工处理
+ *    （**传输层不跟随重定向**，见 pinned-transport.ts 契约）；
  * 2. 域名 allowlist（provider 域名 / 环境变量配置）逐跳校验——重定向到非白名单域名同样拒绝；
  * 3. connect（单跳）与 total（整体）双超时，超时即 abort；
  * 4. 响应体大小上限（先看 content-length，再流式累计，超限即 cancel 读取）；
- * 5. 失败一律抛**明确错误码**：SSRF/策略 → `SSRF_BLOCKED`，超时 → `PROVIDER_TIMEOUT`，超限/非法 URL → `VALIDATION_ERROR`。
+ * 5. 失败一律抛**明确错误码**：SSRF/策略 → `SSRF_BLOCKED`，超时 → `PROVIDER_TIMEOUT`，超限/非法 URL → `VALIDATION_ERROR`；
+ * 6. **M10-P1 M9-07/SA-13：连接固定（DNS rebinding 防护）**——每跳的 DNS **只解析一次**（在 assertSafeUrl 内），
+ *    建连一律走 `PinnedTransport` 并携带该次解析出的**已校验地址**：socket 只连这个地址，
+ *    连接期**不存在第二次 DNS 查询**（Host 头与 TLS servername 仍为原域名，证书校验语义不变）。
  *
  * 诚实边界（不假装覆盖）：
- * - DNS 解析与真实连接之间仍有 TOCTOU 窗口——本实现是"每跳连接前立即重解析 + 全地址分类"，
- *   但受限于全局 fetch（undici）不暴露 socket 级地址固定（pin），无法彻底消除 rebinding；如需更强保证，
- *   应换用带 `lookup` 钩子的 Agent 做连接固定（本包不改依赖，已在报告中标注）。
+ * - pin 消除了"校验地址 ≠ 连接地址"的窗口；但**同一地址上的服务**仍可能被攻击者控制（那是上游信任问题，
+ *   不是 rebinding）。多地址（A/AAAA 混合）场景下当前固定使用**第一个**已校验地址（全部地址都已分类校验过），
+ *   不做 happy-eyeballs 轮转——失败即失败，绝不在失败后回退到未固定路径。
  * - 只用于"下载字节"；调用方不得把未经本取回器的 URL 写入 Attachment 等可信事实。
  */
 
@@ -63,7 +68,11 @@ export class SafeRemoteFetcher {
   private readonly logger = new Logger('SafeRemoteFetcher');
 
   // 显式 @Inject + @Optional：单测/非 Nest 上下文可直接 new，且不依赖 SecurityModule 是否已加载
-  constructor(@Optional() @Inject(SSRF_RESOLVER) private readonly resolver: DnsResolver = nodeDnsResolver) {}
+  constructor(
+    @Optional() @Inject(SSRF_RESOLVER) private readonly resolver: DnsResolver = nodeDnsResolver,
+    // M10-P1 M9-07/SA-13：连接固定传输层（默认 node:https/http + lookup 钩子；单测注入假实现断言 pin）
+    @Optional() @Inject(PINNED_TRANSPORT) private readonly transport: PinnedTransport = nodePinnedTransport,
+  ) {}
 
   /** 环境变量配置的全局下载白名单（provider 域名之外的可信 CDN 出口，逗号分隔） */
   static envAllowedHosts(env = process.env.MEDIA_DOWNLOAD_ALLOWED_HOSTS): string[] {
@@ -102,12 +111,15 @@ export class SafeRemoteFetcher {
         throw new AppError(ErrorCode.PROVIDER_TIMEOUT, `下载总时长超限（${totalTimeoutMs}ms）${this.tag(opts)}`);
       }
       // ① 每一跳都过 ssrf-guard（协议/主机名/IP 字面量 + DNS 解析 + 全部地址分类）
-      const checked = await this.assertHopSafe(current, opts);
+      const hop = await this.assertHopSafe(current, opts);
+      const checked = hop.url;
       const host = normalizeHostname(checked.hostname);
       // ② 每一跳都过域名白名单（重定向到名单外同样拒绝）
       if (allowedHosts.length && !allowedHosts.some((allowed) => host === allowed || host.endsWith(`.${allowed}`))) {
         throw new AppError(ErrorCode.SSRF_BLOCKED, `下载目标域名不在白名单内: ${host}${this.tag(opts)}`);
       }
+      // ③ M10-P1：连接固定——用**本次**解析并已分类校验的地址建连；连接期不再解析 DNS
+      const pinnedAddress = this.pinAddress(hop, opts);
 
       const controller = new AbortController();
       const hopBudget = Math.max(1, Math.min(connectTimeoutMs, deadline - Date.now()));
@@ -115,7 +127,9 @@ export class SafeRemoteFetcher {
       let res: Response;
       const startedAt = Date.now();
       try {
-        res = await fetch(current, { redirect: 'manual', signal: controller.signal });
+        res = await this.transport({
+          url: current, pinnedAddress, addresses: hop.addresses, signal: controller.signal,
+        });
       } catch (err) {
         const timedOut = (err as Error).name === 'AbortError' || Date.now() - startedAt >= hopBudget;
         if (timedOut) {
@@ -168,17 +182,33 @@ export class SafeRemoteFetcher {
     }
   }
 
-  /** 校验单跳 URL（复用 ssrf-guard 的分类函数，绝不重写判定逻辑），失败统一映射为 SSRF_BLOCKED */
-  private async assertHopSafe(raw: string, opts: SafeFetchOptions): Promise<URL> {
+  /**
+   * 校验单跳 URL（复用 ssrf-guard 的分类函数，绝不重写判定逻辑），失败统一映射为 SSRF_BLOCKED。
+   * 返回 `{ url, addresses }`：addresses 是**本次**解析且已逐个分类校验的地址（供连接固定使用）。
+   */
+  private async assertHopSafe(raw: string, opts: SafeFetchOptions): Promise<{ url: URL; addresses: string[] }> {
     try {
-      const { url } = await assertSafeUrl(raw, { allowHttp: opts.allowHttp ?? false, resolve: this.resolver });
-      return url;
+      const { url, addresses } = await assertSafeUrl(raw, { allowHttp: opts.allowHttp ?? false, resolve: this.resolver });
+      return { url, addresses };
     } catch (err) {
       const message = (err as Error).message;
       // 审计留痕：只记主机名（URL 可能含 query 凭证，绝不整体落日志）
       this.logger.warn(`下载被 SSRF 防线拒绝: ${this.safeHost(raw)} ${message}${this.tag(opts)}`);
       throw new AppError(ErrorCode.SSRF_BLOCKED, `下载目标未通过安全校验: ${message}${this.tag(opts)}`, undefined, err);
     }
+  }
+
+  /**
+   * M10-P1 M9-07/SA-13：选出**本跳的连接固定地址**。
+   * 契约：必须来自 assertSafeUrl 本次解析并逐个分类校验过的 addresses（绝不再解析、绝不缓存跨跳复用）；
+   * 解析结果为空时 fail-closed（正常路径下 assertSafeUrl 已保证非空，此处是防御性兜底）。
+   */
+  private pinAddress(hop: { url: URL; addresses: string[] }, opts: SafeFetchOptions): string {
+    const pinned = hop.addresses[0];
+    if (!pinned) {
+      throw new AppError(ErrorCode.SSRF_BLOCKED, `下载目标无可固定地址（拒绝无 pin 出网）${this.tag(opts)}`);
+    }
+    return pinned;
   }
 
   /** 仅取主机名用于日志（解析失败则返回占位，绝不泄漏完整 URL） */

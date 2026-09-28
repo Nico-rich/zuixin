@@ -26,6 +26,29 @@ describe('Pre-M9 F3-B provider baseUrl 调用期校验', () => {
     expect(isMockAdapter('openai-compatible')).toBe(false);
   });
 
+  it('M10-P1 D24：mock 判定是**精确枚举**，不认识的 mock* 名字不再豁免校验（fail-closed）', async () => {
+    // 白名单内 5 个替身
+    for (const name of ['mock', 'mock-router', 'mock-image', 'mock-video', 'mock-embedding']) {
+      expect(isMockAdapter(name)).toBe(true);
+    }
+    // 前缀撞名/未登记名字：历史正则 `/^mock(-|$)/` 会全部放过 → 现在一律不豁免
+    for (const name of ['mock-evil', 'mock-attacker', 'mock-anything', 'mock_', 'mock-image-x', 'Mock', 'mock-image-2', 'mockingbird']) {
+      expect(isMockAdapter(name)).toBe(false);
+    }
+    // 空白容忍是刻意的（配置里多打空格不该改变语义）；但大小写与"撞名"不放行
+    expect(isMockAdapter(' mock-image ')).toBe(true);
+    expect(isMockAdapter('')).toBe(false);
+    expect(isMockAdapter(null)).toBe(false);
+    expect(isMockAdapter(undefined)).toBe(false);
+    // 行为级证据：未登记名字 + 空 baseUrl → 走 fail-closed（而不是"因为是 mock* 就跳过"）
+    await expect(assertProviderBaseUrlSafe({ providerId: 'p1', adapter: 'mock-evil', baseUrl: '' }))
+      .rejects.toMatchObject({ code: ErrorCode.SSRF_BLOCKED });
+    // 未登记名字 + 内网 baseUrl → 同样必须被 SSRF 防线拦下（历史正则会直接放行并出网）
+    await expect(assertProviderBaseUrlSafe({ providerId: 'p1', adapter: 'mock-evil', baseUrl: 'https://169.254.169.254/latest/meta-data' }))
+      .rejects.toMatchObject({ code: ErrorCode.SSRF_BLOCKED });
+    expect(isMockAdapter(' Mock-Image ')).toBe(false); // 不做大小写/空白宽容（枚举即精确）
+  });
+
   it('非 mock adapter 未配置 baseUrl → SSRF_BLOCKED（fail-closed，绝不"无地址就当安全"）', async () => {
     await expect(assertProviderBaseUrlSafe({ providerId: 'p1', providerName: 'X', adapter: 'openai-compatible', baseUrl: '' }))
       .rejects.toMatchObject({ code: ErrorCode.SSRF_BLOCKED });
