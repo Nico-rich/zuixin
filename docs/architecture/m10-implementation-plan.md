@@ -91,6 +91,8 @@ Final Audit（七维） → 自动修复循环 → 最终验收
 
 **热点文件纪律**（R4 快照结论）：`schema.prisma`=W0 独占；`queue.module.ts`/`worker.module.ts`=本 M10 不新增队列、全不碰；`app.module.ts`=A8 唯一；`shared/errors.ts`、`shared/events.ts`=W0 预置后只读；`health.service.ts`=不碰。workflows 模块 18 文件由 A5 独享（P5 内部两项合并避免同模块并行冲突）。主工作树仅 Coordinator 操作 merge，Agent 永不直接写主树。
 
+**基础设施已修（2026-09-28 执行中实抓）**：Redis 默认 `databases=16` 导致 DB 21–33 全部越界且 ioredis **静默落 db0**（A6 实测发现——并行隔离铁律被击穿）。compose 已加 `--databases 64` 并重建容器（无卷、队列为测试数据，安全重建）；A6 在 DB/26 复验隔离真实生效。**教训延续**：分配 DB 号前必须确认 `CONFIG GET databases`。
+
 ## 7. Schema / migration 依赖
 
 Coordinator 单点预整合（W0，一个 commit，含全部 M10 schema）：

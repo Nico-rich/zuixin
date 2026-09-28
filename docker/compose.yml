@@ -20,6 +20,8 @@ services:
 
   redis:
     image: redis:7-alpine
+    # M10: databases=64——并行 worktree e2e 按 DB 号隔离（铁律）；默认 16 会越界并静默落 db0
+    command: ["redis-server", "--databases", "64"]
     ports: ["6379:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
