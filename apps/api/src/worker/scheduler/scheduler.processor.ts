@@ -1,7 +1,7 @@
 import { Inject, Injectable, Logger, OnApplicationShutdown, OnModuleInit } from '@nestjs/common';
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job } from 'bullmq';
-import type { ScheduledJob } from '@prisma/client';
+import type { Prisma, ScheduledJob } from '@prisma/client';
 import { setTimeout as delay } from 'node:timers/promises';
 import { SCHEDULER_QUEUE } from '../../core/queue/scheduler-queue.module';
 import { SchedulerService, SCHEDULED_ACTIVE_STATUSES } from '../../modules/scheduler/scheduler.service';
@@ -17,6 +17,34 @@ const HEARTBEAT_MAX_MS = 5_000;
 /** M8-P9 巡检周期（默认 60s）与优雅停机等待在途作业的上限（默认 25s，低于 30s 进程兜底） */
 const DEFAULT_RECONCILE_INTERVAL_MS = 60_000;
 const DEFAULT_SHUTDOWN_WAIT_MS = 25_000;
+
+/**
+ * M11-P7 D2-13（无界载入治理）：stalled 巡检的载入面收窄。
+ * - **select 收窄**：只取判定与判死事件需要的事实（不再载入 payload/cron/runAt 等大字段）；
+ * - **下推**：逐行阈值 = max(timeoutMs×3, 3×clamp(timeoutMs/3, 500ms, 5s)) 对任意 timeoutMs 的**全局下界**
+ *   是 3×HEARTBEAT_MIN_MS = 1500ms（阈值对 timeoutMs 单调不减）⇒ `updatedAt < now - 1500ms` 的谓词
+ *   可以在 SQL 侧安全裁剪「心跳必然新鲜」的行，绝不漏掉任何真正 stalled 的行；精确判定仍在逐行分支（timeoutMs 逐行不同）；
+ * - **take 分页**：单批 200 行、单周期最多 10 批（按 updatedAt 升序 = 最久无心跳优先），
+ *   余量由下个巡检周期（60s）继续——有界工作，绝不因 running 行积压而无界载入。
+ */
+const RECONCILE_BATCH = 200;
+const RECONCILE_MAX_BATCHES = 10;
+const STALL_MIN_LAG_MS = HEARTBEAT_MIN_MS * STALL_FACTOR;
+
+/** 巡检投影列（判定 + 判死事件需要的全部列） */
+const RECONCILE_SELECT = {
+  id: true, type: true, handler: true, timeoutMs: true, updatedAt: true,
+  attempts: true, organizationId: true, ownerUserId: true,
+} as const;
+
+/** 巡检行（= RECONCILE_SELECT 的投影结果） */
+type ReconcileRow = {
+  id: string; type: string; handler: string; timeoutMs: number; updatedAt: Date;
+  attempts: number; organizationId: string | null; ownerUserId: string | null;
+};
+
+/** 事件落库需要的最小行事实（完整 ScheduledJob 行同样满足，process() 复用同一路径） */
+type EventRow = Pick<ReconcileRow, 'id' | 'type' | 'handler' | 'organizationId' | 'ownerUserId'>;
 
 export interface StalledReconcileResult {
   /** 被判 stalled 的作业数（running 无心跳 → dead） */
@@ -71,28 +99,52 @@ export class SchedulerProcessor extends WorkerHost implements OnApplicationShutd
    */
   async reconcileStalled(): Promise<StalledReconcileResult> {
     const now = Date.now();
-    const rows = await this.prisma.scheduledJob.findMany({ where: { status: 'running' } });
+    // M11-P7 D2-13：心跳新鲜的行（lag ≤ 全局下界 1500ms）在 SQL 侧被裁剪——它们绝不可能是 stalled 行；
+    // timeoutMs 逐行不同无法把精确阈值整体下推，故保留逐行判定 + 分页（见文件头注释）。
+    const where: Prisma.ScheduledJobWhereInput = { status: 'running', updatedAt: { lt: new Date(now - STALL_MIN_LAG_MS) } };
     let reaped = 0;
-    for (const row of rows) {
-      const heartbeatMs = Math.min(Math.max(Math.trunc(row.timeoutMs / 3), HEARTBEAT_MIN_MS), HEARTBEAT_MAX_MS);
-      const threshold = Math.max(row.timeoutMs * STALL_FACTOR, heartbeatMs * STALL_FACTOR);
-      const lag = now - row.updatedAt.getTime();
-      if (lag <= threshold) continue;
-      const done = await this.prisma.scheduledJob.updateMany({
-        where: { id: row.id, status: 'running' }, // 条件更新：与正常完成/重投竞争由 DB 串行裁决
-        data: {
-          status: 'dead',
-          completedAt: new Date(),
-          lastError: `stalled：running 期间心跳中断 ${lag}ms（阈值 ${threshold}ms）→ 判失败，不自动重投（人工 resume 走显式路径）`.slice(0, 2000),
-        },
+    let scanned = 0;
+    let cursorId: string | undefined;
+    for (let batch = 0; batch < RECONCILE_MAX_BATCHES; batch++) {
+      const rows: ReconcileRow[] = await this.prisma.scheduledJob.findMany({
+        where,
+        select: RECONCILE_SELECT,
+        // 最久无心跳优先。注意 updatedAt 会被心跳刷新（可变态）：并发心跳可能让某行的页位置后移，
+        // 至多导致它本轮被重复扫描（逐行判定 + 条件更新仍然幂等）或被推迟到下个巡检周期（60s）——
+        // 绝不产生错误裁决（裁决者是逐行阈值判定 + 条件更新，不是遍历顺序）。
+        orderBy: [{ updatedAt: 'asc' }, { id: 'asc' }],
+        take: RECONCILE_BATCH,
+        ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
       });
-      if (done.count === 0) continue;
-      reaped++;
-      this.logger.error({ jobId: row.id, lag, threshold }, '调度作业心跳中断 → 判 dead（不自动重投，一致性优先）');
-      await this.emitEvent('scheduler.job.dead', row, row.attempts);
+      scanned += rows.length;
+      for (const row of rows) {
+        const heartbeatMs = Math.min(Math.max(Math.trunc(row.timeoutMs / 3), HEARTBEAT_MIN_MS), HEARTBEAT_MAX_MS);
+        const threshold = Math.max(row.timeoutMs * STALL_FACTOR, heartbeatMs * STALL_FACTOR);
+        const lag = now - row.updatedAt.getTime();
+        if (lag <= threshold) continue;
+        const done = await this.prisma.scheduledJob.updateMany({
+          where: { id: row.id, status: 'running' }, // 条件更新：与正常完成/重投竞争由 DB 串行裁决
+          data: {
+            status: 'dead',
+            completedAt: new Date(),
+            lastError: `stalled：running 期间心跳中断 ${lag}ms（阈值 ${threshold}ms）→ 判失败，不自动重投（人工 resume 走显式路径）`.slice(0, 2000),
+          },
+        });
+        if (done.count === 0) continue;
+        reaped++;
+        this.logger.error({ jobId: row.id, lag, threshold }, '调度作业心跳中断 → 判 dead（不自动重投，一致性优先）');
+        await this.emitEvent('scheduler.job.dead', row, row.attempts);
+      }
+      const last = rows[rows.length - 1];
+      // 末批（不足一批）→ 结束；游标未前进（行被并发删除等）→ 结束（绝不无限循环）
+      if (rows.length < RECONCILE_BATCH || !last || last.id === cursorId) break;
+      cursorId = last.id;
+      if (batch === RECONCILE_MAX_BATCHES - 1) {
+        this.logger.warn({ batch: RECONCILE_BATCH, maxBatches: RECONCILE_MAX_BATCHES }, 'stalled 巡检达到单周期分页上限 → 剩余行由下个巡检周期继续');
+      }
     }
-    if (reaped > 0) this.logger.warn({ reaped, scanned: rows.length }, 'stalled 巡检完成');
-    return { reaped, scanned: rows.length };
+    if (reaped > 0) this.logger.warn({ reaped, scanned }, 'stalled 巡检完成');
+    return { reaped, scanned };
   }
 
   async process(job: Job<{ jobId?: string }>): Promise<void> {
@@ -187,7 +239,7 @@ export class SchedulerProcessor extends WorkerHost implements OnApplicationShutd
   }
 
   /** 作业生命周期事件经事件平台落库（eventId 含 attempt → 天然幂等；失败绝不影响作业状态机） */
-  private async emitEvent(eventType: string, row: ScheduledJob, attempt: number): Promise<void> {
+  private async emitEvent(eventType: string, row: EventRow, attempt: number): Promise<void> {
     try {
       await this.events.publish({
         eventId: `sched:${row.id}:${attempt}:${eventType}`,

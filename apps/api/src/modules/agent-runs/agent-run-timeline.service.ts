@@ -24,6 +24,19 @@ const RUN_STATUS_TITLES: Record<string, string> = {
 };
 
 /**
+ * M11-P7 D2-14（无界载入治理）：子行投影上限（run 详情端点 + SSE 快照共用此投影）。
+ * Timeline 是**投影**（事实源仍是各域表；run 边界/终态/用量汇总来自 run 行与聚合，不受子行截断影响）：
+ * 异常 run（死循环/重试风暴）可能产生成千上万子行，无上限 include 会让详情端点与每次 SSE 建连
+ * 都把整棵子行树载入内存。截断语义：**按时间正序保留最早的 N 行**（timeline 从起点开始可读），
+ * 超出部分不下发（截断比无界好；行数上限远高于正常 run 的真实规模：正常 run ≤ 数十步）。
+ */
+export const TIMELINE_STEP_LIMIT = 500;
+export const TIMELINE_TOOL_CALL_LIMIT = 100;
+export const TIMELINE_TASK_LIMIT = 100;
+export const TIMELINE_ARTIFACT_LIMIT = 50;
+export const TIMELINE_APPROVAL_LIMIT = 50;
+
+/**
  * Timeline 投影服务——只读投影，不写任何 Event 表。
  * 单次 run include 查询（steps/toolCalls/tasks+model/artifacts）+ UsageService 聚合（复用 P4，不重复计算）。
  * 敏感数据安全化：ToolCall raw input/output 不进 Timeline（summary 化）；凭证/内部路径零暴露。
@@ -38,13 +51,14 @@ export class AgentRunTimelineService {
       include: {
         steps: {
           orderBy: { stepIndex: 'asc' },
-          include: { toolCalls: { orderBy: { startedAt: 'asc' } } },
+          take: TIMELINE_STEP_LIMIT, // D2-14：无界子行 → 上限（超出部分作为投影截断，run 边界/终态不受影响）
+          include: { toolCalls: { orderBy: { startedAt: 'asc' }, take: TIMELINE_TOOL_CALL_LIMIT } },
         },
         agent: { select: { id: true, slug: true, name: true } },
         agentVersion: { select: { id: true, version: true, status: true } },
-        tasks: { orderBy: { createdAt: 'asc' }, include: { model: { select: { name: true } } } },
-        artifacts: { orderBy: { createdAt: 'asc' } },
-        approvals: { orderBy: { createdAt: 'asc' } },
+        tasks: { orderBy: { createdAt: 'asc' }, take: TIMELINE_TASK_LIMIT, include: { model: { select: { name: true } } } },
+        artifacts: { orderBy: { createdAt: 'asc' }, take: TIMELINE_ARTIFACT_LIMIT },
+        approvals: { orderBy: { createdAt: 'asc' }, take: TIMELINE_APPROVAL_LIMIT },
       },
     });
     if (!run) throw new AppError(ErrorCode.NOT_FOUND, '运行不存在');

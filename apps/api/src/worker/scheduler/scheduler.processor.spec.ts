@@ -19,10 +19,26 @@ function jobRow(over: Partial<ScheduledJob> = {}): ScheduledJob {
   } as ScheduledJob;
 }
 
+/**
+ * M11-P7 D2-13：巡检改为「select 收窄 + 下推 + take 分页」。
+ * 替身忠实实现 where/take/cursor（否则下推/paging 语义在单测里不可见）。
+ */
+function reconcileQuery(rows: ScheduledJob[], args: Record<string, any>): ScheduledJob[] {
+  const cutoff = args.where?.updatedAt?.lt as Date | undefined;
+  const status = args.where?.status as string | undefined;
+  const matched = rows
+    .filter((r) => (!status || r.status === status) && (!cutoff || r.updatedAt.getTime() < cutoff.getTime()))
+    .sort((a, b) => a.updatedAt.getTime() - b.updatedAt.getTime() || a.id.localeCompare(b.id));
+  const cursorId = (args.cursor as { id: string } | undefined)?.id;
+  const from = cursorId ? matched.findIndex((r) => r.id === cursorId) + 1 : 0;
+  const paged = matched.slice(from < 0 ? 0 : from);
+  return typeof args.take === 'number' ? paged.slice(0, args.take) : paged;
+}
+
 function makeProcessor(rows: ScheduledJob[]) {
   const prisma = {
     scheduledJob: {
-      findMany: vi.fn().mockResolvedValue(rows),
+      findMany: vi.fn(async (args: Record<string, any>) => reconcileQuery(rows, args)),
       findUnique: vi.fn(),
       updateMany: vi.fn().mockResolvedValue({ count: 1 }),
     },
@@ -57,9 +73,10 @@ describe('M8-P9 Scheduler stalled 巡检（一致性优先：判 dead，绝不�
     expect(await proc.reconcileStalled()).toEqual({ reaped: 0, scanned: 1 });
   });
 
-  it('心跳新鲜 → 不动（巡检绝不误杀正在执行的作业）', async () => {
+  it('心跳新鲜 → 不动（巡检绝不误杀正在执行的作业；D2-13 下推后连载入都不发生）', async () => {
     const { proc, prisma } = makeProcessor([jobRow({ timeoutMs: 5_000, updatedAt: new Date() })]);
-    expect(await proc.reconcileStalled()).toEqual({ reaped: 0, scanned: 1 });
+    // 心跳新鲜（lag < 全局下界 3×HEARTBEAT_MIN_MS）在 SQL 侧即被裁剪 → scanned=0
+    expect(await proc.reconcileStalled()).toEqual({ reaped: 0, scanned: 0 });
     expect(prisma.scheduledJob.updateMany).not.toHaveBeenCalled();
   });
 
@@ -74,6 +91,51 @@ describe('M8-P9 Scheduler stalled 巡检（一致性优先：判 dead，绝不�
     const { proc, prisma } = makeProcessor([]);
     expect(await proc.reconcileStalled()).toEqual({ reaped: 0, scanned: 0 });
     expect(prisma.scheduledJob.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * M11-P7 D2-13：无界载入治理。
+ * 契约：① select 收窄（不载入 payload/cron 等大字段）；② 心跳下推 SQL（全局下界 3×HEARTBEAT_MIN_MS）；
+ *      ③ take 上限 + 游标分页（不再一次载入全部 running 行）；④ 单周期批数有界（绝不无限循环）。
+ */
+describe('M11-P7 D2-13：stalled 巡检下推 + 分页（无界载入治理）', () => {
+  it('查询形态：select 收窄 + updatedAt 下推 + take 上限 + (updatedAt,id) 稳定排序', async () => {
+    const { proc, prisma } = makeProcessor([]);
+    await proc.reconcileStalled();
+    const args = prisma.scheduledJob.findMany.mock.calls[0][0] as Record<string, any>;
+    expect(args.where).toMatchObject({ status: 'running', updatedAt: { lt: expect.any(Date) } });
+    expect(args.take).toBe(200);
+    expect(args.orderBy).toEqual([{ updatedAt: 'asc' }, { id: 'asc' }]);
+    // 下推界 = 全局下界（阈值对 timeoutMs 单调不减 ⇒ 任何 timeoutMs 的阈值都 ≥ 1500ms）
+    expect(Date.now() - (args.where.updatedAt.lt as Date).getTime()).toBeGreaterThanOrEqual(1400);
+    // select 收窄：绝不载入 payload/cron/runAt/lastError 等大字段
+    expect(Object.keys(args.select).sort()).toEqual(['attempts', 'handler', 'id', 'organizationId', 'ownerUserId', 'timeoutMs', 'type', 'updatedAt']);
+  });
+
+  it('分页：超过单批上限的 stalled 行分多批处理（游标推进、绝不漏行/重复行）', async () => {
+    const staleAt = new Date(Date.now() - 10 * 60_000);
+    const rows = Array.from({ length: 250 }, (_, i) => jobRow({ id: `job-${String(i).padStart(3, '0')}`, updatedAt: staleAt }));
+    const { proc, prisma } = makeProcessor(rows);
+    const res = await proc.reconcileStalled();
+    expect(res).toEqual({ reaped: 250, scanned: 250 }); // 分页绝不漏行
+    const args = prisma.scheduledJob.findMany.mock.calls.map((c) => c[0] as Record<string, any>);
+    expect(args).toHaveLength(2); // 200 + 50
+    expect(args[0].cursor).toBeUndefined();
+    expect(args[1].cursor).toEqual({ id: 'job-199' }); // 游标 = 上一批最后一行
+    expect(args[1].skip).toBe(1);
+    expect(prisma.scheduledJob.updateMany).toHaveBeenCalledTimes(250);
+  });
+
+  it('单周期批数有界：数据面持续满批时也绝不无限循环（达到上限即交由下个周期）', async () => {
+    let call = 0;
+    const { proc, prisma } = makeProcessor([]);
+    prisma.scheduledJob.findMany.mockImplementation(async () => {
+      call++;
+      return Array.from({ length: 200 }, (_, i) => jobRow({ id: `job-${call}-${String(i).padStart(3, '0')}`, updatedAt: new Date(Date.now() - 10 * 60_000) }));
+    });
+    await proc.reconcileStalled();
+    expect(call).toBe(10); // RECONCILE_MAX_BATCHES=10 后停止
   });
 });
 

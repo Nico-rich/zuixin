@@ -13,6 +13,29 @@ interface GenRow {
   conversationId?: string | null; messageId?: string | null; runId?: string | null;
 }
 
+/**
+ * M11-P7 D2-12：替身必须忠实实现 where（下推条件）+ take + cursor，否则"超时判定下推 SQL"在单测里不可见
+ * （原替身无视查询参数全部返回，会掩盖"下推条件写错 = 漏判/误判"这类缺陷）。
+ */
+function genRowMatches(row: GenRow, where: Record<string, any>): boolean {
+  if (!where?.OR) return true;
+  return (where.OR as Array<Record<string, any>>).some((c) =>
+    (!c.status || c.status === row.status)
+    && (!c.type || c.type === row.type)
+    && (!c.startedAt?.lt || (row.startedAt != null && row.startedAt.getTime() < (c.startedAt.lt as Date).getTime()))
+    && (!c.createdAt?.lt || row.createdAt.getTime() < (c.createdAt.lt as Date).getTime()),
+  );
+}
+
+/** 分页切片（与 Prisma 语义一致的最小实现：orderBy createdAt,id + take + cursor/skip） */
+function paginate<T extends { id: string }>(rows: T[], args: Record<string, any>, key: (r: T) => number): T[] {
+  const sorted = [...rows].sort((a, b) => key(a) - key(b) || a.id.localeCompare(b.id));
+  const cursorId = (args.cursor as { id: string } | undefined)?.id;
+  const from = cursorId ? sorted.findIndex((r) => r.id === cursorId) + 1 : 0;
+  const paged = sorted.slice(from < 0 ? 0 : from);
+  return typeof args.take === 'number' ? paged.slice(0, args.take) : paged;
+}
+
 function makeService(opts: {
   staleCount?: number; freshCount?: number; timeoutMs?: number;
   rows?: Array<{ id: string; startedAt: Date; agentId: string; userId: string }>;
@@ -26,16 +49,24 @@ function makeService(opts: {
       findUnique: vi.fn().mockResolvedValue({ key: 'limits', value: { agentRunTimeoutMs: opts.timeoutMs ?? 120000 } }),
     },
     generationTask: {
-      findMany: vi.fn().mockResolvedValue((opts.genRows ?? []).map((r) => ({
-        userId: 'u1', providerId: 'p1', modelId: 'm1', conversationId: null, messageId: null, runId: null, remoteTaskId: null, ...r,
-      }))),
+      findMany: vi.fn(async (args: Record<string, any>) => {
+        const all = (opts.genRows ?? []).map((r) => ({
+          userId: 'u1', providerId: 'p1', modelId: 'm1', conversationId: null, messageId: null, runId: null, remoteTaskId: null, ...r,
+        })) as GenRow[];
+        return paginate(all.filter((r) => genRowMatches(r, args.where ?? {})), args, (r) => r.createdAt.getTime());
+      }),
       updateMany: vi.fn().mockResolvedValue({ count: opts.genUpdateCount ?? 1 }),
     },
     agentRun: {
-      findMany: vi.fn().mockResolvedValue(opts.rows ?? [
-        { id: 'run-stale', startedAt: staleStartedAt, agentId: 'a1', userId: 'u1' },
-        { id: 'run-fresh', startedAt: freshStartedAt, agentId: 'a1', userId: 'u1' },
-      ]),
+      findMany: vi.fn(async (args: Record<string, any>) => {
+        const all = (opts.rows ?? [
+          { id: 'run-stale', startedAt: staleStartedAt, agentId: 'a1', userId: 'u1' },
+          { id: 'run-fresh', startedAt: freshStartedAt, agentId: 'a1', userId: 'u1' },
+        ]) as Array<{ id: string; startedAt: Date; agentId: string; userId: string }>;
+        const cutoff = args.where?.startedAt?.lt as Date | undefined;
+        const matched = cutoff ? all.filter((r) => r.startedAt.getTime() < cutoff.getTime()) : all;
+        return paginate(matched, args, (r) => r.startedAt.getTime());
+      }),
       updateMany: vi.fn().mockImplementation(async ({ where }: { where: { id: string } }) => ({
         count: where.id === 'run-stale' ? (opts.staleCount ?? 1) : (opts.freshCount ?? 0),
       })),
@@ -81,7 +112,9 @@ describe('MediaCleanupService.sweepAgentRuns（M4 Audit MUST-1）', () => {
   it('M6-A2：只扫同步 run（workerId IS NULL）——异步 run 由 lease 恢复链路接管，不被 120s 误杀', async () => {
     const { svc, prisma } = makeService();
     await svc.sweepAgentRuns();
-    expect(prisma.agentRun.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { status: 'running', workerId: null } }));
+    expect(prisma.agentRun.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ status: 'running', workerId: null }),
+    }));
   });
 
   it('并发清扫：条件更新竞态（count=0）→ 不重复计入', async () => {
@@ -222,5 +255,87 @@ describe('Pre-M9 G7：GenerationTask 清扫前的远端状态恢复', () => {
       externalRecover: () => Promise.reject(new Error('外部动作域异常')),
     });
     expect(await svc.sweep()).toBe(1); // 媒体清扫结果不受影响
+  });
+});
+
+/**
+ * M11-P7 D2-12：无界载入治理。
+ * 契约：① 超时判定下推 SQL（与逐行判定严格等价——绝不漏判，也不收紧：护栏内的远端行仍会被询问）；
+ *      ② 单批 take 上限 + 游标分页（不再一次载入全部 processing/pending 任务与全部同步 running run）；
+ *      ③ 单周期批数有界（绝不无限循环）。
+ * 注：本套件替身忠实实现 where/take/cursor（见 genRowMatches/paginate）——下推条件写错会直接表现为漏判失败。
+ */
+describe('M11-P7 D2-12：清扫下推 + 分页（无界载入治理）', () => {
+  const V = LIMITS.VIDEO_TASK_TIMEOUT_MS;
+  const I = LIMITS.IMAGE_TASK_TIMEOUT_MS;
+
+  it('sweepAgentRuns：超时判定下推 SQL + take 上限 + 稳定排序（未超期行根本不进入结果集）', async () => {
+    const { svc, prisma } = makeService();
+    await svc.sweepAgentRuns();
+    const args = prisma.agentRun.findMany.mock.calls[0][0] as Record<string, any>;
+    expect(args.where).toMatchObject({ status: 'running', workerId: null, startedAt: { lt: expect.any(Date) } });
+    expect(args.take).toBe(200); // 单批上限（非全量载入）
+    expect(args.orderBy).toEqual([{ startedAt: 'asc' }, { id: 'asc' }]);
+    // 下推界 = now - agentRunTimeoutMs（严格等价于 now - startedAt > timeoutMs）
+    const lag = Date.now() - (args.where.startedAt.lt as Date).getTime();
+    expect(lag).toBeGreaterThanOrEqual(119_000);
+    expect(lag).toBeLessThanOrEqual(121_000);
+  });
+
+  it('sweep：超时判定下推 SQL（processing 起算 startedAt、pending 起算 createdAt、阈值随 type）', async () => {
+    const old = new Date(NOW - Math.max(V, I) - 60_000);
+    const fresh = new Date(NOW - 30_000);
+    const { svc, prisma } = makeService({
+      genRows: [
+        { id: 't-proc-old', type: 'video', status: 'processing', startedAt: old, createdAt: old },
+        // processing 但 startedAt 为空：原语义 base 落回 now → 绝不判超时（下推同样排除 NULL，语义一致）
+        { id: 't-proc-null-start', type: 'image', status: 'processing', startedAt: null, createdAt: old },
+        { id: 't-pending-old', type: 'image', status: 'pending', startedAt: null, createdAt: new Date(NOW - I - 60_000) },
+        { id: 't-pending-fresh', type: 'image', status: 'pending', startedAt: null, createdAt: fresh },
+      ],
+    });
+    expect(await svc.sweep()).toBe(2); // 仅 t-proc-old + t-pending-old
+    const sweptIds = prisma.generationTask.updateMany.mock.calls.map((c) => (c[0] as { where: { id: string } }).where.id);
+    expect(sweptIds.sort()).toEqual(['t-pending-old', 't-proc-old']);
+    const args = prisma.generationTask.findMany.mock.calls[0][0] as Record<string, any>;
+    expect(args.where.OR).toHaveLength(4); // processing×{video,image} + pending×{video,image}
+    expect(args.take).toBe(200);
+  });
+
+  it('分页：超过单批上限的任务分多批处理（游标推进、绝不漏行）', async () => {
+    const old = new Date(NOW - I - 60_000);
+    const genRows: GenRow[] = Array.from({ length: 250 }, (_, i) => ({
+      id: `t-${String(i).padStart(3, '0')}`, type: 'image', status: 'processing', startedAt: old, createdAt: old,
+    }));
+    const { svc, prisma } = makeService({ genRows });
+    expect(await svc.sweep()).toBe(250); // 分页绝不漏行
+    const args = prisma.generationTask.findMany.mock.calls.map((c) => c[0] as Record<string, any>);
+    expect(args).toHaveLength(2); // 200 + 50
+    expect(args[0].cursor).toBeUndefined();
+    expect(args[1].cursor).toEqual({ id: 't-199' }); // 游标 = 上一批最后一行
+    expect(args[1].skip).toBe(1); // 跳过游标行本身（绝不重复处理）
+  });
+
+  it('下推绝不收紧清扫面：超过基础超时但仍在远端护栏内的行照样被载入并询问远端', async () => {
+    // 已超基础超时、未超 2× 护栏 → 必须被载入（否则永远不会问远端 → 远端已完成的结果会被判超时丢掉）
+    const inGrace = new Date(NOW - V - 60_000);
+    const { svc, media } = makeService({
+      genRows: [{ id: 't-grace', type: 'video', status: 'processing', startedAt: inGrace, createdAt: inGrace, remoteTaskId: 'remote-9' }],
+      recover: 'processing',
+    });
+    expect(await svc.sweep()).toBe(0); // 护栏内保持非终态（远端权威）
+    expect(media.recoverRemoteGenerationTask).toHaveBeenCalledWith('t-grace');
+  });
+
+  it('单周期批数有界：数据面持续满批时也绝不无限循环', async () => {
+    let call = 0;
+    const { svc, prisma } = makeService({});
+    prisma.generationTask.findMany.mockImplementation(async () => {
+      call++;
+      const old = new Date(NOW - I - 60_000);
+      return Array.from({ length: 200 }, (_, i) => ({ id: `t-${call}-${String(i).padStart(3, '0')}`, type: 'image', status: 'processing', startedAt: old, createdAt: old, remoteTaskId: null, userId: 'u1', providerId: 'p1', modelId: 'm1', conversationId: null, messageId: null, runId: null }));
+    });
+    await svc.sweep();
+    expect(call).toBe(10); // 达到单周期批数上限（SWEEP_MAX_BATCHES）后停止，交由下个周期
   });
 });

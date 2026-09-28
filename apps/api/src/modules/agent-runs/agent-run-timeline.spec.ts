@@ -179,6 +179,21 @@ describe('AgentRunTimelineService（只读投影）', () => {
     await expect(service.build('u1', 'run-other')).rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
 
+  it('M11-P7 D2-14：子行投影有界——steps/toolCalls/tasks/artifacts/approvals 全部带 take 上限', async () => {
+    await service.build('u1', 'run-1');
+    const args = prisma.agentRun.findFirst.mock.calls[0][0] as { include: Record<string, any> };
+    const inc = args.include;
+    // 每个子行集合都有显式上限（异常 run 的成千上万子行绝不整树载入）
+    expect(inc.steps.take).toBe(500);
+    expect(inc.steps.include.toolCalls.take).toBe(100);
+    expect(inc.tasks.take).toBe(100);
+    expect(inc.artifacts.take).toBe(50);
+    expect(inc.approvals.take).toBe(50);
+    // 截断不改变排序语义（仍是正序：timeline 从起点可读）
+    expect(inc.steps.orderBy).toEqual({ stepIndex: 'asc' });
+    expect(inc.tasks.orderBy).toEqual({ createdAt: 'asc' });
+  });
+
   it('同 timestamp 项按类型权重排序（tool 在 task 前），确定性输出', async () => {
     const fixture = makeRunFixture('completed');
     // tool-end 与 task 完成时间对齐到同一时刻

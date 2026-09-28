@@ -72,6 +72,14 @@ export class DelegationService {
         this.clearChildSubscription(existing.childRunId);
         return await this.childResult(existing.id, child);
       }
+      // M11-P7 维度2#19：非终态重入（resume 重放/重试同一 ToolCall）绝不重建第二个子 run，但**必须补齐订阅**——
+      // 原实现直接 return，若订阅已丢失（进程重启 / 该进程从未订阅过 / 此前被回收）则子 run 终态事件无人接收，
+      // 父 run 只能等 recoverStale 兜底（最长数分钟空等）。补订阅失败绝不影响返回值：唤醒的事实源始终是 DB
+      // 条件更新 + recoverStale 兜底，订阅只是加速通道。
+      if (child && !this.childSubscriptions.has(existing.childRunId)) {
+        await this.subscribeChildTerminal(existing.childRunId).catch((err) =>
+          this.logger.warn({ childRunId: existing.childRunId, err: (err as Error).message }, '重入补订阅失败（唤醒兜底仍走 DB/recoverStale）'));
+      }
       return { __waiting_delegation: true, delegationId: existing.id, childRunId: existing.childRunId };
     }
 
@@ -118,7 +126,17 @@ export class DelegationService {
         const won = await this.prisma.agentDelegation.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
         if (won) {
           const c = await this.prisma.agentRun.findUnique({ where: { id: won.childRunId } });
-          if (c) return { __waiting_delegation: true, delegationId: won.id, childRunId: won.childRunId };
+          if (c) {
+            // M11-P7 维度2#19：并发同键竞争落败方同样命中「已有委派行」——订阅缺失则补订阅（见幂等早退分支同款语义）；
+            // 子 run 已终态则只回收（终态事件的确认与父 run 唤醒一律走 DB/recoverStale，不依赖订阅存活）。
+            if ((CHILD_TERMINAL as readonly string[]).includes(c.status)) {
+              this.clearChildSubscription(won.childRunId);
+            } else if (!this.childSubscriptions.has(won.childRunId)) {
+              await this.subscribeChildTerminal(won.childRunId).catch((err2) =>
+                this.logger.warn({ childRunId: won.childRunId, err: (err2 as Error).message }, '重入补订阅失败（唤醒兜底仍走 DB/recoverStale）'));
+            }
+            return { __waiting_delegation: true, delegationId: won.id, childRunId: won.childRunId };
+          }
         }
       }
       throw err;
