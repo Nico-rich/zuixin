@@ -197,6 +197,24 @@ describe('SessionEventsService：订阅生命周期', () => {
     expect(subscriber.subscribeCalls).toBeGreaterThan(before);
   });
 
+  it('isSubscribed 只在服务端确认订阅后为 true（e2e 就绪判定依赖它，不能用 NUMSUB——通道跨 DB 全局）', async () => {
+    const { svc, subscriber } = makeService();
+    expect(svc.isSubscribed()).toBe(false); // onModuleInit 之前绝不谎报就绪
+    subscriber.failure = { op: 'subscribe', error: new Error('Redis 未就绪') };
+    svc.onModuleInit();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(svc.isSubscribed()).toBe(false); // 订阅失败 → 保持 false（迟到的事件确实会丢，必须如实反映）
+
+    subscriber.failure = null;
+    subscriber.emit('ready'); // 重连后自愈订阅
+    await new Promise((r) => setTimeout(r, 10));
+    expect(svc.isSubscribed()).toBe(true);
+    // 重连（ready 再次触发）会先清标记再重订阅：标记始终反映"当前这条连接是否已订阅"
+    subscriber.emit('ready');
+    await new Promise((r) => setTimeout(r, 10));
+    expect(svc.isSubscribed()).toBe(true);
+  });
+
   it('收到本 channel 消息 → 分发给监听者；其他 channel 忽略；坏消息丢弃不中断循环', () => {
     const { svc, subscriber } = makeService();
     const seen: SessionEvent[] = [];

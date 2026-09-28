@@ -186,6 +186,16 @@ export class SessionEventsService implements OnModuleInit, OnModuleDestroy {
   /** 测试/诊断：当前监听者数量 */
   listenerCount(): number { return this.listeners.size; }
 
+  /**
+   * 测试/诊断：**本实例**的订阅是否已在 Redis 服务端生效（SUBSCRIBE 已确认）。
+   *
+   * 为什么不能用 `PUBSUB NUMSUB session-events` 判断就绪：通道是**实例全局**的（不同 Redis DB 的客户端
+   * 在同一 channel 上互相可见——DB 号只隔离 keyspace），因此 NUMSUB 会把**其他进程/其他 Agent 的订阅者**
+   * 一起数进来，用它做就绪判定会得出"我已订阅"的假阳性 → 早发的事件丢失 → 测试变成时序碰运气。
+   * 本标记是进程内事实（subscribe promise 的解析即服务端已登记），与外部订阅者无关。
+   */
+  isSubscribed(): boolean { return this.subscribed; }
+
   private async subscribe(): Promise<void> {
     if (this.subscribed) return;
     try {

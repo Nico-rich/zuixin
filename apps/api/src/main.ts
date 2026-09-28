@@ -13,6 +13,7 @@ import { corsOriginsFromEnv } from './modules/security/cors-policy';
 import { TracingMiddleware } from './core/tracing/tracing.middleware';
 import { registerGracefulShutdown } from './lifecycle/graceful-shutdown';
 import { assertProductionSafety } from './modules/security/production-guards';
+import { applyTrustedProxy } from './modules/security/trusted-proxy';
 
 /**
  * M8-P8 API 安全：请求体上限显式化（关闭 Nest 默认 body parser，改为在此集中注册，顺序可控可审计）：
@@ -77,6 +78,10 @@ async function bootstrap() {
   assertProductionSafety();
   const app = await NestFactory.create(AppModule, { bufferLogs: true, bodyParser: false });
   app.useLogger(app.get(Logger));
+  // M10-P1 × M10-P8：TRUSTED_PROXY_HOPS 显式生效于 Express `trust proxy` —— 使 auth 失败计数用的
+  // `req.ip` 与全局限流的 resolveClientIp(hops) 同口径（右起第 N 跳）。未配置（默认 0）时不动 Express，
+  // 即不信任任何 X-Forwarded-For：**不把可伪造头部当作分桶/计数依据**。见 modules/security/trusted-proxy.ts
+  applyTrustedProxy(app);
   app.use(helmet(helmetOptions()));
   // M8-P8：CORS 来源白名单解析抽到 modules/security/cors-policy（唯一来源、可被单测/契约测试覆盖）
   app.enableCors({ origin: corsOriginsFromEnv(), credentials: true });

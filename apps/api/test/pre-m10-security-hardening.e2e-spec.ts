@@ -11,7 +11,7 @@ import { TransformInterceptor } from '../src/common/interceptors/transform.inter
 import { csrfProtection } from '../src/modules/auth/csrf.middleware';
 import { COOKIE_ACCESS, COOKIE_REFRESH } from '../src/modules/auth/auth.constants';
 import { AccessGuardService } from '../src/modules/security/access-guard.service';
-import { SESSION_EVENTS_CHANNEL } from '../src/modules/security/session-events.service';
+import { SessionEventsService } from '../src/modules/security/session-events.service';
 import { PrismaService } from '../src/modules/prisma/prisma.service';
 
 const XRW = { 'X-Requested-With': 'XMLHttpRequest' };
@@ -54,6 +54,12 @@ function decodeJwt(token: string): { sub: string; sid?: string; jti?: string; ex
  * 4. 组织禁用态登录拒绝（ORG_DISABLED）。
  *
  * 说明：本文件不新增任何队列/基础设施，只用既有 PG/Redis/MinIO。
+ *
+ * **共享通道纪律（A13 实测）**：Redis **DB 号只隔离 keyspace**（队列/缓存键按 DB 隔离），
+ * 但 **pub/sub 通道是实例全局的**——不同 DB 的客户端在同一 channel 上互相可见。
+ * `session-events` 是跨 Agent 固定契约名，并行跑的其他 Agent 实例也会在这条通道上收发。
+ * 因此本文件的断言全部**按事件内容收敛**（只认自己 userId/sessionId 造成的事实变化），
+ * 绝不写"通道上不应出现 X"/"订阅者数量应为 N"这类全局断言。
  */
 describe('Pre-M10 Security Hardening (e2e, 2 API instances)', () => {
   let appA: INestApplication;
@@ -113,11 +119,14 @@ describe('Pre-M10 Security Hardening (e2e, 2 API instances)', () => {
     guardB = b.moduleRef.get(AccessGuardService);
 
     redis = new Redis('redis://localhost:6379/21');
-    // 预热：确认两个实例都已订阅 `session-events`（否则早发的事件会丢，测试变成时序碰运气）
-    await waitFor(async () => {
-      const [, count] = (await redis.pubsub('NUMSUB', SESSION_EVENTS_CHANNEL)) as [string, string | number];
-      return Number(count) >= 2;
-    }, 10_000, '两个实例都订阅 session-events');
+    // 就绪判定用**本实例自己的事实**（isSubscribed），不用 `PUBSUB NUMSUB session-events`：
+    // 通道是实例全局的（不同 Redis DB 的客户端在同一 channel 互相可见），NUMSUB 会把其他 Agent
+    // 进程的订阅者一起数进来 → 在"我还没订阅"时给出假阳性 → 早发的事件丢失、断言变成时序碰运气。
+    await waitFor(
+      () => a.moduleRef.get(SessionEventsService).isSubscribed() && b.moduleRef.get(SessionEventsService).isSubscribed(),
+      10_000,
+      '两个实例都已订阅 session-events',
+    );
   });
 
   afterAll(async () => {
