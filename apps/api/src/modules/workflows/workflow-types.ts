@@ -2,7 +2,7 @@
  * M7-P6 Workflow 定义与求值原语（确定性编排；绝无 eval/动态代码执行）。
  * 定义存放在 WorkflowVersion.definition（Json，不可变快照）。
  * M9-P4 增量：wait 步骤 + 步骤级 timeoutMs/retryPolicy + compensate（补偿链）；
- * 版本锁定语义见 `lockedDefinition`（WorkflowVersion.definition 只读，run 锁定 versionId）。
+ * M10-P5 增量：run 级 `definitionSnapshot`（锁定语义见 `lockedDefinition`——快照优先、null 兜底）。
  */
 
 import { AppError, ErrorCode, RETRYABLE_CODES } from '../../common/errors/app-error';
@@ -154,17 +154,24 @@ export function renderTemplate(template: string, ctx: WorkflowContext): string {
 }
 
 /**
- * M9-P4 Version Locking（**无新列的最小实现——缺口如实记录**）：
- * 设计文档原计划 `WorkflowRun.definitionSnapshot Json?`；实际 schema（apps/api/prisma/schema.prisma）中
- * WorkflowRun **既无 definitionSnapshot 也无 metadata 列**，仅 input/output 两个 JSON 列，而 input 是业务入参
- * （写入快照会污染业务语义、且模板 {{input.x}} 会取到快照键）。M9-P4 硬约束禁止改 schema/migration，故降级为：
- * ① run 创建即锁定 versionId（既有；FK `onDelete: Restrict` → 被引用的版本行不可删）；
- * ② `WorkflowVersion.definition` 对已发布版本只读：编辑只改 draft 行或新建版本行（workflows.service.update），
- *    publish 只做 draft→published 的状态迁移，**published 行内容永不被改写**；
- * ③ 执行期一律 `run.version.definition`（本函数），**绝不读 workflow 的最新版本**。
- * ①②③ 共同保证"版本后续发布不影响已运行 run"；`definitionSnapshot` 列仍是已知缺口（见 M9-P4 交付说明）。
+ * Version Locking（M10-P5 起：**真快照**，M9-P4 的无新列降级已闭环）：
+ * ① run 创建即写入 `definitionSnapshot`（该 run 锁定版本的定义副本，见 WorkflowRunsService.createRun）；
+ * ② 执行期**快照优先**（本函数）：快照存在 → 一律按快照执行（版本行被改写/修复/迁移都不影响在跑 run）；
+ * ③ 历史 run（快照列上线前的行，snapshot = null）→ 回退读 `run.version.definition`（M9-P4 的降级语义，
+ *    published 行不可变——workflows.service.update 只改 draft 行或新建版本行，故回退与快照等价）；
+ * ④ 快照存在但结构非法（非对象/无 steps）→ **拒绝执行**（绝不在锁定不变量可疑时静默改用另一份定义）。
  */
-export function lockedDefinition(version: { definition: unknown } | null | undefined): WorkflowDefinition {
+export function lockedDefinition(
+  version: { definition: unknown } | null | undefined,
+  snapshot?: unknown,
+): WorkflowDefinition {
+  if (snapshot != null) {
+    const candidate = snapshot as WorkflowDefinition;
+    if (typeof snapshot === 'object' && !Array.isArray(snapshot) && Array.isArray(candidate.steps)) {
+      return candidate;
+    }
+    throw new AppError(ErrorCode.VALIDATION_ERROR, 'workflow run 定义快照非法，拒绝执行（版本锁定不变量被破坏）');
+  }
   if (!version || version.definition == null) {
     throw new AppError(ErrorCode.VALIDATION_ERROR, '工作流版本缺失或定义为空，拒绝执行（版本锁定不变量被破坏）');
   }

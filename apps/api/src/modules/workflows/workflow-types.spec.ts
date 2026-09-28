@@ -145,4 +145,25 @@ describe('Workflow 定义校验（M9-P4 增量）', () => {
     expect(() => lockedDefinition(null)).toThrowError(/版本锁定/);
     expect(() => lockedDefinition({ definition: null })).toThrowError(/版本锁定/);
   });
+
+  /**
+   * M10-P5 D4/M9-01：run 级 `definitionSnapshot` —— 执行期**快照优先**。
+   * 语义边界：快照存在且合法 → 一律按快照（版本行被改写/修复/迁移都不影响在跑 run）；
+   * 快照缺失（历史 run）→ 回退锁定版本行；快照非法 → **拒绝执行**（绝不在锁定可疑时静默换一份定义）。
+   */
+  it('lockedDefinition（M10-P5）：快照优先于版本行；null 回退版本行；非法快照 → 拒绝执行', () => {
+    const version = { definition: { triggers: [], steps: [{ id: 'version-step', type: 'output' }] } };
+    const snapshot = { triggers: [], steps: [{ id: 'snapshot-step', type: 'output' }] };
+    // ① 快照与版本行不一致时，以快照为准（= 定义变更后仍按创建时的定义执行）
+    expect(lockedDefinition(version, snapshot).steps[0].id).toBe('snapshot-step');
+    // ② 历史 run（快照列上线前）→ 回退版本行（published 行不可变，语义等价）
+    expect(lockedDefinition(version, null).steps[0].id).toBe('version-step');
+    expect(lockedDefinition(version, undefined).steps[0].id).toBe('version-step');
+    // ③ 快照存在但结构非法 → 拒绝执行（而非改用版本行）
+    expect(() => lockedDefinition(version, { steps: 'not-an-array' })).toThrowError(/快照非法/);
+    expect(() => lockedDefinition(version, [1, 2, 3])).toThrowError(/快照非法/);
+    expect(() => lockedDefinition(version, 'oops')).toThrowError(/快照非法/);
+    // ④ 合法的空 triggers 快照仍按快照执行（空数组是合法定义形状，不是"缺失"）
+    expect(lockedDefinition(version, { triggers: [], steps: [] }).steps).toHaveLength(0);
+  });
 });

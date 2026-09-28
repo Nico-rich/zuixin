@@ -170,4 +170,21 @@ export class WorkflowsService {
     await this.prisma.workflow.delete({ where: { id: w.id } });
     return { deleted: true };
   }
+
+  /**
+   * M10-P5 SA-18：webhook secret 轮换（**RBAC = org owner/admin**，比 workflow.write 更严）。
+   * 顺序：先 requireWritable（归属 404 反枚举 + 组织写权限 403）→ 再组织角色（member/admin 之外一律 403）；
+   * 无组织归属的历史个人流程行 → 仅创建者本人可达（与 requireWritable 同一兜底）。
+   * 返回值中的 secret 明文**仅此一次**（DB 只存密文信封；见 WorkflowTriggersService.rotateWebhook）。
+   */
+  async rotateWebhookSecret(userId: string, id: string) {
+    const w = await this.requireWritable(userId, id);
+    if (w.organizationId) {
+      const role = await this.orgs.requireMembership(userId, w.organizationId);
+      if (role !== 'owner' && role !== 'admin') {
+        throw new AppError(ErrorCode.FORBIDDEN, 'webhook 密钥轮换需要组织所有者或管理员权限');
+      }
+    }
+    return this.triggers.rotateWebhook(id, userId);
+  }
 }

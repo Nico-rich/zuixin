@@ -193,6 +193,21 @@ const RETRY_DEF = {
   ],
 };
 
+/**
+ * M10-P5 D4/M9-01：run 级定义快照。首步骤 wait 先把 run 停在 waiting（让出 lease），
+ * 使"改定义"发生在**恢复执行之前**——恢复时会重新进入 execute() 并重新解析定义，
+ * 因此断言"执行的是快照而非被改写的版本行"是确定性的（不依赖与 worker 抢时序）。
+ */
+const snapshotDef = (tag: string) => ({
+  triggers: [{ type: 'manual' }],
+  steps: [
+    { id: 'hold', type: 'wait', wait: { untilMs: 2_000 } },
+    { id: 'mark', type: 'tool', tool: { name: 'probe.record', arguments: { tag } } },
+    { id: 'done', type: 'output', output: { tag: '{{steps.mark.output.tag}}' } },
+  ],
+});
+const SNAPSHOT_DEF = snapshotDef('snapshot-v1');
+
 describe('M9-P4 Advanced Workflow (e2e, 真实 Queue + Worker)', () => {
   let app: INestApplication;
   let worker: INestApplicationContext;
@@ -208,6 +223,8 @@ describe('M9-P4 Advanced Workflow (e2e, 真实 Queue + Worker)', () => {
   let approvalWorkflowId = '';
   let timeoutWorkflowId = '';
   let retryWorkflowId = '';
+  let snapshotWorkflowId = '';
+  let snapshotVersionId = '';
 
   beforeAll(async () => {
     process.env.MOCK_DELAY_MS = '0';
@@ -248,6 +265,8 @@ describe('M9-P4 Advanced Workflow (e2e, 真实 Queue + Worker)', () => {
     approvalWorkflowId = await createWorkflow('e2e M9-P4 approval', APPROVAL_DEF);
     timeoutWorkflowId = await createWorkflow('e2e M9-P4 timeout', TIMEOUT_DEF);
     retryWorkflowId = await createWorkflow('e2e M9-P4 retry', RETRY_DEF);
+    snapshotWorkflowId = await createWorkflow('e2e M9-P4/P5 snapshot', SNAPSHOT_DEF);
+    snapshotVersionId = (await prisma.workflowVersion.findFirst({ where: { workflowId: snapshotWorkflowId, status: 'published' } }))!.id;
   });
 
   afterAll(async () => {
@@ -466,5 +485,45 @@ describe('M9-P4 Advanced Workflow (e2e, 真实 Queue + Worker)', () => {
     expect(flakyRow.attempt).toBe(2); // 首次瞬态失败 → 重试一次后成功
     expect(flakyRow.output).toMatchObject({ ok: true, attempt: 2 });
     expect(flakyCounts.get(stepIdempotencyKey(runId, 0))).toBe(2); // 重试复用同一锚点幂等键
+  });
+
+  it('⑤ 定义快照（M10-P5 D4）：run 创建即写快照；版本行被改写后**仍按快照执行**；快照缺失（历史 run）回退版本行', async () => {
+    // ① 快照优先：run 停在 waiting 期间改写**版本行**（模拟迁移/修复/历史行被改写——不再依赖"published 行不可变"这一外部约定）
+    const runId = await createRun(snapshotWorkflowId, {});
+    await waitForStepStatus(prisma, runId, 0, ['waiting']);
+    const created = await prisma.workflowRun.findUnique({ where: { id: runId } });
+    expect((created?.definitionSnapshot as { steps: Array<{ id: string }> }).steps.map((s) => s.id))
+      .toEqual(['hold', 'mark', 'done']); // 创建时即落快照（与 versionId 同刻锁定）
+    expect((created?.definitionSnapshot as { steps: Array<{ tool?: { arguments?: { tag?: string } } }> }).steps[1].tool?.arguments?.tag)
+      .toBe('snapshot-v1');
+
+    await prisma.workflowVersion.update({
+      where: { id: snapshotVersionId },
+      data: { definition: snapshotDef('tampered-version-row') as never },
+    });
+    // 版本行确实已被改写（否则本用例无鉴别力）
+    const tamperedVersion = await prisma.workflowVersion.findUnique({ where: { id: snapshotVersionId } });
+    expect((tamperedVersion!.definition as { steps: Array<{ tool?: { arguments?: { tag?: string } } }> }).steps[1].tool?.arguments?.tag)
+      .toBe('tampered-version-row');
+
+    expect(await waitForRunStatus(prisma, runId, ['completed', 'failed', 'timeout'], 20_000)).toBe('completed');
+    const run = await prisma.workflowRun.findUnique({
+      where: { id: runId }, include: { steps: { orderBy: { stepIndex: 'asc' } } },
+    });
+    // 恢复执行时重新解析定义 → 取的是 run 自己的快照，**绝不读被改写的版本行**
+    expect(run!.steps.find((s) => s.stepId === 'mark')!.output).toMatchObject({ tag: 'snapshot-v1' });
+    expect(run!.output).toMatchObject({ tag: 'snapshot-v1' });
+    expect(run!.errorCode).toBeNull();
+
+    // ② 历史 run 回退：快照列上线前的行为（definitionSnapshot = null）→ 回退锁定版本行（= 已改写的那份）
+    const legacyRunId = await createRun(snapshotWorkflowId, {});
+    await waitForStepStatus(prisma, legacyRunId, 0, ['waiting']);
+    await prisma.workflowRun.update({ where: { id: legacyRunId }, data: { definitionSnapshot: null as never } });
+    expect(await waitForRunStatus(prisma, legacyRunId, ['completed', 'failed', 'timeout'], 20_000)).toBe('completed');
+    const legacyRun = await prisma.workflowRun.findUnique({
+      where: { id: legacyRunId }, include: { steps: { orderBy: { stepIndex: 'asc' } } },
+    });
+    expect(legacyRun!.definitionSnapshot).toBeNull();
+    expect(legacyRun!.steps.find((s) => s.stepId === 'mark')!.output).toMatchObject({ tag: 'tampered-version-row' });
   });
 });
