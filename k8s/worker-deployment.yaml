@@ -1,0 +1,79 @@
+# M10-P9 运维交付：Worker 副本（**独立 Deployment**，与 API 分开缩放）。
+#
+# 为什么必须分开：
+#   * 负载特征不同——API 受请求量驱动，Worker 受队列积压驱动；绑在一个副本数上必然有一侧过剩或不足；
+#   * 资源画像不同——Worker 跑 AgentRun/Workflow（LLM 调用、长任务），CPU/内存曲线与 API 无关；
+#   * 故障域不同——Worker 停机只影响吞吐（有 recoverStale 兜底），API 停机直接掉可用性。
+#
+# 消费的队列（queue.module.ts / scheduler-queue.module.ts 注册名，勿自行改名）：
+#   image / video / media-cleanup / agent-run / workflow / evaluation / scheduler
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: agent-platform
+  labels:
+    app.kubernetes.io/name: agent-platform
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: agent-platform
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }   # 新副本就绪后再停旧副本；停机不中断在途 job（见下）
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agent-platform
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agent-platform
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: agent-platform
+    spec:
+      # 与 API 同值：Worker 的收尾路径更长（BullMQ close 等当前 job + Scheduler 在途作业 <=25s），
+      # 35s 是硬底线；这里仍取 45。SIGKILL 会打断 job ⇒ 只能靠 recoverStale 兜底（有延迟，别依赖它）。
+      terminationGracePeriodSeconds: 45
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: worker
+      containers:
+        - name: worker
+          # 与 API 同一镜像（同一份 dist，不同入口）。
+          image: registry.example.com/agent-platform-api:0.1.0
+          imagePullPolicy: IfNotPresent
+          # 同 API：产物路径是 dist/src/worker.js（rootDir 被 scripts/prisma 提升，见 api-deployment.yaml 注释）。
+          command: ["node", "dist/src/worker.js"]
+          # 没有 containerPort：Worker 用 NestFactory.createApplicationContext 起，**不监听任何端口**
+          # （见 src/worker.ts）——不要"为了健康检查"给它硬加一个端口。
+          envFrom:
+            - configMapRef: { name: agent-platform-config }
+            - secretRef: { name: agent-platform-secrets }
+          # **没有 livenessProbe / readinessProbe**，这是有意的：
+          #   * 没有 HTTP 面可探；exec 探针只能证明"进程还在"，证明不了"还在消费"；
+          #   * 而进程真死时容器会退出 → 由 restartPolicy 重启，不需要探针。
+          # 由此带来的**真实盲区**：Redis 长时间抖动时 ioredis 会无限重连，进程活着但 job 不推进
+          # （静默停摆），编排层看不见。检测靠监控侧（monitoring/alerts.yml：queue_depth 持续上涨、
+          # scheduler 巡检告警、scheduler.job.dead），处置见 docs/operations/m10-runbook.md §4。
+          # 若要让编排层能自愈，需要给 Worker 加一个只读健康端口（代码改动，本 Phase 不做）。
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "5"] }   # 同 API：镜像无 sleep 二进制时删掉或自行补 busybox
+          resources:
+            # Worker 跑长任务，内存上限给得比 API 宽；CPU 上限宁可留余量（并发 job 会同时抢 CPU）。
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits:   { cpu: "2",    memory: "2Gi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }

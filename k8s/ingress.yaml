@@ -1,0 +1,72 @@
+# M10-P9 运维交付：Ingress（TLS 终止 + SSE 反向代理）。
+#
+# ======================= SSE 是本文件唯一容易配错的地方 =======================
+# 应用侧（apps/api/src/modules/chat/sse-writer.ts）已设：
+#     Cache-Control: no-cache, no-transform
+#     Connection: keep-alive
+#     X-Accel-Buffering: no        ← 只是"请求 nginx 不要缓冲"的**提示**，不是保证
+# 反向代理**默认会缓冲响应体**：事件先攒在 nginx 缓冲里，客户端看到的是"卡住几十秒然后一次性喷出"
+# （或者更糟：一动不动直到超时）。所以下面三条注解缺一不可：
+#   proxy-buffering: "off"        —— 关闭 proxy_buffering（决定性的一条）
+#   proxy-read-timeout: "3600"    —— 默认 60s：SSE 空闲超过 60s 会被代理切断（run 等你两分钟就断线）
+#   proxy-http-version: "1.1"     —— 1.0 会退化成非 chunked，流式效果丢失
+# 别只靠 X-Accel-Buffering：它生效的前提是"上游确实被 nginx 当成可识别的响应头"，一旦中间还有
+# 一层 LB/WAF 或换了 ingress controller（Envoy/Traefik 的开关完全不同），就必须在那一层重配。
+#
+# 验证方法（改动本文件后必须做一次；两个 SSE 端点各验一条）：
+#   # run 观察通道（GET；支持 last-event-id 断线续传）
+#   curl -N -H "Authorization: Bearer <jwt>" "https://<host>/api/v1/agent-runs/<runId>/events"
+#   # 对话通道（POST，响应体即 SSE 流）
+#   curl -N -X POST -H "Content-Type: application/json" -H "Authorization: Bearer <jwt>" \
+#        -d '{"conversationId":null,"message":"hi"}' "https://<host>/api/v1/chat"
+#   期望：事件**逐条**出现（每条一行 data:）；若整段停顿后一次性打印 ⇒ 还有一层在缓冲。
+# ==========================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agent-platform
+  namespace: agent-platform
+  labels:
+    app.kubernetes.io/name: agent-platform
+    app.kubernetes.io/part-of: agent-platform
+  annotations:
+    # --- SSE / 长连接（理由见文件头）---
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    # --- 上传：应用侧上限 video=200MB（shared/constants.ts LIMITS）⇒ 代理侧必须更宽，否则
+    #     请求在到达应用（含它的分类型校验）之前就被 nginx 以 413 拒掉，用户只能看到无信息的失败。
+    nginx.ingress.kubernetes.io/proxy-body-size: "256m"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    # --- 不在此处限流：per-IP 全局限流在应用内（M10-P8 RateLimitGuard）。
+    #     两处同时限流会让"到底谁拒的"变成排障谜题；如需边缘防护请单独评估并在 runbook §4 记录。
+    #
+    # --- 刻意**不设** `use-forwarded-headers`（保持 ingress-nginx 默认 false）：
+    #     默认行为下本层会用"直连对端地址"**覆盖**客户端传来的 X-Forwarded-For，于是 XFF 链最右一跳
+    #     必然是真实客户端 IP —— 这正是 configmap.yaml 里 `TRUSTED_PROXY_HOPS: "1"` 成立的前提
+    #     （全局限流取 XFF 右起第 1 跳，见 runbook §7.4）。
+    #     ⚠️ 若将来在前面加 CDN/第二级 LB：必须**同时**改两处，否则限流分桶会错——
+    #        ① 这里加 `nginx.ingress.kubernetes.io/use-forwarded-headers: "true"`（否则真实客户端 IP 丢失）；
+    #        ② `TRUSTED_PROXY_HOPS` 改为 2（每多一层可信代理 +1）。只改一处 = 所有用户共用一个桶。
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["app.example.com"]
+      secretName: agent-platform-tls     # cert-manager 或平台侧签发；占位符，apply 前替换
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          # 全局前缀是 api/v1（main.ts setGlobalPrefix）⇒ 这里只需转发 /api。
+          # PathType Prefix：/api/v1/... 与 /api/v1 都能命中。
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  name: http
+          # 注意：Web 前端（apps/web）不在本清单里。
+          # 它有自己的构建/部署形态（Next.js），本 Phase 只交付 API/Worker 的编排对象；
+          # 若把 web 也塞进同一个 Ingress，需要先确认其构建产物与镜像（当前无 Dockerfile）。

@@ -1,0 +1,29 @@
+# M10-P9 运维交付：API ClusterIP Service（Ingress 的唯一后端）。
+#
+# 为什么 type 是 ClusterIP：外部流量一律经 Ingress（TLS 终止 + SSE 缓冲关闭注解在那里），
+# 不给 API 直接开 NodePort/LoadBalancer——那会绕过 Ingress 的注解与限流面。
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: agent-platform
+  labels:
+    app.kubernetes.io/name: agent-platform
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: agent-platform
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: agent-platform
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: 3001
+      targetPort: http        # 引用 Deployment 里的端口名，避免两处硬编码漂移
+      protocol: TCP
+  # sessionAffinity: None —— 不需要粘性会话：
+  #   * 认证是无状态 JWT；会话撤销的跨实例失效走 Redis（M10-P1）；
+  #   * 事件投递走 Redis pub/sub（core/events/event-bus.service.ts），不是"连到产生事件的那个实例"；
+  #   * 队列消费者是 Worker，API 副本之间不共享内存状态。
+  # 若某天引入进程内独占状态（例如把 SSE 连接表当成唯一事实源），必须改回 ClientIP 并在此注明原因。
+  sessionAffinity: None

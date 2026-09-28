@@ -1,0 +1,65 @@
+# M10-P9 运维交付：**非敏感**运行时配置（API 与 Worker 共用）。
+#
+# 纪律：任何密钥/口令/连接串都不得出现在这里——它们走 Secret（secret.example.yaml）。
+# 判断标准：`kubectl get configmap -o yaml` 的输出被贴进工单也不应造成任何泄露。
+#
+# 镜像纪律（容易踩）：apps/api/src/env.ts 会按 `../../.env`、`.env` 顺序加载 dotenv，
+# 且**第二次调用带 override: true**。所以镜像的工作目录里**绝不能**存在 `.env` 文件——
+# 否则它会覆盖下面这些值以及 Secret 注入的 DATABASE_URL/JWT_SECRET（.dockerignore 里加 `.env`）。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-platform-config
+  namespace: agent-platform
+  labels:
+    app.kubernetes.io/name: agent-platform
+    app.kubernetes.io/part-of: agent-platform
+data:
+  # --- 运行时形态 ---
+  NODE_ENV: "production"            # 生产守卫（M10-P1）依赖此值：默认密钥/SEED 口令/mock adapter 在此值下应当 fail-fast
+  LOG_LEVEL: "info"                 # pino 级别；排障时临时调 debug（受 common/logging/pino-logging.ts 约束）
+
+  # --- API 监听 ---
+  API_PORT: "3001"                  # src/main.ts 读取；探针端口必须与此一致
+  APP_URL: "https://app.example.com"
+  CORS_ORIGINS: "https://app.example.com"   # 逗号分隔白名单；modules/security/cors-policy.ts 解析
+
+  # --- 优雅停机（见 lifecycle/graceful-shutdown.ts）---
+  GRACEFUL_SHUTDOWN_TIMEOUT_MS: "30000"     # 应用侧兜底：到点记 phase:timeout 并 exit(1)
+  SCHEDULER_SHUTDOWN_WAIT_MS: "25000"       # Scheduler 在途作业收尾窗口（必须 < 上面的值）
+
+  # --- 健康探测 ---
+  HEALTH_PROBE_TIMEOUT_MS: "1000"           # 单个探测硬超时；三项并行 ⇒ /ready 最坏 ≈2×该值
+
+  # --- 反向代理 / 全局限流（M10-P8，审计 SA-25）---
+  # TRUSTED_PROXY_HOPS = **本 API 前面可信代理的层数**，供全局限流解析客户端 IP：
+  # 取 X-Forwarded-For 链「右起第 N 跳」，语义与 Express `trust proxy = N` 一致
+  # （core/rate-limit/global-rate-limit.policy.ts 的 resolveClientIp；`main.ts` 未设 Express trust proxy，
+  #   故由策略层自行解析）。默认 0 = **完全忽略 XFF**（一律用 socket 地址）。
+  #
+  # 本 manifests 的入口路径：客户端 → Ingress（1 层） → Service → Pod。
+  #   * Ingress-NGINX 会在 XFF 链**末尾追加**真实对端地址；取右起第 1 跳 = 拿到的正是 Ingress 看到的那个 IP；
+  #   * 取右起（而非最左）是抗伪造的关键：客户端只能往左**追加**垃圾，右起位置由边界代理写入，篡改无效；
+  #   * 因此本值必须 == 实际代理层数（这里 1）。**写大了**（如 5）：链长不足时回退 socket 地址（此时是
+  #     Ingress Pod IP ⇒ 把全部用户合成一个桶，误伤；若攻击者能直连 Pod 且链够长，还能自选桶）；
+  #   **写小了/写 0**：所有请求按 Ingress 来源 IP 分桶 ⇒ 限流退化为全站共享一个计数器，最先被打爆的是正常用户。
+  #   * 后面若再加一层（CDN / 第二级 Ingress / Service Mesh sidecar），此值必须**同步 +1**，
+  #     否则同一个人拿到两个桶、且限流可被绕过（换 IP 无效但换代理路径有效）。
+  #   * 直连 Pod（kubectl port-forward / 无 Ingress 的调试环境）时链长为 0 → 自动回退 socket 地址，
+  #     不会因为"没走代理"而误判。
+  # 处置与排查入口见 docs/operations/m10-runbook.md §7。
+  TRUSTED_PROXY_HOPS: "1"
+
+  # --- 观测 ---
+  QUEUE_DEPTH_INTERVAL_MS: "60000"          # Worker 独有的队列深度采样周期（core/tracing/queue-depth.sampler.ts）
+
+  # --- 对象存储（非敏感部分；凭证见 Secret）---
+  STORAGE_DRIVER: "s3"              # 生产用 s3（MinIO/S3 兼容）；local 驱动需要挂载可写卷，不建议在生产用
+  STORAGE_ENDPOINT: "https://minio.internal.example.com"
+  STORAGE_BUCKET: "agent-storage"
+  STORAGE_REGION: "us-east-1"
+  # STORAGE_LOCAL_DIR 仅在 STORAGE_DRIVER=local 时有意义（生产不建议）
+  #
+  # 注意：**没有** REDIS_HOST/POSTGRES_HOST 这类变量——代码只认 DATABASE_URL / REDIS_URL 完整连接串
+  # （apps/api/src/env.ts），所以这两个地址连同口令一起放在 Secret 里。
+  # 多实例隔离：演练环境用 REDIS_URL 尾部的 /<db> 号区分（见 docs/operations/m10-runbook.md §1）。

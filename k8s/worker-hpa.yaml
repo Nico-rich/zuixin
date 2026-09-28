@@ -1,0 +1,39 @@
+# M10-P9 运维交付：Worker 独立缩放。
+#
+# 诚实标注：**队列积压（queue_depth）才是正确信号，但今天拿不到 Prometheus 形式的它。**
+#   * 应用侧确实在采样 queue_depth（core/tracing/queue-depth.sampler.ts，每 60s 一条 MetricSample），
+#     但读取面是 JWT 保护的 JSON API（GET /api/v1/metrics，modules/observability），
+#     既不是 Prometheus 文本格式，也不适合给 HPA 用。
+#   * 要按积压缩放，需要二选一：(a) Prometheus Adapter（把 queue_depth 转成外部指标）；(b) KEDA
+#     （直接查 Redis/BullMQ 队列长度）。两者都需要集群侧组件，本 Phase 不新增基础设施。
+# 因此这里先给一个 CPU 版 HPA 作为**代理信号**：它能应对"单个 job 吃满 CPU"这类积压（是常见形态），
+# 但**不等于**按积压缩放——CPU 空转型的积压（例如等 LLM 响应）它不会扩。积压场景请同时依赖
+# monitoring/alerts.yml 的 queue_depth 告警 + runbook §4 的人工介入。
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: worker
+  namespace: agent-platform
+  labels:
+    app.kubernetes.io/name: agent-platform
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: agent-platform
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker
+  minReplicas: 2          # 与 Deployment.replicas 一致；再低会让单副本故障期间吞吐腰斩
+  maxReplicas: 12         # 上限取决于下游：PG 连接数 / Redis 连接数 / provider 并发配额（先按最紧的那个压）
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0        # 积压要快速响应（CPU 信号有分钟级滞后，不再人为加延迟）
+      policies: [{ type: Percent, value: 100, periodSeconds: 60 }]   # 每分钟最多翻倍
+    scaleDown:
+      stabilizationWindowSeconds: 600      # 缩容要慢：在途 job 有长尾，避免刚扩就缩、反复抖动
+      policies: [{ type: Percent, value: 25, periodSeconds: 120 }]
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
