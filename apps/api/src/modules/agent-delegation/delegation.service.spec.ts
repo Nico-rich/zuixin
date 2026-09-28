@@ -257,3 +257,79 @@ describe('DelegationService（X-05 子 run 订阅回收：终态/级联取消后
     expect(svc.pendingChildSubscriptions()).toBe(0);
   });
 });
+
+/**
+ * M11-P7 维度2#19：幂等重入的订阅补齐。
+ * 回归靶心：delegate() 命中已有委派行的两条早退路径（非终态复用 / P2002 竞争落败）原样直接 return，
+ * 从不重建 childSubscriptions —— 若本进程没有该子 run 的订阅（进程重启、此前被回收、该进程从未订阅过），
+ * 子 run 的终态事件就无人接收，父 run 只能等 recoverStale 兜底（最长数分钟空等）。
+ * 契约：复用/落败路径命中存在且非终态的子 run 时补订阅（幂等，绝不重复登记）；子 run 终态则只回收、
+ *       绝不订阅（终态确认与父唤醒的事实源始终是 DB 条件更新 + recoverStale，订阅只是加速通道）。
+ */
+describe('DelegationService（M11-P7 维度2#19 幂等重入补订阅）', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('非终态重入且本进程无订阅 → 补订阅（绝不重开子 run）', async () => {
+    const { svc, prisma, subscribedChannels } = makeService();
+    prisma.agentDelegation.findUnique.mockResolvedValue({ id: 'del-9', childRunId: 'child-9' });
+    prisma.agentRun.findUnique.mockResolvedValue({ id: 'child-9', status: 'running', errorCode: null });
+
+    const res = await svc.delegate(input()) as { __waiting_delegation: boolean; childRunId: string };
+    expect(res).toMatchObject({ __waiting_delegation: true, childRunId: 'child-9' });
+    expect(prisma.agentRun.create).not.toHaveBeenCalled(); // 幂等：绝不重开子 run
+    expect(subscribedChannels()).toEqual(['agent-run:child-9']); // 补齐订阅
+    expect(svc.pendingChildSubscriptions()).toBe(1);
+  });
+
+  it('非终态重入且订阅已在 → 绝不重复登记（一次委派有且只有一条 handler）', async () => {
+    const { svc, prisma, events } = makeService();
+    prisma.agentRun.findUnique.mockResolvedValue(parentRun);
+    await svc.delegate(input()); // 首次：建立订阅
+    prisma.agentDelegation.findUnique.mockResolvedValue({ id: 'del-1', childRunId: 'child-1' });
+    prisma.agentRun.findUnique.mockResolvedValue({ id: 'child-1', status: 'running', errorCode: null });
+    await svc.delegate(input()); // 重入：订阅已在 → 不重复订阅
+    expect(events.subscribe).toHaveBeenCalledTimes(1);
+    expect(svc.pendingChildSubscriptions()).toBe(1);
+  });
+
+  it('补订阅失败绝不影响返回（唤醒兜底始终是 DB 条件更新 + recoverStale，订阅只是加速通道）', async () => {
+    const { svc, prisma, events } = makeService();
+    prisma.agentDelegation.findUnique.mockResolvedValue({ id: 'del-9', childRunId: 'child-9' });
+    prisma.agentRun.findUnique.mockResolvedValue({ id: 'child-9', status: 'running', errorCode: null });
+    events.subscribe.mockRejectedValue(new Error('订阅表已满'));
+    const res = await svc.delegate(input()) as { __waiting_delegation: boolean };
+    expect(res.__waiting_delegation).toBe(true); // 绝不把补订阅失败升级为业务错误
+    expect(svc.pendingChildSubscriptions()).toBe(0); // 绝不留下"看似已订阅"的假象
+  });
+
+  it('P2002 竞争落败方（子 run 仍在跑）→ 补订阅', async () => {
+    const { svc, prisma, subscribedChannels } = makeService();
+    // 第 1 次 idempotency 查询未命中（本进程首次进入）；第 2 次（P2002 冲突后）读到赢家行
+    prisma.agentDelegation.findUnique
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ id: 'del-9', childRunId: 'child-9' });
+    prisma.agentRun.create.mockRejectedValue({ code: 'P2002' }); // 并发同键：唯一约束裁决
+    prisma.agentRun.findUnique.mockResolvedValue({ ...parentRun, status: 'running' });
+
+    expect(await svc.delegate(input())).toMatchObject({ __waiting_delegation: true, childRunId: 'child-9' });
+    expect(subscribedChannels()).toEqual(['agent-run:child-9']); // 落败方同样补齐订阅
+    expect(svc.pendingChildSubscriptions()).toBe(1);
+  });
+
+  it('P2002 竞争落败方（子 run 已终态）→ 只回收不订阅（终态确认走 DB）', async () => {
+    const { svc, prisma } = makeService();
+    prisma.agentRun.findUnique.mockResolvedValue(parentRun);
+    await svc.delegate(input()); // 本进程持有 child-1 的订阅
+    expect(svc.pendingChildSubscriptions()).toBe(1);
+
+    prisma.agentRun.create.mockRejectedValue({ code: 'P2002' });
+    prisma.agentDelegation.findUnique
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ id: 'del-1', childRunId: 'child-1' });
+    prisma.agentRun.findUnique.mockResolvedValue({ ...parentRun, status: 'completed' });
+
+    expect(await svc.delegate(input())).toMatchObject({ __waiting_delegation: true });
+    expect(svc.pendingChildSubscriptions()).toBe(0); // 绝不订阅一个不会再产生事件的 run
+    expect(prisma.agentRunMessage.create).toHaveBeenCalledTimes(1); // 只来自首次委派（落败方绝不重建子 run 数据）
+  });
+});
