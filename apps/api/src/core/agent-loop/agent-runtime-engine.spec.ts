@@ -64,7 +64,16 @@ function makeEngine(opts: {
     stream: opts.streamFn ?? (async function* () { yield { type: 'text', text: '你好' }; }),
   };
   const capabilities = opts.capabilities ?? {};
-  const modelResolver = { resolveDefaultLLM: vi.fn().mockResolvedValue({ adapter, apiModelId: 'm', providerId: 'p1', modelId: 'm1', providerName: 'Mock', timeoutMs: 1000, capabilities }) };
+  // M9-P3：引擎经 RoutingService 决策取「首选 + 回退句柄」；本桩为单候选链（next()=null → 无回退），
+  // 与接线前「单 provider + 回合内重试」行为等价（回退链行为由 m9-p3-routing.e2e-spec / model-resolver 覆盖）。
+  const resolvedLLM = { adapter, apiModelId: 'm', providerId: 'p1', modelId: 'm1', providerName: 'Mock', timeoutMs: 1000, capabilities };
+  const modelResolver = {
+    resolveDefaultLLM: vi.fn().mockResolvedValue(resolvedLLM),
+    resolveLLMRoute: vi.fn().mockResolvedValue({
+      resolved: resolvedLLM, decisionId: 'decision-1', chain: [],
+      isFallback: () => false, next: async () => null, markUsed: async () => undefined,
+    }),
+  };
   const llmManager = { resolve: vi.fn().mockResolvedValue({ adapter, apiModelId: 'm', providerId: 'p1', modelId: 'm1', providerName: 'Mock', timeoutMs: 1000, capabilities }) };
   // Pre-M9 G1/G2：熔断器（内存 KV 替身，永不熔断 → 对既有断言零影响）；opts.breaker 可注入观测替身
   const breaker = opts.breaker ?? new CircuitBreakerService({

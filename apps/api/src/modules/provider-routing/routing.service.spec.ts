@@ -3,7 +3,7 @@ import { HealthStatus, ModelType, ProviderType } from '@prisma/client';
 import { RoutingService } from './routing.service';
 import { CircuitBreakerService } from '../../core/circuit-breaker/circuit-breaker.service';
 import { KVStore } from '../../core/circuit-breaker/kv-store.interface';
-import { AppError } from '../../common/errors/app-error';
+import { AppError, ErrorCode } from '../../common/errors/app-error';
 
 /** 内存 KV（真实熔断状态机 + 假存储：单测不依赖 Redis） */
 function memoryKV() {
@@ -64,6 +64,8 @@ function makeSut(rows: {
   providers: ReturnType<typeof makeProvider>[];
   policies?: ReturnType<typeof makePolicy>[];
   capabilities?: Array<{ providerId: string; capability: string }>;
+  /** M9-P3 只读延迟事实（usage_records.latencyMs 聚合结果，与真实 groupBy 同形状） */
+  latencyRows?: Array<{ providerId: string | null; _avg: { latencyMs: number | null } }>;
 }) {
   const created: Array<Record<string, unknown>> = [];
   const updated: Array<{ where: { id: string }; data: Record<string, unknown> }> = [];
@@ -74,6 +76,7 @@ function makeSut(rows: {
     },
     providerCapability: { findMany: vi.fn(async () => rows.capabilities ?? []) },
     providerPolicy: { findMany: vi.fn(async () => rows.policies ?? []) },
+    usageRecord: { groupBy: vi.fn(async () => rows.latencyRows ?? []) },
     routingDecision: {
       create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
         const row = { id: `decision-${created.length + 1}`, ...data };
@@ -355,5 +358,219 @@ describe('M8-P7 RoutingService（服务端 deterministic 路由）', () => {
     expect(created[0]).toMatchObject({
       organizationId: 'org-1', requestId: 'req-1', traceId: 'trace-1', runId: 'run-1', taskId: 'task-1',
     });
+  });
+});
+
+/**
+ * M9-P3 生产接线新增维度：健康/延迟评分（只读事实）→ 排序；偏好组/软能力偏好；
+ * sticky tie-break；审计事实落库；recordFallback（自持重试语义的调用方）；retryableOnly。
+ * 全部输入仍是**服务端事实**——调用方只能表达需求（能力/预算/偏好），不能指定 provider。
+ */
+describe('M9-P3 RoutingService（评分事实 / 偏好排序 / 回退语义）', () => {
+  beforeEach(() => { clock = 1_700_000_000_000; vi.clearAllMocks(); });
+
+  it('健康状态参与排序：同价同优先级时 healthStatus 基分高者胜，决策记为 health_score', async () => {
+    const { svc, created } = makeSut({
+      providers: [
+        makeProvider({ id: 'p-a', healthStatus: HealthStatus.untested, models: [cheapLLM()] }),
+        makeProvider({ id: 'p-z', healthStatus: HealthStatus.healthy, models: [cheapLLM()] }),
+      ],
+    });
+    const r = await svc.route({ capability: 'text_generation', organizationId: 'org-1' });
+    expect(r.providerId).toBe('p-z'); // providerId 字典序本应选 p-a → 是评分决定了胜出者
+    expect(r.reasonCode).toBe('health_score');
+    expect(r.candidates.find((c) => c.providerId === 'p-z')!.healthScore).toBe(85);
+    expect(r.candidates.find((c) => c.providerId === 'p-a')!.healthScore).toBe(65);
+    // 审计行携带评分事实（可复现「为什么是它」）
+    const audited = created[0].candidates as Array<Record<string, unknown>>;
+    expect(audited.find((c) => c.providerId === 'p-z')).toMatchObject({ healthScore: 85, healthStatus: 'healthy' });
+  });
+
+  it('延迟事实参与排序：usage_records 均值低者胜（只读聚合，无任何写入）', async () => {
+    const { svc, created } = makeSut({
+      providers: [
+        makeProvider({ id: 'p-a', models: [cheapLLM()] }),
+        makeProvider({ id: 'p-z', models: [cheapLLM()] }),
+      ],
+      latencyRows: [
+        { providerId: 'p-a', _avg: { latencyMs: 30_000 } }, // 拉满延迟罚分
+        { providerId: 'p-z', _avg: { latencyMs: 120 } },
+      ],
+    });
+    const r = await svc.route({ capability: 'text_generation' });
+    expect(r.providerId).toBe('p-z');
+    expect(r.candidates.find((c) => c.providerId === 'p-a')!.latencyMs).toBe(30_000);
+    expect(r.candidates.find((c) => c.providerId === 'p-z')!.latencyMs).toBe(120);
+    const audited = created[0].candidates as Array<Record<string, unknown>>;
+    expect(audited.find((c) => c.providerId === 'p-z')).toMatchObject({ latencyMs: 120, healthScore: 99.88 });
+  });
+
+  it('观测面故障（延迟聚合抛错）→ 退化为无样本中性分，绝不阻断路由决策', async () => {
+    const { svc, prisma } = makeSut({ providers: [makeProvider({ id: 'p-a', models: [cheapLLM()] })] });
+    prisma.usageRecord.groupBy.mockRejectedValueOnce(new Error('db down'));
+    const r = await svc.route({ capability: 'text_generation' });
+    expect(r.providerId).toBe('p-a');
+    expect(r.candidates[0]).toMatchObject({ latencyMs: null, healthScore: 85 });
+  });
+
+  it('熔断窗口失败率罚分：窗口内失败者排序落后（事实来自只读 windowStats，不改写计数）', async () => {
+    const { svc, breaker, store, created } = makeSut({
+      providers: [
+        makeProvider({ id: 'p-a', models: [cheapLLM()] }),
+        makeProvider({ id: 'p-z', models: [cheapLLM()] }),
+      ],
+    });
+    for (let i = 0; i < 4; i++) await breaker.recordFailure('p-z'); // 阈值 5 未到 → 仍 healthy，只有评分受影响
+    const failuresBefore = store.get('cb:p-z:consecutiveFailures');
+    const r = await svc.route({ capability: 'text_generation' });
+    expect(r.providerId).toBe('p-a');
+    expect(r.candidates.find((c) => c.providerId === 'p-z')).toMatchObject({
+      windowFailures: 4, windowSuccesses: 0, healthScore: 25, breakerState: 'healthy',
+    });
+    expect((created[0].candidates as Array<Record<string, unknown>>).find((c) => c.providerId === 'p-z'))
+      .toMatchObject({ windowFailures: 4, windowSuccesses: 0 });
+    expect(store.get('cb:p-z:consecutiveFailures')).toBe(failuresBefore); // 路由是纯读取，绝不写熔断事实
+  });
+
+  it('冷却到期的半开候选不被「触发熔断的历史窗口」压制（探测路径可达）；审计仍记录原始窗口事实', async () => {
+    const { svc, breaker, created } = makeSut({
+      providers: [
+        makeProvider({ id: 'p-a', models: [cheapLLM()] }),
+        makeProvider({ id: 'p-z', models: [cheapLLM()] }), // 健康且有更靠后的 id：若无该规则它会靠评分胜出
+      ],
+    });
+    await breaker.recordFailure('p-a', { failureThreshold: 1, cooldownSec: 60 });
+    clock += 61_000; // 冷却到期 → half_open（探测放行 + 抢占单飞探测槽）
+    const r = await svc.route({ capability: 'text_generation' });
+    expect(r.providerId).toBe('p-a');
+    const row = r.candidates.find((c) => c.providerId === 'p-a')!;
+    expect(row).toMatchObject({ breakerState: 'half_open', healthScore: 85, windowFailures: 1 });
+    expect((created[0].candidates as Array<Record<string, unknown>>).find((c) => c.providerId === 'p-a'))
+      .toMatchObject({ breakerState: 'half_open', windowFailures: 1 }); // 原始事实照常落审计
+  });
+
+  it('偏好模型（routingPolicy.defaults.*）进偏好组：更贵也优先——但绝不硬过滤', async () => {
+    const { svc } = makeSut({
+      providers: [
+        makeProvider({ id: 'p-a', models: [cheapLLM()] }),
+        makeProvider({ id: 'p-b', models: [priceyLLM()] }),
+      ],
+    });
+    const picked = await svc.route({ capability: 'text_generation', preferredModelIds: ['pricey'] });
+    expect(picked.providerId).toBe('p-b');
+    expect(picked.estimatedCost).toBeCloseTo(0.2, 6);
+    expect(picked.reasonCode).toBe('capability_match'); // 胜出者是价格更差的一方：偏好组决定
+
+    // 偏好 provider 不健康 → 仍按常规候选链回退（偏好只影响排序，绝不让链路不可用）
+    const { svc: unhealthy } = makeSut({
+      providers: [
+        makeProvider({ id: 'p-a', models: [cheapLLM()] }),
+        makeProvider({ id: 'p-b', healthStatus: HealthStatus.unhealthy, models: [priceyLLM()] }),
+      ],
+    });
+    const fallback = await unhealthy.route({ capability: 'text_generation', preferredModelIds: ['pricey'] });
+    expect(fallback.providerId).toBe('p-a');
+    expect(fallback.candidates.find((c) => c.providerId === 'p-b')!.reasonCode).toBe('unhealthy');
+    expect(fallback.reasonCode).toBe('capability_match'); // 唯一合格候选：无对手可比较，仍正常产出可用链路
+  });
+
+  it('软能力偏好（preferCapabilities）：命中数多者优先，未命中仍可用（不是硬过滤）', async () => {
+    const { svc, created } = makeSut({
+      providers: [
+        makeProvider({ id: 'p-a', models: [makeModel({ id: 'm-a' })] }),
+        makeProvider({ id: 'p-b', models: [makeModel({ id: 'm-b', capabilities: { tools: true } })] }),
+      ],
+    });
+    const r = await svc.route({ capability: 'text_generation', preferCapabilities: ['function_calling'] });
+    expect(r.providerId).toBe('p-b'); // providerId 字典序本应选 p-a
+    expect(r.candidates.find((c) => c.providerId === 'p-b')!.capabilityFit).toBe(1);
+    expect(r.candidates.find((c) => c.providerId === 'p-a')!.capabilityFit).toBe(0);
+    expect((created[0].candidates as Array<Record<string, unknown>>).find((c) => c.providerId === 'p-b'))
+      .toMatchObject({ capabilityFit: 1, accepted: true, reasonCode: 'selected' });
+
+    // 无候选命中软偏好 → 照常按原维度排序（降级可用，绝不 PROVIDER_UNAVAILABLE）
+    const plain = await svc.route({ capability: 'text_generation', preferCapabilities: ['vision'] });
+    expect(plain.providerId).toBe('p-a');
+  });
+
+  it('stickyKey 稳定 tie-break：同键恒定同序（可复现），异键稳定分摊同质候选', async () => {
+    const providers = () => [
+      makeProvider({ id: 'p-a', models: [cheapLLM()] }),
+      makeProvider({ id: 'p-z', models: [cheapLLM()] }),
+    ];
+    const { svc } = makeSut({ providers: providers() });
+    const first = (await svc.route({ capability: 'text_generation', stickyKey: 'run-x' })).providerId;
+    const second = (await svc.route({ capability: 'text_generation', stickyKey: 'run-x' })).providerId;
+    expect(second).toBe(first); // 同 key 同序
+
+    const winners = new Set<string>();
+    for (let i = 0; i < 16; i++) {
+      const { svc: fresh } = makeSut({ providers: providers() });
+      winners.add((await fresh.route({ capability: 'text_generation', stickyKey: `run-${i}` })).providerId);
+    }
+    expect(winners.size).toBe(2); // 同质候选被稳定打散（负载分摊）
+
+    // 不给 stickyKey → 回到 M8-P7 冻结语义（providerId 字典序）
+    const { svc: noSticky } = makeSut({ providers: providers() });
+    expect((await noSticky.route({ capability: 'text_generation', runId: 'run-x' })).providerId).toBe('p-a');
+  });
+
+  it('recordFallback：回退实际承载 → 决策行改写为实际 provider（绝不触碰熔断计数）', async () => {
+    const { svc, store, updated } = makeSut({
+      providers: [
+        makeProvider({ id: 'p-a', models: [cheapLLM()] }),
+        makeProvider({ id: 'p-b', models: [priceyLLM()] }),
+      ],
+    });
+    const r = await svc.route({ capability: 'text_generation', runId: 'run-1' });
+    await svc.recordFallback(r.decisionId, r.chain[1]);
+    expect(updated[0]).toMatchObject({
+      where: { id: r.decisionId },
+      data: { providerId: 'p-b', reasonCode: 'fallback', estimatedCost: 0.2 },
+    });
+    expect([...store.keys()].filter((k) => k.startsWith('cb:'))).toEqual([]); // 计数写入者是调用方（引擎），绝不双计
+  });
+
+  it('recordFallback 失败（决策行已过期/库故障）→ 只告警，绝不上抛打断调用链', async () => {
+    const { svc, prisma } = makeSut({ providers: [makeProvider({ id: 'p-a', models: [cheapLLM()] })] });
+    const r = await svc.route({ capability: 'text_generation' });
+    prisma.routingDecision.update.mockRejectedValueOnce(new Error('gone'));
+    await expect(svc.recordFallback(r.decisionId, r.chain[0])).resolves.toBeUndefined();
+  });
+
+  it('retryableOnly：不可重试错误（参数/鉴权类）立即停止回退链（只记一次失败，不污染后续候选）', async () => {
+    const { svc, store } = makeSut({
+      providers: [
+        makeProvider({ id: 'p-a', models: [cheapLLM()] }),
+        makeProvider({ id: 'p-b', models: [priceyLLM()] }),
+      ],
+    });
+    const r = await svc.route({ capability: 'text_generation' });
+    const calls: string[] = [];
+    await expect(r.invoke(async (target) => {
+      calls.push(target.providerId);
+      throw new AppError(ErrorCode.UNSUPPORTED_PARAMETER, '参数不被支持');
+    }, { retryableOnly: true })).rejects.toMatchObject({ code: 'UNSUPPORTED_PARAMETER' });
+    expect(calls).toEqual(['p-a']); // 换 provider 也救不回来 → 不继续打
+    expect(store.get('cb:p-a:consecutiveFailures')).toBe('1');
+    expect(store.get('cb:p-b:consecutiveFailures')).toBeUndefined();
+  });
+
+  it('retryableOnly 不改变可重试语义：可重试错误仍走到回退候选', async () => {
+    const { svc } = makeSut({
+      providers: [
+        makeProvider({ id: 'p-a', models: [cheapLLM()] }),
+        makeProvider({ id: 'p-b', models: [priceyLLM()] }),
+      ],
+    });
+    const r = await svc.route({ capability: 'text_generation' });
+    const calls: string[] = [];
+    const out = await r.invoke(async (target) => {
+      calls.push(target.providerId);
+      if (target.providerId === 'p-a') throw new AppError(ErrorCode.PROVIDER_TIMEOUT, '超时');
+      return 'ok';
+    }, { retryableOnly: true });
+    expect(calls).toEqual(['p-a', 'p-b']);
+    expect(out).toBe('ok');
   });
 });

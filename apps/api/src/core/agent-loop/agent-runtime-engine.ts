@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { ZodSchema } from 'zod';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import { AgentEvent, AppError, ErrorCode } from '@ai-agent/shared';
-import { ModelResolverService } from '../../providers/llm/model-resolver.service';
+import { LLMTurnRoute, ModelResolverService } from '../../providers/llm/model-resolver.service';
 import { LLMManagerService } from '../../providers/llm/llm-manager.service';
 import { ResolvedLLM } from '../../providers/llm/llm-manager.service';
 import { ChatMessage, ToolDefinitionWire } from '../../providers/llm/llm.types';
@@ -211,7 +211,8 @@ export class AgentRuntimeEngine {
         if (ctx.signal.aborted) { finalStatus = 'cancelled'; break; }
         if (Date.now() >= deadline) { finalStatus = 'timeout'; errorCode = ErrorCode.AGENT_RUN_TIMEOUT; break; }
 
-        const resolved = await this.resolveLLM(ctx.agent);
+        const route = await this.resolveLLMRoute(ctx, runId);
+        let resolved = route.resolved;
         // Tool Calling 能力降级（MUST-3）：capabilities.functionCalling === false 时不发送 tools；
         // requiresTools 的 Agent 直接 NO_TOOL_CAPABILITY 终态——绝不伪装完成。
         const supportsTools = resolved.capabilities?.['functionCalling'] !== false;
@@ -230,39 +231,66 @@ export class AgentRuntimeEngine {
         let turnError: unknown = null;
         // Pre-M9 R1：真实 token 计量（adapter 在流末尾产出 usage 块——provider 报告的权威数字，绝不本地估算）
         let turnUsage: { inputTokens: number; outputTokens: number } | undefined;
-        for (let attempt = 0; attempt <= LLM_MAX_RETRIES; attempt++) {
-          const contentLenAtAttempt = content.length; // 失败重试回滚本回合部分文本（避免重复计入最终回答）
-          const turnLenAtAttempt = turnText.length;
-          try {
-            const stream = resolved.adapter.stream({
-              model: resolved.apiModelId, messages, temperature: ctx.agent.temperature ?? 0.7,
-              maxTokens: ctx.agent.maxTokens, tools: toolsToSend, signal: ctx.signal,
-            });
-            for await (const chunk of stream) {
-              if (chunk.type === 'text') {
-                content += chunk.text; turnText += chunk.text;
-                yield { type: 'text.delta', text: chunk.text };
-              } else if (chunk.type === 'tool_calls') toolCalls = chunk.toolCalls;
-              else if (chunk.type === 'usage') turnUsage = chunk.usage;
-            }
-            turnError = null;
-            break;
-          } catch (err) {
-            turnError = err;
-            content = content.slice(0, contentLenAtAttempt);
-            turnText = turnText.slice(0, turnLenAtAttempt);
-            // M6-A8：用户取消优先识别（绝不伪装 provider failure，也绝不重试已取消的回合）
-            if (ctx.signal.aborted) break;
-            const appErr = err instanceof AppError ? err : mapProviderError(err as ProviderLikeError);
-            if (!appErr.retryable || attempt >= LLM_MAX_RETRIES) break;
-            const jitter = 0.7 + Math.random() * 0.6;
-            yield { type: 'status', stage: 'agent', message: '模型暂时不可用，正在重试…' };
+        // M9-P3 Provider 回退（与「同 provider 重试」是两种语义，绝不混同）：
+        //   hop 内 = 同 provider 重试（瞬时故障，退避重打同一个 provider，LLM_MAX_RETRIES 次）；
+        //   hop 间 = 换 provider 回退（重试耗尽且错误可重试 → 按服务端候选链换下一个 provider，
+        //           链来自 RoutingService.route()——组织策略/健康/延迟/成本/熔断的事实排序，LLM 不参与）。
+        // 熔断计数：每个失败的 provider 记一次失败（失败即记，换 provider 前），成功的 provider 记一次成功——
+        // 与 Pre-M9 G2「回合粒度计数」语义一致，且绝不双计（RoutingService 在本路径不写熔断计数）。
+        for (let hop = 0; ; hop++) {
+          for (let attempt = 0; attempt <= LLM_MAX_RETRIES; attempt++) {
+            const contentLenAtAttempt = content.length; // 失败重试回滚本回合部分文本（避免重复计入最终回答）
+            const turnLenAtAttempt = turnText.length;
             try {
-              await this.sleep(Math.round(this.retryBackoffMs()[Math.min(attempt, this.retryBackoffMs().length - 1)] * jitter), ctx.signal);
-            } catch {
-              break; // 退避被取消打断 → 走取消路径（turnError 保留 → AGENT_CANCELLED usage）
+              const stream = resolved.adapter.stream({
+                model: resolved.apiModelId, messages, temperature: ctx.agent.temperature ?? 0.7,
+                maxTokens: ctx.agent.maxTokens, tools: toolsToSend, signal: ctx.signal,
+              });
+              for await (const chunk of stream) {
+                if (chunk.type === 'text') {
+                  content += chunk.text; turnText += chunk.text;
+                  yield { type: 'text.delta', text: chunk.text };
+                } else if (chunk.type === 'tool_calls') toolCalls = chunk.toolCalls;
+                else if (chunk.type === 'usage') turnUsage = chunk.usage;
+              }
+              turnError = null;
+              break;
+            } catch (err) {
+              turnError = err;
+              content = content.slice(0, contentLenAtAttempt);
+              turnText = turnText.slice(0, turnLenAtAttempt);
+              // M6-A8：用户取消优先识别（绝不伪装 provider failure，也绝不重试已取消的回合）
+              if (ctx.signal.aborted) break;
+              const appErr = err instanceof AppError ? err : mapProviderError(err as ProviderLikeError);
+              if (!appErr.retryable || attempt >= LLM_MAX_RETRIES) break;
+              const jitter = 0.7 + Math.random() * 0.6;
+              yield { type: 'status', stage: 'agent', message: '模型暂时不可用，正在重试…' };
+              try {
+                await this.sleep(Math.round(this.retryBackoffMs()[Math.min(attempt, this.retryBackoffMs().length - 1)] * jitter), ctx.signal);
+              } catch {
+                break; // 退避被取消打断 → 走取消路径（turnError 保留 → AGENT_CANCELLED usage）
+              }
             }
           }
+          if (!turnError || ctx.signal.aborted) break;
+          const hopErr = turnError instanceof AppError ? turnError : mapProviderError(turnError as ProviderLikeError);
+          if (!hopErr.retryable) break; // 不可重试（参数/鉴权类）：换 provider 也救不回来
+          const failedProviderId = resolved.providerId;
+          let nextResolved: ResolvedLLM | null = null;
+          try {
+            nextResolved = await route.next();
+          } catch (err) {
+            this.logger.warn(`回退候选解析失败（按链耗尽处理）: ${(err as Error).message}`);
+          }
+          if (!nextResolved) break;
+          await this.recordBreakerFailure(failedProviderId); // 失败 provider 计一次（换 provider 前，绝不遗漏）
+          resolved = nextResolved;
+          turnError = null;
+          yield { type: 'status', stage: 'agent', message: '当前模型持续不可用，正在切换备用模型…' };
+          this.logger.warn(
+            { runId, providerId: failedProviderId, nextProviderId: resolved.providerId, hop },
+            'provider 回合失败（可重试耗尽）→ 按路由回退链切换候选',
+          );
         }
         if (turnError) {
           // M6-A8：用户取消 → cancelled（绝不伪装成 provider failure）；中断回合仍记 usage（可能已计费）
@@ -289,8 +317,10 @@ export class AgentRuntimeEngine {
           await this.recordBreakerFailure(resolved.providerId);
           throw turnError;
         }
-        // Pre-M9 G1/G2：回合成功 → 复位熔断（半开探测成功即自愈；失败计数清零）
+        // Pre-M9 G1/G2：回合成功 → 复位熔断（半开探测成功即自愈；失败计数清零）；
+        // M9-P3：若本回合由回退候选承载 → 审计行改写为实际 provider（reasonCode=fallback），决策与事实一致
         await this.recordBreakerSuccess(resolved.providerId);
+        await route.markUsed();
         await this.persistence.recordChatUsage({
           userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.messageId ?? '',
           providerId: resolved.providerId, modelId: resolved.modelId, runId,
@@ -828,7 +858,14 @@ export class AgentRuntimeEngine {
     }));
   }
 
-  private async resolveLLM(agent: AgentLoopAgentConfig): Promise<ResolvedLLM> {
+  /**
+   * LLM 回合解析（M9-P3 路由接线）：
+   * - Agent 钉死模型（agent.modelId）→ 直连解析（显式选择，绝不静默换模型），仅保留熔断快速失败；
+   * - 未钉死 → RoutingService 决策（capability/组织策略/健康/延迟/成本/熔断），返回首选 + 回退链句柄。
+   * 工具回合把 function_calling 作为**软偏好**传入（命中优先，不硬过滤——能力降级语义留在本引擎 MUST-3）。
+   */
+  private async resolveLLMRoute(ctx: AgentRuntimeContext, runId: string): Promise<LLMTurnRoute> {
+    const agent = ctx.agent;
     if (agent.modelId) {
       const resolved = await this.llmManager.resolve(agent.modelId);
       // Pre-M9 G2：钉死模型的 provider 已熔断（open/探测槽被占）→ 快速失败
@@ -836,9 +873,19 @@ export class AgentRuntimeEngine {
       if (!(await this.canCallProvider(resolved.providerId))) {
         throw new AppError(ErrorCode.PROVIDER_UNAVAILABLE, `模型 provider 处于熔断状态，请稍后重试：${resolved.providerName}`);
       }
-      return resolved;
+      return {
+        resolved, decisionId: '', chain: [],
+        isFallback: () => false,
+        next: async () => null,              // 钉死模型无回退链（显式选择不可被路由覆盖）
+        markUsed: async () => undefined,     // 无路由决策行，无需改写
+      };
     }
-    return this.modelResolver.resolveDefaultLLM();
+    return this.modelResolver.resolveLLMRoute({
+      organizationId: ctx.organizationId,
+      runId,
+      // 该 Agent 声明了工具清单 → 工具能力作为软偏好（命中优先；不支持工具时的降级/终态由 MUST-3 裁决）
+      preferFunctionCalling: agent.tools.length > 0,
+    });
   }
 
   /** 熔断判定（best-effort：KV 不可用时放行——熔断是优化/保护，不是准入事实来源） */

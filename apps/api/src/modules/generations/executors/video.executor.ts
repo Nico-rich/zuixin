@@ -2,7 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { AppError, ErrorCode } from '@ai-agent/shared';
 import { ModelResolverService } from '../../../providers/llm/model-resolver.service';
 import { VideoManagerService, ResolvedVideo } from '../../../providers/video/video-manager.service';
-import { ModelRouterService } from '../../../core/model-router/model-router.service';
+import { UsageService } from '../../usage/usage.service';
 import { MediaExecContext, MediaExecResult, MediaExecutor, MediaRemoteQuery, MediaRemoteStatus } from '../media-types';
 
 interface VideoTaskInput {
@@ -24,25 +24,42 @@ export class VideoExecutor implements MediaExecutor {
   constructor(
     @Inject(ModelResolverService) private readonly modelResolver: ModelResolverService,
     @Inject(VideoManagerService) private readonly videoManager: VideoManagerService,
-    @Inject(ModelRouterService) private readonly modelRouter: ModelRouterService,
+    @Inject(UsageService) private readonly usage: UsageService,
   ) {}
 
   async execute(ctx: MediaExecContext): Promise<MediaExecResult> {
     const input = ctx.task.input as unknown as VideoTaskInput;
-    const candidates = await this.modelResolver.listVideoCandidates();
-    const { result, usedModel } = await this.modelRouter.execute(candidates, async (candidate) => {
-      await ctx.setProviderAttempt(candidate.providerId, candidate.modelId);
-      const resolved = await this.videoManager.resolve(candidate.modelId);
+    // M9-P3：候选与顺序来自 RoutingService 决策（capability=video_generation）+ 回退链句柄；
+    // 参数能力不匹配抛 UNSUPPORTED_PARAMETER（不可重试）→ 句柄立即停止回退（绝不静默改写参数）。
+    const route = await this.modelResolver.resolveMediaRoute({
+      capability: 'video_generation',
+      ...(await this.routingContext(ctx)),
+      budget: { units: input.duration ?? 1 },
+    });
+    // 归因：句柄成功返回时 used 即实际承载的候选（回退后为回退候选），失败时 invoke 抛错不使用
+    const used: { current: { providerId: string; modelId: string } | null } = { current: null };
+    const result = await route.invoke(async (target) => {
+      await ctx.setProviderAttempt(target.providerId, target.modelId);
+      used.current = { providerId: target.providerId, modelId: target.modelId };
+      const resolved = await this.videoManager.resolve(target.modelId);
       this.assertCapabilities(resolved, input);
       return this.runGeneration(resolved, input, ctx);
-    });
+    }, { retryableOnly: true });
     return {
       files: [{ url: result.url, mimeType: 'video/mp4', metadata: { duration: input.duration } }],
       imageCount: 0,
       videoSeconds: input.duration ?? 0,
-      providerId: usedModel.providerId,
-      modelId: usedModel.modelId,
+      providerId: used.current?.providerId ?? route.providerId,
+      modelId: used.current?.modelId ?? route.modelId,
     };
+  }
+
+  /** 路由上下文（组织归属走 T1 单一事实源归因链：run→项目组织 > task→run > 用户个人组织） */
+  private async routingContext(ctx: MediaExecContext): Promise<{ organizationId: string; runId?: string; taskId: string }> {
+    const organizationId = await this.usage.resolveOrganizationId({
+      userId: ctx.task.userId, runId: ctx.task.runId, taskId: ctx.task.id,
+    });
+    return { organizationId, runId: ctx.task.runId ?? undefined, taskId: ctx.task.id };
   }
 
   /**
