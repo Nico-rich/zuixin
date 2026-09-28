@@ -36,6 +36,7 @@ import { RateLimitModule } from './core/rate-limit/rate-limit.module';
 import { KnowledgeApiModule } from './modules/knowledge/knowledge.module';
 import { EvaluationApiModule } from './modules/evaluation/evaluation-api.module'; // M9-P1 Evaluation
 import { CreativeLoopApiModule } from './modules/creative-loop/creative-loop-api.module'; // M9-P5 Creative Performance Loop
+import { MarketplaceApiModule } from './modules/marketplace/marketplace-api.module'; // M9-P6 Marketplace 公开层
 import { TracingModule } from './core/tracing/tracing.module';
 import { ObservabilityApiModule } from './modules/observability/observability-api.module';
 import { GenerationsModule } from './modules/generations/generations.module';
@@ -95,6 +96,7 @@ import { SseModule } from './core/sse/sse.module';
     KnowledgeApiModule,
     EvaluationApiModule, // M9-P1 Evaluation / Experimentation
     CreativeLoopApiModule, // M9-P5 创意闭环（洞察/假设/loop 编排）
+    MarketplaceApiModule, // M9-P6 Marketplace 公开层（发布/评审/审核/检索）
     GenerationsModule,
     TasksModule,
     ChatModule,
