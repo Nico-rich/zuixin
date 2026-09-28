@@ -8,3 +8,6 @@ data/
 *.log
 .DS_Store
 .turbo/
+
+# Claude Code 会话目录（worktrees/settings 本地态不入库）
+.claude/
