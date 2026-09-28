@@ -46,7 +46,7 @@ export class ProjectsService {
   }
 
   async update(userId: string, id: string, dto: UpdateProjectDto) {
-    await this.requireOwned(userId, id);
+    await this.requireOwned(userId, id, 'write');
     const data: Prisma.ProjectUpdateInput = {};
     if (dto.name) data.name = dto.name;
     if (dto.description !== undefined) data.description = dto.description;
@@ -56,13 +56,23 @@ export class ProjectsService {
   }
 
   async softDelete(userId: string, id: string) {
-    await this.requireOwned(userId, id);
+    await this.requireOwned(userId, id, 'write');
     // 软删除：项目下对话保留（仍可访问），仅不再挂在该项目下
     await this.prisma.project.update({ where: { id }, data: { deletedAt: new Date() } });
   }
 
-  /** 归属校验：本人或所属组织成员 → 404（防枚举；跨组织不可见） */
-  private async requireOwned(userId: string, id: string) {
+  /**
+   * 归属校验：本人或所属组织成员 → 404（防枚举；跨组织不可见）。
+   *
+   * M10-P15（IDOR/RBAC 全端点矩阵）：**写路径另有 RBAC 维度**。
+   * `requireOwned` 只回答"能不能看到"，不回答"能不能改"——组织项目上 viewer 是成员（看得到）
+   * 但只持有 `project.read`（矩阵 deny-by-default）。此前 update/softDelete 仅做归属校验，
+   * 于是 viewer 可改名/软删**他人**（乃至 owner）的项目，与 create 的 `project.write` 裁决自相矛盾。
+   * 现在写路径在同一处补齐：先归属（非成员 → 404 防枚举，**顺序不可颠倒**，否则 403 会泄露行存在性），
+   * 再按项目所属组织裁决 `project.write`（成员但无写权 → 403）。
+   * 无 organizationId 的历史行退回 userId 归属（不引入新失败面）。
+   */
+  private async requireOwned(userId: string, id: string, action: 'read' | 'write' = 'read') {
     const p = await this.prisma.project.findFirst({
       where: {
         id, deletedAt: null,
@@ -73,6 +83,9 @@ export class ProjectsService {
       },
     });
     if (!p) throw new AppError(ErrorCode.NOT_FOUND, '项目不存在');
+    if (action === 'write' && p.organizationId) {
+      await this.orgs.requirePermission(userId, p.organizationId, 'project.write');
+    }
     return p;
   }
 }

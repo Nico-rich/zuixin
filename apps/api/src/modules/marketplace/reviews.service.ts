@@ -56,7 +56,7 @@ export class ReviewsService {
       throw new AppError(ErrorCode.VALIDATION_ERROR, '评分必须是 1~5 的整数');
     }
     const pub = await this.requirePublication(publicationId);
-    await this.access.assertVisible(userId, pub); // 未发布条目跨组织 → 404 防枚举
+    await this.access.assertVisible(userId, pub, '发布条目不存在'); // 未发布条目跨组织 → 404 防枚举
     if (pub.status !== 'published') {
       throw new AppError(ErrorCode.VALIDATION_ERROR, '仅已上架的发布条目可评分');
     }
@@ -81,7 +81,7 @@ export class ReviewsService {
    */
   async list(userId: string, publicationId: string, dto: ListReviewsDto): Promise<ReviewView[]> {
     const pub = await this.requirePublication(publicationId);
-    const caps = await this.access.assertVisible(userId, pub);
+    const caps = await this.access.assertVisible(userId, pub, '发布条目不存在');
     const filter = dto.moderationStatus;
     if (filter && filter !== 'approved' && !caps.canModerate) {
       throw new AppError(ErrorCode.FORBIDDEN, '仅组织 owner/admin 可查看待审/已驳回评审');
@@ -99,7 +99,11 @@ export class ReviewsService {
     const review = await this.prisma.extensionReview.findUnique({ where: { id: reviewId } });
     if (!review) throw new AppError(ErrorCode.NOT_FOUND, '评审不存在');
     const pub = await this.requirePublication(review.publicationId);
-    await this.access.assertModerationRights(userId, pub); // 治理显式判定：非成员 404 / member|viewer 403
+    // 治理显式判定：非成员 404 / member|viewer 403。
+    // M10-P15（BUG-16）：本端点的**入口 id 是评审 id**，故非成员的 404 必须复用评审级文案
+    // （`评审不存在`）——沿用条目级文案会让"评审 id 是否存在"变成 1 位文案 oracle
+    // （幽灵评审 404「评审不存在」/ 他人真实评审 404「发布条目不存在」，同码异文可枚举）。
+    await this.access.assertModerationRights(userId, pub, '评审不存在');
     const current = review.moderationStatus as ReviewModerationStatus;
     assertModerationTransition(current, dto.status);
     const counts = await this.prisma.extensionReview.updateMany({

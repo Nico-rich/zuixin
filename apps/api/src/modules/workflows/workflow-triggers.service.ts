@@ -310,6 +310,14 @@ export class WorkflowTriggersService implements OnModuleInit {
     }
     const wf = await this.prisma.workflow.findUnique({ where: { id: workflowId } });
     if (!wf) throw new AppError(ErrorCode.NOT_FOUND, '工作流不存在');
+    // M10-P15（BUG-10）：**归档必须真正撤销 webhook 触发**。
+    // 此前本路径只判断"workflowVersion.status === 'published'"（在 createRun 内），而归档只改
+    // `workflow.status`（版本行仍是 published）→ 归档后持有 token+secret 的外部调用方仍能持续创建 run，
+    // "关闭"操作形同虚设。`tickScheduled`/`handleEvent` 两条触发路径都判定 `wf.status !== 'published'`，
+    // 本路径是唯一漏网的一条；此处与它们对齐（手动触发路径由 createRun 的 WORKFLOW_NOT_PUBLISHED 兜底）。
+    if (wf.status !== 'published') {
+      throw new AppError(ErrorCode.WORKFLOW_NOT_PUBLISHED, '工作流未发布或已归档，拒绝触发');
+    }
     const idempotencyKey = createHash('sha256').update(`${workflowId}:${eventId}`).digest('hex');
     const run = await this.runs.createRun(wf.userId, {
       workflowId, triggerType: 'webhook', triggerId: eventId, idempotencyKey, payload,

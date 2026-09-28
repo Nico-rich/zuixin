@@ -115,8 +115,12 @@ export class AgentsAdminService {
   /** 回滚：activeVersionId 指回目标 published/archived 版本（零复制） */
   async rollback(agentId: string, versionId: string) {
     const agent = await this.requireAgent(agentId);
+    // M10-P15（BUG-8）：**行级归属 miss → 404**（与全仓行级资源口径一致）。
+    // 此前与"目标为 draft"共用一个 400 文案，让"版本不存在/不属于本 agent"被误读为状态错误；
+    // 两种 miss（不存在 id / 他 agent 的版本）文案本来相同故无枚举 oracle，但语义错误且不可断言归属规则。
     const target = await this.prisma.agentVersion.findFirst({ where: { id: versionId, agentId } });
-    if (!target || target.status === 'draft') throw new AppError(ErrorCode.VALIDATION_ERROR, '回滚目标必须是已发布或归档版本');
+    if (!target) throw new AppError(ErrorCode.NOT_FOUND, '版本不存在');
+    if (target.status === 'draft') throw new AppError(ErrorCode.VALIDATION_ERROR, '回滚目标必须是已发布或归档版本');
     await this.prisma.agent.update({ where: { id: agent.id }, data: { activeVersionId: target.id } });
     await this.registry.refresh();
     return target;

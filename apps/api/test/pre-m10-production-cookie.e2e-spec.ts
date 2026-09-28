@@ -21,6 +21,9 @@ import { ACCESS_TTL_SEC, REFRESH_TTL_SEC } from '../src/modules/auth/auth.consta
  * 断言只锁定 cookie 属性：无论 A1（M10-P1 生产守卫/会话治理）是否已合并，本文件都应自然通过。
  * 生产进程按契约提供合法凭证：`ENCRYPTION_KEY` 必须是 base64 的 32 字节（CryptoService 构造即校验，
  * 否则进程启动即失败），`JWT_SECRET` 用测试专用随机值——绝不使用仓库 .env 里的开发密钥。
+ * `SEED_ADMIN_PASSWORD` 同理必须显式给强口令：子进程 env 由 `...process.env` 展开，而本机 .env 按开发
+ * 约定填的是占位/默认口令（M10-P1 启动守卫会在 `NODE_ENV=production` 下据此**拒绝启动**）。
+ * 子进程只做 cookie 属性断言、不执行 seed，故这里给随机强口令既满足守卫也不影响断言。
  * Redis 用本 Agent 专属 DB 31（非 0；越界索引会静默回落 DB0 → 隔离失效，故 beforeAll 校验库容量）。
  */
 const STAMP = `${Date.now()}`;
@@ -225,6 +228,8 @@ describe('M10-P12 生产 cookie 属性 (e2e, 真 API 进程)', () => {
     const jwtSecret = randomBytes(48).toString('base64url');
     // 契约：ENCRYPTION_KEY 必须是 base64 的 **32 字节**（CryptoService 构造即校验；否则生产进程启动即失败）
     const encryptionKey = randomBytes(32).toString('base64');
+    // 生产启动守卫（M10-P1）会拒绝占位/默认 SEED_ADMIN_PASSWORD —— 显式覆盖，绝不继承本机 .env 的开发口令
+    const seedPassword = `Prod-Guard-${randomBytes(18).toString('base64url')}`;
 
     const envFor = (nodeEnv: string, port: number, extra: Record<string, string> = {}): NodeJS.ProcessEnv => ({
       ...process.env,
@@ -234,6 +239,7 @@ describe('M10-P12 生产 cookie 属性 (e2e, 真 API 进程)', () => {
       REDIS_URL: `redis://localhost:6379/${DB_PROD}`,
       JWT_SECRET: jwtSecret,
       ENCRYPTION_KEY: encryptionKey,
+      SEED_ADMIN_PASSWORD: seedPassword,
       ...extra,
     });
 

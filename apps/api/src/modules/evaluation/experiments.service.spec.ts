@@ -28,7 +28,9 @@ function makeHarness(over: {
       create: vi.fn(async (args: { data: Record<string, unknown> }) => ({ id: 'var-new', ...args.data })),
       updateMany: vi.fn(async () => ({ count: 1 })),
     },
-    agentVersion: { findUnique: vi.fn(async () => (over.version === undefined ? { id: 'av1' } : over.version)) },
+    // M10-P15（BUG-3）：变体绑定走**归属谓词**（本组织 ∨ 系统级），不再全局 findUnique。
+    // 单测不模拟谓词求值，只回放 `over.version`；谓词本身在下方专门用例中断言。
+    agentVersion: { findFirst: vi.fn(async (_args?: unknown) => (over.version === undefined ? { id: 'av1' } : over.version)) },
     evaluationRun: { findMany: vi.fn(async () => over.runs ?? []) },
     evaluationCaseRun: { findMany: vi.fn(async () => []) },
     evaluator: { findMany: vi.fn(async () => []) },
@@ -102,6 +104,15 @@ describe('ExperimentsService.addVariant（流量与基线不变量）', () => {
     const h = makeHarness({ version: null });
     await expect(h.service.addVariant('org1', 'exp1', { name: 'B', agentVersionId: 'av-missing' })).rejects.toMatchObject({ code: 'NOT_FOUND' });
     expect(h.prisma.experimentVariant.create).not.toHaveBeenCalled();
+  });
+
+  it('M10-P15：agentVersionId 查询必须带归属谓词（本组织 ∨ 系统级）——跨租户版本与悬空版本同为 404', async () => {
+    const h = makeHarness();
+    await h.service.addVariant('org1', 'exp1', { name: 'B', agentVersionId: 'av1' });
+    const arg = (h.prisma.agentVersion.findFirst as ReturnType<typeof vi.fn>).mock.calls[0][0] as { where: Record<string, unknown> };
+    expect(arg.where).toEqual({ id: 'av1', agent: { OR: [{ organizationId: 'org1' }, { scope: 'system' }] } });
+    // 与 EvaluationRunsService 同一可见性口径：系统级版本（平台目录）必须放行
+    expect(arg.where.agent).toMatchObject({ OR: expect.arrayContaining([{ scope: 'system' }]) });
   });
 });
 

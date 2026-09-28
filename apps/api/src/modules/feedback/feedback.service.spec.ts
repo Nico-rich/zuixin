@@ -23,6 +23,8 @@ function makeService(ledgerOutput: unknown = null) {
     creativePerformance: { create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => ({ id: 'cp-http', ...data })), findMany: vi.fn().mockResolvedValue([]) },
     performanceSnapshot: { create: vi.fn(async () => ({ id: 'snap-http' })) },
     artifact: { findFirst: vi.fn().mockResolvedValue({ id: 'art-1' }) },
+    // M10-P15（BUG-15）：projectId 服务端归属裁决（非本人项目 → 404）
+    project: { findFirst: vi.fn().mockResolvedValue({ id: 'proj-1' }) },
     memory: { findFirst: vi.fn().mockResolvedValue(null), findMany: vi.fn().mockResolvedValue([]) },
     $transaction: vi.fn(async (fn: (t: unknown) => Promise<unknown>) => fn(tx)),
   };
@@ -96,6 +98,39 @@ describe('FeedbackService（M7-P8 学习闭环 + Pre-M9 G11 幂等）', () => {
       metrics: { impressions: 1, clicks: 0, spend: 0, conversions: 0, revenue: 0, orders: 0 },
     }, { toolCallId: 'tc-3' })).rejects.toMatchObject({ code: 'NOT_FOUND' });
     expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('M10-P15（BUG-15）：projectId 服务端归属裁决 —— 非本人项目 → 404 且零写入（两条事实路径）', async () => {
+    // submit：跨租户 projectId 绝不落库（此前原样写入 ⇒ 跨租户引用注入 / 归属链断裂）
+    const submit = makeService();
+    submit.prisma.project.findFirst.mockResolvedValue(null);
+    await expect(submit.svc.submit('u1', { subjectType: 'artifact', subjectId: 'a1', rating: 5, projectId: 'foreign-proj' }))
+      .rejects.toMatchObject({ code: 'NOT_FOUND', message: '项目不存在' });
+    expect(submit.prisma.feedback.create).not.toHaveBeenCalled();
+    expect(submit.prisma.$transaction).not.toHaveBeenCalled();
+    expect(submit.svc).toBeDefined();
+
+    // capturePerformance：同上（写入前的判定，快照/事实均不落库）
+    const perf = makeService();
+    perf.prisma.project.findFirst.mockResolvedValue(null);
+    await expect(perf.svc.capturePerformance('u1', {
+      projectId: 'foreign-proj',
+      metrics: { impressions: 1, clicks: 0, spend: 0, conversions: 0, revenue: 0, orders: 0 },
+    })).rejects.toMatchObject({ code: 'NOT_FOUND', message: '项目不存在' });
+    expect(perf.prisma.$transaction).not.toHaveBeenCalled();
+
+    // 谓词锚：归属判定含 userId + deletedAt（谓词放宽即等于跨租户可写）
+    const anchor = makeService();
+    await anchor.svc.submit('u1', { subjectType: 'artifact', subjectId: 'a1', rating: 5, projectId: 'proj-1' });
+    expect(anchor.prisma.project.findFirst).toHaveBeenCalledWith({
+      where: { id: 'proj-1', userId: 'u1', deletedAt: null }, select: { id: true },
+    });
+
+    // 省略 projectId（个人面）不受影响：不查项目、照常落库
+    const personal = makeService();
+    await personal.svc.submit('u1', { subjectType: 'artifact', subjectId: 'a1', rating: 5 });
+    expect(personal.prisma.project.findFirst).not.toHaveBeenCalled();
+    expect(personal.prisma.feedback.create).toHaveBeenCalledTimes(1);
   });
 });
 

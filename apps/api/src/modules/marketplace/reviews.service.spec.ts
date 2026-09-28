@@ -149,6 +149,14 @@ describe('ReviewsService（评分 + 审核状态机）', () => {
       .rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
 
+  it('M10-P15（BUG-16）：moderate 的非成员 404 必须复用**评审级**文案（条目级文案 = 评审 id 存在性 oracle）', async () => {
+    const h = makeHarness({ review: reviewRow() });
+    await h.service.moderate('u-out', 'rv-1', { status: 'approved' });
+    // 入口 id 是评审 id ⇒ 404 文案必须与「评审不存在」逐字相同；传条目级文案会让
+    // "幽灵评审" 与 "他人真实评审" 同码异文，攻击者可据此枚举评审 id。
+    expect(h.access.assertModerationRights).toHaveBeenCalledWith('u-out', expect.objectContaining({ id: 'pub-1' }), '评审不存在');
+  });
+
   it('moderate：权限不足（access 抛 403/404）→ 状态绝不改变', async () => {
     for (const code of ['FORBIDDEN', 'NOT_FOUND']) {
       const h = makeHarness({ review: reviewRow() });

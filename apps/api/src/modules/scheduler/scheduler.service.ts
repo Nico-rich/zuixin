@@ -307,7 +307,15 @@ export class SchedulerService {
     });
   }
 
-  /** 单行读取 + 归属校验（组织作业 → membership；个人作业 → owner 本人） */
+  /**
+   * 单行读取 + 归属校验（组织作业 → membership；个人作业 → owner 本人）。
+   *
+   * M10-P15 结论（**回滚曾经的"一律 404"改动**）：组织作业的归属裁决走 `auth.require` —— 非成员
+   * 一律 403（禁用组织 403 `ORG_DISABLED`），这是 **M8-P5 冻结的错误码语义**
+   * （`m8-p5-scheduler-events.e2e-spec.ts`「B 对 A 的作业做写操作 → 403（非成员）」），
+   * 不得为了消除"作业行存在性 oracle"而改动它（冻结原则优先；该 1 位 oracle 已列入 P15 报告风险清单）。
+   * 个人作业（organizationId=null）仍按 `ownerUserId` 判等 → 跨用户 404（防枚举，与 workflows/connections 同口径）。
+   */
   async get(userId: string, id: string): Promise<ScheduledJob> {
     const row = await this.prisma.scheduledJob.findUnique({ where: { id } });
     if (!row) throw new AppError(ErrorCode.NOT_FOUND, '作业不存在');

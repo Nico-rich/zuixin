@@ -50,6 +50,7 @@ export class EventsController {
 
   @Post(':eventId/redeliver')
   async redeliver(@Req() req: Request & { user: AuthedUser }, @Param('eventId') eventId: string) {
-    return this.platform.redeliver(req.user.userId, eventId);
+    // M10-P15（BUG-11）：平台级（无组织）事件仅平台管理员可重投（与 /routing/capabilities/sync 同一口径）
+    return this.platform.redeliver(req.user.userId, eventId, { platformAdmin: req.user.role === 'admin' });
   }
 }

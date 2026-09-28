@@ -450,8 +450,12 @@ describe('M10-P2 Provider HTTP Contract（真实 HTTP/SSE：假服务器 × open
       const before = await prisma.metricSample.count({ where: { name: 'provider_degraded' } });
       const svc = new LLMManagerService(prismaStub('llm') as never, cryptoStub, publicResolver, metrics);
       await svc.refresh();
+      // M10-P15（跨 Phase 测试加固）：计数比较必须用 **count**，不能用 `take:5` 的 rows.length ——
+      // 观测面是**累积**事实（历史运行留下的采样行永不清理），一旦累计 ≥5 行，
+      // `rows.length(=5) > before(≥5)` 恒假，用例会随运行次数永久变红。
+      const after = await prisma.metricSample.count({ where: { name: 'provider_degraded' } });
       const rows = await prisma.metricSample.findMany({ where: { name: 'provider_degraded' }, orderBy: { sampledAt: 'desc' }, take: 5 });
-      expect(rows.length).toBeGreaterThan(before);
+      expect(after).toBeGreaterThan(before);
       const labels = rows[0].labels as Record<string, unknown>;
       expect(labels).toMatchObject({ type: 'llm', providerId: 'p-llm-bad', providerName: 'BAD-llm', adapter: BAD_ADAPTER });
       expect(String(labels.reason)).toContain(BAD_ADAPTER);

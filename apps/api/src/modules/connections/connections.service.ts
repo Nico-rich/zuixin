@@ -46,9 +46,14 @@ export class ConnectionsService {
   }
 
   async get(userId: string, id: string) {
-    // M8-P1：本人或所属组织成员可见（跨组织 404 防枚举）
+    // M10-P15（BUG-14）：**用户级资源，唯一归属谓词 = `userId`**。
+    // 旧实现为 `OR: [{ userId }, { 组织成员 }]`：连接行**永不**挂共享组织（创建时一律挂
+    // `ensurePersonalOrganization(userId)`，见 `callback`），却给了"组织成员"分支——只要连接者把
+    // 他人邀进自己的个人组织（`invitations` 未拦个人组织），该成员即可读到同事连接的
+    // `providerAccountId`/`scope`/`expiresAt`。而 `list`/`refresh`/`revoke`/`remove` 全是 `{ id, userId }`
+    // ——读面比写面宽即横向越权（同一组织内的用户间越权）。此处与其余路径对齐：非本人一律 404 防枚举。
     const c = await this.prisma.connection.findFirst({
-      where: { id, OR: [{ userId }, { organization: { deletedAt: null, members: { some: { userId } } } }] },
+      where: { id, userId },
       select: CONNECTION_SELECT,
     });
     if (!c) throw new AppError(ErrorCode.NOT_FOUND, '连接不存在');

@@ -150,7 +150,7 @@ export class PublicationsService {
   /** 编辑条目元数据：**仅 draft/rejected**（已上架须先撤回，避免公开内容静默变更） */
   async update(userId: string, id: string, dto: UpdatePublicationDto): Promise<PublicationRow> {
     const pub = await this.require(id);
-    await this.access.assertPublicationWrite(userId, pub);
+    await this.access.assertPublicationWrite(userId, pub, '发布条目不存在');
     if (pub.status === 'published') {
       throw new AppError(ErrorCode.VALIDATION_ERROR, '已上架条目不可直接编辑：请先撤回（withdraw）再修改');
     }
@@ -172,7 +172,7 @@ export class PublicationsService {
   /** 上架：draft → published（重跑门禁：扩展此刻仍须通过平台校验） */
   async publish(userId: string, id: string): Promise<PublicationRow> {
     const pub = await this.require(id);
-    await this.access.assertPublicationWrite(userId, pub);
+    await this.access.assertPublicationWrite(userId, pub, '发布条目不存在');
     const next = assertPublicationTransition(pub.status as PublicationStatus, 'publish');
     const gate = await this.assertPublishable(userId, pub.extensionId);
     if (gate.publisherOrganizationId !== pub.organizationId) {
@@ -189,7 +189,7 @@ export class PublicationsService {
   /** 撤回：published → draft（作者侧下架；目录立即不可见，可再发布） */
   async withdraw(userId: string, id: string): Promise<PublicationRow> {
     const pub = await this.require(id);
-    await this.access.assertPublicationWrite(userId, pub);
+    await this.access.assertPublicationWrite(userId, pub, '发布条目不存在');
     const next = assertPublicationTransition(pub.status as PublicationStatus, 'withdraw');
     const updated = await this.casStatus(id, pub.status as PublicationStatus, next);
     await this.writeAudit(userId, updated.organizationId, 'marketplace.publication.withdraw', id, {});
@@ -199,7 +199,7 @@ export class PublicationsService {
   /** 修订：rejected → draft（驳回后回草稿；再上架必须重走 publish 门禁） */
   async revise(userId: string, id: string): Promise<PublicationRow> {
     const pub = await this.require(id);
-    await this.access.assertPublicationWrite(userId, pub);
+    await this.access.assertPublicationWrite(userId, pub, '发布条目不存在');
     const next = assertPublicationTransition(pub.status as PublicationStatus, 'revise');
     const updated = await this.casStatus(id, pub.status as PublicationStatus, next);
     await this.writeAudit(userId, updated.organizationId, 'marketplace.publication.revise', id, {});
@@ -213,7 +213,7 @@ export class PublicationsService {
    */
   async reject(userId: string, id: string, dto: RejectPublicationDto): Promise<PublicationRow> {
     const pub = await this.require(id);
-    await this.access.assertModerationRights(userId, pub);
+    await this.access.assertModerationRights(userId, pub, '发布条目不存在');
     const next = assertPublicationTransition(pub.status as PublicationStatus, 'reject');
     const updated = await this.casStatus(id, pub.status as PublicationStatus, next);
     await this.writeAudit(userId, updated.organizationId, 'marketplace.publication.reject', id, { reason: dto.reason });

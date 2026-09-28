@@ -196,7 +196,9 @@ describe('PublicationsService（上架门禁 + 状态机）', () => {
   it('publish：draft→published，重跑门禁并 CAS 落库（锚定当前状态）', async () => {
     const h = makeHarness();
     const updated = await h.service.publish('u1', 'pub-1');
-    expect(h.access.assertPublicationWrite).toHaveBeenCalledWith('u1', expect.objectContaining({ id: 'pub-1' }));
+    // M10-P15（BUG-13）：书写权的 404 必须复用调用方"发布条目不存在"的文案
+    // （文案不一致 ⇒ 可用错误文案区分"行不存在"与"行存在但非成员" ⇒ 存在性 oracle）
+    expect(h.access.assertPublicationWrite).toHaveBeenCalledWith('u1', expect.objectContaining({ id: 'pub-1' }), '发布条目不存在');
     expect(h.prisma.extensionPublication.updateMany).toHaveBeenCalledWith({
       where: { id: 'pub-1', status: 'draft' }, data: { status: 'published' },
     });

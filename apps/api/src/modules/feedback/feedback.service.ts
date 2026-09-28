@@ -32,6 +32,20 @@ export class FeedbackService {
     @Inject(MemoryService) private readonly memories: MemoryService,
   ) {}
 
+  /**
+   * M10-P15（BUG-15）：`projectId` 一律**服务端归属裁决**。
+   *
+   * 旧实现把请求体的 `projectId` 原样落库（`submit` / `capturePerformance` 两条路径，
+   * 仅 `artifactId` 做了归属校验）——跨租户者可把他人项目 id 写进自己的事实行，
+   * 形成跨租户引用注入（归属链断裂：后续按 projectId 归集/配额/审计会把行记到他人项目下）。
+   * 与 knowledge/memories/projects 同口径：非本人项目 → 404「项目不存在」（防枚举，不区分"他人项目"与"不存在"）。
+   */
+  private async requireOwnedProject(userId: string, projectId: string | null | undefined): Promise<void> {
+    if (!projectId) return;
+    const p = await this.prisma.project.findFirst({ where: { id: projectId, userId, deletedAt: null }, select: { id: true } });
+    if (!p) throw new AppError(ErrorCode.NOT_FOUND, '项目不存在');
+  }
+
   async submit(userId: string, input: {
     projectId?: string | null;
     subjectType: string; subjectId: string;
@@ -43,6 +57,7 @@ export class FeedbackService {
     if (!Number.isInteger(input.rating) || input.rating < 1 || input.rating > 5) {
       throw new AppError(ErrorCode.VALIDATION_ERROR, '评分必须为 1~5');
     }
+    await this.requireOwnedProject(userId, input.projectId);
     // G11：Feedback 事实 + ToolCall 账本同事务（崩溃重放复用账本，绝不产生第二条反馈）
     const row = await withToolCallLedger(this.prisma, opts.toolCallId, (tx) => tx.feedback.create({
       data: {
@@ -83,6 +98,7 @@ export class FeedbackService {
       const a = await this.prisma.artifact.findFirst({ where: { id: input.artifactId, userId } });
       if (!a) throw new AppError(ErrorCode.NOT_FOUND, '制品不存在');
     }
+    await this.requireOwnedProject(userId, input.projectId); // M10-P15（BUG-15）
     const m = input.metrics;
     const periodEnd = input.periodEnd ? new Date(input.periodEnd) : new Date();
     const periodStart = input.periodStart ? new Date(input.periodStart) : new Date(periodEnd.getTime() - 30 * 86400_000);

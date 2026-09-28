@@ -47,7 +47,15 @@ function makeService(initialRow?: Record<string, unknown>) {
       delete: vi.fn(async () => { state.row = null; return {}; }),
     },
   };
-  const auth = { require: vi.fn().mockResolvedValue('owner') };
+  // M10-P15（BUG-6）：get() 不再经 authorize，而是自行判定成员身份 + 组织治理态（跨租户 → 404）
+  const auth = {
+    require: vi.fn().mockResolvedValue('owner'),
+    membership: vi.fn(async (_userId: string, organizationId: string | null) => (
+      organizationId
+        ? { role: 'owner', orgStatus: organizationId === 'org-disabled' ? 'disabled' : 'active' }
+        : null
+    )),
+  };
   const queue = {
     add: vi.fn().mockResolvedValue({ id: 'j' }),
     getDelayed: vi.fn().mockResolvedValue([] as Array<{ id: string; remove: () => Promise<void> }>),
@@ -232,6 +240,9 @@ describe('SchedulerService（M8-P5 调度：幂等/状态机/队列投递）', (
   it('get/list：组织作业校验成员身份；个人作业按 owner 过滤（他人不可见）', async () => {
     const { svc, prisma, auth, state } = makeService({ organizationId: 'org-9' });
     await svc.get('u1', 'job-1');
+    // M10-P15（回滚"一律 404"）：组织作业归属裁决**独家**委托 `auth.require` —— 非成员 403、
+    // 禁用组织 403 ORG_DISABLED 是 M8-P5 冻结的错误码语义（m8-p5-scheduler-events e2e 锁定），
+    // 服务层绝不自行把非成员折叠成 404。
     expect(auth.require).toHaveBeenCalledWith('u1', 'org-9');
 
     await svc.list('u1', { organizationId: 'org-9' });
@@ -244,5 +255,22 @@ describe('SchedulerService（M8-P5 调度：幂等/状态机/队列投递）', (
 
     state.row = makeRow({ organizationId: null, ownerUserId: 'other' });
     await expect(svc.get('u1', 'job-1')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('M10-P15（冻结语义）：组织作业的非成员 → 403 原样冒泡（绝不改写为 404）；禁用组织 → 403 ORG_DISABLED', async () => {
+    const foreign = makeService({ organizationId: 'org-9' });
+    // 非成员：`auth.require` 抛 403 FORBIDDEN → 服务层**不得**吞掉改写成 404（M8-P5 冻结错误码）
+    foreign.auth.require.mockRejectedValueOnce(Object.assign(new Error('无权访问该组织'), { status: 403, code: 'FORBIDDEN' }));
+    await expect(foreign.svc.get('u-foreign', 'job-1')).rejects.toMatchObject({ status: 403, code: 'FORBIDDEN' });
+
+    // 禁用组织：冻结态对**读**路径同样生效（此前只挡写路径，读路径 200 泄露组织数据）
+    // 错误形状与守卫同源：HttpException(403, { code: 'ORG_DISABLED' })——同样由 require 独家裁决
+    const disabled = makeService({ organizationId: 'org-disabled' });
+    disabled.auth.require.mockRejectedValueOnce(Object.assign(new Error('组织已被禁用，无法访问其资源'), {
+      status: 403, response: { code: 'ORG_DISABLED' },
+    }));
+    await expect(disabled.svc.get('u1', 'job-1')).rejects.toMatchObject({
+      status: 403, response: { code: 'ORG_DISABLED' },
+    });
   });
 });

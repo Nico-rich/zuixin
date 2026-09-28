@@ -7,9 +7,10 @@ const V1_DEF = { triggers: [{ type: 'manual' }], steps: [{ id: 'v1-step', type: 
 const V2_DEF = { triggers: [{ type: 'manual' }], steps: [{ id: 'v2-step', type: 'output' }] };
 const PUBLISHED_V1 = { id: 'ver-1', version: 1, status: 'published', definition: V1_DEF };
 
-function make(opts: { existingRun?: Record<string, unknown> | null; version?: Record<string, unknown>; run?: Record<string, unknown> } = {}) {
+function make(opts: { existingRun?: Record<string, unknown> | null; version?: Record<string, unknown>; run?: Record<string, unknown>; workflowStatus?: string } = {}) {
   const prisma = {
-    workflow: { findFirst: vi.fn(async () => ({ id: WF, userId: USER, projectId: 'p-1' })) },
+    // M10-P15（BUG-10）：publishedVersion 现在裁决 `Workflow.status`（归档必须撤销全部触发路径）
+    workflow: { findFirst: vi.fn(async () => ({ id: WF, userId: USER, projectId: 'p-1', status: opts.workflowStatus ?? 'published' })) },
     // 显式返回类型：`mockResolvedValueOnce(null)`（未发布/无版本分支）需要它
     workflowVersion: { findFirst: vi.fn(async (): Promise<Record<string, unknown> | null> => opts.version ?? PUBLISHED_V1) },
     workflowRun: {
@@ -105,5 +106,23 @@ describe('WorkflowRunsService.createRun 定义快照（M10-P5 D4/M9-01）', () =
     unpublished.prisma.workflowVersion.findFirst.mockResolvedValueOnce(null);
     await expect(unpublished.svc.createRun(USER, { workflowId: WF, triggerType: 'manual' }))
       .rejects.toMatchObject({ code: 'WORKFLOW_NOT_PUBLISHED' });
+  });
+
+  it('M10-P15（BUG-10）：已归档工作流**四条触发路径 + retry** 一律拒绝——版本行仍是 published 也不例外', async () => {
+    // 归档只改 Workflow.status（版本行保持 published，webhook 行保持 enabled）→
+    // 只判"版本已发布"会让归档后的 manual/webhook/retry 继续创建 run（关闭形同虚设）。
+    for (const triggerType of ['manual', 'webhook', 'schedule', 'event'] as const) {
+      const archived = make({ workflowStatus: 'archived' });
+      await expect(archived.svc.createRun(USER, { workflowId: WF, triggerType }))
+        .rejects.toMatchObject({ code: 'WORKFLOW_NOT_PUBLISHED' });
+      expect(archived.prisma.workflowRun.create).not.toHaveBeenCalled();
+      expect(archived.prisma.workflowVersion.findFirst).not.toHaveBeenCalled();
+    }
+
+    const retryAfterArchive = make({ workflowStatus: 'archived' });
+    retryAfterArchive.prisma.workflowRun.findFirst
+      .mockResolvedValueOnce({ id: 'r', workflowId: WF, status: 'failed', attempt: 1, input: {}, triggerType: 'manual' });
+    await expect(retryAfterArchive.svc.retry(USER, 'r')).rejects.toMatchObject({ code: 'WORKFLOW_NOT_PUBLISHED' });
+    expect(retryAfterArchive.prisma.workflowRun.create).not.toHaveBeenCalled();
   });
 });
