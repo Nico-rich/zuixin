@@ -1,12 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Logger } from '@nestjs/common';
 import { CredentialService } from './credentials.service';
 import { CryptoService } from '../../core/crypto/crypto.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 
 const TEST_KEY = Buffer.alloc(32, 7).toString('base64');
 
-function makeService() {
-  const crypto = new CryptoService(TEST_KEY);
+function makeService(config: string | { keys: Record<number, string>; currentVersion?: number } = TEST_KEY) {
+  const crypto = new CryptoService(config);
   const prisma = {
     connection: {
       findUnique: vi.fn().mockResolvedValue({ id: 'c1', provider: 'mock', status: 'active' }),
@@ -219,5 +220,102 @@ describe('CredentialService（Pre-M9 C5：多实例安全——DB 条件更新�
       if (prev === undefined) delete process.env.CONNECTION_REFRESH_WAIT_MS;
       else process.env.CONNECTION_REFRESH_WAIT_MS = prev;
     }
+  });
+});
+
+/**
+ * M11-P1（D1-09）：`Credential.keyVersion` 恒为 1 的收口 ——
+ * ① 写路径：`keyVersion` 与密文**同一条语句**写出，且取自密文自述版本（不可能失配）；
+ * ② 读路径：版本裁决接线（未知版本 → KEY_VERSION_INVALID 既有行为；落后版本 → 可解但记欠账 + 节流 warn）。
+ */
+describe('CredentialService（M11-P1：keyVersion 落库 + 读路径密钥版本裁决）', () => {
+  const KEY_V2 = Buffer.alloc(32, 42).toString('base64');
+  const MULTI = { keys: { 1: TEST_KEY, 2: KEY_V2 }, currentVersion: 2 };
+  const v1Encoder = new CryptoService({ keys: { 1: TEST_KEY }, currentVersion: 1 });
+  /** 历史落库格式（3 段、无版本前缀）= 版本 1：存量数据的老形态 */
+  const legacyV1 = (plain: string): string => v1Encoder.encrypt(plain).replace(/^v1\./, '');
+  /** 格式合法但版本未配置（v9）→ 无法恢复明文 */
+  const unknownVersion = (plain: string): string => v1Encoder.encrypt(plain).replace(/^v1\./, 'v9.');
+
+  beforeEach(() => vi.clearAllMocks());
+
+  it('写路径（单密钥）：keyVersion = 密文自述版本 = 1；access/refresh 两行都写', async () => {
+    const { svc, crypto, prisma } = makeService();
+    await svc.store('c1', { accessToken: 'a', refreshToken: 'r', expiresInSeconds: 60, providerAccountId: 'p' });
+    const creates = (prisma.credential.create as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0].data);
+    expect(creates).toHaveLength(2);
+    for (const row of creates) expect(row.keyVersion).toBe(crypto.keyVersionOf(row.encryptedValue));
+    expect(creates.every((row) => row.keyVersion === 1)).toBe(true);
+  });
+
+  it('写路径（多密钥）：v2 环境写出 v2 密文 + keyVersion=2（不再恒为 1）', async () => {
+    const { svc, crypto, prisma } = makeService(MULTI);
+    await svc.store('c1', { accessToken: 'a', refreshToken: 'r', expiresInSeconds: 60, providerAccountId: 'p' });
+    const creates = (prisma.credential.create as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0].data);
+    expect(creates).toHaveLength(2);
+    for (const row of creates) {
+      expect(row.keyVersion).toBe(2);
+      expect(row.keyVersion).toBe(crypto.keyVersionOf(row.encryptedValue)); // 列与密文自述版本一致
+      expect(crypto.needsRewrap(row.encryptedValue)).toBe(false);
+    }
+  });
+
+  it('读路径（多密钥）：旧版本密文正常解密（不阻断轮换窗口），并计入迁移欠账 + warn（节流）', async () => {
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    try {
+      const { svc, prisma } = makeService(MULTI);
+      prisma.credential.findFirst.mockImplementation(async (args: { where: { type: string } }) => ({
+        encryptedValue: legacyV1(args.where.type === 'access_token' ? 'ACC' : 'REF'), expiresAt: null,
+        keyVersion: 1,
+      }));
+      expect((await svc.getAccessToken('c1'))?.token).toBe('ACC'); // 旧版本仍可解（不抛错）
+      expect(await svc.getRefreshToken('c1')).toBe('REF');
+      expect(svc.staleKeyVersionStats()).toEqual({
+        total: 2, byVersion: { '1': 2 }, currentKeyVersion: 2, configuredVersions: [1, 2],
+      });
+      expect(warn).toHaveBeenCalledTimes(1); // 首条立即告警，其后按节流（第 100/200… 次）
+      const logged = JSON.stringify(warn.mock.calls);
+      expect(logged).toContain('旧密钥版本'); // 可观测：欠账必须能被运维看到
+      expect(logged).not.toContain('ACC'); // 绝不泄漏明文
+      expect(logged).not.toContain(TEST_KEY); // 绝不泄漏密钥材料
+      expect(logged).not.toContain(KEY_V2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('读路径（当前版本）：不计数、不告警', async () => {
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    try {
+      const { svc, crypto, prisma } = makeService(MULTI);
+      prisma.credential.findFirst.mockResolvedValue({ encryptedValue: crypto.encrypt('NEW'), expiresAt: null, keyVersion: 2 });
+      expect((await svc.getAccessToken('c1'))?.token).toBe('NEW');
+      expect(svc.staleKeyVersionStats().total).toBe(0);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('读路径（版本未知/格式非法）：KEY_VERSION_INVALID（既有行为保持，绝不静默降级），且不污染欠账计数', async () => {
+    const { svc, prisma } = makeService(MULTI);
+    prisma.credential.findFirst.mockResolvedValue({ encryptedValue: unknownVersion('X'), expiresAt: null, keyVersion: 9 });
+    await expect(svc.getAccessToken('c1')).rejects.toMatchObject({ code: ErrorCode.KEY_VERSION_INVALID });
+    expect(svc.staleKeyVersionStats().total).toBe(0); // 没读成功就不算"读到了旧版本"
+
+    prisma.credential.findFirst.mockResolvedValue({ encryptedValue: 'not-a-ciphertext', expiresAt: null, keyVersion: 1 });
+    await expect(svc.getRefreshToken('c1')).rejects.toMatchObject({ code: ErrorCode.KEY_VERSION_INVALID });
+  });
+
+  it('refresh→store 后：新密文与 keyVersion 同步换代（读回新令牌且无欠账）', async () => {
+    const { svc, crypto, prisma, mockProvider } = makeService(MULTI);
+    prisma.credential.findFirst.mockResolvedValue({ encryptedValue: crypto.encrypt('REF_TOKEN'), expiresAt: null, keyVersion: 2 });
+    const res = await svc.refresh('c1');
+    expect(res.accessToken).toBe('new_access');
+    expect(mockProvider.refreshToken).toHaveBeenCalledTimes(1);
+    const creates = (prisma.credential.create as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0].data);
+    expect(creates.length).toBeGreaterThan(0);
+    for (const row of creates) expect(row.keyVersion).toBe(crypto.keyVersionOf(row.encryptedValue));
+    expect(svc.staleKeyVersionStats().total).toBe(0);
   });
 });
