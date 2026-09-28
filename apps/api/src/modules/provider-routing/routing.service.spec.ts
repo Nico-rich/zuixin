@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { HealthStatus, ModelType, ProviderType } from '@prisma/client';
 import { RoutingService } from './routing.service';
 import { CircuitBreakerService } from '../../core/circuit-breaker/circuit-breaker.service';
@@ -411,6 +411,74 @@ describe('M9-P3 RoutingService（评分事实 / 偏好排序 / 回退语义）',
     const r = await svc.route({ capability: 'text_generation' });
     expect(r.providerId).toBe('p-a');
     expect(r.candidates[0]).toMatchObject({ latencyMs: null, healthScore: 85 });
+  });
+
+  describe('M11-P4（维度2#8）延迟聚合进程内 TTL 缓存：24h groupBy 不再每次 route() 无条件执行', () => {
+    let nowSpy: ReturnType<typeof vi.spyOn>;
+    afterEach(() => { delete process.env.ROUTING_LATENCY_CACHE_TTL_MS; nowSpy?.mockRestore(); });
+    /** 固定 Date.now（缓存 TTL 用真实时钟；熔断器用的是测试自有 clock——两者互不干扰） */
+    const fixNow = (t: number) => { nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t); };
+
+    it('TTL 内的第二次路由复用同一次聚合（groupBy 只执行 1 次），且排序/审计事实一致', async () => {
+      fixNow(1_700_000_000_000);
+      const { svc, prisma, created } = makeSut({
+        providers: [makeProvider({ id: 'p-a', models: [cheapLLM()] }), makeProvider({ id: 'p-z', models: [cheapLLM()] })],
+        latencyRows: [{ providerId: 'p-a', _avg: { latencyMs: 30_000 } }, { providerId: 'p-z', _avg: { latencyMs: 120 } }],
+      });
+      const first = await svc.route({ capability: 'text_generation' });
+      const second = await svc.route({ capability: 'text_generation' });
+      expect(prisma.usageRecord.groupBy).toHaveBeenCalledTimes(1); // 45s TTL 内第二次零查询
+      // 陈旧容忍面：两次决策与审计读同一份聚合事实（缓存命中绝不改变决策证据）
+      expect(first.providerId).toBe('p-z');
+      expect(second.providerId).toBe('p-z');
+      expect(second.candidates.find((c) => c.providerId === 'p-a')!.latencyMs).toBe(30_000);
+      expect((created[1].candidates as Array<Record<string, unknown>>).find((c) => c.providerId === 'p-a'))
+        .toMatchObject({ latencyMs: 30_000 });
+    });
+
+    it('TTL 过期后直查（缓存失效 → 新观测进入决策）', async () => {
+      fixNow(1_700_000_000_000);
+      const rows: Array<{ providerId: string | null; _avg: { latencyMs: number | null } }> = [
+        { providerId: 'p-a', _avg: { latencyMs: 30_000 } }, { providerId: 'p-z', _avg: { latencyMs: 120 } },
+      ];
+      const { svc, prisma } = makeSut({
+        providers: [makeProvider({ id: 'p-a', models: [cheapLLM()] }), makeProvider({ id: 'p-z', models: [cheapLLM()] })],
+        latencyRows: rows,
+      });
+      const first = await svc.route({ capability: 'text_generation' });
+      expect(first.providerId).toBe('p-z'); // 延迟事实：p-z 更快
+      // 45s TTL 过后 provider 延迟反转（真实观测变化）→ 直查读到新值，排序随之翻转
+      rows[0]._avg.latencyMs = 10;
+      rows[1]._avg.latencyMs = 30_000;
+      nowSpy.mockReturnValue(1_700_000_000_000 + 46_000);
+      const second = await svc.route({ capability: 'text_generation' });
+      expect(prisma.usageRecord.groupBy).toHaveBeenCalledTimes(2);
+      expect(second.providerId).toBe('p-a');
+      expect(second.candidates.find((c) => c.providerId === 'p-z')!.latencyMs).toBe(30_000);
+    });
+
+    it('查询失败绝不写缓存：失败后的下一次 route() 仍直查（降级不被缓存放大）', async () => {
+      fixNow(1_700_000_000_000);
+      const { svc, prisma } = makeSut({
+        providers: [makeProvider({ id: 'p-a', models: [cheapLLM()] })],
+        latencyRows: [{ providerId: 'p-a', _avg: { latencyMs: 900 } }],
+      });
+      prisma.usageRecord.groupBy.mockRejectedValueOnce(new Error('db down'));
+      const degraded = await svc.route({ capability: 'text_generation' });
+      expect(degraded.candidates[0]).toMatchObject({ latencyMs: null }); // 无样本降级
+      const recovered = await svc.route({ capability: 'text_generation' }); // TTL 内，但失败未入缓存 → 直查
+      expect(prisma.usageRecord.groupBy).toHaveBeenCalledTimes(2);
+      expect(recovered.candidates[0]).toMatchObject({ latencyMs: 900 });
+    });
+
+    it('无样本（聚合无该 provider 行）也缓存：TTL 内不为空结果反复查询', async () => {
+      fixNow(1_700_000_000_000);
+      const { svc, prisma } = makeSut({ providers: [makeProvider({ id: 'p-a', models: [cheapLLM()] })], latencyRows: [] });
+      const r = await svc.route({ capability: 'text_generation' });
+      expect(r.candidates[0]).toMatchObject({ latencyMs: null, healthScore: 85 });
+      await svc.route({ capability: 'text_generation' });
+      expect(prisma.usageRecord.groupBy).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('熔断窗口失败率罚分：窗口内失败者排序落后（事实来自只读 windowStats，不改写计数）', async () => {
