@@ -40,7 +40,7 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-body-size: "256m"
     nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
     # --- 不在此处限流：per-IP 全局限流在应用内（M10-P8 RateLimitGuard）。
-    #     两处同时限流会让"到底谁拒的"变成排障谜题；如需边缘防护请单独评估并在 runbook §4 记录。
+    #     两处同时限流会让"到底谁拒的"变成排障谜题；如需边缘防护请单独评估并在 runbook §7.4 记录。
     #
     # --- 刻意**不设** `use-forwarded-headers`（保持 ingress-nginx 默认 false）：
     #     默认行为下本层会用"直连对端地址"**覆盖**客户端传来的 X-Forwarded-For，于是 XFF 链最右一跳

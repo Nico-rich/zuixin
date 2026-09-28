@@ -33,8 +33,11 @@ spec:
         app.kubernetes.io/component: worker
         app.kubernetes.io/part-of: agent-platform
     spec:
-      # 与 API 同值：Worker 的收尾路径更长（BullMQ close 等当前 job + Scheduler 在途作业 <=25s），
-      # 35s 是硬底线；这里仍取 45。SIGKILL 会打断 job ⇒ 只能靠 recoverStale 兜底（有延迟，别依赖它）。
+      # 与 API 同值：Worker 的收尾路径更长（BullMQ close 等当前 job + Scheduler 在途作业），
+      # 35s 是硬底线（应用侧 30s 全局兜底 + preStop 5s）；这里仍取 45。SIGKILL 会打断 job ⇒
+      # 只能靠 recoverStale 兜底（有延迟，别依赖它）。
+      # Scheduler 的在途等待由 configmap 的 SCHEDULER_SHUTDOWN_WAIT_MS 决定：M11-P10 起为 **8s**
+      # （必须 < finalizeLeases 阶段预算 12s——见 k8s/configmap.yaml 的注释与 graceful-shutdown.ts:78）。
       terminationGracePeriodSeconds: 45
       affinity:
         podAntiAffinity:
@@ -62,7 +65,7 @@ spec:
           #   * 而进程真死时容器会退出 → 由 restartPolicy 重启，不需要探针。
           # 由此带来的**真实盲区**：Redis 长时间抖动时 ioredis 会无限重连，进程活着但 job 不推进
           # （静默停摆），编排层看不见。检测靠监控侧（monitoring/alerts.yml：queue_depth 持续上涨、
-          # scheduler 巡检告警、scheduler.job.dead），处置见 docs/operations/m10-runbook.md §4。
+          # scheduler 巡检告警、scheduler.job.dead），处置见 docs/operations/m10-runbook.md §7.2。
           # 若要让编排层能自愈，需要给 Worker 加一个只读健康端口（代码改动，本 Phase 不做）。
           lifecycle:
             preStop:

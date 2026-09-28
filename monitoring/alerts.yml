@@ -8,7 +8,8 @@
 #   [可用]   —— 表达式只依赖**标准 exporter**（blackbox_exporter / kube-state-metrics），今天就能生效；
 #   [待导出] —— 表达式依赖应用内指标（名字与 MetricSample 对齐），**在导出器落地前不会生效**（评估为 no data）。
 #               它们是有价值的"缺口清单"：谁来做导出（暴露 /metrics 文本格式，或让 otel-collector 转）都能直接用。
-# 在导出器落地前，[待导出] 类信号的**人工替代判据**见 docs/operations/m10-runbook.md §4 告警响应表。
+# 在导出器落地前，[待导出] 类信号的**人工替代判据**见 docs/operations/m10-runbook.md §7.2 处置表
+# （§7.1 是规则状态总表；本节每条规则的 description 都直接指向 §7.2 的对应处置行）。
 #
 # 加载：rules_files 指向本文件（Prometheus 2.x `rule_files:` 接受任意 .yml）。
 #   校验：promtool check rules monitoring/alerts.yml
@@ -46,7 +47,8 @@ groups:
             处置顺序：① curl 任一 Pod 的 /api/v1/health 看 `checks[].critical` 与 `status`
             （unavailable=关键依赖故障；degraded=仅非关键依赖，不应触发本条）；
             ② 再看 `db.state`/`redis.state` 与 latencyMs 定位是哪一个；
-            ③ 若为 DB/Redis 真实故障，按 runbook §4 的「DB 不可用」「Redis 丢失」行处置。
+            ③ 若为 DB/Redis 真实故障，按 runbook §7.2 的 ApiReadyUnavailable（DB 故障）与 Redis 数据丢失
+            （Redis 故障 → **不恢复数据**，重启 Worker 靠 recoverStale 重投）两行处置。
             注意：**不要**因为这条告警就去重启 API Pod——重启治不好下游依赖，只会丢在途请求。
 
       - alert: ApiPodRestartLoop
@@ -89,7 +91,7 @@ groups:
             先在日志里搜「优雅停机超时」或 30s 窗口相关的 phase=timeout（JSON 日志 msg 字段）。
             确认是超时的话，含义是**有钩子挂住**（Prisma/ioredis/BullMQ close 未在窗口内返回），
             后果：kubelet 用 SIGKILL 收尾 ⇒ 在途 job 被打断、lease 只能靠 recoverStale 兜底（有延迟）。
-            排查：① 是否 Redis/PG 半开导致 close 挂住（runbook §4「Redis 丢失」行）；
+            排查：① 是否 Redis/PG 半开导致 close 挂住（runbook §7.2 Redis 数据丢失 行）；
             ② 20 秒级长任务是否远超 GRACEFUL_SHUTDOWN_TIMEOUT_MS；
             ③ 不要靠调大 terminationGracePeriodSeconds 掩盖——先找到挂住的钩子。
 
@@ -116,7 +118,7 @@ groups:
             assertQueueDepth）。5min 窗口是为了滤掉瞬时尖峰。
             处置顺序：① Worker 副本数与 CPU 是否被 HPA 顶到 max（k8s/worker-hpa.yaml）；
             ② 是否有 job 长尾（单 run 卡在 provider 超时/重试）⇒ 查 run 时长与 provider 错误率；
-            ③ 下游 provider 限流/熔断 ⇒ runbook §4「Provider 故障」行；
+            ③ 下游 provider 限流/熔断 ⇒ runbook §7.2 Provider 故障/限流 行；
             ④ 最后才考虑临时抬高 AGENT_RUN_QUEUE_MAX_DEPTH —— 那只是把 429 推迟，不解决吞吐。
 
       - alert: AgentRunQueueSaturated
@@ -131,7 +133,7 @@ groups:
           description: >-
             depth ≥ maxDepth ⇒ 用户侧已可见失败（这是**已发生**的用户影响，不是预警）。
             先止血再找根因：评估是否临时扩容 Worker（kubectl scale deploy/worker）或临时抬高水位，
-            同时按 runbook §4 找积压来源。
+            同时按 runbook §7.2 的队列积压/队列已满两行找积压来源（长尾 job / provider 故障 / 被 HPA 顶到上限）。
 
   # ---------------------------------------------------------------------------
   # 4) Scheduler 作业死亡：dead 不自动重投（一致性优先）⇒ 必须人工介入
@@ -159,7 +161,7 @@ groups:
           description: >-
             dead 是终态：该作业对应的周期性工作**已经停摆**，不会自愈。
             处置：① 查 ScheduledJob.lastError 区分是心跳中断（worker 失联/长任务超时）还是重试超限；
-            ② 若是 worker 自身问题（OOM/被 SIGKILL），先修 worker，再用人工显式路径重投（runbook §4「调度作业 dead」）。
+            ② 若是 worker 自身问题（OOM/被 SIGKILL），先修 worker，再用人工显式路径重投（runbook §7.2 SchedulerJobDead 行）。
 
   # ---------------------------------------------------------------------------
   # 5) 非关键依赖降级（对象存储）：/ready 仍 200，但生成类能力受损
@@ -182,4 +184,4 @@ groups:
           description: >-
             影响面：附件上传、生成产物读写会失败；对话/查询不受影响（因此**不要**摘 API 流量）。
             处置：检查 MinIO/S3 端点可达性与凭证（Secret 里的 STORAGE_*）；
-            若是桶被误删，按 runbook §3.3 用 mc mirror 回灌到新桶再切。
+            若是桶被误删，按 runbook §5 用 mc mirror（scripts/minio-mirror.ts）回灌到新桶再切。

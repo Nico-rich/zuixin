@@ -21,12 +21,22 @@ data:
 
   # --- API 监听 ---
   API_PORT: "3001"                  # src/main.ts 读取；探针端口必须与此一致
-  APP_URL: "https://app.example.com"
+  # APP_URL 已删除（M11-P10 E-03）：**没有任何读取点**——`grep -rn "APP_URL" apps/ packages/` 为空，
+  # 放在这里只会制造"改了却不生效"的假象（排障时最耗时的一类坑）。将来若真需要对外绝对地址
+  # （分享链接 / webhook 回址 / 邮件），先在代码里接线，再把这一行加回来并注明读取点。
   CORS_ORIGINS: "https://app.example.com"   # 逗号分隔白名单；modules/security/cors-policy.ts 解析
 
   # --- 优雅停机（见 lifecycle/graceful-shutdown.ts）---
-  GRACEFUL_SHUTDOWN_TIMEOUT_MS: "30000"     # 应用侧兜底：到点记 phase:timeout 并 exit(1)
-  SCHEDULER_SHUTDOWN_WAIT_MS: "25000"       # Scheduler 在途作业收尾窗口（必须 < 上面的值）
+  GRACEFUL_SHUTDOWN_TIMEOUT_MS: "30000"     # 全局兜底：到点记 phase:timeout 并 exit(1)（绝不无限等待）
+  # Scheduler 在途作业收尾窗口。**必须 < finalizeLeases 阶段预算 12s**
+  # （apps/api/src/lifecycle/graceful-shutdown.ts:78 的 STEP_BUDGET_CAP_MS.finalizeLeases = 12_000；
+  #  Scheduler 的等待正是挂在 finalizeLeases 阶段——worker/scheduler/scheduler.processor.ts 的 onLifecycleStep）。
+  # 每步的实际预算是 min(本步上限, 全局剩余)：写大到接近全局 30s，会把预算吃光，
+  # 后续 closeBullmq(上限 20s)/closeRedis/closeDatabase 三个阶段就拿不到时间 → 触发 phase:timeout → exit(1)，
+  # 于是"为了多等一个作业"反而丢掉了队列/连接的全部有序收尾。8s 是刻意留白：
+  # 等不到的在途作业由 stalled 巡检判 dead（不自动重投，人工显式重投），代价可接受。
+  # 代码侧默认值是 25s（scheduler.processor.ts 的 DEFAULT_SHUTDOWN_WAIT_MS）——本行是部署侧显式收窄。
+  SCHEDULER_SHUTDOWN_WAIT_MS: "8000"
 
   # --- 健康探测 ---
   HEALTH_PROBE_TIMEOUT_MS: "1000"           # 单个探测硬超时；三项并行 ⇒ /ready 最坏 ≈2×该值
@@ -47,7 +57,7 @@ data:
   #     否则同一个人拿到两个桶、且限流可被绕过（换 IP 无效但换代理路径有效）。
   #   * 直连 Pod（kubectl port-forward / 无 Ingress 的调试环境）时链长为 0 → 自动回退 socket 地址，
   #     不会因为"没走代理"而误判。
-  # 处置与排查入口见 docs/operations/m10-runbook.md §7。
+  # 处置与排查入口见 docs/operations/m10-runbook.md §7.4（含 `ratelimit:global:*` 键空间与 fail-open 语义）。
   TRUSTED_PROXY_HOPS: "1"
 
   # --- 观测 ---
@@ -62,4 +72,5 @@ data:
   #
   # 注意：**没有** REDIS_HOST/POSTGRES_HOST 这类变量——代码只认 DATABASE_URL / REDIS_URL 完整连接串
   # （apps/api/src/env.ts），所以这两个地址连同口令一起放在 Secret 里。
-  # 多实例隔离：演练环境用 REDIS_URL 尾部的 /<db> 号区分（见 docs/operations/m10-runbook.md §1）。
+  # 多实例隔离：演练环境用 REDIS_URL 尾部的 /<db> 号区分（见 docs/operations/m10-runbook.md §7.4 末的
+  # 「多实例/多环境共用 Redis」提醒——**Redis 的 Pub/Sub 通道不按 DB 号隔离**，只有 keyspace 隔离）。
