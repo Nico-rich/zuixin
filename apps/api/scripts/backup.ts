@@ -1,5 +1,5 @@
 /**
- * M10-P9 运维脚本：PostgreSQL 全库逻辑备份（一致性快照 + 内容校验 + manifest + 可选远端归档）。
+ * M10-P9 运维脚本：PostgreSQL 全库逻辑备份（一致性快照 + 内容校验 + 可选静态加密 + manifest + 可选远端归档）。
  *
  * 来源：`docs/operations/m8-disaster-recovery.md` §3.1/§3.3/§3.4 的手工命令脚本化（审计 DR-13/PR-6）。
  *
@@ -7,7 +7,12 @@
  * - **只读**：`pg_dump` 不修改源库（本脚本对生产/开发库绝对安全）；
  * - **一致性**：pg_dump 单事务 repeatable-read 快照（参数见 lib/dump.ts 的 PG_DUMP_CONSISTENCY_ARGS）；
  * - **不信"非空文件"**：必须解析产物内容（表数/COPY 段/行数）并与期望比对，失败即非 0 退出；
- * - **manifest**：把"备份是否可信"变成机器可读事实（编排/告警读 checks）；
+ * - **静态加密（M11-P9/D1-13）**：`--encrypt gpg` 在 gzip 之后再加一层 gpg（对称或公钥）。
+ *   压缩不是加密：备份常要出仓库（异地桶/离线介质/工单附件），明文 dump 含用户数据与凭证密文。
+ *   口令只经环境变量 → **stdin** 交给 gpg，绝不进 argv/日志；加密后**立刻解密回读比对 sha256**——
+ *   "加完解不开"的备份等于没有备份，这一条是自检而不是可选项（失败即退出码 3 且不删明文产物）；
+ * - **远端核对**：上传后用 `mc stat` 比对体积与 ETag（单段对象 ETag == 内容 md5）——零传输的内容级核对；
+ * - **manifest**：把"备份是否可信/是否加密"变成机器可读事实（编排/告警读 checks 与 encryption）；
  * - **幂等**：同名备份（同 label + 同秒）默认拒绝覆盖；`--force` 才允许；
  * - **不碰密钥**：连接串只回显脱敏形式；`.env` 只报存在性（RPO=0 清单）。
  *
@@ -23,13 +28,15 @@ import { resolve } from 'node:path';
 
 import {
   DEFAULT_EXIT_CODES, EXIT_FAIL, EXIT_OK, EXIT_PRECONDITION, EXIT_USAGE, EXIT_VERIFY,
-  commandExists, createLogger, fail, formatBytes, formatDuration, run, sha256File, stamp,
+  commandExists, createLogger, fail, formatBytes, formatDuration, md5File, run, sha256File, sha256Stream, stamp,
 } from './lib/cli';
 import { RPO_ZERO_SECRET_KEYS, envFileMeta, findEnvBackupCopies, loadEnv, parseDatabaseUrl, secretPresence, storageConfigFromEnv } from './lib/env';
-import { buildPgDumpArgs, createDumpStatsCollector, verifyDumpStats, type DumpStats } from './lib/dump';
+import { buildPgDumpArgs, createDumpStatsCollector, verifyDumpStats, type BackupCheck, type DumpStats } from './lib/dump';
 import { KEY_TABLES, PgClient, type PgMode } from './lib/pg';
 import { MANIFEST_TOOL, MANIFEST_VERSION, backupFileName, buildBackupManifest, manifestSummaryLines, manifestVerdict } from './lib/manifest';
-import { McClient, parseMcListJson, safeMcError } from './lib/mc';
+import { McClient, parseMcListJson, parseMcStatJson, etagAsMd5, safeMcError } from './lib/mc';
+import { openArtifactStream, planRetention, type Compression, type Encryption } from './lib/artifact';
+import { GPG_CIPHER_ALGO, GPG_PASSPHRASE_ENV, describeGpgMode, encryptFile, gpgPreflight, type GpgMode } from './lib/gpg';
 import { helpText, parseArgs, type FlagSpec } from './lib/args';
 
 const SCRIPT = 'backup.ts';
@@ -40,11 +47,13 @@ const SPECS: readonly FlagSpec[] = [
   { name: 'pg-mode', type: 'string', valueName: '<auto|docker|direct>', default: 'auto', help: 'pg 客户端来源：docker exec 容器 / 直连 / 自动探测' },
   { name: 'pg-container', type: 'string', valueName: '<name>', default: 'docker-postgres-1', help: 'docker 模式下的 PostgreSQL 容器名' },
   { name: 'pg-client-dir', type: 'string', valueName: '<dir>', help: 'direct 模式下 pg_dump/psql 所在目录（默认走 PATH）' },
-  { name: 'expect-tables', type: 'number', valueName: '<n>', help: '期望表数（校验用；不传则只做内部一致性校验）' },
+  { name: 'expect-tables', type: 'number', valueName: '<n>', help: '期望表数（校验用；不传则只做内部一致性校验）。**随迁移递增，务必用当前真实表数**（M11 为 88）' },
   { name: 'min-rows', type: 'number', valueName: '<n>', default: 0, help: '数据行下限（默认 0；演练可传实际值的 90%）' },
   { name: 'keep-plain', type: 'boolean', help: '保留未压缩的 .sql（默认压缩后删除明文，节省磁盘）' },
   { name: 'no-compress', type: 'boolean', help: '不压缩（只留 .sql；大库慎用）' },
   { name: 'gzip-level', type: 'number', valueName: '<0-9>', default: 6, help: 'gzip 级别（默认 6：体积/耗时平衡）' },
+  { name: 'encrypt', type: 'string', valueName: '<none|gpg>', default: 'none', help: '静态加密（默认 none；gpg = gpg 对称/公钥加密；口令只经环境变量 BACKUP_GPG_PASSPHRASE → stdin）' },
+  { name: 'encrypt-recipient', type: 'string', valueName: '<keyid|email>', help: '改用**公钥**加密（需 --encrypt gpg；公钥须已在 keyring 里，运维机不需要口令）' },
   { name: 'force', type: 'boolean', help: '允许覆盖同名备份（默认拒绝，防手滑覆盖当日备份）' },
   { name: 'prune', type: 'boolean', help: '执行保留策略清理（默认只提示不删除）' },
   { name: 'prune-keep', type: 'number', valueName: '<n>', default: 30, help: '保留最近 N 份备份（默认 30，与 DR 手册 §3.4 一致）' },
@@ -108,39 +117,54 @@ async function gzipFile(src: string, dst: string, level: number): Promise<void> 
   await pipeline(createReadStream(src), createGzip({ level }), createWriteStream(dst));
 }
 
-/** 保留策略：只删本脚本自己产出的、且超出保留份数的文件（默认 dry-run，需 --prune 才真删）。 */
+/**
+ * 幂等保护：同名产物（明文 / 归档产物 / manifest）已存在则拒绝（`--force` 才允许覆盖）。
+ * dry-run 与真实执行走**同一个**函数——否则会出现"dry-run 说没事、真跑却覆盖了当日备份"。
+ */
+function assertNoExistingArtifact(
+  logger: ReturnType<typeof createLogger>,
+  paths: readonly string[],
+  force: boolean,
+  dryRun: boolean,
+): void {
+  const hit = paths.filter((p) => existsSync(p));
+  if (hit.length === 0 || force) return;
+  fail(logger, `目标文件已存在${dryRun ? '（--force 可覆盖）' : '，拒绝覆盖（--force 可覆盖）'}：${hit.join(', ')}`, EXIT_PRECONDITION);
+}
+
+/**
+ * 保留策略：只删本脚本自己产出的、且超出保留份数的文件（默认 dry-run，需 --prune 才真删）。
+ *
+ * 分组键走 lib/artifact.ts 的 `backupSetKey()`（扩展名链解析），不再用"白名单正则"——
+ * M11 加加密时正是白名单正则漏掉了新形态 `.sql.gz.gpg`，会让加密备份**永远不被回收**（磁盘悄悄涨满）。
+ * 挑选逻辑（哪几套超期、每套删哪些文件）在 `planRetention()`，本函数只负责 unlink。
+ */
 function pruneBackups(
   outDir: string,
   database: string,
   keep: number,
   logger: ReturnType<typeof createLogger>,
   apply: boolean,
-): { scanned: number; removed: string[] } {
-  const names = readdirSync(outDir).filter((n) => n.startsWith(`${database}-`) || n.startsWith(`${database}.-`));
-  const sets = new Map<string, string[]>();
-  for (const name of names) {
-    const m = /^(.*)-(\d{8}-\d{6})\.(?:sql|sql\.gz|manifest\.json)$/.exec(name);
-    if (!m) continue;
-    const key = `${m[1]}-${m[2]}`;
-    sets.set(key, [...(sets.get(key) ?? []), name]);
-  }
-  const ordered = [...sets.keys()].sort().reverse(); // 时间戳字典序 == 时间序
-  const victims = ordered.slice(keep);
+): { scanned: number; removed: string[]; setsRemoved: number; setNames: string[]; untouched: string[] } {
+  // 归组/排序/挑选都是纯逻辑，放在 lib/artifact.ts 的 planRetention()（有单测）；
+  // 这里只做 IO：读目录 + 按计划 unlink。
+  const plan = planRetention(readdirSync(outDir), { database, keep });
   const removed: string[] = [];
-  for (const key of victims) {
-    for (const name of sets.get(key) ?? []) {
-      if (apply) {
-        try {
-          unlinkSync(resolve(outDir, name));
-        } catch (err) {
-          logger.warn(`删除失败（跳过）：${name} — ${(err as Error).message}`);
-          continue;
-        }
+  for (const name of plan.victimFiles) {
+    if (apply) {
+      try {
+        unlinkSync(resolve(outDir, name));
+      } catch (err) {
+        logger.warn(`删除失败（跳过）：${name} — ${(err as Error).message}`);
+        continue;
       }
-      removed.push(name);
     }
+    removed.push(name);
   }
-  return { scanned: sets.size, removed };
+  if (plan.untouched.length) {
+    logger.info(`保留策略：${plan.untouched.length} 个文件不匹配本脚本命名规则，未参与清理（原样保留）`);
+  }
+  return { scanned: plan.scannedSets, removed, setsRemoved: plan.victims.length, setNames: plan.victims, untouched: plan.untouched };
 }
 
 function printEnvReminder(
@@ -178,19 +202,24 @@ async function main(): Promise<void> {
     process.stdout.write(
       helpText({
         script: SCRIPT,
-        summary: 'PostgreSQL 全库一致性逻辑备份（pg_dump → 内容校验 → gzip → manifest → 可选远端归档）',
+        summary: 'PostgreSQL 全库一致性逻辑备份（pg_dump → 内容校验 → gzip → 可选 gpg 加密 → manifest → 可选远端归档）',
         specs: SPECS,
         notes: [
           'pg_dump 只读，不对源库做任何写入；一致性由 pg_dump 单事务快照保证。',
           '校验口径：解析 dump 自身的 CREATE TABLE / COPY 段与行数——"非空文件"不等于"可用备份"。',
+          '静态加密（--encrypt gpg）：压缩不是加密。口令只经环境变量 BACKUP_GPG_PASSPHRASE 走 stdin，'
+            + '绝不进 argv/日志；加密后立刻解密回读比对 sha256（失败 ⇒ 退出码 3 且**不删**明文产物，避免删掉唯一可用副本）。',
+          '公钥模式（--encrypt-recipient）：加密只需公钥、解密只需私钥在 keyring，运维机不需要放口令（生产推荐）。',
+          '--upload 在传完后用 mc stat 比对**体积 + ETag**（单段对象 ETag == 内容 md5，零传输的内容级核对）。',
           '本脚本不做 PITR（需 WAL 归档）；RPO = 备份时刻（DR 手册 §1）。',
-          '默认不执行保留策略清理（--prune 才删），且只删本脚本命名规则的产物。',
+          '默认不执行保留策略清理（--prune 才删），且只删本脚本命名规则的产物（含 .gpg 形态）。',
         ],
         examples: [
           'npx tsx scripts/backup.ts --dry-run',
           'npx tsx scripts/backup.ts --label daily',
-          'npx tsx scripts/backup.ts --label pre-migration --expect-tables 73',
-          'npx tsx scripts/backup.ts --label offsite --upload --bucket db-backups',
+          'npx tsx scripts/backup.ts --label pre-migration --expect-tables 88   # 88 = 当前真实表数，随迁移递增',
+          'BACKUP_GPG_PASSPHRASE=$(pass show db-backup) npx tsx scripts/backup.ts --label daily --encrypt gpg',
+          'npx tsx scripts/backup.ts --label offsite --encrypt gpg --encrypt-recipient ops@example.com --upload --bucket db-backups',
           'BACKUP_DIR=D:/backups npx tsx scripts/backup.ts --prune --prune-keep 14',
         ],
         exitCodes: DEFAULT_EXIT_CODES,
@@ -222,24 +251,52 @@ async function main(): Promise<void> {
   const envBackupDir = resolve((v['env-backup-dir'] as string | undefined) ?? resolve(outDir, 'env'));
   const label = v.label as string | undefined;
   const ts = stamp();
-  const plainName = backupFileName({ database: target.database, stamp: ts, label });
-  const plainPath = resolve(outDir, plainName);
-  const gzPath = `${plainPath}.gz`;
-  const manifestPath = resolve(outDir, `${plainName.replace(/\.sql$/, '')}.manifest.json`);
   const compress = v['no-compress'] !== true;
   const keepPlain = v['keep-plain'] === true || !compress;
   const expectTables = v['expect-tables'] as number | undefined;
   const minRows = v['min-rows'] as number;
 
+  // ---- 加密模式解析（**绝不静默降级为明文**：--encrypt gpg 给不出密钥就直接退出码 4）----
+  const encryptArg = String(v.encrypt).toLowerCase();
+  if (!['none', 'gpg'].includes(encryptArg)) {
+    fail(logger, `--encrypt 只支持 none|gpg，收到 "${String(v.encrypt)}"`, EXIT_USAGE);
+  }
+  const recipient = (v['encrypt-recipient'] as string | undefined) ?? null;
+  if (recipient && encryptArg !== 'gpg') fail(logger, '--encrypt-recipient 需要同时给出 --encrypt gpg', EXIT_USAGE);
+  const encryption: Encryption = encryptArg === 'gpg' ? 'gpg' : 'none';
+  const compression: Compression = compress ? 'gzip' : 'none';
+  const gpgMode: { kind: GpgMode; recipient?: string | null } = recipient ? { kind: 'public-key', recipient } : { kind: 'symmetric' };
+  const passphrase = encryption === 'gpg' && gpgMode.kind === 'symmetric' ? (process.env[GPG_PASSPHRASE_ENV] ?? null) : null;
+
+  const plainName = backupFileName({ database: target.database, stamp: ts, label });
+  const plainPath = resolve(outDir, plainName);
+  const preEncryptionPath = resolve(outDir, backupFileName({ database: target.database, stamp: ts, label, compression }));
+  const artifactName = backupFileName({ database: target.database, stamp: ts, label, compression, encryption });
+  const artifactPath = resolve(outDir, artifactName);
+  const manifestPath = resolve(outDir, `${plainName.replace(/\.sql$/, '')}.manifest.json`);
+
   logger.raw('');
   logger.raw('=== M10-P9 备份计划 ===');
   logger.raw(`源库        ：${target.redacted}`);
   logger.raw(`输出目录    ：${outDir}`);
-  logger.raw(`备份文件    ：${plainName}${compress ? ' → 追加 .gz' : '（不压缩）'}`);
+  logger.raw(`产物（唯一）：${artifactName}`);
   logger.raw(`manifest    ：${manifestPath}`);
   logger.raw(`env 文件    ：${envReport.file ?? '（未找到，仅用进程环境）'}`);
   logger.raw(`压缩        ：${compress ? `gzip -${v['gzip-level']}` : '关闭'}；明文保留：${keepPlain ? '是' : '否'}`);
+  logger.raw(
+    `加密        ：${encryption === 'gpg' ? describeGpgMode(gpgMode) : '关闭（明文备份——出仓库前必须自行加密）'}` +
+      (encryption === 'gpg' && gpgMode.kind === 'symmetric'
+        ? `；${GPG_PASSPHRASE_ENV}：${passphrase ? `已设置（长度 ${passphrase.length}，不回显）` : '缺失'}`
+        : ''),
+  );
   logger.raw(`校验期望    ：表数 ${expectTables ?? '（自动/内部一致性）'}，数据行下限 ${minRows}`);
+
+  // 加密前置检查：即使 --dry-run 也要做（dry-run 的价值就是"先证明密钥/工具齐备"）
+  if (encryption === 'gpg') {
+    const preflight = await gpgPreflight({ mode: gpgMode });
+    logger.raw(`gpg 前置    ：${preflight.ok ? '通过' : 'FAIL'} — ${preflight.detail}`);
+    if (!preflight.ok) fail(logger, `加密备份无法执行：${preflight.detail}`, EXIT_PRECONDITION);
+  }
 
   const resolved = await resolvePgClient({
     requested: String(v['pg-mode']),
@@ -261,9 +318,7 @@ async function main(): Promise<void> {
       logger.warn(`读取 pg_dump 版本失败：${(err as Error).message}`);
     }
     logger.raw(`pg_dump     ：${version}`);
-    if (existsSync(plainPath) && v.force !== true) {
-      fail(logger, `目标文件已存在（--force 可覆盖）：${plainPath}`, EXIT_PRECONDITION);
-    }
+    assertNoExistingArtifact(logger, [plainPath, artifactPath], v.force === true, true);
     if (!existsSync(outDir)) logger.raw(`输出目录    ：不存在，将在正式执行时创建`);
     printEnvReminder(logger, envReport, envBackupDir);
     logger.raw('');
@@ -272,9 +327,7 @@ async function main(): Promise<void> {
   }
 
   // ---- 前置：目标文件冲突（幂等保护）----
-  if (existsSync(plainPath) && v.force !== true) {
-    fail(logger, `目标文件已存在，拒绝覆盖（--force 可覆盖）：${plainPath}`, EXIT_PRECONDITION);
-  }
+  assertNoExistingArtifact(logger, [plainPath, artifactPath, manifestPath], v.force === true, false);
   mkdirSync(outDir, { recursive: true });
   mkdirSync(envBackupDir, { recursive: true });
 
@@ -295,8 +348,10 @@ async function main(): Promise<void> {
     fail(logger, 'pg_dump 输出为空（0 字节）——备份失败，拒绝继续', EXIT_FAIL);
   }
   const plainBytes = statSync(plainPath).size;
+  // 明文 sha256：加密自检的**基准**（自检走"解密 → 解压"全链，验证产物最终能还原出这份明文）
+  const plainSha256 = await sha256File(plainPath);
   if (dumpRes.stderr.trim()) logger.warn(`pg_dump stderr（非致命，需人工确认）：${dumpRes.stderr.trim().slice(0, 400)}`);
-  logger.info(`pg_dump 完成：${formatBytes(plainBytes)} / ${formatDuration(dumpMs)}`);
+  logger.info(`pg_dump 完成：${formatBytes(plainBytes)} / ${formatDuration(dumpMs)}（sha256 ${plainSha256.slice(0, 16)}…）`);
 
   // ---- 2) 内容统计 ----
   logger.step('解析 dump 内容（表 / COPY 段 / 逐表行数 / 扩展）');
@@ -307,39 +362,98 @@ async function main(): Promise<void> {
   for (const { table } of KEY_TABLES) keyTableRows[table] = stats.rowCounts[table] ?? -1; // -1 = 备份里没有该表
 
   // ---- 3) 校验 ----
-  const checks = verifyDumpStats(stats, { sizeBytes: plainBytes, expectTables, minRows });
+  const checks: BackupCheck[] = verifyDumpStats(stats, { sizeBytes: plainBytes, expectTables, minRows });
   const failedChecks = checks.filter((c) => !c.ok);
   logger.info(`内容统计：表 ${stats.tables} / COPY 段 ${stats.copySegments} / 行 ${stats.totalRows} / 扩展 [${stats.extensions.join(',')}]`);
   for (const c of checks) logger.raw(`  [${c.ok ? 'ok' : 'FAIL'}] ${c.name} — ${c.detail}`);
 
   // ---- 4) 压缩 ----
-  let gzBytes = 0;
-  let gzSha256 = '';
+  let preEncryptionBytes = 0;
+  let preEncryptionSha256 = '';
   let compressMs = 0;
   if (compress) {
     logger.step(`gzip -${v['gzip-level']} 压缩`);
     const t0 = Date.now();
-    await gzipFile(plainPath, gzPath, Number(v['gzip-level']));
+    await gzipFile(plainPath, preEncryptionPath, Number(v['gzip-level']));
     compressMs = Date.now() - t0;
-    gzBytes = statSync(gzPath).size;
-    gzSha256 = await sha256File(gzPath);
-    logger.info(`压缩完成：${formatBytes(gzBytes)}（压缩比 ${(plainBytes / Math.max(gzBytes, 1)).toFixed(2)}x）/ ${formatDuration(compressMs)}`);
-    if (!keepPlain) {
-      rmSync(plainPath);
-      logger.info('已删除明文 .sql（用 --keep-plain 保留）');
-    }
+    preEncryptionBytes = statSync(preEncryptionPath).size;
+    preEncryptionSha256 = await sha256File(preEncryptionPath);
+    logger.info(
+      `压缩完成：${formatBytes(preEncryptionBytes)}（压缩比 ${(plainBytes / Math.max(preEncryptionBytes, 1)).toFixed(2)}x）/ ${formatDuration(compressMs)}`,
+    );
   } else {
-    gzBytes = plainBytes;
-    gzSha256 = await sha256File(plainPath);
+    preEncryptionBytes = plainBytes;
+    preEncryptionSha256 = await sha256File(plainPath);
   }
 
-  // ---- 5) 远端归档（可选；先传数据文件，manifest 生成后单独传）----
-  const backupFileNameOnDisk = compress ? `${plainName}.gz` : plainName;
+  // ---- 4b) 静态加密（可选；**加密后立刻解密回读自检**——"加完解不开"等于没有备份）----
+  let artifactBytes = preEncryptionBytes;
+  let artifactSha256 = preEncryptionSha256;
+  let encryptMs = 0;
+  let decryptVerified = false;
+  if (encryption === 'gpg') {
+    logger.step(`gpg 加密 → ${artifactName}`);
+    const t0 = Date.now();
+    const enc = await encryptFile({ inPath: preEncryptionPath, outPath: artifactPath, mode: gpgMode, passphrase });
+    encryptMs = Date.now() - t0;
+    if (!enc.ok) {
+      // 不留半截密文（它比"没有加密备份"更危险：看起来像备份，其实解不开）
+      if (existsSync(artifactPath)) rmSync(artifactPath);
+      fail(logger, enc.detail, EXIT_FAIL);
+    }
+    artifactBytes = enc.outBytes;
+    artifactSha256 = await sha256File(artifactPath);
+    logger.info(
+      `加密完成：${formatBytes(artifactBytes)}（体积 +${(((artifactBytes - preEncryptionBytes) / Math.max(preEncryptionBytes, 1)) * 100).toFixed(2)}%）/ ${formatDuration(encryptMs)}`,
+    );
+
+    logger.step('加密自检：解密回读（gpg → gunzip）并与明文 dump 的 sha256 比对');
+    const verifyStarted = Date.now();
+    const opened = openArtifactStream(artifactPath, { passphrase });
+    let reHash = '';
+    let readDetail = 'ok';
+    try {
+      reHash = await sha256Stream(opened.stream);
+      const res = await opened.finished;
+      readDetail = res.ok ? 'ok' : res.detail;
+      decryptVerified = res.ok && reHash === plainSha256;
+    } catch (err) {
+      readDetail = (err as Error).message;
+      decryptVerified = false;
+    }
+    const decryptCheck: BackupCheck = {
+      name: 'encrypted-artifact-decryptable',
+      ok: decryptVerified,
+      detail: decryptVerified
+        ? `解密回读 sha256 与明文 dump 一致（${reHash.slice(0, 16)}…，${formatDuration(Date.now() - verifyStarted)}）——密文确实由当前密钥解得开`
+        : `解密回读失败或与明文不一致（链路：${readDetail}；回读 sha256 ${reHash.slice(0, 16) || 'n/a'}… ≠ 期望 ${plainSha256.slice(0, 16)}…）`,
+    };
+    checks.push(decryptCheck);
+    logger.raw(`  [${decryptCheck.ok ? 'ok' : 'FAIL'}] ${decryptCheck.name} — ${decryptCheck.detail}`);
+    if (!decryptVerified) {
+      // 关键：**不删**明文产物——自检失败时唯一的可用副本就是它
+      logger.error(`加密自检失败：产物 ${artifactPath} 不可信；已保留 ${preEncryptionPath}（明文/压缩产物）供人工处理`);
+      logger.error(`常见原因：${GPG_PASSPHRASE_ENV} 与加密时不一致、keyring 私钥缺失、磁盘写入被截断`);
+      process.exit(EXIT_VERIFY);
+    }
+  }
+
+  // ---- 4c) 明文清理（**放在加密自检之后**：自检失败时不能把唯一可用副本删掉）----
+  if (compress && !keepPlain) {
+    rmSync(plainPath);
+    logger.info('已删除明文 .sql（用 --keep-plain 保留）');
+  }
+
+  // ---- 5) 远端归档（可选；先传产物，manifest 生成后单独传）----
+  const backupFileNameOnDisk = artifactName;
   let mc: McClient | null = null;
   let mcMounts: { hostPath: string; containerPath: string }[] = [];
   let mcDirRef = outDir;
   let remoteTarget = '';
   const uploaded: string[] = [];
+  let remoteBytes = 0;
+  let remoteEtag: string | null = null;
+  let remoteContentVerified = false;
   if (v.upload === true) {
     const storage = storageConfigFromEnv();
     if (!storage.accessKeyId || !storage.secretAccessKey) {
@@ -367,19 +481,37 @@ async function main(): Promise<void> {
       timeoutMs: 3_600_000,
     });
     if (cp.code !== 0) fail(logger, `上传失败 ${backupFileNameOnDisk}：${safeMcError(cp)}`, EXIT_FAIL);
-    // 远端体积核对（截断上传是静默事故的常见形态；哈希留给 minio-mirror.ts 的抽样校验）
-    const ls = await mc.list(`${mc.ref(bucket)}/${prefix}${backupFileNameOnDisk}`, { mounts: mcMounts });
+    // 远端核对（截断/传错对象是静默事故的常见形态）：体积用 ls，内容用 stat 的 ETag
+    const remotePath = `${mc.ref(bucket)}/${prefix}${backupFileNameOnDisk}`;
+    const ls = await mc.list(remotePath, { mounts: mcMounts });
     const remoteSummary = parseMcListJson(ls.stdout);
-    const expected = compress ? gzBytes : plainBytes;
-    if (remoteSummary.totalBytes !== expected) {
-      fail(
-        logger,
-        `远端对象体积不符：期望 ${expected} 字节，实际 ${remoteSummary.totalBytes} 字节（${mc.ref(bucket)}/${prefix}${backupFileNameOnDisk}）`,
-        EXIT_VERIFY,
+    remoteBytes = remoteSummary.totalBytes;
+    if (remoteBytes !== artifactBytes) {
+      fail(logger, `远端对象体积不符：期望 ${artifactBytes} 字节，实际 ${remoteBytes} 字节（${remotePath}）`, EXIT_VERIFY);
+    }
+    // ETag 内容级核对：单段上传的 ETag == 对象内容 md5 ⇒ 零传输即可确认"桶里那一个就是本地这一个"。
+    // 多段上传（大对象）ETag 形如 `<md5>-<n>`，此时**不假装核对过**，如实标注 contentVerified=false。
+    const stat = await mc.stat(remotePath);
+    const remoteStat = parseMcStatJson(stat.stdout);
+    remoteEtag = remoteStat?.etag ?? null;
+    const expectedMd5 = await md5File(artifactPath);
+    const remoteMd5 = remoteEtag ? etagAsMd5(remoteEtag) : null;
+    if (remoteStat && remoteStat.sizeBytes !== artifactBytes) {
+      fail(logger, `远端对象体积不符（mc stat）：期望 ${artifactBytes} 字节，实际 ${remoteStat.sizeBytes} 字节（${remotePath}）`, EXIT_VERIFY);
+    }
+    if (remoteMd5) {
+      if (remoteMd5 !== expectedMd5) {
+        fail(logger, `远端对象内容不符（ETag/md5）：本地 ${expectedMd5}，远端 ${remoteMd5}（${remotePath}）`, EXIT_VERIFY);
+      }
+      remoteContentVerified = true;
+      logger.info(`远端已确认：${prefix}${backupFileNameOnDisk}（${formatBytes(remoteBytes)}，ETag/md5=${remoteMd5} 一致）`);
+    } else {
+      logger.warn(
+        `远端已确认体积（${formatBytes(remoteBytes)}），但 ETag 不是单段 md5（${remoteEtag ?? 'null'}）⇒ **未做内容级核对**；` +
+          '需要内容级证明时用 minio-mirror.ts --checksum-sample',
       );
     }
     uploaded.push(`${prefix}${backupFileNameOnDisk}`);
-    logger.info(`远端已确认：${prefix}${backupFileNameOnDisk}（${formatBytes(remoteSummary.totalBytes)}）`);
   }
 
   // ---- 6) manifest ----
@@ -393,16 +525,24 @@ async function main(): Promise<void> {
     files: {
       plain: keepPlain ? plainPath : null,
       plainBytes,
-      gz: compress ? gzPath : plainPath,
-      gzBytes,
-      gzSha256,
+      plainSha256,
+      artifact: artifactPath,
+      artifactBytes,
+      artifactSha256,
+      preEncryptionSha256,
     },
     stats,
+    encryption:
+      encryption === 'gpg'
+        ? { scheme: 'gpg', mode: gpgMode.kind, recipient: gpgMode.recipient ?? null, cipher: GPG_CIPHER_ALGO, decryptVerified }
+        : null,
     checks,
     keyTableRows,
     secrets: secretPresence(),
-    durations: { dumpMs, statsMs, compressMs, totalMs },
-    remote: mc ? { kind: 'minio', target: remoteTarget, uploaded } : null,
+    durations: { dumpMs, statsMs, compressMs, encryptMs, totalMs },
+    remote: mc
+      ? { kind: 'minio', target: remoteTarget, uploaded, bytes: remoteBytes, etag: remoteEtag, contentVerified: remoteContentVerified }
+      : null,
     retentionHint: `建议保留 ${v['prune-keep']} 份（${v.prune === true ? '本次已执行清理' : '本次未清理，--prune 生效'}），异地留存见 runbook`,
   });
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
@@ -420,12 +560,22 @@ async function main(): Promise<void> {
   }
 
   // ---- 7) 保留策略 ----
+  // 口径：一份「备份集」= 同一时间戳的 .sql/.gz/.gpg + manifest.json（删就整套删，留就整套留，
+  // 避免"留下 manifest 却删掉密文"这种看起来很完整、实际恢复不了的状态）。
   if (v.prune === true) {
-    const { scanned, removed } = pruneBackups(outDir, target.database, Number(v['prune-keep']), logger, true);
-    logger.info(`保留策略：扫描 ${scanned} 份备份，删除 ${removed.length} 份（保留最近 ${v['prune-keep']} 份）`);
+    const { scanned, removed, setsRemoved, setNames } = pruneBackups(outDir, target.database, Number(v['prune-keep']), logger, true);
+    logger.info(
+      `保留策略：扫描 ${scanned} 份备份集，删除 ${setsRemoved} 套（${removed.length} 个文件）` +
+        `（保留最近 ${v['prune-keep']} 套；含 .sql/.gz/.gpg/manifest 整套删除）` +
+        `${setNames.length ? `：${setNames.slice(0, 3).join(', ')}${setNames.length > 3 ? ' …' : ''}` : ''}`,
+    );
   } else {
-    const { removed } = pruneBackups(outDir, target.database, Number(v['prune-keep']), logger, false);
-    if (removed.length) logger.warn(`保留策略：有 ${removed.length} 份超出保留数（未删除；加 --prune 执行）：${removed.slice(0, 5).join(', ')}`);
+    const { removed, setsRemoved } = pruneBackups(outDir, target.database, Number(v['prune-keep']), logger, false);
+    if (removed.length) {
+      logger.warn(
+        `保留策略：有 ${setsRemoved} 套备份超出保留数（共 ${removed.length} 个文件，未删除；加 --prune 执行）：${removed.slice(0, 5).join(', ')}`,
+      );
+    }
   }
 
   // ---- 8) 摘要 + RPO=0 清单 ----

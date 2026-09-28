@@ -272,7 +272,8 @@ export function sqlLiteral(value: string): string {
 }
 
 /**
- * 逐表行数：一次查询拿到全部表的 count（避免 73 张表 × 一次 docker exec 往返）。
+ * 逐表行数：一次查询拿到全部表的 count（避免 88 张表 × 一次 docker exec 往返——M11-P9 校正：
+ * 数字随迁移递增，务必用当前真实表数 `SELECT count(*) FROM pg_class … relkind='r'`，别照抄常量）。
  * `query_to_xml` 让 PG 自己为每张表生成 `SELECT count(*)` 并抽回文本。
  */
 export const ROW_COUNT_SQL = `

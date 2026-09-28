@@ -9,16 +9,19 @@
  *      "就地恢复生产库"必须由人工按 runbook §4.2 执行，脚本不提供这条捷径；
  *   3. **拒绝复用已存在的库**（除显式 `--reuse-existing`），默认每次都是全新库 ⇒ 演练可重复、无脏状态。
  *
+ * 产物形态（M11-P9）：`.sql` / `.sql.gz` / `.sql.gpg` / `.sql.gz.gpg` 都能直接回灌——
+ * 解压/解密收敛在 lib/artifact.ts 的**一个** helper 里（原先三处各写一遍，漏改一处就会出现
+ * "统计到 0 张表"的假失败）。加密备份的口令与 backup.ts 同源（`BACKUP_GPG_PASSPHRASE`，只走 stdin）。
+ *
  * 校验口径（**与 m8 手册踩过的坑一致**）：逐表行数必须与 **dump 文件自身的 COPY 段**比较，
  * 绝不与"源库当前行数"比较——源库在备份之后仍在写入，那样比会得到假失败。
  *
  * 用法：`cd apps/api && npx tsx scripts/restore.ts --help`
  */
 
-import { createReadStream, existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { resolve } from 'node:path';
-import { createGunzip } from 'node:zlib';
 
 import {
   DEFAULT_EXIT_CODES, EXIT_FAIL, EXIT_OK, EXIT_PRECONDITION, EXIT_USAGE, EXIT_VERIFY,
@@ -30,11 +33,13 @@ import {
   parseCopyRowsText, pickSampleTables, type CopyRowSample, type DumpStats,
 } from './lib/dump';
 import { KEY_TABLES, PgClient, assertSafeTargetDatabase, type PgMode } from './lib/pg';
+import { openArtifactStream, parseArtifactName, type ArtifactChain } from './lib/artifact';
+import { GPG_PASSPHRASE_ENV } from './lib/gpg';
 import { helpText, parseArgs, type FlagSpec } from './lib/args';
 
 const SCRIPT = 'restore.ts';
 const SPECS: readonly FlagSpec[] = [
-  { name: 'dump', alias: 'f', type: 'string', valueName: '<file.sql|file.sql.gz>', help: '备份文件（必填；.gz 自动解压）' },
+  { name: 'dump', alias: 'f', type: 'string', valueName: '<file.sql[.gz][.gpg]>', help: '备份文件（必填；.gz 自动解压、.gpg 自动解密）' },
   { name: 'target-db', alias: 't', type: 'string', valueName: '<name>', help: '恢复目标库名（必填；必须是**新建**的临时库）' },
   { name: 'confirm', type: 'boolean', help: '真正执行恢复（不传则等同 --dry-run：只打印计划）' },
   { name: 'reuse-existing', type: 'boolean', help: '允许目标库已存在（默认拒绝；dump 自带 --clean 会先 DROP 再 CREATE）' },
@@ -51,10 +56,25 @@ const SPECS: readonly FlagSpec[] = [
 
 const TARGET_PREFIX_HINT = 'm10p9_';
 
-async function collectStats(file: string): Promise<DumpStats> {
+/** 传入口令（对称加密的备份）。口令只从环境变量读，绝不进 argv；只报"有没有"。 */
+function resolvePassphrase(chain: ArtifactChain): { value: string | null; note: string } {
+  if (chain.encryption !== 'gpg') return { value: null, note: '不适用（未加密）' };
+  const value = process.env[GPG_PASSPHRASE_ENV] ?? null;
+  return {
+    value,
+    note: value ? `已设置（长度 ${value.length}，不回显；经 stdin 传给 gpg）` : `未设置——对称加密的备份必须提供；公钥加密的备份可缺省（私钥在 keyring 里）`,
+  };
+}
+
+/**
+ * 读一遍产物（经 lib/artifact.ts 的统一解压/解密链路）并统计内容。
+ * `onOpened` 让调用方拿到本次读取的链路对象（用于在失败时把 gpg 的原始错误报出来）。
+ */
+async function collectStats(file: string, passphrase: string | null, onOpened: (opened: ReturnType<typeof openArtifactStream>) => void): Promise<DumpStats> {
   const collector = createDumpStatsCollector();
-  const input = file.endsWith('.gz') ? createReadStream(file).pipe(createGunzip()) : createReadStream(file);
-  const rl = createInterface({ input, crlfDelay: Infinity });
+  const opened = openArtifactStream(file, { passphrase });
+  onOpened(opened);
+  const rl = createInterface({ input: opened.stream, crlfDelay: Infinity });
   for await (const line of rl) collector.pushLine(line);
   return collector.finish();
 }
@@ -65,13 +85,21 @@ async function collectStats(file: string): Promise<DumpStats> {
  * 而一遍读完才知道行数。代价是一次额外的解压/读取——对演练频率而言可忽略，
  * 换来的好处是采样目标确定（同一份 dump 永远抽同一批）而不是"边读边猜"。
  */
-async function collectSampleRows(file: string, targets: readonly string[], maxRowsPerTable: number): Promise<CopyRowSample> {
+async function collectSampleRows(
+  file: string,
+  passphrase: string | null,
+  targets: readonly string[],
+  maxRowsPerTable: number,
+): Promise<CopyRowSample> {
   if (targets.length === 0) return { rows: {}, skipped: [] };
   const collector = createCopyRowCollector(targets, maxRowsPerTable);
-  const input = file.endsWith('.gz') ? createReadStream(file).pipe(createGunzip()) : createReadStream(file);
-  input.on('error', () => undefined); // 与回灌路径同样：读流错误不能变成未捕获异常
-  const rl = createInterface({ input, crlfDelay: Infinity });
-  for await (const line of rl) collector.pushLine(line);
+  const opened = openArtifactStream(file, { passphrase });
+  const rl = createInterface({ input: opened.stream, crlfDelay: Infinity });
+  try {
+    for await (const line of rl) collector.pushLine(line);
+  } catch {
+    /* 读取失败（损坏的 .gz / 解不开的 .gpg）：由调用方检查 opened.finished 得到原因 */
+  }
   return collector.finish();
 }
 
@@ -89,6 +117,8 @@ async function main(): Promise<void> {
         specs: SPECS,
         notes: [
           '默认行为是 dry-run：不给 --confirm 时只做前置检查与计划打印，不创建/写入任何库。',
+          '产物形态自动识别：.sql / .sql.gz / .sql.gpg / .sql.gz.gpg（先 gzip 后 gpg）；'
+            + `加密备份的解密口令来自环境变量 ${GPG_PASSPHRASE_ENV}（经 stdin，不进 argv）。`,
           '硬闸门：目标库名 ≠ DATABASE_URL 的库名；目标库不存在（除非 --reuse-existing）；目标库名必须是合法标识符。',
           '行数校验与 **dump 文件自身的 COPY 段**比对（不与源库当前行数比——那会因源库持续写入而假失败）。',
           '内容级抽样（--verify-sample，默认 3 张）：回灌后**再 dump 单表**，与备份里的 COPY 行逐行原样比对——'
@@ -98,6 +128,7 @@ async function main(): Promise<void> {
         examples: [
           'npx tsx scripts/restore.ts --dump backup/agent_platform-20260928-120000.sql.gz --target-db m10p9_drill',
           'npx tsx scripts/restore.ts -f backup/x.sql.gz -t m10p9_drill --confirm',
+          'BACKUP_GPG_PASSPHRASE=… npx tsx scripts/restore.ts -f backup/x.sql.gz.gpg -t m10p9_drill --confirm',
           'npx tsx scripts/restore.ts -f backup/x.sql.gz -t m10p9_drill --confirm --keep',
           'npx tsx scripts/restore.ts -f backup/x.sql.gz -t m10p9_drill --confirm --skip-rowcount-all',
         ],
@@ -132,6 +163,17 @@ async function main(): Promise<void> {
   const dumpBytes = statSync(dumpPath).size;
   if (dumpBytes === 0) fail(logger, `备份文件为 0 字节：${dumpPath}`, EXIT_PRECONDITION);
 
+  // 产物扩展名链（.gz 解压 / .gpg 解密）——解析不出就**明确拒绝**，绝不猜着读
+  const parsedName = parseArtifactName(dumpPath);
+  if (!parsedName.ok) fail(logger, parsedName.error, EXIT_USAGE);
+  const chain: ArtifactChain = {
+    base: parsedName.base,
+    compression: parsedName.compression,
+    encryption: parsedName.encryption,
+    suffix: parsedName.suffix,
+  };
+  const passphraseInfo = resolvePassphrase(chain);
+
   const outDir = resolve((v['out-dir'] as string | undefined) ?? process.env.BACKUP_DIR ?? resolve(__dirname, '../../../backup'));
   const confirm = v.confirm === true;
   const keep = v.keep === true;
@@ -145,6 +187,11 @@ async function main(): Promise<void> {
   logger.raw('=== M10-P9 恢复计划 ===');
   logger.raw(`模式        ：${effectiveDryRun ? 'DRY-RUN（未执行任何写入；加 --confirm 才真正恢复）' : 'EXECUTE（--confirm 已给出）'}`);
   logger.raw(`备份文件    ：${dumpPath}（${formatBytes(dumpBytes)}）`);
+  logger.raw(
+    `产物形态    ：${chain.suffix === '' ? '明文 .sql' : `扩展名链 ${chain.suffix}`}` +
+      `（压缩：${chain.compression === 'gzip' ? 'gzip（读取时解压）' : '无'}；加密：${chain.encryption === 'gpg' ? 'gpg（读取时解密）' : '无'}）`,
+  );
+  if (chain.encryption === 'gpg') logger.raw(`解密口令    ：${GPG_PASSPHRASE_ENV} ${passphraseInfo.note}`);
   logger.raw(`源库（只读）：${target.redacted}`);
   logger.raw(`目标临时库  ：${targetArg}`);
   logger.raw(`恢复后处理  ：${keep ? '保留临时库' : '校验通过后 DROP 临时库'}；目标已存在：${reuseExisting ? '允许复用' : '拒绝（默认）'}`);
@@ -154,8 +201,44 @@ async function main(): Promise<void> {
   // ---- 解析 dump 内容（期望值来源；dry-run 也做，等于"先证明这个备份文件是可解析的"）----
   logger.step('解析备份文件内容（表 / COPY 段 / 逐表行数）');
   const statsStarted = Date.now();
-  const stats = await collectStats(dumpPath);
+  let statsOpened: ReturnType<typeof openArtifactStream> | null = null;
+  let stats: DumpStats;
+  try {
+    stats = await collectStats(dumpPath, passphraseInfo.value, (opened) => {
+      statsOpened = opened;
+      logger.raw(`  读取链路：${opened.description}`);
+    });
+  } catch (err) {
+    // 读取过程中断时，**先问链路本身**再报错：口令错误的直接表现是 gunzip 报
+    // "unexpected end of file"（密文没解出来 ⇒ 后面拿到的不是 gzip 数据），
+    // 只报这句会把"口令不对"误诊成"备份损坏"——而这两件事的处置完全不同
+    // （前者去取回口令，后者要立刻改用别的备份）。链路详情里有 gpg 的原始 "Bad session key"。
+    const opened = statsOpened as ReturnType<typeof openArtifactStream> | null;
+    const chainResult = opened ? await opened.finished : null;
+    const what = chain.encryption === 'gpg' ? '解密或解压' : '解压';
+    if (chainResult && !chainResult.ok) {
+      fail(
+        logger,
+        `读取/解析备份文件失败（${what}链路中断）：${chainResult.detail}\n  （下游现象：${(err as Error).message}）\n` +
+          `  提示：对称加密的备份需要 ${GPG_PASSPHRASE_ENV}（与备份时一致）；公钥加密需要私钥在 keyring 中。`,
+        EXIT_PRECONDITION,
+      );
+    }
+    fail(logger, `读取/解析备份文件失败（${what}链路中断）：${(err as Error).message}`, EXIT_VERIFY);
+  }
   const statsMs = Date.now() - statsStarted;
+  {
+    const opened = statsOpened as ReturnType<typeof openArtifactStream> | null;
+    const chainResult = opened ? await opened.finished : { ok: true, detail: 'ok' };
+    if (!chainResult.ok) {
+      fail(
+        logger,
+        `产物读取链路失败：${chainResult.detail}\n  提示：对称加密的备份需要 ${GPG_PASSPHRASE_ENV}（与备份时一致）；` +
+          '公钥加密需要私钥在 keyring 中。口令错误会以 gpg 的 "Bad session key" 暴露，不会静默产出半个库。',
+        EXIT_PRECONDITION,
+      );
+    }
+  }
   logger.raw(`  表 ${stats.tables} / COPY 段 ${stats.copySegments} / 数据行 ${stats.totalRows} / 扩展 [${stats.extensions.join(',')}] / 迁移行 ${String(stats.migrationsRows)}`);
   if (stats.tables === 0) fail(logger, '备份文件里没有任何 CREATE TABLE——不是有效的 pg_dump 产物', EXIT_PRECONDITION);
   if (stats.copySegments !== stats.tables) {
@@ -207,7 +290,7 @@ async function main(): Promise<void> {
     startedAt: new Date().toISOString(),
     mode: resolved.mode,
     source: target.redacted,
-    dump: { path: dumpPath, bytes: dumpBytes, stats },
+    dump: { path: dumpPath, bytes: dumpBytes, chain: { compression: chain.compression, encryption: chain.encryption, suffix: chain.suffix }, stats },
     target: targetArg,
     createdByUs,
     steps: [] as { name: string; ok: boolean; detail: string; ms?: number }[],
@@ -226,13 +309,19 @@ async function main(): Promise<void> {
 
     // ---- 回灌（psql -v ON_ERROR_STOP=1；任何 SQL 失败立即非 0）----
     logger.step('回灌 SQL（ON_ERROR_STOP=1：任一语句失败立即中断）');
-    const input = dumpPath.endsWith('.gz') ? createReadStream(dumpPath).pipe(createGunzip()) : createReadStream(dumpPath);
-    // 读流错误（截断的 .gz 等）必须有监听者：否则 Node 会把 'error' 抛成未捕获异常（进程直接崩）
-    input.on('error', (err: Error) => logger.error(`读取备份流失败（psql 会因输入截断而失败）：${err.message}`));
-    const load = await resolved.client.loadScript(targetArg, input, Number(v['timeout-ms']));
-    if (load.code !== 0) {
-      steps.push({ name: 'load', ok: false, detail: `psql 退出码 ${load.code}：${load.stderr.trim().slice(0, 400)}` });
-      throw new Error(`回灌失败（psql 退出码 ${load.code}）：${load.stderr.trim().slice(0, 400)}`);
+    // 解压/解密链与上面两遍读取**同一个** helper（三处收敛于此）；读流错误由 helper 记录，避免未捕获异常
+    const loadOpened = openArtifactStream(dumpPath, {
+      passphrase: passphraseInfo.value,
+      onError: (msg) => logger.error(`读取备份流失败（psql 会因输入截断而失败）：${msg}`),
+    });
+    const load = await resolved.client.loadScript(targetArg, loadOpened.stream, Number(v['timeout-ms']));
+    const loadChain = await loadOpened.finished;
+    if (load.code !== 0 || !loadChain.ok) {
+      const detail =
+        (load.code !== 0 ? `psql 退出码 ${load.code}：${load.stderr.trim().slice(0, 400)}` : '') +
+        (!loadChain.ok ? `${load.code !== 0 ? '；' : ''}${chain.encryption === 'gpg' ? '解密' : '解压'}链路失败：${loadChain.detail}` : '');
+      steps.push({ name: 'load', ok: false, detail });
+      throw new Error(`回灌失败（${detail}）`);
     }
     steps.push({ name: 'load', ok: true, detail: `psql ON_ERROR_STOP=1 退出码 0，stderr ${load.stderr.length} 字节`, ms: load.durationMs });
     logger.info(`回灌完成：${formatDuration(load.durationMs)}，stderr ${load.stderr.length} 字节`);
@@ -296,7 +385,7 @@ async function main(): Promise<void> {
       steps.push({ name: 'sample-consistency', ok: true, detail: '未抽样（--verify-sample 0 或没有符合条件的小表）' });
     } else {
       logger.step(`校验 D：抽样内容一致性（${sampleTargets.length} 张表：${sampleTargets.join(', ')}）`);
-      const dumpSample: CopyRowSample = await collectSampleRows(dumpPath, sampleTargets, sampleCap);
+      const dumpSample: CopyRowSample = await collectSampleRows(dumpPath, passphraseInfo.value, sampleTargets, sampleCap);
       let sampleOk = true;
       const skipped: string[] = [];
       for (const table of sampleTargets) {

@@ -6,11 +6,24 @@
  * 不必去猜"这个 5MB 的 .sql 到底完不完整"。
  */
 
+import { artifactStamp, artifactSuffix, type Compression, type Encryption } from './artifact';
 import type { BackupCheck, DumpStats } from './dump';
 import type { SecretPresence } from './env';
 
 export const MANIFEST_TOOL = 'm10-backup';
-export const MANIFEST_VERSION = 1;
+/** v2（M11-P9）：`files` 由「gz 三件套」改为「产物（artifact）+ 加密前 sha256」，并新增 `encryption` 段。 */
+export const MANIFEST_VERSION = 2;
+
+/** 产物加密事实（未加密时为 null；**只含算法与模式，绝不含密钥材料**）。 */
+export interface ManifestEncryption {
+  scheme: 'gpg';
+  mode: 'symmetric' | 'public-key';
+  /** 公钥模式下的收件人（公钥标识不是秘密）；对称模式为 null */
+  recipient: string | null;
+  cipher: string;
+  /** 加密后是否**实际解密回读**并与加密前 sha256 比对（备份脚本的自检；false = 未自检，不可当作"能恢复"） */
+  decryptVerified: boolean;
+}
 
 export interface BackupManifest {
   tool: string;
@@ -25,22 +38,42 @@ export interface BackupManifest {
   /** 备份模式：docker exec 容器内客户端 / 直连 */
   mode: string;
   files: {
-    /** 明文 dump（--keep-plain 时保留；否则为 null——已压缩） */
+    /** 明文 dump（--keep-plain 时保留；否则为 null——已压缩/加密后删除） */
     plain: string | null;
     plainBytes: number;
-    gz: string;
-    gzBytes: number;
-    gzSha256: string;
+    /** 明文 dump 的 sha256（**加密自检与恢复校对的基准**：产物解出来必须等于它） */
+    plainSha256: string;
+    /**
+     * **落盘并上传的那一个产物**（含扩展名链：.sql / .sql.gz / .sql.gpg / .sql.gz.gpg）。
+     * 恢复、异地核对、保留策略都以它为准——"备份文件是哪个"必须有唯一答案。
+     */
+    artifact: string;
+    artifactBytes: number;
+    artifactSha256: string;
+    /** 加密前产物的 sha256（未加密时 == artifactSha256；加密时用于证明"密文能解回原物"） */
+    preEncryptionSha256: string;
   };
+  /** 加密事实（未加密为 null） */
+  encryption: ManifestEncryption | null;
   stats: DumpStats;
   checks: BackupCheck[];
   /** 关键表行数（点名的几张业务表；便于事后对比"备份时刻的业务规模"） */
   keyTableRows: Record<string, number>;
   /** RPO=0 密钥清单（只报存在性，绝不报值） */
   secrets: Record<string, SecretPresence>;
-  durations: { dumpMs: number; statsMs: number; compressMs: number; totalMs: number };
+  durations: { dumpMs: number; statsMs: number; compressMs: number; encryptMs: number; totalMs: number };
   /** 远端归档结果（未上传时为 null） */
-  remote: { kind: 'minio'; target: string; uploaded: string[] } | null;
+  remote: {
+    kind: 'minio';
+    target: string;
+    uploaded: string[];
+    /** 远端对象体积（字节；与 artifactBytes 比对过） */
+    bytes: number;
+    /** 远端 ETag（单段上传时即内容 md5；null = 服务端未给出） */
+    etag: string | null;
+    /** 是否做过**内容级**核对（ETag==md5 时比对；否则为 false——只比了体积，如实标注） */
+    contentVerified: boolean;
+  } | null;
   /** 保留提示（保留策略是运维约定，脚本只回显） */
   retentionHint: string;
 }
@@ -57,6 +90,7 @@ export function buildBackupManifest(input: Omit<BackupManifest, 'tool' | 'versio
     mode: input.mode,
     files: input.files,
     stats: input.stats,
+    encryption: input.encryption,
     checks: input.checks,
     keyTableRows: input.keyTableRows,
     secrets: input.secrets,
@@ -79,23 +113,46 @@ export function manifestSummaryLines(m: BackupManifest): string[] {
   lines.push(`备份结论：${verdict.ok ? 'PASS（全部校验通过）' : `FAIL（失败项：${verdict.failed.join(', ')}）`}`);
   lines.push(`数据库：${m.database} @ ${m.source}`);
   lines.push(`客户端：${m.pgVersion}（模式 ${m.mode}）`);
-  lines.push(`明文 dump：${m.files.plain ?? '（已压缩后删除）'}  ${m.files.plainBytes} 字节`);
-  lines.push(`压缩产物：${m.files.gz}  ${m.files.gzBytes} 字节  sha256=${m.files.gzSha256}`);
+  lines.push(`明文 dump：${m.files.plain ?? '（已压缩/加密后删除）'}  ${m.files.plainBytes} 字节  sha256=${m.files.plainSha256}`);
+  const enc = m.encryption;
+  lines.push(
+    `产物：${m.files.artifact}  ${m.files.artifactBytes} 字节  sha256=${m.files.artifactSha256}` +
+      (enc
+        ? `\n加密：${enc.scheme}/${enc.mode}（${enc.cipher}${enc.recipient ? `，收件人 ${enc.recipient}` : ''}）；解密自检：${enc.decryptVerified ? '通过' : '**未做**'}`
+        : '\n加密：未加密（明文备份——出仓库前必须自行加密）'),
+  );
+  if (enc) lines.push(`加密前 sha256：${m.files.preEncryptionSha256}`);
   lines.push(`内容统计：表 ${m.stats.tables} / COPY 段 ${m.stats.copySegments} / 数据行 ${m.stats.totalRows} / 扩展 [${m.stats.extensions.join(',')}] / 索引语句 ${m.stats.indexStatements} / 迁移行 ${String(m.stats.migrationsRows)}`);
   lines.push(`关键表行数：${Object.entries(m.keyTableRows).map(([k, v]) => `${k}=${v}`).join('  ') || '（未采集）'}`);
-  lines.push(`耗时：dump ${m.durations.dumpMs}ms / 统计 ${m.durations.statsMs}ms / 压缩 ${m.durations.compressMs}ms / 合计 ${m.durations.totalMs}ms`);
+  if (m.remote) {
+    lines.push(
+      `远端归档：${m.remote.target} — ${m.remote.uploaded.length} 个对象 / ${m.remote.bytes} 字节；` +
+        `内容级核对：${m.remote.contentVerified ? `通过（ETag ${m.remote.etag}）` : '未做（ETag 非单段 md5，只比了体积）'}`,
+    );
+  }
+  lines.push(
+    `耗时：dump ${m.durations.dumpMs}ms / 统计 ${m.durations.statsMs}ms / 压缩 ${m.durations.compressMs}ms / 加密 ${m.durations.encryptMs}ms / 合计 ${m.durations.totalMs}ms`,
+  );
   for (const c of m.checks) lines.push(`  [${c.ok ? 'ok' : 'FAIL'}] ${c.name} — ${c.detail}`);
   return lines;
 }
 
-/** 备份文件名的规范形式（时间戳 + 可选标签；order 便于 `ls | sort` 取最新）。 */
-export function backupFileName(opts: { database: string; stamp: string; label?: string; compressed?: boolean }): string {
+/** 备份文件名的规范形式（时间戳 + 可选标签 + **扩展名链**；order 便于 `ls | sort` 取最新）。 */
+export function backupFileName(opts: {
+  database: string;
+  stamp: string;
+  label?: string;
+  compression?: Compression;
+  encryption?: Encryption;
+}): string {
   const label = opts.label ? `-${opts.label.replace(/[^A-Za-z0-9._-]/g, '_')}` : '';
-  return `${opts.database}${label}-${opts.stamp}.sql${opts.compressed ? '.gz' : ''}`;
+  return `${opts.database}${label}-${opts.stamp}.sql${artifactSuffix(opts.compression ?? 'none', opts.encryption ?? 'none')}`;
 }
 
-/** 从备份文件名解析时间戳（保留/清理策略按它排序，而不是按 mtime——拷贝会改动 mtime）。 */
+/**
+ * 从备份文件名解析时间戳（保留/清理策略按它排序，而不是按 mtime——拷贝会改动 mtime）。
+ * 走 artifact.ts 的扩展名链解析 ⇒ 新增形态（.gpg 等）不会再出现"保留策略看不见这个文件"的漏网。
+ */
 export function stampFromBackupName(name: string): string | null {
-  const m = /-(\d{8}-\d{6})(?:\.sql)(?:\.gz)?$/.exec(name);
-  return m ? m[1] : null;
+  return artifactStamp(name);
 }
