@@ -34,6 +34,7 @@ import { EventsApiModule } from './modules/events/events-api.module';
 import { AuditModule } from './modules/audit/audit.module';
 import { RateLimitModule } from './core/rate-limit/rate-limit.module';
 import { KnowledgeApiModule } from './modules/knowledge/knowledge.module';
+import { EvaluationApiModule } from './modules/evaluation/evaluation-api.module'; // M9-P1 Evaluation
 import { TracingModule } from './core/tracing/tracing.module';
 import { ObservabilityApiModule } from './modules/observability/observability-api.module';
 import { GenerationsModule } from './modules/generations/generations.module';
@@ -91,6 +92,7 @@ import { SseModule } from './core/sse/sse.module';
     FeedbackApiModule,
     AuditApiModule,
     KnowledgeApiModule,
+    EvaluationApiModule, // M9-P1 Evaluation / Experimentation
     GenerationsModule,
     TasksModule,
     ChatModule,

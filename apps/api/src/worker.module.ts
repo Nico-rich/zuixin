@@ -19,6 +19,7 @@ import { AgentRunWorkerModule } from './worker/agent-run/agent-run-worker.module
 import { WorkflowWorkerModule } from './worker/workflow/workflow-worker.module';
 import { ExtensionsModule } from './modules/extensions/extensions.module';
 import { SchedulerWorkerModule } from './worker/scheduler/scheduler-worker.module';
+import { EvaluationWorkerModule } from './worker/evaluation/evaluation-worker.module'; // M9-P1 评测队列
 import { SecurityModule } from './modules/security/security.module';
 import { LifecycleModule } from './lifecycle/lifecycle.module';
 
@@ -38,6 +39,7 @@ import { LifecycleModule } from './lifecycle/lifecycle.module';
     AgentRunWorkerModule,
     WorkflowWorkerModule,
     SchedulerWorkerModule,
+    EvaluationWorkerModule, // M9-P1：evaluation 队列（评测 run 执行）
     LifecycleModule, // Pre-M9 G3：有序停机阶段（pause → lease finalization → 等在途 job → 关 BullMQ）
   ],
 })
