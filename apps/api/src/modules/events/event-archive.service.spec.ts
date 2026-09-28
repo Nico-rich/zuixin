@@ -10,6 +10,8 @@ import type { JobHandler, JobHandlerContext } from '../scheduler/scheduler.servi
 function makeService(prismaOverrides: Record<string, unknown> = {}, scheduleResult?: unknown) {
   const prisma = {
     user: { findFirst: vi.fn().mockResolvedValue({ id: 'admin-1' }) },
+    // 平台周期作业行：默认"缺失"（= 需要开通）；已有行（幂等命中/人工停用）由测试覆盖
+    scheduledJob: { findFirst: vi.fn().mockResolvedValue(null) },
     eventEnvelope: {
       findMany: vi.fn().mockResolvedValue([]),
       updateMany: vi.fn().mockResolvedValue({ count: 0 }),
@@ -25,8 +27,9 @@ function makeService(prismaOverrides: Record<string, unknown> = {}, scheduleResu
     getHandler: (name: string) => handlers.get(name),
     listHandlers: () => [...handlers.keys()],
   };
-  const svc = new EventArchiveService(prisma as never, scheduler as never);
-  return { svc, prisma, scheduler, handlers };
+  const metrics = { recordMetric: vi.fn().mockResolvedValue(undefined) };
+  const svc = new EventArchiveService(prisma as never, scheduler as never, metrics as never);
+  return { svc, prisma, scheduler, metrics, handlers };
 }
 
 /** 行替身（只用到 id） */
@@ -133,6 +136,30 @@ describe('EventArchiveService（M9-11 归档：published → consumed，条件�
   });
 });
 
+// M11-P8（维度2#10）：归档活性指标
+describe('EventArchiveService 归档活性指标（event_archive_count）', () => {
+  it('每次归档执行写一条 event_archive_count（value = 归档行数；平台级归属 null；无敏感字段）', async () => {
+    const { svc, prisma, metrics } = makeService();
+    prisma.eventEnvelope.findMany.mockResolvedValue(rows(3));
+    prisma.eventEnvelope.updateMany.mockResolvedValue({ count: 3 });
+    await svc.archiveExpired({ now: new Date() });
+    expect(metrics.recordMetric).toHaveBeenCalledWith(
+      'event_archive_count', 3, 'count',
+      expect.objectContaining({ scanned: 3, batches: 1 }),
+      null,
+    );
+    // 指标 labels 不含任何行级/敏感字段（只有计数与窗口）
+    const labels = metrics.recordMetric.mock.calls[0][3];
+    expect(Object.keys(labels).sort()).toEqual(['batches', 'retentionMs', 'scanned']);
+  });
+
+  it('0 行也写指标（0 值是"归档在跑、只是没活儿"的活性信号——与"归档没跑"可区分）', async () => {
+    const { svc, metrics } = makeService();
+    await svc.archiveExpired();
+    expect(metrics.recordMetric).toHaveBeenCalledWith('event_archive_count', 0, 'count', expect.anything(), null);
+  });
+});
+
 describe('EventArchiveService 启动接线（handler 注册 + 周期作业开通，绝不阻塞启动）', () => {
   beforeEach(() => vi.clearAllMocks());
 
@@ -144,6 +171,7 @@ describe('EventArchiveService 启动接线（handler 注册 + 周期作业开通
       handler: EVENT_ARCHIVE_HANDLER, type: 'recurring', cron: EVENT_ARCHIVE_CRON,
       idempotencyKey: EVENT_ARCHIVE_IDEMPOTENCY_KEY, ownerUserId: 'admin-1', organizationId: null,
     }));
+    svc.onModuleDestroy(); // 清探测定时器（测试隔离）
   });
 
   it('handler 真实可执行：payload 作为覆盖项传入归档（周期触发 → 归档生效）', async () => {
@@ -155,25 +183,31 @@ describe('EventArchiveService 启动接线（handler 注册 + 周期作业开通
     await handler({ jobId: 'j', name: 'n', handler: EVENT_ARCHIVE_HANDLER, attempt: 1, payload: { batchSize: 1 }, organizationId: null, traceId: null } as JobHandlerContext);
     expect(prisma.eventEnvelope.updateMany).toHaveBeenCalledTimes(1);
     expect(prisma.eventEnvelope.findMany.mock.calls[0][0].take).toBe(1);
+    svc.onModuleDestroy();
   });
 
-  it('无 admin 用户（未初始化的库）→ 不开通、不抛错（启动照常）', async () => {
+  it('无 admin 用户（未初始化的库）→ 不开通、不抛错（启动照常；稍后自动重试——D2-18）', async () => {
     const { svc, scheduler } = makeService({ user: { findFirst: vi.fn().mockResolvedValue(null) } });
     await expect(svc.onModuleInit()).resolves.toBeUndefined();
     expect(scheduler.schedule).not.toHaveBeenCalled();
     expect(scheduler.registerHandler).toHaveBeenCalled(); // handler 仍注册（手工作业可执行）
+    svc.onModuleDestroy(); // 这一路径会安排退避重试 → 停机时清除
   });
 
-  it('开通失败（DB/Redis 不可达）→ 只告警，绝不让事件归档阻断进程启动', async () => {
+  it('开通失败（DB/Redis 不可达）→ 只告警 + 安排重试，绝不让事件归档阻断进程启动', async () => {
     const { svc, scheduler } = makeService({}, null);
     scheduler.schedule.mockRejectedValue(new Error('connect ECONNREFUSED'));
     await expect(svc.onModuleInit()).resolves.toBeUndefined();
+    svc.onModuleDestroy();
   });
 
-  it('幂等命中（已存在）→ 不重复开通；非活跃态（paused/dead）→ 绝不自动复活（只告警）', async () => {
-    const { svc, scheduler } = makeService({}, { job: { id: 'sched-1', status: 'paused' }, created: false });
+  it('已注册且非活跃（paused/dead）→ 不重复开通、绝不自动复活（只告警）；结束即停探测', async () => {
+    const { svc, scheduler } = makeService({
+      scheduledJob: { findFirst: vi.fn().mockResolvedValue({ id: 'sched-1', status: 'paused' }) },
+    }, { job: { id: 'sched-1', status: 'paused' }, created: false });
     await expect(svc.onModuleInit()).resolves.toBeUndefined();
-    expect(scheduler.schedule).toHaveBeenCalledTimes(1); // 只做幂等查询，不 resume
+    expect(scheduler.schedule).not.toHaveBeenCalled(); // 行存在 → 连开通调用都不发起（绝不抢运维裁决）
     expect((scheduler as { resume?: unknown }).resume).toBeUndefined(); // 归档服务绝不调用 resume
+    svc.onModuleDestroy();
   });
 });

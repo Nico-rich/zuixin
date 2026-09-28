@@ -18,6 +18,9 @@ import { EventArchiveService } from './event-archive.service';
  * 它不是 relay/消费者：不加订阅、不建队列、不改表结构，只把超过保留窗口的 `published` 行
  * 条件收敛为 `consumed`（周期触发复用既有 Scheduler——`SchedulerModule` 由此导入；
  * 本模块被 SchedulerWorkerModule 导入 → worker 进程即归档的执行方）。
+ *
+ * M11-P8：归档的**开通**改为周期性探测（`RecurringJobProvisioner`，D2-18）并新增归档活性指标
+ * （`event_archive_count`，维度2#10）——仍不删行、不加订阅、不建队列（`SchedulerModule` 导入关系不变）。
  */
 @Module({
   imports: [EventsModule, OrganizationsModule, SchedulerModule],

@@ -1,6 +1,8 @@
-import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { SchedulerService } from '../scheduler/scheduler.service';
+import { RecurringJobProvisioner } from '../scheduler/recurring-job-provisioner';
+import { ObservabilityService, RETENTION_METRIC_NAMES } from '../../core/tracing/observability.service';
 
 /**
  * M9-11 / M10-P10：EventEnvelope **归档消费者**（published → consumed）。
@@ -26,6 +28,12 @@ import { SchedulerService } from '../scheduler/scheduler.service';
  *   与真实消费者的 `deliver` 竞争，都只有唯一赢家；已 consumed 的行绝不二次处理；
  * - **批量**：每批 `limit=batchSize` 一次 SELECT + 一次 UPDATE（无长事务、无全表锁），
  *   批数上限 `maxBatches`（单次执行有界，未扫完的部分留给下一个周期——绝不长时间占用 worker）。
+ *
+ * M11-P8 增补（不改上述任何边界）：
+ * - **D2-18 开通失败重试**：周期作业开通由 `RecurringJobProvisioner` 周期性探测（缺失/失败 → 退避重试开通），
+ *   不再"启动时失败一次即永久停摆"；人工 paused/dead 仍绝不自动复活；
+ * - **维度2#10 归档活性指标**：每次归档执行都写一条 `event_archive_count`（value = 归档行数，含 0），
+ *   0 行另打 debug 日志——"归档在跑但没活儿"与"归档没跑"可区分（仍有界、仍不删行）。
  */
 export const DEFAULT_EVENT_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 export const DEFAULT_ARCHIVE_BATCH_SIZE = 500;
@@ -73,70 +81,53 @@ function clampInt(value: number | undefined, fallback: number, min: number, max:
 }
 
 @Injectable()
-export class EventArchiveService implements OnModuleInit {
+export class EventArchiveService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger('EventArchive');
+  private readonly provisioner: RecurringJobProvisioner;
 
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(SchedulerService) private readonly scheduler: SchedulerService,
-  ) {}
+    @Inject(ObservabilityService) private readonly metrics: ObservabilityService,
+  ) {
+    this.provisioner = new RecurringJobProvisioner({
+      prisma,
+      scheduler,
+      logger: this.logger,
+      spec: {
+        name: EVENT_ARCHIVE_JOB_NAME,
+        handler: EVENT_ARCHIVE_HANDLER,
+        cron: EVENT_ARCHIVE_CRON,
+        idempotencyKey: EVENT_ARCHIVE_IDEMPOTENCY_KEY,
+        // 单次执行有界（10 批 × 500 行）；超过退避重投 3 次仍失败 → dead（运维面可见）
+        timeoutMs: 120_000, maxAttempts: 3, backoffMs: 5_000,
+        inactiveHint: '自动归档当前停用，需运维显式 resume',
+      },
+    });
+  }
 
   /**
    * worker 启动：① 注册 handler（纯内存操作，必须成功——否则运维/测试创建的归档作业会被判"handler 未注册"）；
-   * ② 尽力开通平台周期作业（best-effort：DB 未就绪/无 admin/Redis 不可达 → 只告警，**绝不让事件归档
-   *   阻断进程启动**；周期作业缺失只影响"自动归档"，手工创建同 handler 的作业仍可执行）。
+   * ② 开通平台周期作业（best-effort：DB 未就绪/无 admin/Redis 不可达 → **只告警 + 稍后自动重试**，
+   *   **绝不让事件归档阻断进程启动**；周期作业缺失只影响"自动归档"，手工创建同 handler 的作业仍可执行）。
+   *
+   * M11-P8（D2-18）：开通**不再是"一次性、失败即永久告警"**——`RecurringJobProvisioner` 会周期性探测
+   * （按幂等键直查行）：缺失/失败 → 指数退避重试开通（含"seed 前无 admin"这个启动竞态）；已被人工
+   * pause/dead 的作业仍**绝不自动复活**（运维显式动作优先，只告警）。
    *
    * 注：本服务由 EventPlatformModule 提供，而该模块同时被 SchedulerWorkerModule（worker 进程，
-   * 归档的真实执行方）与 EventsApiModule（API 进程）导入——两个进程都会注册 handler 并尝试开通，
+   * 归档的真实执行方）与 EventsApiModule（API 进程）导入——两个进程都会注册 handler 并探测开通，
    * 开通受 idempotencyKey 全局唯一约束保护（并发 P2002 → 复用赢家行），绝不产生第二个作业。
    */
   async onModuleInit(): Promise<void> {
     this.scheduler.registerHandler(EVENT_ARCHIVE_HANDLER, (ctx) =>
       this.archiveExpired((ctx.payload ?? {}) as ArchiveRunOptions).then(() => undefined));
-    try {
-      await this.ensureRecurringJob();
-    } catch (err) {
-      this.logger.warn(
-        `归档周期作业开通失败（不阻塞启动；可人工创建 handler=${EVENT_ARCHIVE_HANDLER} 的 recurring 作业）: ${(err as Error).message}`,
-      );
-    }
+    await this.provisioner.start();
   }
 
-  /**
-   * 开通/确认平台周期作业（幂等）。归属：平台 admin（ScheduledJob.ownerUserId 是必填外键，
-   * 平台作业必须有 owner——选最早的 admin 作为平台身份；**不为此改 schema**）。
-   * 已被人工 pause/dead 的作业**绝不自动复活**（运维显式动作优先），只告警提示。
-   */
-  private async ensureRecurringJob(): Promise<void> {
-    const owner = await this.prisma.user.findFirst({
-      where: { role: 'admin' }, orderBy: { createdAt: 'asc' }, select: { id: true },
-    });
-    if (!owner) {
-      this.logger.warn('无 admin 用户（未初始化？）→ 暂不开通归档周期作业');
-      return;
-    }
-    const { job, created } = await this.scheduler.schedule({
-      ownerUserId: owner.id,
-      organizationId: null,
-      name: EVENT_ARCHIVE_JOB_NAME,
-      handler: EVENT_ARCHIVE_HANDLER,
-      type: 'recurring',
-      cron: EVENT_ARCHIVE_CRON,
-      // 单次执行有界（10 批 × 500 行）；超过退避重投 3 次仍失败 → dead（运维面可见）
-      timeoutMs: 120_000, maxAttempts: 3, backoffMs: 5_000,
-      idempotencyKey: EVENT_ARCHIVE_IDEMPOTENCY_KEY,
-    });
-    if (created) {
-      this.logger.log({ jobId: job.id, cron: EVENT_ARCHIVE_CRON, retentionMs: eventRetentionMs() }, '归档周期作业已开通');
-      return;
-    }
-    if (job.status !== 'scheduled' && job.status !== 'running') {
-      // paused/dead/completed/cancelled：运维意图或失败终态 —— 绝不静默复活，只提示
-      this.logger.warn(
-        { jobId: job.id, status: job.status },
-        '归档周期作业不在活跃态（paused/dead/终态）→ 自动归档当前停用，需运维显式 resume',
-      );
-    }
+  /** 停机清探测定时器（幂等；绝不拖住进程退出） */
+  onModuleDestroy(): void {
+    this.provisioner.stop();
   }
 
   /**
@@ -173,7 +164,15 @@ export class EventArchiveService implements OnModuleInit {
     }
     if (archived > 0) {
       this.logger.log({ archived, scanned, batches, cutoff, retentionMs }, 'EventEnvelope 归档完成（published → consumed）');
+    } else {
+      // M11-P8（D2-18）：0 行也留痕（debug）——"归档在跑但没活儿"与"归档没跑"必须可区分
+      this.logger.debug({ scanned, batches, cutoff, retentionMs }, 'EventEnvelope 归档完成：无超期 published 行');
     }
+    // M11-P8（维度2#10）归档**活性指标**：每次执行都写一条（value = 归档行数，含 0）。
+    // 平台级事实 → organizationId 显式 null；**无敏感字段**（只有计数与窗口，不含 eventId/actor/payload）。
+    await this.metrics.recordMetric(RETENTION_METRIC_NAMES.eventArchiveCount, archived, 'count', {
+      scanned, batches, retentionMs,
+    }, null);
     return { scanned, archived, batches, retentionMs };
   }
 }
