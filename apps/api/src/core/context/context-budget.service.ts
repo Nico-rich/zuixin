@@ -1,6 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
-import { MemoryBlock } from './types';
+import { DEGRADED_SUMMARY_PRIORITY, MemoryBlock } from './types';
 import { TokenEstimator } from './token-estimator';
 
 export interface ContextBudget {
@@ -40,6 +40,9 @@ export function scopePriority(scope: MemoryBlock['scope']): number {
  * - knowledge 组内：保持输入顺序（KnowledgeSource 已按 similarity 降序）→ 高相似度优先；
  * - summary 组（M9-P2）：块携带版本段（block.source.segments，最早→最新）时，超预算**裁掉最早版本段**
  *   ——保留最新段（最近的对话信息），仍然超预算的那一段才走通用比例截断；
+ * - 降级块（D29，block.degraded=true，如【摘要降级】兜底段）：**不裁不截，放不下就整块丢弃**
+ *   ——它的预算优先级最低（DEGRADED_SUMMARY_PRIORITY=6，排在最近消息之后），
+ *   绝不因"压缩过的原文"挤占正常摘要/记忆/知识/消息的预算；
  * - 单块超过剩余预算 → 按比例确定性截断 content 并重估 tokenCount（不丢消息、不破坏配对）；
  * - 同输入同预算 → 同输出。
  */
@@ -70,7 +73,7 @@ export class ContextBudgetService {
     // 按 priority 分组并保持组内原顺序（order 排序后已保证时间/相似度语义）
     const groups = new Map<number, MemoryBlock[]>();
     for (const b of optional) {
-      const p = b.priority ?? this.defaultPriority(b.scope);
+      const p = this.priorityOf(b);
       if (!groups.has(p)) groups.set(p, []);
       groups.get(p)!.push(b);
     }
@@ -87,6 +90,11 @@ export class ContextBudgetService {
           remaining -= tokens;
         } else if (priority === 5) {
           truncated = true; // recent 组：预算不足 → 丢弃（更旧的更不可能保留）
+          continue;
+        } else if (block.degraded === true) {
+          // D29 降级块（如【摘要降级】兜底段）：置尾 + 最低优先级 → 预算不足整块丢弃，
+          // 绝不裁段/截断后挤占正常内容的预算（降级文本不与正常来源同权）。
+          truncated = true;
           continue;
         } else if (block.scope === 'summary' && Array.isArray(block.source?.segments)) {
           // summary 组：裁掉最早版本段（保留最新段——最近的对话上下文更相关）
@@ -112,6 +120,15 @@ export class ContextBudgetService {
       estimatedTokens: kept.reduce((s, b) => s + this.tokensOf(b), 0),
       truncated,
     };
+  }
+
+  /**
+   * 块的实际预算优先级 = 显式 priority > scope 默认；**降级块（D29）强制不低于 DEGRADED_SUMMARY_PRIORITY**。
+   * 降权在统一决策点兜底：即使调用方忘了给降级块标 priority，它也绝不可能与正常来源同权。
+   */
+  private priorityOf(b: MemoryBlock): number {
+    const base = b.priority ?? this.defaultPriority(b.scope);
+    return b.degraded === true ? Math.max(DEGRADED_SUMMARY_PRIORITY, base) : base;
   }
 
   private tokensOf(b: MemoryBlock): number {

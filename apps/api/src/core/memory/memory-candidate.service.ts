@@ -22,6 +22,11 @@ import { SummaryRefinerService } from './summary-refiner.service';
  * 3. 提升走既有 Memory 表（active 语义 = Memory.status=active，ContextAssembler 既有 sources 只读该表）；
  *    MemoryCandidate 表**不直接进上下文**。
  *
+ * 去重（X-29，「先查后写 + DB 约束兜底」双层）：
+ * - 应用层：isDuplicate（Memory 按 content / MemoryCandidate 按 contentHash）→ 命中即计入 duplicated；
+ * - DB 层：UNIQUE(userId, contentHash)（M10 W0）——并发竞态窗口内 create 撞 P2002 → 计 duplicated 并继续，
+ *   绝不当错误抛出（不影响聊天），也绝无重复候选行。
+ *
  * 上限闸门与既有提取器同源：每日候选上限复用 limits.dailyMemoryCandidates（不计入则只留 candidate 不提升）。
  */
 export const DEFAULT_PROMOTE_CONFIDENCE = 0.8;
@@ -50,7 +55,7 @@ export interface ExtractResult {
   extracted: number;
   promoted: number;
   rejected: number;
-  /** 与既有记忆/候选重复而跳过的条数 */
+  /** 与既有记忆/候选重复而跳过的条数（应用层预检命中，或并发下 DB UNIQUE 兜底 P2002） */
   duplicated: number;
 }
 
@@ -116,7 +121,7 @@ export class MemoryCandidateService {
       const result: ExtractResult = { summaryId, skipped: null, ...EMPTY };
 
       for (const item of parsed.memories.slice(0, MAX_ITEMS_PER_SUMMARY)) {
-        // 去重：同用户同内容（Memory 任意状态 / MemoryCandidate 任意状态）→ 不重复落库
+        // 去重（X-29）：同用户同内容（Memory 任意状态 / MemoryCandidate 任意状态）→ 不重复落库
         const dup = await this.isDuplicate(conversation.userId, item.content);
         if (dup) { result.duplicated++; continue; }
 
@@ -126,19 +131,28 @@ export class MemoryCandidateService {
           && item.importance >= promoteLimits.importance
           && remaining > 0;
 
-        const row = await this.prisma.memoryCandidate.create({
-          data: {
-            userId: conversation.userId,
-            projectId: conversation.projectId,
-            sourceSummaryId: summary.id,
-            content: item.content,
-            contentHash: memoryContentHash(item.content), // M10 W0：去重锚点（A11 语义补强）
-            category: item.category as MemoryCategory,
-            importance: item.importance,
-            confidence: item.confidence,
-            status: rejected ? 'rejected' : 'candidate',
-          },
-        });
+        let row: Awaited<ReturnType<typeof this.prisma.memoryCandidate.create>>;
+        try {
+          row = await this.prisma.memoryCandidate.create({
+            data: {
+              userId: conversation.userId,
+              projectId: conversation.projectId,
+              sourceSummaryId: summary.id,
+              content: item.content,
+              contentHash: memoryContentHash(item.content), // M10 W0：去重锚点（A11 语义补强）
+              category: item.category as MemoryCategory,
+              importance: item.importance,
+              confidence: item.confidence,
+              status: rejected ? 'rejected' : 'candidate',
+            },
+          });
+        } catch (err) {
+          // 并发兜底（X-29）：应用层 isDuplicate 与 INSERT 之间存在竞态窗口
+          //（同内容摘要被并发提炼 / 跨实例）。DB UNIQUE(userId, contentHash) 兜住第二行，
+          // 这里把 P2002 计为 duplicated 并继续——绝不产生重复候选行，也绝不当成错误（500）抛给调用方。
+          if ((err as { code?: string }).code === 'P2002') { result.duplicated++; continue; }
+          throw err;
+        }
         result.extracted++;
 
         if (eligible && row) {
@@ -203,6 +217,7 @@ export class MemoryCandidateService {
   /**
    * LLM 提炼：prompt 只包含真实消息行（**绝不含摘要文本**——防循环污染）。
    * 返回 null = LLM 不可用/输出非法（安全降级，不落任何候选）。
+   * D30：非法 JSON / 不合 schema 走 warn（此前静默 0 候选，线上无法区分"模型返回垃圾"与"无可提炼内容"）。
    */
   private async invokeExtractor(messages: Array<{ role: string; content: string }>) {
     const transcript = messages
@@ -218,15 +233,31 @@ export class MemoryCandidateService {
         { role: 'user', content: `真实对话消息：\n${transcript}` },
       ],
     });
-    const parsed = ExtractedCandidatesSchema.safeParse(JSON.parse(r.content));
-    if (!parsed.success) return null;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(r.content);
+    } catch {
+      this.logger.warn('记忆候选提炼：LLM 输出不是合法 JSON → 本次 0 候选（安全降级，不影响聊天）');
+      return null;
+    }
+    const parsed = ExtractedCandidatesSchema.safeParse(raw);
+    if (!parsed.success) {
+      this.logger.warn('记忆候选提炼：LLM 输出不符合约定 schema → 本次 0 候选（安全降级，不影响聊天）');
+      return null;
+    }
     return { memories: parsed.data.memories.filter((m) => this.categories.includes(m.category)) };
   }
 
+  /**
+   * 应用层去重预检（X-29，「先查后写」的快路径；慢竞态由 create 的 P2002 兜底）：
+   * - MemoryCandidate 按 **contentHash**（与 DB UNIQUE(userId, contentHash) 同锚点、同哈希口径，
+   *   走唯一索引，命中即等价于 DB 约束会拒绝的那一行）；
+   * - Memory 表无 contentHash 列 → 按 content 精确匹配（哈希相同 ⇔ 内容相同，语义等价）。
+   */
   private async isDuplicate(userId: string, content: string): Promise<boolean> {
     const [memory, candidate] = await Promise.all([
       this.prisma.memory.count({ where: { userId, content } }),
-      this.prisma.memoryCandidate.count({ where: { userId, content } }),
+      this.prisma.memoryCandidate.count({ where: { userId, contentHash: memoryContentHash(content) } }),
     ]);
     return memory > 0 || candidate > 0;
   }

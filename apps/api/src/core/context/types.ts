@@ -2,10 +2,12 @@ import { ChatMessage } from '../../providers/llm/llm.types';
 
 /**
  * 上下文块来源。
- * M1 仅使用 'conversation'（最近会话消息）；
- * 未来按审查报告 §4 扩展：'system'（Agent System Prompt）、
- * 'user'（User Memory）、'project'（Project Memory）、'knowledge'（KB/RAG 检索）。
- * M9-P2 已实现：'summary'（对话摘要版本段——超预算时裁掉最早版本段）。
+ * 已落地（本枚举描述现状，不再是"未来扩展"清单）：
+ * - 'conversation'：最近会话消息（M1 内置源，ContextAssembler 内建）；
+ * - 'project' / 'user'：项目级/用户级 active 记忆（ProjectMemorySource / UserMemorySource）；
+ * - 'summary'：对话摘要版本段（M9-P2 ConversationSummarySource——超预算时裁掉最早版本段）；
+ * - 'knowledge'：KB/RAG 检索块（KnowledgeSource，需 Agent 配置 knowledge.enabled 才检索）。
+ * 未落地：'system'（Agent System Prompt 由运行链路单独注入，不经本源注册）。
  */
 export type MemoryScope = 'system' | 'conversation' | 'user' | 'project' | 'knowledge' | 'summary';
 
@@ -21,6 +23,12 @@ export interface MemoryBlock {
   required?: boolean;
   /** token 估算（BudgetApplier 截断用） */
   tokenCount?: number;
+  /**
+   * D29 降级块标记：内容为降级产物（如【摘要降级】兜底段——LLM 不可用时按消息原文压缩）。
+   * 语义：置尾（order = CONTEXT_ORDER.degraded_summary）+ 最低预算优先级（DEGRADED_SUMMARY_PRIORITY）+
+   * 预算不足直接丢弃——绝不与正常来源同权进入上下文排序。非降级块不设此字段。
+   */
+  degraded?: boolean;
   /** 来源元数据（引用/citation 预留，不注入模型） */
   source?: Record<string, unknown>;
 }
@@ -44,8 +52,8 @@ export interface AssembleContext {
 
 /**
  * 上下文块组装顺序锁定（架构审查报告 §4）。
- * system → project memory → user memory → summary → knowledge → recent messages。
- * 未实现的源（summary/knowledge/system）不产生任何数据。
+ * system → project memory → user memory → summary → knowledge → recent messages →（降级摘要，置尾）。
+ * 'system' 位由运行链路的 System Prompt 单独注入，不产生本表数据；其余位均已落地实现。
  */
 export const CONTEXT_ORDER = {
   system: 0,
@@ -54,13 +62,19 @@ export const CONTEXT_ORDER = {
   summary: 30,
   knowledge: 40,
   recent_messages: 100,
+  /** D29：降级摘要（含【摘要降级】兜底段的版本链）排到全部常规源之后——置尾，绝不与正常摘要同权 */
+  degraded_summary: 110,
 } as const;
 
 /**
- * 未来上下文数据源接口（M6+ 实现）：
- * Conversation Summary / User Memory / Project Memory / KB 检索
- * 均实现此接口并注册进 ContextAssembler 即生效。
- * 注意：M1 不实现任何未来源。
+ * D29 降级块的预算优先级：6 = 低于全部常规源（summary=3 / knowledge=4 / recent_messages=5）。
+ * 预算不足时最先被丢弃，绝不挤占正常摘要、记忆与最近消息的预算。
+ */
+export const DEGRADED_SUMMARY_PRIORITY = 6;
+
+/**
+ * 上下文数据源接口：ProjectMemory / UserMemory / ConversationSummary / Knowledge 均实现本接口，
+ * 注册进 ContextAssembler 即生效（注册点在 ContextModule 的 useFactory）。
  */
 export interface MemorySource {
   readonly scope: MemoryScope;

@@ -40,6 +40,17 @@ export interface MemoryExtractor {
 /** 接口的 DI token（接口类型在运行时被擦除，不能用类名当 token） */
 export const MEMORY_EXTRACTOR = Symbol('MEMORY_EXTRACTOR');
 
+/**
+ * zod 失败摘要（D30 日志用）：只输出 issue 的路径 + 错误码，**不输出模型返回的原始值**（脱敏纪律）。
+ * 例：`memories.0.importance:invalid_type, memories:invalid_type`
+ */
+function issuesOf(error: { issues: ReadonlyArray<{ path: ReadonlyArray<string | number>; code: string }> }): string {
+  return error.issues
+    .slice(0, 5)
+    .map((i) => `${i.path.map(String).join('.') || '<root>'}:${i.code}`)
+    .join(', ');
+}
+
 @Injectable()
 export class LLMMemoryExtractor implements MemoryExtractor {
   private readonly logger = new Logger('MemoryExtractor');
@@ -69,8 +80,21 @@ export class LLMMemoryExtractor implements MemoryExtractor {
           { role: 'user', content: `用户消息："${input.userMessage}"\nAI 回复："${input.assistantReply.slice(0, 2000)}"` },
         ],
       });
-      const parsed = ExtractedCandidatesSchema.safeParse(JSON.parse(r.content));
-      if (!parsed.success) return 0; // 非法 JSON → 安全降级（mock LLM 场景即此路径）
+      // D30：非法 JSON **不再静默**——此前两条降级路径都直接 return 0，线上无法区分
+      // "模型返回垃圾" 与 "模型没提取到东西"。降级行为不变（0 候选、不抛错），只补 warn 可观测性。
+      // 日志只记结构信息（issue 路径/码），绝不落模型原文（脱敏纪律）。
+      let raw: unknown;
+      try {
+        raw = JSON.parse(r.content);
+      } catch {
+        this.logger.warn('记忆提取：LLM 输出不是合法 JSON → 本轮 0 候选（安全降级，不影响聊天）');
+        return 0;
+      }
+      const parsed = ExtractedCandidatesSchema.safeParse(raw);
+      if (!parsed.success) {
+        this.logger.warn(`记忆提取：LLM 输出不符合约定 schema → 本轮 0 候选（安全降级）：${issuesOf(parsed.error)}`);
+        return 0;
+      }
 
       let saved = 0;
       for (const c of parsed.data.memories) {

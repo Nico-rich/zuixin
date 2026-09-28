@@ -145,4 +145,49 @@ describe('ContextBudgetService（统一预算决策，deterministic）', () => {
     const r2 = svc.apply(blocks, { maxTokens: 40 });
     expect(r1.blocks.map((b) => b.content)).toEqual(r2.blocks.map((b) => b.content));
   });
+
+  // ===== D29 降级块（【摘要降级】兜底段）：降权 + 置尾，绝不与正常来源同权 =====
+
+  const degradedBlock = (over: Partial<MemoryBlock> = {}) =>
+    makeBlock({
+      scope: 'summary', degraded: true, order: 110, priority: 6,
+      content: '【对话摘要】【摘要降级：模型不可用，按消息原文压缩】\n用户：内容1',
+      source: { summaryId: 's1', version: 1, segments: ['【摘要降级：模型不可用，按消息原文压缩】\n用户：内容1'] },
+      ...over,
+    });
+
+  it('降级块预算不足 → 整块丢弃（不裁段/不截断），正常摘要与记忆照常保留', () => {
+    const normal = makeBlock({
+      scope: 'summary', content: '【对话摘要】正常摘要文本', order: 30, tokenCount: 12,
+      source: { summaryId: 's2', version: 2, segments: ['正常摘要文本'] },
+    });
+    const memory = makeBlock({ scope: 'user', content: '记忆', order: 20, tokenCount: 10 });
+    const r = svc.apply([normal, memory, degradedBlock({ tokenCount: 40 })], { maxTokens: 22 });
+    expect(r.truncated).toBe(true);
+    expect(r.blocks.map((b) => b.content)).toEqual(['记忆', '【对话摘要】正常摘要文本']);
+    expect(r.blocks.some((b) => b.degraded === true)).toBe(false);
+  });
+
+  it('降级块即使被调用方漏标 priority → 仍按最低优先级分配（预算只够正常块时被丢弃）', () => {
+    const normal = makeBlock({
+      scope: 'summary', content: '【对话摘要】正常摘要文本', order: 30, tokenCount: 12,
+      source: { summaryId: 's2', version: 2, segments: ['正常摘要文本'] },
+    });
+    const r = svc.apply([normal, degradedBlock({ priority: undefined, tokenCount: 40 })], { maxTokens: 12 });
+    expect(r.blocks.map((b) => b.content)).toEqual(['【对话摘要】正常摘要文本']);
+  });
+
+  it('降级块预算足够 → 保留但置尾（输出顺序排在最近消息之后），不挤占正常内容', () => {
+    const recent = makeBlock({ scope: 'conversation', content: '最近消息', order: 100, tokenCount: 5 });
+    const r = svc.apply([degradedBlock({ tokenCount: 8 }), recent], { maxTokens: 50 });
+    expect(r.blocks).toHaveLength(2);
+    expect(r.blocks.map((b) => b.content)).toEqual(['最近消息', degradedBlock().content]); // 置尾：降级块在最后
+    expect(r.truncated).toBe(false);
+  });
+
+  it('降级块与正常来源同权重不会互相顶掉：预算恰够两者 → 都保留（只是降级块排在尾部）', () => {
+    const normal = makeBlock({ scope: 'summary', content: '【对话摘要】正常摘要', order: 30, tokenCount: 6 });
+    const r = svc.apply([degradedBlock({ tokenCount: 6 }), normal], { maxTokens: 12 });
+    expect(r.blocks.map((b) => b.content)).toEqual(['【对话摘要】正常摘要', degradedBlock().content]);
+  });
 });

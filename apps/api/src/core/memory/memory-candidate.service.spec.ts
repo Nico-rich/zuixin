@@ -1,10 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
-import { MemoryCandidateService } from './memory-candidate.service';
+import { Logger } from '@nestjs/common';
+import { MemoryCandidateService, memoryContentHash } from './memory-candidate.service';
 
 /** 内存 fake Prisma（只实现本服务用到的语义；时间递增保证次序确定） */
 type CandRow = {
   id: string; userId: string; projectId: string | null; sourceSummaryId: string | null;
-  content: string; category: string; importance: number; confidence: number;
+  content: string; contentHash?: string; category: string; importance: number; confidence: number;
   status: string; createdAt: Date; promotedAt: Date | null;
 };
 type MemRow = {
@@ -176,6 +177,44 @@ describe('MemoryCandidateService（三态提炼，防循环污染）', () => {
     expect(db.memories).toHaveLength(0);
   });
 
+  it('去重锚点 = contentHash（与 DB UNIQUE(userId, contentHash) 同口径）：既有候选指纹相同 → 跳过', async () => {
+    const content = '用户偏好亚马逊主图 2000×2000';
+    const db = makeDbWithInterval({
+      // 来源摘要为空 → 不触发 already_extracted 幂等分支，命中纯去重分支
+      candidates: [{ id: 'cand-old', userId: 'u1', projectId: null, sourceSummaryId: null, content, contentHash: memoryContentHash(content), category: 'preference', importance: 80, confidence: 0.9, status: 'rejected', createdAt: at(0), promotedAt: null }],
+    });
+    const { svc } = makeService(db, JSON.stringify({ memories: [item()] }));
+    const r = await svc.extractFromSummary('sum1');
+    expect(r).toMatchObject({ extracted: 0, promoted: 0, duplicated: 1 });
+    expect(db.candidates).toHaveLength(1);
+  });
+
+  it('落库候选携带 contentHash（内容 sha256；应用层预检与 DB 约束同一锚点）', async () => {
+    const db = makeDbWithInterval();
+    const { svc } = makeService(db, JSON.stringify({ memories: [item()] }));
+    await svc.extractFromSummary('sum1');
+    expect(db.candidates[0].contentHash).toBe(memoryContentHash('用户偏好亚马逊主图 2000×2000'));
+  });
+
+  it('并发兜底（X-29）：create 撞 UNIQUE(P2002) → 计 duplicated 并继续，绝不抛错（500）、绝无重复候选行', async () => {
+    const db = makeDbWithInterval();
+    const reply = JSON.stringify({
+      memories: [
+        { content: '并发候选A', category: 'preference', importance: 80, confidence: 0.9 },
+        { content: '并发候选B', category: 'preference', importance: 80, confidence: 0.9 },
+      ],
+    });
+    const { svc } = makeService(db, reply);
+    // 竞态窗口：应用层 isDuplicate 时还看不到对方的行，INSERT 时才撞唯一键（另一实例已写入同一 contentHash）
+    db.prisma.memoryCandidate.create.mockRejectedValueOnce(
+      Object.assign(new Error('Unique constraint failed on the fields: (`userId`,`contentHash`)'), { code: 'P2002' }),
+    );
+    const r = await svc.extractFromSummary('sum1');
+    expect(r).toMatchObject({ skipped: null, extracted: 1, duplicated: 1, promoted: 1 }); // 绝不因 P2002 中断整批
+    expect(db.candidates).toHaveLength(1); // 绝无重复候选行
+    expect(db.candidates[0].content).toBe('并发候选B'); // 后续条目照常落库
+  });
+
   it('重复内容（既有 Memory 或候选）→ 跳过，不重复落库', async () => {
     const db = makeDbWithInterval({ memories: [{ id: 'mem-old', userId: 'u1', scope: 'user', projectId: null, content: '用户偏好亚马逊主图 2000×2000', category: 'preference', importance: 80, confidence: 0.9, status: 'active', source: 'manual', sourceMessageId: null, metadata: null, createdAt: at(0) }] });
     const { svc } = makeService(db, JSON.stringify({ memories: [item()] }));
@@ -232,6 +271,22 @@ describe('MemoryCandidateService（三态提炼，防循环污染）', () => {
     const b = await makeService(down, new Error('provider down')).svc.extractFromSummary('sum1');
     expect(b.extracted).toBe(0);
     expect(down.candidates).toHaveLength(0);
+  });
+
+  it('LLM 输出非法 JSON / 不合 schema → warn 日志（D30：降级不再静默）', async () => {
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    try {
+      const bad = makeDbWithInterval();
+      await makeService(bad, '不是JSON').svc.extractFromSummary('sum1');
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('不是合法 JSON'))).toBe(true);
+
+      const mismatch = makeDbWithInterval();
+      await makeService(mismatch, JSON.stringify({ memories: [{ content: 'x' }] })).svc.extractFromSummary('sum1');
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('不符合约定 schema'))).toBe(true);
+      expect(mismatch.candidates).toHaveLength(0); // 降级行为不变：0 候选
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('人工裁决：candidate → active 写入 Memory 表；→ rejected 只改候选态', async () => {
