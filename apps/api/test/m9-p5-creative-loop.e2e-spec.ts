@@ -1,9 +1,12 @@
 import { Test } from '@nestjs/testing';
+import { getQueueToken } from '@nestjs/bullmq';
 import { INestApplication, INestApplicationContext } from '@nestjs/common';
+import { Queue } from 'bullmq';
 import request from 'supertest';
 import cookieParser from 'cookie-parser';
 import { randomUUID } from 'node:crypto';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { WORKFLOW_QUEUE } from '../src/core/queue/queue.module';
 import { AppModule } from '../src/app.module';
 import { WorkerModule } from '../src/worker.module';
 import { GlobalExceptionFilter } from '../src/common/filters/global-exception.filter';
@@ -20,22 +23,27 @@ import { factsHashOf } from '../src/modules/creative-loop/insight-rules';
 /**
  * M9-P5 Creative Performance Loop e2e（真实 PostgreSQL/Redis/BullMQ + Worker 进程内实例）。
  *
- * 运行方式（**独立 Redis DB，与 m7-p6/m9-p4 的 db 0/8 隔离**）：
- *   cd apps/api && REDIS_URL=redis://localhost:6379/9 npx vitest run test/m9-p5-creative-loop.e2e-spec.ts
+ * 运行方式（**独立 Redis DB，与其他 e2e 的 db 0/8/9 隔离**）：
+ *   cd apps/api && REDIS_URL=redis://localhost:6379/24 npx vitest run test/m9-p5-creative-loop.e2e-spec.ts
  *
  * 覆盖（闭环全程，**只复用既有系统，绝不新建第二套**）：
  *   ① 洞察：事实/派生层服务端计算（Feedback + CreativePerformance + M9-P1 摘要）+ 分层标注；
- *      LLM 解读独立写入 → facts/derived/factsHash **逐字节不变**（DB 行复核）。
+ *      LLM 解读独立写入 → facts/derived/factsHash **逐字节不变**（专表行复核）。
  *   ② 假设状态机：draft 不可启动 loop；draft→ready 后可启动；固化定义 = 模板产物且发布为 v1（版本锁定）。
  *   ③ 人工审批门：run 停在 approval（**写操作尚未执行**）；审批绑定摘要 = 将被执行的动作；生成步骤复用 M5 生成链。
  *   ④ approve → 外部动作（M7-P3 全链：审批 + 幂等键）→ wait 观察窗 → run completed；补偿步骤正常流程不执行。
  *   ⑤ 判据收敛：事实未回流 → 绝不臆断（awaiting-facts）；回流后读路径按判据自动 validated（条件更新）。
- *   ⑥ 拒绝审批 → 写操作**绝不执行** + 假设按 run 终态系统驳回。
+ *   ⑥ 拒绝审批 → 写操作**绝不执行** + 假设按 run 终态系统驳回；补偿链被真实评估且**无可补偿步骤**（未发布）。
+ *   ⑥b P5 补偿链**真实执行**：已发布后步骤失败 → 逆序补偿链调用 rollback_publish（幂等锚点下标的
+ *      外部动作）→ 审批绑定校验**闭锁拒绝**（绝不落第二条外部动作）→ run.output.compensation 留痕
+ *      → 模块把"已发布未回滚"作为事实回报（verdict.facts.rollback + status.rollback）。
  *   ⑦ 条件更新：并发状态推进恰好一个成功；并发启动绝不产生第二个 run；取消 run 不自动终态化 + 人工判定。
  *   ⑧ 租户隔离：非成员一律 404（防枚举），绝不因知道 id 而放行。
+ *   ⑨ 存储隔离：假设/洞察落在**专表**（CreativeHypothesis/CreativeInsight），绝不进入 `Artifact` 容器
+ *      （既无"制品列表污染"风险，也无需 conversationId/storageKey 空值兜底）。
  *
- * 说明：本 Phase 无 creative-loop 专表（schema 冻结），假设/洞察以 `Artifact`（type='other'）文档承载——
- * 见 src/modules/creative-loop/creative-loop-store.ts 文件头"已知缺口"。本 spec 的清理按 id 精确删除。
+ * 说明：M10-P4 起假设/洞察写入 creative-loop 专表（organizationId 直列，查询一律 server-side scope）；
+ * 历史 `Artifact(type='other')` 行由 store 层**首次访问幂等回填**（本 spec 不再产生这类行）。
  */
 
 const XRW = { 'X-Requested-With': 'XMLHttpRequest' };
@@ -168,12 +176,9 @@ describe('M9-P5 Creative Performance Loop (e2e, 真实 Queue + Worker)', () => {
     for (const id of workflowIds) {
       await prisma.workflow.delete({ where: { id } }).catch(() => undefined); // 级联 versions/runs/steps
     }
-    for (const id of insightIds) {
-      await prisma.artifact.delete({ where: { id } }).catch(() => undefined);
-    }
-    for (const id of hypothesisIds) {
-      await prisma.artifact.delete({ where: { id } }).catch(() => undefined);
-    }
+    // 闭环专表（按 id 精确删除；已删除的行 count=0 无副作用）
+    await prisma.creativeInsight.deleteMany({ where: { id: { in: insightIds } } }).catch(() => undefined);
+    await prisma.creativeHypothesis.deleteMany({ where: { id: { in: hypothesisIds } } }).catch(() => undefined);
     await prisma.creativePerformance.deleteMany({ where: { userId, projectId } }).catch(() => undefined);
     await prisma.feedback.deleteMany({ where: { userId, projectId } }).catch(() => undefined);
     await prisma.project.delete({ where: { id: projectId } }).catch(() => undefined);
@@ -255,14 +260,17 @@ describe('M9-P5 Creative Performance Loop (e2e, 真实 Queue + Worker)', () => {
     expect(attached.body.data.derived).toEqual(insightSnapshot.derived);
     expect(attached.body.data.factsHash).toBe(insightSnapshot.factsHash);
 
-    // DB 行复核：事实层未被解读改写（隔离不变量在存储层同样成立）
-    const row = await prisma.artifact.findUniqueOrThrow({ where: { id: insightId } });
-    const content = row.content as Record<string, never>;
-    expect(content.kind).toBe(INSIGHT_KIND);
-    expect(content.facts).toEqual(insightSnapshot.facts);
-    expect(content.derived).toEqual(insightSnapshot.derived);
-    expect(content.factsHash).toBe(insightSnapshot.factsHash);
-    expect((content.interpretation as unknown as Record<string, unknown>).source).toBe('llm-interpretation');
+    // DB 行复核（专表列）：事实层未被解读改写（隔离不变量在存储层同样成立）
+    const row = await prisma.creativeInsight.findUniqueOrThrow({ where: { id: insightId } });
+    expect(row.organizationId).toEqual(expect.any(String)); // 组织隔离 = 直列（server-side scope）
+    expect(row.projectId).toBe(projectId);
+    expect(row.userId).toBe(userId);
+    expect(row.facts).toEqual(insightSnapshot.facts);
+    expect(row.derived).toEqual(insightSnapshot.derived);
+    expect(row.factsHash).toBe(insightSnapshot.factsHash);
+    expect(row.layering).toEqual({ facts: 'service-computed', derived: 'service-computed', interpretation: 'llm-interpretation' });
+    expect((row.interpretation as unknown as Record<string, unknown>).source).toBe('llm-interpretation');
+    expect(row.version).toBe(2); // 建行 v1 + 一次解读写入（factsHash CAS 锚定 + version 前移）
 
     // 再写一次解读（可覆盖，事实仍不变）
     const again = await api().post(`/api/v1/creative-loop/insights/${insightId}/interpretation`).set(XRW).set('Cookie', cookie)
@@ -279,8 +287,15 @@ describe('M9-P5 Creative Performance Loop (e2e, 真实 Queue + Worker)', () => {
     hypothesisId = created.body.data.id as string;
     hypothesisIds.push(hypothesisId);
     expect(created.body.data).toMatchObject({ status: 'draft', terminal: false });
+    expect(created.body.data.kind).toBe(HYPOTHESIS_KIND);
     expect(created.body.data.organizationId).toEqual(expect.any(String));
     expect(created.body.data.projectId).toBe(projectId);
+
+    // 专表落库（M10-P4）：组织直列 + 版本锚点（非状态字段更新走 version CAS）
+    const createdRow = await prisma.creativeHypothesis.findUniqueOrThrow({ where: { id: hypothesisId } });
+    expect(createdRow).toMatchObject({ status: 'draft', statement, platform: 'mock', version: 1 });
+    expect(createdRow.organizationId).toBe(created.body.data.organizationId);
+    expect(createdRow.history).toHaveLength(0);
 
     // 跨组织引用洞察 → 404（绝不落库）
     await api().post('/api/v1/creative-loop/hypotheses').set(XRW).set('Cookie', cookie)
@@ -474,10 +489,11 @@ describe('M9-P5 Creative Performance Loop (e2e, 真实 Queue + Worker)', () => {
     await api().post(`/api/v1/creative-loop/hypotheses/${hypothesisId}/status`).set(XRW).set('Cookie', cookie)
       .send({ status: 'rejected' }).expect(400);
     await api().delete(`/api/v1/creative-loop/hypotheses/${hypothesisId}`).set(XRW).set('Cookie', cookie).expect(400);
-    const stable = await prisma.artifact.findUniqueOrThrow({ where: { id: hypothesisId } });
-    const stableDoc = stable.content as { status: string; history: unknown[] };
-    expect(stableDoc.status).toBe('validated');
-    expect(stableDoc.history).toHaveLength(3); // draft→ready, ready→running, running→validated
+    const stable = await prisma.creativeHypothesis.findUniqueOrThrow({ where: { id: hypothesisId } });
+    expect(stable.status).toBe('validated');
+    expect((stable.history as unknown as unknown[])).toHaveLength(3); // draft→ready, ready→running, running→validated
+    expect(stable.verdict).toMatchObject({ decision: 'validated', decidedBy: 'criteria' });
+    expect(stable.loop).toMatchObject({ runId: loopRunId, attempts: 1 });
 
     // 洞察事实层未被闭环后续动作改写（解读隔离在闭环全程保持）
     const insight = await api().get(`/api/v1/creative-loop/insights/${insightId}`).set('Cookie', cookie).expect(200);
@@ -507,7 +523,7 @@ describe('M9-P5 Creative Performance Loop (e2e, 真实 Queue + Worker)', () => {
 
     const run = await waitFor(
       '第二 run 终态',
-      () => prisma.workflowRun.findUniqueOrThrow({ where: { id: runId } }),
+      () => prisma.workflowRun.findUniqueOrThrow({ where: { id: runId }, include: { steps: { orderBy: { stepIndex: 'asc' } } } }),
       (r) => ['completed', 'failed', 'timeout'].includes(r.status),
     );
     expect(run.status).toBe('failed');
@@ -516,11 +532,149 @@ describe('M9-P5 Creative Performance Loop (e2e, 真实 Queue + Worker)', () => {
       where: { userId, idempotencyKey: stepExternalActionKey(runId, 3) },
     })).toBe(0);
 
+    // 补偿链被**真实评估**：run 失败于审批步骤（index 2），未执行任何写操作 → 无可补偿步骤
+    // （计划为空 → 绝不写 run.output.compensation、绝不产生回滚锚点行/回滚外部动作）
+    expect(run.currentStep).toBe(2);
+    expect(run.steps.map((s) => [s.stepIndex, s.stepId])).toEqual([
+      [0, LOOP_STEP_IDS.insightSnapshot], [1, LOOP_STEP_IDS.generateCreative], [2, LOOP_STEP_IDS.humanReview],
+    ]);
+    expect(run.steps.some((s) => s.stepType === 'compensation')).toBe(false);
+    expect(await prisma.workflowStepRun.count({ where: { workflowRunId: runId, stepType: 'compensation' } })).toBe(0);
+    expect((run.output ?? null)).toBeNull(); // 无补偿声明命中 → 不写终态 output（既有语义）
+    expect(await prisma.externalAction.count({
+      where: { userId, idempotencyKey: { in: [stepExternalActionKey(runId, 3), stepExternalActionKey(runId, 4)] } },
+    })).toBe(0);
+
     const status = await api().get(`/api/v1/creative-loop/hypotheses/${h2}/status`).set('Cookie', cookie).expect(200);
     expect(status.body.data.hypothesis.status).toBe('rejected');
     expect(status.body.data.hypothesis.verdict).toMatchObject({ decision: 'rejected', decidedBy: 'system' });
     expect(String(status.body.data.hypothesis.verdict.reason)).toContain('failed');
     expect(status.body.data.pending.reason).toBeNull();
+    // 回滚投影：从未发布 → not-required（且判决缘由不提"未回滚"）
+    expect(status.body.data.rollback).toMatchObject({ required: false, status: 'not-required', publishActionId: null });
+    expect(String(status.body.data.hypothesis.verdict.reason)).not.toContain('未回滚');
+  });
+
+  it('⑥b P5 补偿链真实执行：已发布后失败 → rollback_publish 被真实调用（闭锁拒绝 + 锚点留痕 + 事实回报）', async () => {
+    const h4 = await createHypothesis({
+      statement: '第四假设：暖色背景主图可提升加购率',
+      successCriteria: { metric: 'roas', op: 'gte', value: 1 },
+    });
+    await api().post(`/api/v1/creative-loop/hypotheses/${h4}/status`).set(XRW).set('Cookie', cookie)
+      .send({ status: 'ready' }).expect(201);
+    // 观察窗取长值：本用例在**观察窗期间**构造失败残留（窗口到期由延迟作业唤醒，绝不参与本用例判定）
+    const started = await api().post(`/api/v1/creative-loop/hypotheses/${h4}/start`).set(XRW).set('Cookie', cookie)
+      .send({ waitMs: 30_000 }).expect(201);
+    const runId = started.body.data.run.runId as string;
+    runIds.push(runId);
+
+    // 审批放行 → publish_creative 经 M7-P3 全链执行（**平台写操作既成事实**）
+    const approval = (await waitFor(
+      '第四 loop 审批',
+      () => prisma.approval.findFirst({ where: { workflowRunId: runId, status: 'requested' } }),
+      (a) => a !== null,
+    ))!;
+    await api().post(`/api/v1/approvals/${approval.id}/approve`).set(XRW).set('Cookie', cookie).expect(201);
+    await waitFor(
+      '第四 run 进入观察窗（发布已完成）',
+      () => prisma.workflowRun.findUniqueOrThrow({ where: { id: runId }, include: { steps: { orderBy: { stepIndex: 'asc' } } } }),
+      (r) => r.status === 'waiting'
+        && r.steps.find((s) => s.stepId === LOOP_STEP_IDS.publishCreative)?.status === 'completed',
+    );
+    const publishAction = await prisma.externalAction.findUniqueOrThrow({
+      where: { userId_provider_idempotencyKey: { userId, provider: 'mock', idempotencyKey: stepExternalActionKey(runId, 3) } },
+    });
+    expect(publishAction.status).toBe('completed');
+
+    // 构造 M9-P4 ③ 的**失败残留**输入状态（引擎显式支持并幂等补做补偿链的分支）：
+    // loop 定义在 publish 之后没有可失败步骤（rollback 是 compensation-only、wait 是时间窗、output 不失败），
+    // 故按引擎的恢复路径注入——观察窗步骤行已被原执行者标记 failed（崩溃于补偿/终态写入之前），
+    // 随后 run 被重新投递 → 引擎必须**幂等补做逆序补偿链**（绝不重执行已完成的发布副作用）。
+    await prisma.workflowStepRun.update({
+      where: { workflowRunId_stepIndex: { workflowRunId: runId, stepIndex: 5 } },
+      data: { status: 'failed', errorCode: 'PROVIDER_TIMEOUT', errorMessage: 'e2e：观察窗读取超时（失败残留注入）' },
+    });
+    await prisma.workflowRun.update({
+      where: { id: runId },
+      data: {
+        status: 'queued', currentStep: 5, workerId: null, leaseUntil: null, heartbeatAt: null,
+        waitingOnApprovalId: null, waitingOnAgentRunId: null, completedAt: null, errorCode: null, errorMessage: null,
+      },
+    });
+    const queue = app.get<Queue>(getQueueToken(WORKFLOW_QUEUE));
+    await queue.add('execute', { runId }, {
+      jobId: `m9p5-compensate-${runId}`, attempts: 1, removeOnComplete: true, removeOnFail: { count: 500 },
+    });
+
+    const failed = await waitFor(
+      '第四 run 补偿后终态',
+      () => prisma.workflowRun.findUniqueOrThrow({ where: { id: runId }, include: { steps: { orderBy: { stepIndex: 'asc' } } } }),
+      (r) => r.status === 'failed',
+    );
+    expect(failed.errorCode).toBe('PROVIDER_TIMEOUT'); // 终态归因 = 触发补偿链的失败
+
+    // **补偿链真实执行**：run.output.compensation 记录 rollback_publish 的调用结果（绝不静默跳过）
+    expect(failed.output).toMatchObject({
+      compensation: [{
+        stepId: LOOP_STEP_IDS.publishCreative, compensateStepId: LOOP_STEP_IDS.rollbackPublish,
+        stepIndex: 4, status: 'failed', errorCode: 'APPROVAL_BINDING_MISMATCH',
+      }],
+    });
+    // 锚点行 = 定义中的回滚步骤下标（行复用，stepType 留痕 'compensation'；绝不新建第二行）
+    const anchor = failed.steps.find((s) => s.stepIndex === 4)!;
+    expect(anchor.stepId).toBe(LOOP_STEP_IDS.rollbackPublish);
+    expect(anchor.stepType).toBe('compensation');
+    expect(anchor.status).toBe('failed');
+    expect(anchor.errorCode).toBe('APPROVAL_BINDING_MISMATCH');
+    expect(await prisma.workflowStepRun.count({ where: { workflowRunId: runId, stepIndex: 4 } })).toBe(1);
+
+    // 闭锁拒绝（fail-closed）：授权校验先于行创建 → **绝不产生第二条平台写操作**
+    // （引擎只认 run 内最早一条已完成审批 = 发布所绑定者，故回滚动作无法获得授权——见结算报告"依赖/A5"）
+    expect(await prisma.externalAction.count({
+      where: { userId, idempotencyKey: stepExternalActionKey(runId, 4) },
+    })).toBe(0);
+    const publishAfter = await prisma.externalAction.findUniqueOrThrow({ where: { id: publishAction.id } });
+    expect(publishAfter.status).toBe('completed'); // 已发布的写操作**未被篡改/未重复执行**
+
+    // 模块如实回报："已发布未回滚"是事实（绝非默认已回滚）
+    const status = await api().get(`/api/v1/creative-loop/hypotheses/${h4}/status`).set('Cookie', cookie).expect(200);
+    expect(status.body.data.hypothesis.status).toBe('rejected');
+    expect(status.body.data.hypothesis.verdict).toMatchObject({
+      decidedBy: 'system',
+      reason: expect.stringContaining('已发布的写操作未回滚'),
+      facts: { publishActionId: publishAction.id, rollback: 'failed' },
+    });
+    expect(status.body.data.rollback).toMatchObject({
+      required: true, status: 'failed', publishActionId: publishAction.id,
+      compensateStepId: LOOP_STEP_IDS.rollbackPublish, errorCode: 'APPROVAL_BINDING_MISMATCH',
+    });
+    const detail = await api().get(`/api/v1/creative-loop/hypotheses/${h4}/run`).set('Cookie', cookie).expect(200);
+    expect(detail.body.data.rollback).toMatchObject({ required: true, status: 'failed', publishActionId: publishAction.id });
+
+    // 崩溃重放（补偿已记录、终态写入前再次崩溃）：锚点行 attempt 前移、链**幂等补做**，
+    // 副作用仍 exactly-once（同一幂等键 + 闭锁拒绝先于行创建 → 外部动作行数恒为 0）
+    await prisma.workflowRun.update({
+      where: { id: runId },
+      data: { status: 'queued', workerId: null, leaseUntil: null, heartbeatAt: null, completedAt: null },
+    });
+    await queue.add('execute', { runId }, {
+      jobId: `m9p5-compensate-replay-${runId}`, attempts: 1, removeOnComplete: true, removeOnFail: { count: 500 },
+    });
+    await waitFor(
+      '第四 run 重放后仍为 failed',
+      () => prisma.workflowRun.findUniqueOrThrow({ where: { id: runId } }),
+      (r) => r.status === 'failed' && r.workerId === null,
+    );
+    const replayedAnchor = await prisma.workflowStepRun.findUniqueOrThrow({
+      where: { workflowRunId_stepIndex: { workflowRunId: runId, stepIndex: 4 } },
+    });
+    // 正常流程 skip 时 attempt=1 → 首次补偿 attempt=2 → 重放补做 attempt=3（同一锚点行前移，绝不新建第二行）
+    expect(replayedAnchor.attempt).toBe(3);
+    expect(replayedAnchor.stepType).toBe('compensation');
+    expect(await prisma.workflowStepRun.count({ where: { workflowRunId: runId, stepIndex: 4 } })).toBe(1);
+    expect(await prisma.externalAction.count({
+      where: { userId, idempotencyKey: stepExternalActionKey(runId, 4) },
+    })).toBe(0);
   });
 
   it('⑦ 条件更新：并发推进恰好一次；并发启动绝不产生第二个 run；cancelled 不自动终态化', async () => {
@@ -532,9 +686,10 @@ describe('M9-P5 Creative Performance Loop (e2e, 真实 Queue + Worker)', () => {
       api().post(`/api/v1/creative-loop/hypotheses/${h3}/status`).set(XRW).set('Cookie', cookie).send({ status: 'ready' }),
     ]);
     expect([a.status, b.status].sort()).toEqual([201, 400]);
-    const afterRace = await prisma.artifact.findUniqueOrThrow({ where: { id: h3 } });
-    expect((afterRace.content as { status: string; history: unknown[] }).status).toBe('ready');
-    expect((afterRace.content as { history: unknown[] }).history).toHaveLength(1);
+    const afterRace = await prisma.creativeHypothesis.findUniqueOrThrow({ where: { id: h3 } });
+    expect(afterRace.status).toBe('ready');
+    expect((afterRace.history as unknown as unknown[])).toHaveLength(1);
+    expect(afterRace.version).toBe(2); // v1 建行 + 一次状态 CAS（version 随状态推进前移）
 
     // 并发启动：workflow 并发创建收敛为最早一行 + 幂等键相同 → 绝不产生第二个 run；
     // 两个请求都收到 201 且指向**同一个 run**（双击的确定性结果，绝不是两个 run）
@@ -555,11 +710,12 @@ describe('M9-P5 Creative Performance Loop (e2e, 真实 Queue + Worker)', () => {
     const runId3 = runs3[0].id;
     runIds.push(runId3);
     for (const r of [s1, s2]) expect(r.body.data.run.runId).toBe(runId3); // 两个响应收敛到同一 run
-    const doc3 = await prisma.artifact.findUniqueOrThrow({ where: { id: h3 } });
-    const doc3Content = doc3.content as { status: string; loop: { attempts: number }; history: Array<Record<string, string>> };
-    expect(doc3Content.status).toBe('running');
-    expect(doc3Content.loop.attempts).toBe(1);
-    expect(doc3Content.history.map((h) => [h.from, h.to])).toEqual([['draft', 'ready'], ['ready', 'running']]);
+    const doc3 = await prisma.creativeHypothesis.findUniqueOrThrow({ where: { id: h3 } });
+    const doc3Loop = doc3.loop as unknown as { attempts: number };
+    expect(doc3.status).toBe('running');
+    expect(doc3Loop.attempts).toBe(1);
+    expect((doc3.history as unknown as Array<Record<string, string>>).map((h) => [h.from, h.to]))
+      .toEqual([['draft', 'ready'], ['ready', 'running']]);
 
     // 取消 run（运维动作）→ 假设**绝不自动终态化**，判定留给人
     await waitFor(
@@ -582,7 +738,7 @@ describe('M9-P5 Creative Performance Loop (e2e, 真实 Queue + Worker)', () => {
 
     // 删除：draft/rejected 可删（本假设已取消 + 人工判定为 rejected）；running/validated 拒绝删除的语义在单测覆盖
     await api().delete(`/api/v1/creative-loop/hypotheses/${h3}`).set(XRW).set('Cookie', cookie).expect(200);
-    expect(await prisma.artifact.count({ where: { id: h3 } })).toBe(0); // 确实删除（含状态条件更新谓词）
+    expect(await prisma.creativeHypothesis.count({ where: { id: h3 } })).toBe(0); // 确实删除（含状态条件更新谓词）
     hypothesisIds.splice(hypothesisIds.indexOf(h3), 1);
   });
 
@@ -600,21 +756,30 @@ describe('M9-P5 Creative Performance Loop (e2e, 真实 Queue + Worker)', () => {
     await api().get(`/api/v1/creative-loop/hypotheses/${hypothesisId}/run`).set('Cookie', outsiderCookie).expect(404);
 
     // 事实未被越权请求改写
-    const row = await prisma.artifact.findUniqueOrThrow({ where: { id: hypothesisId } });
-    expect((row.content as { status: string }).status).toBe('validated');
-    expect((row.content as { statement: string }).statement).toBe(statement);
+    const row = await prisma.creativeHypothesis.findUniqueOrThrow({ where: { id: hypothesisId } });
+    expect(row.status).toBe('validated');
+    expect(row.statement).toBe(statement);
   });
 
-  it('⑨ 不可见性：创意闭环文档绝不进入用户制品列表（Artifact 容器隔离）', async () => {
-    // 闭环文档（假设/洞察）以 Artifact 承载，但 conversationId=null/storageKey=null 且 kind 判别——
-    // 既有制品读路径（会话制品列表）绝不应看到它们。
-    const rows = await prisma.artifact.findMany({ where: { id: { in: [...hypothesisIds, ...insightIds] } } });
-    expect(rows).toHaveLength(hypothesisIds.length + insightIds.length);
-    for (const row of rows) {
-      const kind = (row.content as { kind?: string }).kind;
-      expect([HYPOTHESIS_KIND, INSIGHT_KIND]).toContain(kind);
-      expect(row.conversationId).toBeNull();
-      expect(row.storageKey).toBeNull();
+  it('⑨ 存储隔离：假设/洞察只在专表，绝不进入 Artifact 容器（无制品列表污染路径）', async () => {
+    // M10-P4 起闭环文档写专表：既无 conversationId/storageKey 空值兜底，也不与用户制品共表——
+    // 既有制品读路径（会话制品列表/按 kind 扫描）在结构上就不可能看到它们。
+    const hypotheses = await prisma.creativeHypothesis.findMany({ where: { id: { in: hypothesisIds } } });
+    expect(hypotheses).toHaveLength(hypothesisIds.length);
+    const insights = await prisma.creativeInsight.findMany({ where: { id: { in: insightIds } } });
+    expect(insights).toHaveLength(insightIds.length);
+
+    // 专表行有组织直列（server-side scope 的前提），且旧容器零残留
+    for (const h of hypotheses) expect(h.organizationId).toEqual(expect.any(String));
+    for (const i of insights) expect(i.organizationId).toEqual(expect.any(String));
+    expect(await prisma.artifact.count({ where: { id: { in: [...hypothesisIds, ...insightIds] } } })).toBe(0);
+
+    // 列表读路径（专表）按组织/项目 server-side 过滤：本项目的假设可见，且不含其它组织的行
+    const listed = await api().get(`/api/v1/creative-loop/hypotheses?projectId=${projectId}&limit=50`).set('Cookie', cookie).expect(200);
+    const listedIds = (listed.body.data.hypotheses as Array<{ id: string; organizationId: string }>);
+    for (const row of listedIds) {
+      const stored = hypotheses.find((h) => h.id === row.id);
+      if (stored) expect(row.organizationId).toBe(stored.organizationId);
     }
   });
 });

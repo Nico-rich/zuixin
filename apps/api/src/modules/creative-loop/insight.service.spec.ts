@@ -24,7 +24,10 @@ function makeHarness(over: {
   const store = {
     create: vi.fn(async (userId: string, doc: InsightDoc) => ({ id: 'ins-1', userId, doc, createdAt: new Date(), updatedAt: new Date() })),
     get: vi.fn(async (): Promise<StoredDoc<InsightDoc> | null> => (over.doc
-      ? { id: 'ins-1', userId: 'u1', doc: over.doc, createdAt: new Date('2026-01-01T00:00:00Z'), updatedAt: new Date('2026-01-01T00:00:00Z') }
+      ? {
+        id: 'ins-1', userId: 'u1', doc: over.doc, version: 1,
+        createdAt: new Date('2026-01-01T00:00:00Z'), updatedAt: new Date('2026-01-01T00:00:00Z'),
+      }
       : null)),
     list: vi.fn(async () => []),
     saveInterpretation: vi.fn(async () => over.saveCount ?? 1),
