@@ -5,6 +5,7 @@ import { Readable } from 'node:stream';
 import { PrismaService } from '../prisma/prisma.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { StorageAdapter } from '../../core/storage/storage.types';
+import { storageDeadlineMs, withStorageDeadline } from '../../core/storage/storage-timeouts';
 import { maxBytesForMime, sanitizeFilename, sniffMatchesMime, storageExtensionForMime, typeForMime } from '../security/upload-guard';
 import { QuotaService } from '../billing/quota.service';
 import { BillingService } from '../billing/billing.service';
@@ -59,6 +60,13 @@ export class AttachmentsService {
    *
    * 顺序理由：①~⑦ 是纯内存校验（无外部副作用、无成本），放在配额之前——被拒的坏文件绝不占用
    * 配额、也不产生"预留后立即回滚"的噪声；配额只覆盖真正产生资源消耗的存储/落库窗口。
+   *
+   * M11-P11（D1-12/NV-13）追加：
+   * 9. 存储调用**双端有界**：驱动侧 `NodeHttpHandler` 建连/请求超时（见 storage-s3.adapter），
+   *    调用侧这里再套 `withStorageDeadline`（默认 `STORAGE_DEADLINE_MS` = 请求超时 + 5s 宽限）。
+   *    存储端点半开/挂死时，上传请求在确定时间内以 **5xx** 结束（`StorageTimeoutError` 非
+   *    HttpException → 全局过滤器兜底 500），**绝不留下永久挂起的 HTTP 请求与配额预留**；
+   *    回滚路径的 `delete` 同样有界（清理挂死绝不拖住失败响应）。
    */
   async save(userId: string, file: UploadFileInput, meta?: { conversationId?: string; messageId?: string }) {
     const type = typeForMime(file.mimetype);
@@ -91,7 +99,12 @@ export class AttachmentsService {
     const storageKey = `${userId}/${now.getFullYear()}/${String(now.getMonth() + 1).padStart(2, '0')}/${attachmentId}${ext}`;
     let stored = false;
     try {
-      await this.storage.put(storageKey, Readable.from(cleaned.buffer), { contentType: file.mimetype, sizeBytes: storedBytes });
+      // M11-P11 ⑨：调用面硬上界（超时 → StorageTimeoutError → 5xx，预留由下方 catch 释放）
+      await withStorageDeadline(
+        this.storage.put(storageKey, Readable.from(cleaned.buffer), { contentType: file.mimetype, sizeBytes: storedBytes }),
+        storageDeadlineMs(),
+        `attachments:put:${attachmentId}`,
+      );
       stored = true;
       const attachment = await this.prisma.attachment.create({
         data: {
@@ -114,9 +127,13 @@ export class AttachmentsService {
       await this.quota.release(attachmentId, 'attachment_upload');
       return attachment;
     } catch (err) {
-      // 上传失败回滚：释放预留（幂等，绝不残留占用额度）+ 尽力清理已落对象（避免孤儿对象）
+      // 上传失败回滚：释放预留（幂等，绝不残留占用额度）+ 尽力清理已落对象（避免孤儿对象）。
+      // M11-P11 ⑨：清理同样有界——存储端挂死时失败响应绝不因"尽力清理"被拖成永久挂起请求。
       await this.quota.release(attachmentId, 'attachment_upload');
-      if (stored) await this.storage.delete(storageKey).catch(() => undefined);
+      if (stored) {
+        await withStorageDeadline(this.storage.delete(storageKey), storageDeadlineMs(), `attachments:rollback:${attachmentId}`)
+          .catch(() => undefined);
+      }
       throw err;
     }
   }

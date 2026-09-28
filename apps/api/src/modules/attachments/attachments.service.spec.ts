@@ -1,7 +1,9 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { HttpException } from '@nestjs/common';
 import { AttachmentsService } from './attachments.service';
 import { AttachmentHttpError } from './attachment-errors';
 import { AppError } from '../../common/errors/app-error';
+import { StorageTimeoutError } from '../../core/storage/storage-timeouts';
 import { makeBombZip, makeJpegWithExif, makeNormalZip, makePngWithMetadata } from '../../../test/support/attachment-fixtures';
 
 /**
@@ -102,6 +104,57 @@ describe('AttachmentsService 配额（M10-P7）', () => {
     await upload(m, 'image/png', makePngWithMetadata(), 'a.png', { conversationId: 'conv-1' });
     expect(m.prisma.conversation.findFirst.mock.calls[0][0]).toMatchObject({ where: { id: 'conv-1', userId: 'user-1' } });
     expect((m.quota.assertQuota.mock.calls[0] as unknown[])[1]).toBe('proj-9');
+  });
+});
+
+describe('AttachmentsService 存储调用有界（M11-P11 D1-12/NV-13）', () => {
+  /** 小值驱动：真实等待 20ms 即可判定"有界"，不依赖 fake timers 与真实驱动的交互 */
+  const DEADLINE_MS = '20';
+  let savedDeadline: string | undefined;
+  beforeEach(() => { savedDeadline = process.env.STORAGE_DEADLINE_MS; process.env.STORAGE_DEADLINE_MS = DEADLINE_MS; });
+  afterEach(() => {
+    if (savedDeadline === undefined) delete process.env.STORAGE_DEADLINE_MS; else process.env.STORAGE_DEADLINE_MS = savedDeadline;
+    vi.useRealTimers();
+  });
+
+  it('存储端半开（put 永不 settle）→ 有界超时（StorageTimeoutError）+ 释放预留 + 不落库/不计量', async () => {
+    const m = makeService();
+    m.storage.put.mockImplementation(() => new Promise<never>(() => undefined)); // 挂死的 S3/MinIO
+
+    const startedAt = Date.now();
+    const err = await upload(m, 'image/png', makePngWithMetadata(), 'a.png').catch((e: unknown) => e);
+    expect(Date.now() - startedAt).toBeLessThan(2_000); // 有界：绝不等底层（原实现会永久挂起）
+    expect(err).toBeInstanceOf(StorageTimeoutError);
+    expect(err).toMatchObject({ code: 'STORAGE_TIMEOUT' });
+    // 5xx 语义：普通 Error（非 HttpException/AppError）→ GlobalExceptionFilter 兜底 500（内部细节不外泄）
+    expect(err).not.toBeInstanceOf(HttpException);
+    expect((err as StorageTimeoutError).message).toContain('attachments:put:');
+
+    expect(m.quota.release).toHaveBeenCalledTimes(1);   // 预留绝不残留占用
+    expect(m.prisma.attachment.create).not.toHaveBeenCalled();
+    expect(m.billing.recordUsage).not.toHaveBeenCalled();
+    expect(m.storage.delete).not.toHaveBeenCalled();    // put 未确认成功 → 无"孤儿对象"可清（删除竞态由存储侧幂等兜底）
+  });
+
+  it('回滚清理同样有界：对象已落 + 落库失败 + delete 挂死 → 仍以原错误在界内结束（不被清理拖死）', async () => {
+    const m = makeService();
+    m.prisma.attachment.create.mockRejectedValue(new Error('unique 冲突'));
+    m.storage.delete.mockImplementation(() => new Promise<never>(() => undefined)); // 清理挂死
+
+    const startedAt = Date.now();
+    const err = await upload(m, 'image/png', makePngWithMetadata(), 'a.png').catch((e: unknown) => e);
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    expect((err as Error).message).toBe('unique 冲突'); // 原错误归因不被超时改写
+    expect(m.quota.release).toHaveBeenCalledTimes(1);
+    expect(m.storage.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it('正常路径不因兜底而改变语义（未超时的 put 照常落库→计量→释放）', async () => {
+    const m = makeService();
+    const row = await upload(m, 'image/png', makePngWithMetadata(), 'a.png');
+    expect(row.storageKey).toMatch(/^user-1\/\d{4}\/\d{2}\/[0-9a-f-]{36}\.png$/);
+    expect(m.quota.release).toHaveBeenCalledTimes(1);
+    expect(m.billing.recordUsage).toHaveBeenCalledTimes(1);
   });
 });
 
