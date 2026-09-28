@@ -50,8 +50,27 @@ function make(opts: {
     workflow: { findUnique: vi.fn(async () => ({ id: WF, userId: 'u1', projectId: null, status: 'published' })) },
   };
   const crypto = { encrypt: vi.fn((s: string) => enc(s)), decrypt: vi.fn((c: string) => dec(c)) };
-  const events = { subscribe: vi.fn(async () => undefined) };
-  const runs = { createRun: vi.fn(async () => ({ id: 'run-1' })) };
+  // EventBusService 语义替身：handler 按 channel 登记在 Set（subscribe 加入 / unsubscribe **精确移除** / emit 分发）；
+  // Set 空则删 channel 键——与被替身的 EventBusService 完全同形（D2-03 的断言必须能观察总线侧是否真的解绑）
+  const handlersByChannel = new Map<string, Set<(event: Record<string, unknown>) => void>>();
+  const events = {
+    subscribe: vi.fn(async (channel: string, handler: (event: Record<string, unknown>) => void) => {
+      if (!handlersByChannel.has(channel)) handlersByChannel.set(channel, new Set());
+      handlersByChannel.get(channel)!.add(handler);
+    }),
+    unsubscribe: vi.fn((channel: string, handler: (event: Record<string, unknown>) => void) => {
+      const set = handlersByChannel.get(channel);
+      if (!set) return;
+      set.delete(handler);
+      if (set.size === 0) handlersByChannel.delete(channel);
+    }),
+  };
+  const emit = (channel: string, event: Record<string, unknown>) => {
+    for (const h of [...(handlersByChannel.get(channel) ?? [])]) h(event);
+  };
+  const subscribedChannels = () => [...handlersByChannel.keys()];
+  // 入参显式声明：`.mock.calls[i][j]` 才可被断言（零参 mock 的 calls 元素类型是空元组）
+  const runs = { createRun: vi.fn(async (_userId: string, _input: Record<string, unknown>) => ({ id: 'run-1' })) };
   // 入参显式声明：`.mock.calls[i][j]` 才可被断言（零参 mock 的 calls 元素类型是空元组）。
   const queue = {
     getJobSchedulers: vi.fn(async (_start?: number, _end?: number, _asc?: boolean) => opts.schedulers ?? []),
@@ -63,7 +82,11 @@ function make(opts: {
   const svc = new WorkflowTriggersService(
     prisma as never, crypto as never, events as never, runs as never, queue as never, audit as never,
   );
-  return { svc, prisma, crypto, events, runs, queue, audit, currentSecret: () => webhook?.secretEncrypted ?? null };
+  return {
+    svc, prisma, crypto, events, runs, queue, audit,
+    emit, subscribedChannels,
+    currentSecret: () => webhook?.secretEncrypted ?? null,
+  };
 }
 
 afterEach(() => { delete process.env.WEBHOOK_SECRET_GRACE_MS; });
@@ -240,6 +263,111 @@ describe('WorkflowTriggersService.syncSchedules（M10-P5 X-06 重发布）', () 
     await svc.unregisterTriggers(WF, archived);
     // 归档 = 注销全部既有调度器（mock 中仅剩 #1 这一份）
     expect(queue.removeJobScheduler.mock.calls.map((c) => c[0])).toEqual([`wf-sched-${WF}#1`]);
+  });
+});
+
+/**
+ * D2-03：event 订阅的**真解绑**。
+ * 回归靶心：原实现 `unregisterEvent` 只 `Set.delete(workflowId)` —— EventBusService 的 handler 表是
+ * 进程内常驻结构（闭包捕获 this），归档既不解绑 handler、也不删除 `eventSubscriptions` 的 Map 键
+ * → 两者都随发布/归档次数线性增长（长驻 API 进程内存泄漏）。
+ * 契约：最后一个成员注销 → unsubscribe(精确 handler) + 删 Map 键；仍有成员 → 只摘成员，handler 保留。
+ */
+describe('WorkflowTriggersService event 订阅治理（D2-03 真解绑）', () => {
+  const CH = 'ch-1';
+
+  it('登记幂等（重发布不重复订阅）；Map 键 = channel 数（可观测）', async () => {
+    const { svc, events } = make();
+    await svc.registerEvent(WF, CH);
+    await svc.registerEvent(WF, CH); // 重复发布同一版本
+    expect(events.subscribe).toHaveBeenCalledTimes(1);
+    expect(svc.pendingEventSubscriptions()).toBe(1);
+  });
+
+  it('多 workflow 共享 channel：注销其一 → handler 保留，channel 继续服务其余成员（绝不误伤）', async () => {
+    const { svc, events, runs, emit, subscribedChannels } = make();
+    await svc.registerEvent(WF, CH);
+    await svc.registerEvent(OTHER_WF, CH);
+    expect(events.subscribe).toHaveBeenCalledTimes(1); // 单 channel 单 handler（分发时现查成员集合）
+
+    await svc.unregisterEvent(WF, CH);
+    expect(events.unsubscribe).not.toHaveBeenCalled(); // 仍有成员 → 不解绑
+    expect(subscribedChannels()).toEqual([CH]);
+    expect(svc.pendingEventSubscriptions()).toBe(1);
+
+    emit(CH, { id: 'evt-1' });
+    await vi.waitFor(() => expect(runs.createRun).toHaveBeenCalledTimes(1));
+    expect(runs.createRun.mock.calls[0][1]).toMatchObject({ workflowId: OTHER_WF }); // 仅剩余成员被触发
+  });
+
+  it('最后一个成员注销 → unsubscribe(同一 handler 引用) + 删除 Map 键；迟到事件不再产生任何处理', async () => {
+    const { svc, events, runs, emit, subscribedChannels } = make();
+    await svc.registerEvent(WF, CH);
+    const handler = events.subscribe.mock.calls[0][1];
+    await svc.unregisterEvent(WF, CH);
+
+    expect(events.unsubscribe).toHaveBeenCalledWith(CH, handler); // **精确**解绑（不是只删自己的 Map）
+    expect(subscribedChannels()).toEqual([]); // 总线的 handler 表已无该 channel（Set 空 → 键删除）
+    expect(svc.pendingEventSubscriptions()).toBe(0); // 绝不残留空 Set
+
+    emit(CH, { id: 'evt-late' }); // 归档后的迟到事件（总线侧已无 handler）
+    await new Promise((r) => setTimeout(r, 5));
+    expect(runs.createRun).not.toHaveBeenCalled();
+  });
+
+  it('循环发布/归档 N 次：channel 数与总线 handler 表每次回落（"channel 不再增长"）', async () => {
+    const { svc, events, subscribedChannels } = make();
+    for (let i = 0; i < 3; i++) {
+      await svc.registerEvent(WF, CH);
+      expect(svc.pendingEventSubscriptions()).toBe(1);
+      await svc.unregisterEvent(WF, CH);
+      expect(svc.pendingEventSubscriptions()).toBe(0);
+      expect(subscribedChannels()).toEqual([]);
+    }
+    expect(events.subscribe).toHaveBeenCalledTimes(3);   // 每次归档后重新发布 = 重新订阅
+    expect(events.unsubscribe).toHaveBeenCalledTimes(3); // 每次归档 = 真解绑（订阅/解绑严格对称）
+  });
+
+  it('幂等/安全：从未登记、非成员、重复注销 → 一律 no-op（绝不误删他人 handler）', async () => {
+    const { svc, events, runs, emit } = make();
+    await svc.unregisterEvent(WF, 'ch-none'); // 从未登记
+    expect(events.unsubscribe).not.toHaveBeenCalled();
+
+    await svc.registerEvent(WF, CH);
+    await svc.unregisterEvent(OTHER_WF, CH); // 不在成员集合 → 不动 handler
+    expect(events.unsubscribe).not.toHaveBeenCalled();
+    emit(CH, { id: 'evt-1' });
+    await vi.waitFor(() => expect(runs.createRun).toHaveBeenCalledTimes(1));
+
+    await svc.unregisterEvent(WF, CH);
+    await svc.unregisterEvent(WF, CH); // 重复注销
+    expect(events.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(svc.pendingEventSubscriptions()).toBe(0);
+  });
+
+  it('归档定义路径（unregisterTriggers）：带 event 触发器的定义 → 订阅真正解除', async () => {
+    const { svc, events, subscribedChannels } = make();
+    const def: WorkflowDefinition = {
+      triggers: [{ type: 'event', event: 'ch-arch' }],
+      steps: [{ id: 'a', type: 'output' }],
+    };
+    await svc.registerTriggers(WF, def);
+    expect(subscribedChannels()).toEqual(['ch-arch']);
+    await svc.unregisterTriggers(WF, def);
+    expect(events.unsubscribe).toHaveBeenCalledWith('ch-arch', expect.any(Function));
+    expect(subscribedChannels()).toEqual([]);
+    expect(svc.pendingEventSubscriptions()).toBe(0);
+  });
+
+  it('订阅建立失败（EventBus 有界订阅显式抛错）→ 键回滚，绝不留下"看似已订阅"的半成品', async () => {
+    const { svc, events, subscribedChannels } = make();
+    events.subscribe.mockRejectedValueOnce(new Error('redis down'));
+    await expect(svc.registerEvent(WF, CH)).rejects.toThrow('redis down');
+    expect(svc.pendingEventSubscriptions()).toBe(0);
+    expect(subscribedChannels()).toEqual([]);
+    await svc.registerEvent(WF, CH); // 键已回滚 → 重试时重新订阅（原实现会因残留空 Set 而跳过订阅）
+    expect(events.subscribe).toHaveBeenCalledTimes(2);
+    expect(svc.pendingEventSubscriptions()).toBe(1);
   });
 });
 

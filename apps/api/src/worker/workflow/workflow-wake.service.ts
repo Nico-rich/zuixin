@@ -8,6 +8,11 @@ import { EventBusService, agentRunChannel } from '../../core/events/event-bus.se
 import { WORKFLOW_APPROVAL_DECIDED_CHANNEL } from '../../core/events/workflow-channels';
 import { parseWaitingUntil } from '../../modules/workflows/workflow-wait.service';
 
+/** 子 AgentRun 终态事件类型（driver 观察通道发布；**其余事件绝不触发唤醒**） */
+export const CHILD_TERMINAL_EVENTS: readonly string[] = ['run.completed', 'run.failed', 'run.cancelled', 'run.timeout'];
+/** 子 AgentRun 终态状态（DB 事实；与上述事件类型一一对应——订阅后校验用） */
+export const CHILD_TERMINAL_STATUSES: readonly string[] = ['completed', 'failed', 'cancelled', 'timeout'];
+
 /**
  * M7-P6 Workflow 唤醒（waiting → queued + 唯一 jobId；与 M6 wakeWaitingRun 同构原语）：
  * - 审批决断：订阅全局通道（API 进程 decide 发布）→ 条件更新唤醒；recoverStale 兜底（事件丢失）；
@@ -17,6 +22,18 @@ import { parseWaitingUntil } from '../../modules/workflows/workflow-wait.service
 @Injectable()
 export class WorkflowWakeService implements OnModuleInit {
   private readonly logger = new Logger('WorkflowWake');
+  /**
+   * D2-04：子 run 终态订阅表（childRunId → handler）—— 与 M10-P10 X-05（delegation）对称。
+   *
+   * EventBusService 的 handler 登记是**进程内常驻**资源（handler 表 + 闭包捕获 this）：
+   * 原实现每次进入 waiting-on-child 都新订阅一个闭包且终态后从不摘除 →
+   * ① 订阅随等待次数线性累积（长驻 worker 内存泄漏）；② 同一 childRunId 重入等待会**多份投递**。
+   * 回收时机 = 终态确认 / 唤醒路径（事件处理、订阅后校验、兜底唤醒 recoverStale）。
+   *
+   * **丢订阅绝不丢唤醒**：唤醒的事实源是 **DB 条件更新**（waiting + waitingOnAgentRunId →
+   * queued，count=0 即竞争失败），兜底通道 `WorkflowLeaseService.recoverStale` ④ 不依赖本订阅。
+   */
+  private readonly childSubscriptions = new Map<string, (event: Record<string, unknown>) => void>();
 
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
@@ -48,19 +65,31 @@ export class WorkflowWakeService implements OnModuleInit {
     return { woken: true };
   }
 
-  /** 子 AgentRun 终态唤醒（等待该子 run 的 workflow run；条件更新去重，重复唤醒幂等） */
+  /**
+   * 子 AgentRun 终态唤醒（等待该子 run 的 workflow run；条件更新去重，重复唤醒幂等）。
+   * D2-04：本方法是该子 run 订阅的**终点**（三条出口都回收）——
+   * 子 run 已终态 → 不会再产生终态事件，订阅已无意义；唤醒的事实源是 DB（+recoverStale 兜底）。
+   */
   async wakeByAgentRun(childRunId?: string): Promise<{ woken: boolean }> {
     if (!childRunId) return { woken: false };
     const target = await this.prisma.workflowRun.findFirst({
       where: { status: 'waiting', waitingOnAgentRunId: childRunId }, select: { id: true },
     });
-    if (!target) return { woken: false };
+    if (!target) {
+      // 无人再等待该子 run（父 run 已终态/已唤醒/被取消）→ 订阅永不触发，立即回收
+      this.clearChildSubscription(childRunId);
+      return { woken: false };
+    }
     const done = await this.prisma.workflowRun.updateMany({
       where: { id: target.id, status: 'waiting', waitingOnAgentRunId: childRunId },
       data: { status: 'queued', waitingOnAgentRunId: null, workerId: null, leaseUntil: null, heartbeatAt: null },
     });
-    if (done.count === 0) return { woken: false };
+    if (done.count === 0) {
+      this.clearChildSubscription(childRunId); // 竞争：已被其他路径唤醒/已终态 → 订阅已无意义
+      return { woken: false };
+    }
     await this.enqueueWake(target.id);
+    this.clearChildSubscription(childRunId);
     this.logger.log({ childRunId, runId: target.id }, '子 AgentRun 终态 → 唤醒 workflow run');
     return { woken: true };
   }
@@ -136,13 +165,51 @@ export class WorkflowWakeService implements OnModuleInit {
       `wake:${runId}`).then(() => undefined);
   }
 
-  /** 订阅特定子 AgentRun 的观察通道（processor 进入 waiting 时调用；driver 事件实时触发 wakeByAgentRun） */
+  /**
+   * 订阅特定子 AgentRun 的观察通道（processor 进入 waiting 时调用；driver 事件实时触发 wakeByAgentRun）。
+   *
+   * D2-04（对称 M10-P10 X-05）：
+   * - **登记前先回收**同名订阅——同一步重入等待绝不产生第二份 handler（绝不双份投递/累积）；
+   * - 订阅建立失败时（EventBusService 有界订阅会显式抛错）不记录 handler，绝不留下"看似已订阅"的假象；
+   * - **订阅后校验**：子 run 若已终态（终态事件在「run 落 waiting」与「本订阅建立」之间发布 →
+   *   Pub/Sub at-most-once 已丢失），立即按 DB 事实唤醒并回收订阅——既不丢唤醒，也不留死订阅。
+   */
   async watchChildRun(childRunId: string): Promise<void> {
-    await this.events.subscribe(agentRunChannel(childRunId), (event) => {
+    this.clearChildSubscription(childRunId);
+    const handler = (event: Record<string, unknown>) => {
       const type = event.type as string | undefined;
-      if (type && ['run.completed', 'run.failed', 'run.cancelled', 'run.timeout'].includes(type)) {
-        void this.wakeByAgentRun(childRunId).catch(() => undefined);
-      }
-    });
+      if (!type || !CHILD_TERMINAL_EVENTS.includes(type)) return; // 非终态事件：绝不触发唤醒、订阅保留
+      // 终态事件即本订阅的终点：先回收订阅再唤醒（终态 run 不会再发终态事件）
+      this.clearChildSubscription(childRunId);
+      void this.wakeByAgentRun(childRunId).catch(() => undefined);
+    };
+    await this.events.subscribe(agentRunChannel(childRunId), handler);
+    this.childSubscriptions.set(childRunId, handler);
+    // 订阅后校验（best-effort：DB 抖动绝不影响"进入等待"这一事实——recoverStale 仍会兜底唤醒）
+    const child = await this.prisma.agentRun
+      .findUnique({ where: { id: childRunId }, select: { status: true } })
+      .catch(() => null);
+    if (child && CHILD_TERMINAL_STATUSES.includes(child.status)) {
+      this.logger.warn({ childRunId, status: child.status }, '订阅后校验：子 run 已终态（终态事件早于订阅建立）→ 立即按 DB 事实唤醒');
+      this.clearChildSubscription(childRunId);
+      await this.wakeByAgentRun(childRunId).catch(() => undefined);
+    }
+  }
+
+  /**
+   * D2-04：回收子 run 终态订阅（幂等；未登记则 no-op——绝不误删他人 handler）。
+   * 公开面同时供兜底巡检（`WorkflowLeaseService.recoverStale` 唤醒/超时分支）调用：
+   * 事件丢失时唤醒由 DB 兜底，订阅则由这些"终态确认/唤醒路径"一并回收。
+   */
+  clearChildSubscription(childRunId: string): void {
+    const handler = this.childSubscriptions.get(childRunId);
+    if (!handler) return;
+    this.childSubscriptions.delete(childRunId);
+    this.events.unsubscribe(agentRunChannel(childRunId), handler);
+  }
+
+  /** 在途子 run 订阅数（可观测；终态/唤醒后必须回落，绝不随等待次数累积） */
+  pendingChildSubscriptions(): number {
+    return this.childSubscriptions.size;
   }
 }
