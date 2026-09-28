@@ -57,7 +57,13 @@ export interface EffectiveAgentToolsInput {
   declaredPermissions: readonly ExtensionPermissionName[];
   /** 平台工具注册表查询 */
   lookup: PlatformToolLookup;
-  /** 组织级工具策略（当前仓库无该表/列 → 生产调用不传 = 无额外限制；保留该维度供未来策略接入，不新增表/列） */
+  /**
+   * 组织级策略面（**M10-P14 起由 `ExtensionOrgAllowlist` 驱动**，见 ExtensionsService.materializeAgent）：
+   * - `undefined` = 无额外限制（未配置组织白名单，或本组织在白名单内）；
+   * - `[]` = 组织策略未放行任何工具 → 全部剔除（`org_policy_denied`）：扩展配置了组织白名单而本组织不在其中时
+   *   的 fail-closed 表达（物化绝不产出带工具的 Agent）；
+   * - 无论传入什么，交集语义不变：本参数**只能收紧、永不扩张**工具集。
+   */
   orgAllowlist?: readonly string[];
   /** 剔除审计回调（调用方接 logger.warn） */
   onDropped?: (drop: DroppedTool) => void;
@@ -122,9 +128,11 @@ export function resolveEffectiveAgentTools(input: EffectiveAgentToolsInput): Eff
       drop(name, 'tool_permission_not_wrappable', `工具权限面 ${tool.permission} 不在扩展可获得面（${AGENT_TOOL_PERMISSION_FACE.join('/')}）`);
       continue;
     }
-    // ⑤ 组织级工具策略（若接入）：未放行一律不授予
+    // ⑤ 组织级策略面（M10-P14：扩展组织白名单）：未放行一律不授予（`[]` = 该组织策略未放行任何工具）
     if (input.orgAllowlist && !input.orgAllowlist.includes(name)) {
-      drop(name, 'org_policy_denied', '组织级工具策略未放行该工具');
+      drop(name, 'org_policy_denied', input.orgAllowlist.length
+        ? '组织级工具策略未放行该工具'
+        : '组织级策略未放行任何工具（扩展配置了组织白名单而该组织不在其中）');
       continue;
     }
     tools.push(name);

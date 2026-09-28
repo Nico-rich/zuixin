@@ -120,6 +120,17 @@ function makeHarness() {
       update: vi.fn().mockImplementation(({ where, data }) => Promise.resolve({ id: where.id, ...data })),
       delete: vi.fn().mockResolvedValue({}),
     },
+    // M10-P14（D16）：扩展组织白名单（缺省空 = 对所有组织开放，既有用例语义不变）
+    extensionOrgAllowlist: {
+      findMany: vi.fn().mockResolvedValue([]),
+      upsert: vi.fn().mockImplementation(({ create }) => Promise.resolve({ id: 'al-1', ...create })),
+      deleteMany: vi.fn().mockResolvedValue({ count: 1 }),
+    },
+    organization: {
+      findFirst: vi.fn().mockResolvedValue({ id: 'org1', status: 'active' }),
+      findUnique: vi.fn().mockResolvedValue({ id: 'org1', status: 'active', isPersonal: false, deletedAt: null }),
+      update: vi.fn().mockImplementation(({ where, data }) => Promise.resolve({ id: where.id, ...data })),
+    },
     agent: {
       findUnique: vi.fn().mockResolvedValue(null),
       create: vi.fn().mockImplementation(({ data }) => Promise.resolve({ id: 'a1', ...data })),
@@ -145,7 +156,11 @@ function makeHarness() {
     },
     $transaction: vi.fn(async (ops: unknown[]) => Promise.all(ops as Promise<unknown>[])),
   };
-  const authz = { authorize: vi.fn().mockResolvedValue('owner') };
+  const authz = {
+    authorize: vi.fn().mockResolvedValue('owner'),
+    // M10-P14：白名单 owner 判定读成员行（含组织治理态）
+    membership: vi.fn().mockResolvedValue({ role: 'owner', orgStatus: 'active' }),
+  };
   const crypto = new CryptoService(PLATFORM_KEY);
   // M8-P8：provider baseUrl 安装时增加 DNS 层 SSRF 校验；单测注入确定性解析器（DNS 边界替换点），
   // 规则本身的覆盖见 src/modules/security/ssrf-guard.spec.ts
@@ -577,5 +592,168 @@ describe('Pre-M9 F4 agent 工具白名单（effective tools 交集）', () => {
     expect(resolveEffectiveAgentTools({
       extensionId: 'e2', requested: ['billing.charge'], declaredPermissions: ['agent.run', 'config.read', 'config.write'], lookup: (n) => harness.registry.get(n),
     }).tools).toEqual([]);
+  });
+});
+
+describe('M10-P14（D16）Extension 组织白名单（ExtensionOrgAllowlist 落点）', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  /** 平台级 agent 类扩展安装视图（organizationId=null：所有组织可见可装；白名单是唯一的组织级门禁） */
+  function withPlatformAgentInstall(harness: ReturnType<typeof makeHarness>, tools = ['knowledge.search']) {
+    const { prisma } = harness;
+    const version = publishedVersion(agentManifestWith('brand', tools), 'brand');
+    const ext = { id: 'e2', organizationId: null, slug: 'brand', name: '品牌助手', description: 'd', kind: 'agent', status: 'published' };
+    prisma.extension.findUnique.mockResolvedValue(ext);
+    prisma.extensionVersion.findFirst.mockResolvedValue(version);
+    prisma.extensionVersion.findUnique.mockResolvedValue(version);
+    prisma.extensionInstallation.upsert.mockResolvedValue({ id: 'i2', organizationId: 'org1', extensionId: 'e2', versionId: 'v1', status: 'enabled' });
+    prisma.agent.findUnique.mockResolvedValue(null);
+    return { ext, version };
+  }
+
+  it('未配置白名单 = 对所有组织开放：install 正常且 orgAllowlist 不传（既有语义不变）', async () => {
+    const harness = makeHarness();
+    const { svc, prisma, authz } = harness;
+    withPlatformAgentInstall(harness);
+    prisma.extensionOrgAllowlist.findMany.mockResolvedValue([]);
+    const mocked = vi.mocked(resolveEffectiveAgentTools);
+    mocked.mockClear();
+
+    await svc.install('u1', 'e2', { organizationId: 'org1' });
+
+    expect(prisma.extensionInstallation.upsert).toHaveBeenCalled();
+    expect(mocked.mock.calls.every((c) => !('orgAllowlist' in c[0]))).toBe(true);
+    expect(authz.authorize).toHaveBeenCalledWith('u1', 'org1', 'agent.write');
+  });
+
+  it('白名单仅含 org2 → org1 安装被拒（403，绝不落安装行/物化资源）', async () => {
+    const harness = makeHarness();
+    const { svc, prisma } = harness;
+    withPlatformAgentInstall(harness);
+    prisma.extensionOrgAllowlist.findMany.mockResolvedValue([{ organizationId: 'org2' }]);
+
+    await expect(svc.install('u1', 'e2', { organizationId: 'org1' })).rejects.toMatchObject({
+      code: 'FORBIDDEN', message: expect.stringContaining('组织白名单'),
+    });
+    expect(prisma.extensionInstallation.upsert).not.toHaveBeenCalled();
+    expect(prisma.agent.create).not.toHaveBeenCalled();
+  });
+
+  it('白名单含本组织 → 安装放行；白名单后置收紧 → 启用路径同一门禁（403，安装行状态不被改写）', async () => {
+    const harness = makeHarness();
+    const { svc, prisma } = harness;
+    withPlatformAgentInstall(harness);
+    prisma.extensionOrgAllowlist.findMany.mockResolvedValue([{ organizationId: 'org1' }]);
+    await expect(svc.install('u1', 'e2', { organizationId: 'org1' })).resolves.toBeTruthy();
+
+    prisma.extensionOrgAllowlist.findMany.mockResolvedValue([{ organizationId: 'org2' }]);
+    prisma.extensionInstallation.findUnique.mockResolvedValue({ id: 'i2', organizationId: 'org1', extensionId: 'e2', versionId: 'v1', status: 'disabled' });
+    await expect(svc.setEnabled('u1', 'e2', 'org1', true)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(prisma.extensionInstallation.update).not.toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: 'enabled' }),
+    }));
+  });
+
+  it('物化期兜底（历史安装/直连调用）：非白名单组织经 orgAllowlist=[] 求交 → 零工具 + 剔除审计', async () => {
+    const harness = makeHarness();
+    const { svc, prisma, authz } = harness;
+    const { ext, version } = withPlatformAgentInstall(harness);
+    prisma.extensionOrgAllowlist.findMany.mockResolvedValue([{ organizationId: 'org2' }]);
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const mocked = vi.mocked(resolveEffectiveAgentTools);
+    mocked.mockClear();
+    const materializeAgent = (svc as unknown as {
+      materializeAgent: (e: unknown, v: string, m: unknown, org: string) => Promise<string>;
+    }).materializeAgent.bind(svc);
+
+    await materializeAgent(ext, version.id, version.manifest, 'org1');
+
+    expect(authz.authorize).not.toHaveBeenCalled(); // 兜底路径不依赖调用者身份（历史数据物化）
+    const call = mocked.mock.calls.at(-1)![0];
+    expect(call.orgAllowlist).toEqual([]); // 组织策略面为空 → 全部剔除（fail-closed）
+    const createArg = prisma.agentVersion.create.mock.calls.at(-1)![0] as { data: { tools: string[]; config: { toolPolicy?: { dropped: unknown[] } } } };
+    expect(createArg.data.tools).toEqual([]);
+    expect(createArg.data.config.toolPolicy?.dropped.length).toBe(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('组织白名单'));
+    warn.mockRestore();
+  });
+
+  it('白名单查询：平台级扩展任何登录用户可读；组织私有扩展仅成员可读（非成员 403）；组织禁用不影响只读治理数据', async () => {
+    const { svc, prisma, authz } = makeHarness();
+    prisma.extension.findUnique.mockResolvedValue({ id: 'e2', organizationId: null, slug: 'brand', kind: 'agent', status: 'published' });
+    prisma.extensionOrgAllowlist.findMany.mockResolvedValue([{ organizationId: 'org1', createdAt: new Date(0) }]);
+    await expect(svc.listAllowlist('stranger', 'e2')).resolves.toMatchObject({ restricted: true });
+    expect(authz.membership).not.toHaveBeenCalled();
+
+    authz.membership.mockResolvedValueOnce(null); // 非成员
+    prisma.extension.findUnique.mockResolvedValue({ id: 'e3', organizationId: 'org1', slug: 'priv', kind: 'agent', status: 'published' });
+    await expect(svc.listAllowlist('stranger', 'e3')).rejects.toMatchObject({ code: 'FORBIDDEN' });
+
+    // 组织禁用（orgStatus=disabled）仍可读：白名单是"为何本组织不可用"的自查入口
+    authz.membership.mockResolvedValueOnce({ role: 'owner', orgStatus: 'disabled' });
+    await expect(svc.listAllowlist('u1', 'e3')).resolves.toMatchObject({ extensionId: 'e3' });
+  });
+
+  it('增条目 RBAC：平台级扩展需平台管理员；组织成员（有 agent.write）与外部人一律拒绝；不可自加入', async () => {
+    const { svc, prisma, authz } = makeHarness();
+    prisma.extension.findUnique.mockResolvedValue({ id: 'e2', organizationId: null, slug: 'brand', kind: 'agent', status: 'published' });
+    prisma.user.findUnique.mockResolvedValue({ id: 'u1', role: 'user' });
+    await expect(svc.addAllowlistEntry('u1', 'e2', 'org1')).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(prisma.extensionOrgAllowlist.upsert).not.toHaveBeenCalled();
+
+    // 组织私有扩展：owner 可增；member 虽有 agent.write 但白名单是治理动作 → 拒绝
+    authz.membership.mockResolvedValue({ role: 'member', orgStatus: 'active' });
+    prisma.extension.findUnique.mockResolvedValue({ id: 'e3', organizationId: 'org1', slug: 'priv', kind: 'agent', status: 'published' });
+    await expect(svc.addAllowlistEntry('u1', 'e3', 'org2')).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    authz.membership.mockResolvedValue({ role: 'owner', orgStatus: 'active' });
+    prisma.organization.findFirst.mockResolvedValue({ id: 'org2' });
+    await expect(svc.addAllowlistEntry('u1', 'e3', 'org2')).resolves.toBeTruthy();
+    expect(prisma.extensionOrgAllowlist.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      where: { extensionId_organizationId: { extensionId: 'e3', organizationId: 'org2' } },
+    }));
+
+    // 目标组织不存在 → 404（不落脏数据）
+    prisma.organization.findFirst.mockResolvedValue(null);
+    await expect(svc.addAllowlistEntry('u1', 'e3', 'nope')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('删条目 IDOR：非 extension owner 只能删本组织条目；跨组织删除一律 403；条目不存在 → 404', async () => {
+    const { svc, prisma, authz } = makeHarness();
+    prisma.extension.findUnique.mockResolvedValue({ id: 'e3', organizationId: 'org1', slug: 'priv', kind: 'agent', status: 'published' });
+    authz.membership.mockResolvedValue({ role: 'member', orgStatus: 'active' }); // 调用者仅是扩展所属组织的 member
+    authz.authorize.mockRejectedValueOnce(Object.assign(new Error('权限不足'), { code: 'FORBIDDEN' }));
+
+    await expect(svc.removeAllowlistEntry('u2', 'e3', 'org2')).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(prisma.extensionOrgAllowlist.deleteMany).not.toHaveBeenCalled();
+
+    // 本组织 owner 自助退出：允许（只收回自身可用性，绝不提权）
+    authz.membership.mockResolvedValue({ role: 'owner', orgStatus: 'active' });
+    authz.authorize.mockResolvedValue('owner');
+    prisma.extensionOrgAllowlist.deleteMany.mockResolvedValue({ count: 1 });
+    await expect(svc.removeAllowlistEntry('u1', 'e3', 'org1')).resolves.toMatchObject({ removed: true });
+
+    prisma.extensionOrgAllowlist.deleteMany.mockResolvedValue({ count: 0 });
+    await expect(svc.removeAllowlistEntry('u1', 'e3', 'org1')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('白名单收紧的即时回收：非白名单组织的既有安装 → disabled + 物化资源失效（绝不遗留可用能力）', async () => {
+    const { svc, prisma } = makeHarness();
+    const ext = { id: 'e4', organizationId: null, slug: 'tool-ext', kind: 'tool', status: 'published' };
+    prisma.extension.findUnique.mockResolvedValue(ext);
+    prisma.user.findUnique.mockResolvedValue({ id: 'admin', role: 'admin' });
+    prisma.organization.findFirst.mockResolvedValue({ id: 'org1' });
+    // 白名单 = [org1]；历史安装分布：org1（保留）+ org2（回收）
+    prisma.extensionOrgAllowlist.findMany.mockResolvedValue([{ organizationId: 'org1' }]);
+    prisma.extensionOrgAllowlist.upsert.mockResolvedValue({ id: 'al-1', extensionId: 'e4', organizationId: 'org1' });
+    prisma.extensionInstallation.findMany.mockResolvedValue([
+      { id: 'i1', organizationId: 'org1', extensionId: 'e4', versionId: 'v1', status: 'enabled' },
+      { id: 'i2', organizationId: 'org2', extensionId: 'e4', versionId: 'v1', status: 'enabled' },
+    ]);
+
+    const r = await svc.addAllowlistEntry('admin', 'e4', 'org1');
+
+    expect(r.disabledOrganizations).toEqual(['org2']);
+    expect(prisma.extensionInstallation.update).toHaveBeenCalledWith({ where: { id: 'i2' }, data: { status: 'disabled' } });
+    expect(prisma.extensionInstallation.update).not.toHaveBeenCalledWith({ where: { id: 'i1' }, data: { status: 'disabled' } });
   });
 });

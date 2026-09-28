@@ -58,14 +58,20 @@ export class ExtensionsService implements OnModuleInit {
 
   // ===== 可见性 / 授权 =====
 
+  /** 平台管理员判定（user.role='admin'，DB 权威读取；不依赖 token 声明） */
+  private async isPlatformAdmin(userId: string): Promise<boolean> {
+    const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { role: true } });
+    return user?.role === 'admin';
+  }
+
   /** 平台级扩展（organizationId=null）仅平台管理员可管理；组织私有扩展需该组织 agent.write */
   private async assertCanManage(userId: string, organizationId: string | null): Promise<void> {
     if (organizationId) {
+      // M10-P14：组织禁用 → 该组织的扩展管理一律拒绝（AuthorizationService 以 ORG_DISABLED 403 同码拒绝）
       await this.authz.authorize(userId, organizationId, 'agent.write');
       return;
     }
-    const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { role: true } });
-    if (!user || user.role !== 'admin') throw new AppError(ErrorCode.FORBIDDEN, '平台级扩展仅平台管理员可管理');
+    if (!(await this.isPlatformAdmin(userId))) throw new AppError(ErrorCode.FORBIDDEN, '平台级扩展仅平台管理员可管理');
   }
 
   /** 目标组织可见性：平台级扩展所有组织可见；组织私有扩展仅该组织可见（跨组织 404 防枚举） */
@@ -93,6 +99,137 @@ export class ExtensionsService implements OnModuleInit {
     });
     if (!installation) throw new AppError(ErrorCode.NOT_FOUND, '扩展未安装');
     return installation;
+  }
+
+  // ===== M10-P14（D16）组织白名单：ExtensionOrgAllowlist 落点 =====
+
+  /**
+   * 扩展的组织级使用白名单（`ExtensionOrgAllowlist`）：
+   * - **未配置任何条目 = 对所有组织开放**（不引入默认收紧，保持 M8/M9 既有语义）；
+   * - **配置了条目 = 仅白名单组织可用**（fail-closed）：非白名单组织 install/enable 一律 403；
+   *   历史安装（白名单配置之前已安装/启用）在变更时被回收（installation→disabled + 物化资源失效）；
+   * - 物化期兜底：非白名单组织即便走到物化路径，`resolveEffectiveAgentTools` 收到的 orgAllowlist 为 `[]`
+   *   → 全部工具被剔除（`org_policy_denied`）+ 审计日志（绝不产出带工具的 Agent）。
+   *
+   * RBAC（语义自洽 + 测试锁定；**绝不新增权限位**）：
+   * - **增/删条目（extension owner）**：平台级扩展（organizationId=null）仅平台管理员；组织私有扩展需
+   *   该组织 owner/admin（organization.write 之上再收紧：member 虽有 agent.write 但不得管理白名单）；
+   * - **删条目（本组织自助退出）**：目标组织的 owner/admin 可删除**本组织**的条目（只收回自身可用性，
+   *   绝不构成提权）；组织成员/非成员一律拒绝（IDOR）；
+   * - **自加入被禁止**：任何组织不得把自己加入他方扩展的白名单（那将绕开扩展所有者的收紧决策）——
+   *   只有 extension owner 可增条目。
+   */
+  private async isOrgAllowlisted(extensionId: string, organizationId: string): Promise<boolean> {
+    const entries = await this.prisma.extensionOrgAllowlist.findMany({
+      where: { extensionId }, select: { organizationId: true },
+    });
+    if (!entries.length) return true; // 未配置白名单 = 对所有组织开放
+    return entries.some((e) => e.organizationId === organizationId);
+  }
+
+  /** 使用前门禁（install / enable 路径）：非白名单组织 → 403（绝不静默降级为"无工具"） */
+  private async assertOrgAllowlisted(extensionId: string, organizationId: string): Promise<void> {
+    if (!(await this.isOrgAllowlisted(extensionId, organizationId))) {
+      throw new AppError(ErrorCode.FORBIDDEN, '扩展未对该组织开放（组织白名单）');
+    }
+  }
+
+  /**
+   * extension owner 判定（白名单条目增删）：平台级 → 平台管理员；组织私有 → 该组织 owner/admin
+   * （成员虽有 agent.write，但白名单是治理动作 → 收紧到 owner/admin；组织禁用 → 组织侧管理权一并冻结）。
+   */
+  private async isAllowlistOwner(userId: string, ext: { organizationId: string | null }): Promise<boolean> {
+    if (!ext.organizationId) return this.isPlatformAdmin(userId);
+    const membership = await this.authz.membership(userId, ext.organizationId);
+    if (!membership || membership.orgStatus === 'disabled') return false;
+    return membership.role === 'owner' || membership.role === 'admin';
+  }
+
+  private async assertAllowlistOwner(userId: string, ext: { organizationId: string | null }): Promise<void> {
+    if (await this.isAllowlistOwner(userId, ext)) return;
+    throw new AppError(ErrorCode.FORBIDDEN, '仅扩展所有者可管理该扩展的组织白名单（平台级扩展=平台管理员；组织私有扩展=所属组织 owner/admin）');
+  }
+
+  /** 目标组织的 owner/admin 判定（自助退出白名单） */
+  private async assertOrgGovernance(userId: string, organizationId: string): Promise<void> {
+    const role = await this.authz.authorize(userId, organizationId, 'agent.write');
+    if (role !== 'owner' && role !== 'admin') {
+      throw new AppError(ErrorCode.FORBIDDEN, '仅该组织 owner/admin 可执行');
+    }
+  }
+
+  /**
+   * 只读治理数据（任何能看见该扩展的登录用户可读）：
+   * - 平台级扩展（organizationId=null）：任何登录用户可读（白名单不是秘密，市场目录本就公开）；
+   * - 组织私有扩展：仅该组织成员可读（非成员 → 403，与 list/get 同口径）；
+   * - **组织禁用不阻断本端点**：白名单是"为何本组织不可用"的自查入口（只读治理数据），
+   *   故按成员身份（membership）而非 authorize 裁决——authorize 在禁用组织会以 ORG_DISABLED 拒绝。
+   */
+  async listAllowlist(userId: string, id: string) {
+    const ext = await this.requireExtension(id);
+    if (ext.organizationId) {
+      const membership = await this.authz.membership(userId, ext.organizationId);
+      if (!membership) throw new AppError(ErrorCode.FORBIDDEN, '无权访问该组织');
+    }
+    const items = await this.prisma.extensionOrgAllowlist.findMany({
+      where: { extensionId: id }, select: { organizationId: true, createdAt: true }, orderBy: { createdAt: 'asc' },
+    });
+    return { extensionId: id, restricted: items.length > 0, items };
+  }
+
+  /** 增条目（extension owner）：目标组织必须存在（防脏数据/防伪造 id） */
+  async addAllowlistEntry(userId: string, id: string, organizationId: string) {
+    const ext = await this.requireExtension(id);
+    await this.assertAllowlistOwner(userId, ext);
+    const org = await this.prisma.organization.findFirst({
+      where: { id: organizationId, deletedAt: null }, select: { id: true },
+    });
+    if (!org) throw new AppError(ErrorCode.NOT_FOUND, '组织不存在');
+    const entry = await this.prisma.extensionOrgAllowlist.upsert({
+      where: { extensionId_organizationId: { extensionId: id, organizationId } },
+      create: { extensionId: id, organizationId }, update: {},
+    });
+    // 收紧立即生效：非白名单组织的既有安装与物化资源被回收（绝不遗留可用能力）
+    const enforcement = await this.enforceAllowlist(ext);
+    return { entry, ...enforcement };
+  }
+
+  /** 删条目（extension owner，或该组织 owner/admin 自助退出） */
+  async removeAllowlistEntry(userId: string, id: string, organizationId: string) {
+    const ext = await this.requireExtension(id);
+    if (!(await this.isAllowlistOwner(userId, ext))) {
+      // 非 extension owner：仅允许"本组织自助退出"（只收回自身可用性，绝不提权；跨组织一律 403 → IDOR 防线）
+      await this.assertOrgGovernance(userId, organizationId);
+    }
+    const removed = await this.prisma.extensionOrgAllowlist.deleteMany({ where: { extensionId: id, organizationId } });
+    if (!removed.count) throw new AppError(ErrorCode.NOT_FOUND, '白名单条目不存在');
+    // 删除条目不自动启用被回收的安装（重新启用是显式动作）；清除后若白名单为空则恢复"对所有组织开放"
+    await this.enforceAllowlist(ext);
+    return { removed: true, extensionId: id, organizationId };
+  }
+
+  /**
+   * 白名单收紧的即时回收：白名单非空时，未列入的组织其安装 → disabled + 物化资源失效。
+   * （删除条目不做自动恢复——重新启用是显式动作。）
+   */
+  private async enforceAllowlist(ext: { id: string; slug: string; kind: string }): Promise<{ disabledOrganizations: string[] }> {
+    const entries = await this.prisma.extensionOrgAllowlist.findMany({
+      where: { extensionId: ext.id }, select: { organizationId: true },
+    });
+    if (!entries.length) return { disabledOrganizations: [] }; // 白名单清空 = 恢复对所有组织开放（不追溯启用）
+    const allowed = new Set(entries.map((e) => e.organizationId));
+    const installations = await this.prisma.extensionInstallation.findMany({ where: { extensionId: ext.id } });
+    const disabledOrganizations: string[] = [];
+    for (const inst of installations) {
+      if (allowed.has(inst.organizationId)) continue;
+      if (inst.status !== 'disabled') {
+        await this.prisma.extensionInstallation.update({ where: { id: inst.id }, data: { status: 'disabled' } });
+      }
+      await this.deactivateMaterialized(ext, inst.organizationId);
+      disabledOrganizations.push(inst.organizationId);
+    }
+    if (disabledOrganizations.length) await this.reconcile();
+    return { disabledOrganizations };
   }
 
   // ===== 声明校验（含平台资源引用）=====
@@ -131,7 +268,10 @@ export class ExtensionsService implements OnModuleInit {
 
   /**
    * 薄适配：把平台注册表 + 审计日志接到唯一实现 resolveEffectiveAgentTools 上。
-   * lookup 只信平台注册表（授权控制面事实源）；orgAllowlist 预留组织策略面（当前无该表/列，生产不传）。
+   * lookup 只信平台注册表（授权控制面事实源）；orgAllowlist = 组织策略面放行的工具名单——
+   * M10-P14 起由 `ExtensionOrgAllowlist`（扩展组织白名单）驱动：非白名单组织传 `[]`（一律不予工具），
+   * 白名单内/未配置白名单传 undefined（无额外工具级限制）。声明期校验（assertAgentToolsDeclarable）不传 →
+   * 声明合法性不受某个组织的白名单影响（白名单是用得成/用不成，不是清单合法性）。
    */
   private effectiveAgentTools(
     extensionId: string, requested: readonly string[], declaredPermissions: readonly ExtensionPermissionName[],
@@ -382,6 +522,8 @@ export class ExtensionsService implements OnModuleInit {
     await this.authz.authorize(userId, input.organizationId, 'agent.write');
     const ext = await this.requireExtension(id);
     this.assertVisible(ext, input.organizationId);
+    // M10-P14（D16）：扩展配置了组织白名单时，仅白名单组织可安装（非白名单 → 403，绝不落安装行/物化资源）
+    await this.assertOrgAllowlisted(ext.id, input.organizationId);
 
     const version = input.versionId
       ? await this.prisma.extensionVersion.findFirst({ where: { id: input.versionId, extensionId: id } })
@@ -432,6 +574,8 @@ export class ExtensionsService implements OnModuleInit {
     await this.authz.authorize(userId, organizationId, 'agent.write');
     const ext = await this.requireExtension(id);
     this.assertVisible(ext, organizationId);
+    // M10-P14（D16）：启用路径同样受白名单约束（白名单可能在安装后才配置 → 此处补齐，历史安装不得继续可用）
+    if (enabled) await this.assertOrgAllowlisted(ext.id, organizationId);
     const installation = await this.requireInstallation(id, organizationId);
     const nextStatus = enabled ? 'enabled' : 'disabled';
     if (installation.status === nextStatus) {
@@ -498,7 +642,15 @@ export class ExtensionsService implements OnModuleInit {
     // F4（唯一实现）：清单里的 tools 只是"请求"，绝不原样落库——
     // effective = 请求 ∩ 平台注册表 ∩ 可包装权限面（read/write/generate）∩ 扩展/组织策略面。
     // 越权项（external_action/destructive/financial 等）在此被剔除并审计；已发布版本行不可变 → 剔除清单落既有的 AgentVersion.config。
-    const effective = this.effectiveAgentTools(ext.id, block.tools, manifest.permissions);
+    //
+    // M10-P14（D16）：扩展组织白名单的**落点** —— 组织白名单非空且本组织不在其中时，组织策略面传 `[]`：
+    // effective 变为空（每个工具以 org_policy_denied 剔除 + 审计日志），绝不产出带工具的 Agent。
+    // （install / enable 路径已前置 403 拒绝；此处是历史安装、直连服务调用与未来调用方的纵深兜底。）
+    const orgAllowlisted = await this.isOrgAllowlisted(ext.id, organizationId);
+    if (!orgAllowlisted) {
+      this.logger.warn(`扩展 ${ext.id} 未对组织 ${organizationId} 开放（组织白名单）→ 物化工具清单为空（fail-closed）`);
+    }
+    const effective = this.effectiveAgentTools(ext.id, block.tools, manifest.permissions, orgAllowlisted ? undefined : []);
     const config = {
       extensionId: ext.id, extensionVersion: versionId,
       ...(effective.dropped.length

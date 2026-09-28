@@ -73,4 +73,22 @@ describe('AuthorizationService（M8-P1 RBAC 矩阵，deny-by-default）', () => 
     prisma.organization.findFirst.mockResolvedValue(null); // 已删除/不存在
     await expect(svc.authorize('u1', 'org-1', 'project.read')).rejects.toMatchObject({ code: 'FORBIDDEN' });
   });
+
+  it('M10-P14：组织禁用（status=disabled）→ 403 ORG_DISABLED（owner 亦不可访问；服务层纵深）', async () => {
+    const { svc, prisma } = makeService();
+    prisma.organization.findFirst.mockResolvedValue({ id: 'org-1', status: 'disabled' });
+    prisma.organizationMember.findUnique.mockResolvedValue({ role: 'owner' });
+
+    // 组织级读写一律拒绝（即便矩阵本应放行：冻结优先于角色权限）
+    for (const p of ['organization.read', 'project.read', 'agent.read', 'agent.write'] as OrgPermission[]) {
+      const err = await svc.authorize('u1', 'org-1', p).catch((e) => e);
+      expect(err.getStatus()).toBe(403);
+      expect(err.getResponse()).toMatchObject({ code: 'ORG_DISABLED' });
+    }
+    await expect(svc.require('u1', 'org-1')).rejects.toMatchObject({ status: 403 });
+
+    // 组织 active → 既有矩阵行为不变
+    prisma.organization.findFirst.mockResolvedValue({ id: 'org-1', status: 'active' });
+    await expect(svc.authorize('u1', 'org-1', 'agent.write')).resolves.toBe('owner');
+  });
 });

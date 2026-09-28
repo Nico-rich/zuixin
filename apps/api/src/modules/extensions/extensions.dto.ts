@@ -35,3 +35,8 @@ export const InstallSchema = z.strictObject({
 export const OrgScopedSchema = z.strictObject({
   organizationId: z.string().min(1).max(64),
 });
+
+/** M10-P14：组织白名单条目（extension owner 增删；目标组织必须存在且未软删） */
+export const AllowlistEntrySchema = z.strictObject({
+  organizationId: z.string().min(1).max(64),
+});
