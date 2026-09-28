@@ -22,7 +22,7 @@ import {
  *    1 文档/1000 块、m=16/ef_construction=64 默认 HNSW。灌 3e4 行后 `ANALYZE`，用**生产同一条 SQL**
  *    （`buildSimilaritySearchSql`，仅把表名换到临时表）跑 EXPLAIN：钉死 rpc=1.1 → 选 HNSW 有序扫描；
  *    备注（勿过度解读）：**本探针不构成"默认 rpc 一定选错"的断言**——在 3e4 行临时表上 rpc=4.0/8.0 也选了 HNSW。
- *    缺陷窗口是**代价噪声区**（实测 1e3~3e3 行 rpc=4.0 → Seq+Sort，实测 Seq+Sort 慢 30×~12000×），
+ *    缺陷窗口是**代价估算打平区**（实测 1e3~3e3 行 rpc=4.0 → Seq+Sort；选错代价 10×~15000×），
  *    其非单调性见文件头交叉点表；本探针断言的是"钉死后在真实规模上**必然**走索引"这一生产保证。
  * 2) 【执行证据】同一条 SQL 在钉死 GUC 下 `EXPLAIN (ANALYZE, BUFFERS)`：计划里真的是 Index Scan（不是只被选中）；
  * 3) 【作用域证据】检索走完 `searchSimilarChunks` 后，**会话级** GUC 仍是 PG/pgvector 默认值

@@ -25,9 +25,11 @@ const CHUNK_INSERT_BATCH = 500;
 // ─────────────────────────────────────────────────────────────────────────────
 // M11-P14（NV-10）HNSW 规模交叉点实验结论 —— 检索期 GUC 的取值依据
 //
-// 实验（scratch 库，一次性、用完即删；形状与生产一致：1536 维向量、content 800 字符/行=chunking 默认、
-// userId scope 下推、距离上界=1-0.3、LIMIT 5；二维扫描 = 行数(1e3~3e5) × random_page_cost(1.0~8.0)，
-// `EXPLAIN (ANALYZE, BUFFERS)` 实测，索引参数 = 生产默认 m=16/ef_construction=64）：
+// 实验（scratch 库，一次性、用完即删；形状与生产一致：1536 维向量、content≈800 字符/行=chunking 默认、
+// userId scope 下推、距离上界=1-0.3、LIMIT 5、1 文档/1000 块；索引与生产同定义
+// `USING hnsw (embedding vector_cosine_ops)` = pgvector 默认 m=16/ef_construction=64）。
+// 二维扫描 = 行数(1e3~1e6) × random_page_cost(1.0~8.0)：`EXPLAIN (COSTS)` 判 planner 选择，
+// `EXPLAIN (ANALYZE, BUFFERS)` 实测耗时（同一份数据、同一条 SQL）：
 //
 //   行数    rpc=1.0   rpc=1.1   rpc=2.0   rpc=4.0(PG 默认)   rpc=8.0
 //   1e3     HNSW      HNSW      HNSW      **Seq+Sort**       Seq+Sort
@@ -36,20 +38,28 @@ const CHUNK_INSERT_BATCH = 500;
 //   3e4     HNSW      HNSW      HNSW      HNSW               Seq+Sort
 //   1e5     HNSW      HNSW      HNSW      HNSW               HNSW
 //   3e5     HNSW      HNSW      HNSW      HNSW               HNSW
+//   1e6     HNSW      HNSW      HNSW      HNSW               HNSW
 //
-// 同一查询的实测耗时（同一数据、同一 SQL，只换 planner 的选择）：
-//   Seq+Sort 命中时：3e3 行 21.9ms / 1e4 行 3175ms / 3e4 行 7609ms / 1e5 行 >60s（statement_timeout 截断）
-//   HNSW 命中时：    1e3~3e5 行全部 0.4~0.8ms（ef_search=40；ef_search 40→400 仍为 0.4~3ms 量级）
-//   → 规划器选错时代价 30×~12000×，且**不随规模单调**（3e3~3e5 段都可能退回 Seq+Sort）。
+// 为什么"规模大了就会自动走索引"是错的：两条路径的**估算代价比**（idx/seq @rpc=1.1）在 1e3~3e3 只有
+// 0.39~0.63（几乎打平 → 任何 rpc>1.1 都会翻成 Seq+Sort），1e4 起才拉开（0.15 → 1e5 的 0.034 →
+// 1e6 的 0.006）。即**危险窗口恰在 10^3~3×10^3 行**（估算打平区），更大规模是"蒙对"而非保证。
 //
-// 为什么默认 rpc=4.0 会选错：宽向量列被 TOAST 存到行外，顺序扫描每行都要额外取一次 TOAST 页，
-// 而 planner 的代价模型只看**堆页**（看不到 TOAST 取列成本），于是把 Seq+Sort 估得远比实际便宜。
-// 因此"到多大数据量才自动生效"这个问题没有安全答案——**必须把检索期 GUC 显式钉死**。
+// 实测耗时（HNSW 首次=冷态 16~60ms，热态 0.4~1.0ms）：
+//   选错（planner 选了 Seq+Sort）：1e3 7.0ms / 3e3 21.9~24.0ms / 1e4 3175ms / 3e4 7609ms
+//     （work_mem=4MB 触发外部排序落盘，规模越大越贵；强制 Seq 路径复测 1e4 165ms / 3e5 3164ms
+//       —— 绝对值随缓存与排序溢出状态浮动，量级差不变）
+//   选对（HNSW 有序扫描）：1e3~1e6 全部 0.4~1.0ms（ef_search=40）；1e5/1e6 上 ef_search
+//     10/40/100/200/400 → 0.4/0.5/0.7~2.5/0.9~3.7/1.5~4.3ms（更大 ef 只买到更慢）
+//   → 选错代价 10×~15000×，且**不随规模单调**（危险窗口 1e3~3e3；rpc=8.0 时延伸到 3e4）。
+//
+// 根因：宽向量列被 TOAST 存到行外，顺序扫描每行都要额外取一次 TOAST 页，而 planner 的代价模型只看
+// **堆页**（看不到 TOAST 取列成本），于是把 Seq+Sort 估得远比实际便宜。M10 P16 审计在 1e4 行观测到
+// 同一现象（其数据形状下窗口更宽）——边界随内容/统计形状浮动，故**没有"到多大数据量自动生效"的安全答案**。
 //
 // 结论（本模块据此固定，作用域=本次检索的显式事务，不污染连接池里的其它查询）：
-//   1) random_page_cost 取 SSD 口径 1.1：实测在 1e3~3e5 行**全部**选择 HNSW 有序扫描；
-//   2) hnsw.ef_search 默认保持 pgvector 默认值 40（时延最优区间；更大值只买到合成语料上分辨不出的召回，
-//      真实 embedding 分布的召回率 NOT VERIFIED，故不做无依据的上调）；
+//   1) random_page_cost 取 SSD 口径 1.1：实测在 1e3~1e6 行**全部**选择 HNSW 有序扫描（7 档 × 5 值网格）；
+//   2) hnsw.ef_search 默认保持 pgvector 默认值 40：合成语料上 ef=10 起召回已饱和（恰好返回精确最近邻），
+//      40→400 只把时延抬到 1.5~4.3ms；**真实 embedding 分布的召回率 NOT VERIFIED**，故不做无依据的上调；
 //   3) 两个值都可用 env 覆盖（不同磁盘/不同召回要求），非法值 → 回退默认并 warn（检索绝不因调参挂掉）。
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -85,7 +95,7 @@ export const resolveHnswRandomPageCost = (env: NodeJS.ProcessEnv = process.env):
  * - 阈值以距离上界表达（`<=> <= 1 - threshold`），与相似度阈值数学等价；
  * - userId/projectId scope 下推 WHERE（HNSW 候选集后过滤，越权行绝不进入候选集）。
  * 注：形状正确只是**必要**条件——pgvector 的 HNSW 有序扫描路径是**代价敏感**的，默认 random_page_cost=4.0
- * 下 1e3~3e5 行区间 planner 会随机性地退回 Seq Scan+Sort（宽向量 TOAST 取列成本不在代价模型里）。
+ * 下 1e3~3×10^3 行区间（估算打平区）planner 会退回 Seq Scan+Sort（宽向量 TOAST 取列成本不在代价模型里）。
  * P14（M11）起检索在显式事务内钉死检索期 GUC（见 `searchSimilarChunks` 与文件头的实测交叉点表），
  * 使该形状在本模块的调用路径上**必定**走索引；EXPLAIN 断言（enable_sort=off）只用于验证"路径可用"。
  */
@@ -210,7 +220,7 @@ export class KnowledgeRepository {
    * 返回集合语义不变（topK 内、相似度 ≥ threshold、按相似度降序）。
    *
    * M11-P14：形状正确**不足以**让 planner 选 HNSW——代价模型看不到 TOAST 取列成本，默认
-   * random_page_cost=4.0 下 1e3~3e5 行区间会随机性地退回 Seq+Sort（实测慢 30×~12000×，
+   * random_page_cost=4.0 下 1e3~3×10^3 行区间会退回 Seq+Sort（实测慢 10×~15000×，
    * 见文件头实验表）。故检索在**显式事务**内先钉死检索期 GUC（`set_config(..., is_local=true)`
    * 等价 `SET LOCAL`，事务结束即失效，绝不泄漏到连接池里的其它查询），再执行同一份 SQL。
    */
