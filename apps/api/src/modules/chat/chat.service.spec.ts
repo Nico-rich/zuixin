@@ -33,8 +33,11 @@ function makeChat(agentEvents?: () => AsyncIterable<AgentEvent>, agentId = 'gene
   const agent: Agent = { id: agentId, execute: () => events() };
   const agentRegistry = { resolveForIntent: vi.fn().mockResolvedValue(agent) };
   const quota = { assertQuota: vi.fn().mockResolvedValue({ organizationId: 'personal-test', consumed: 0, total: 1, reservationId: 'r-1' }), release: vi.fn().mockResolvedValue(undefined) };
-  const svc = new ChatService(prisma as never, kv as never, router as never, context as never, attachmentsService as never, memoryExtractor as never, agentRegistry as never, quota as never);
-  return { svc, prisma, kv, context, memoryExtractor, agentRegistry, agent };
+  // M9-P2：增量摘要 + 候选提炼（fire-and-forget；单测只验证调用不被阻塞/失败不冒泡）
+  const summaryRefiner = { maybeRefine: vi.fn().mockResolvedValue({ created: [], pendingMessages: 0 }) };
+  const memoryCandidates = { extractFromSummary: vi.fn().mockResolvedValue({ summaryId: null, skipped: null, extracted: 0, promoted: 0, rejected: 0, duplicated: 0 }) };
+  const svc = new ChatService(prisma as never, kv as never, router as never, context as never, attachmentsService as never, memoryExtractor as never, agentRegistry as never, quota as never, summaryRefiner as never, memoryCandidates as never);
+  return { svc, prisma, kv, context, memoryExtractor, agentRegistry, agent, summaryRefiner, memoryCandidates };
 }
 
 /** 收集 SSE 帧的 fake sink（缓冲式按 \n\n 分帧解析） */

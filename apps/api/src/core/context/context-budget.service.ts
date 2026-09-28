@@ -24,8 +24,9 @@ export function scopePriority(scope: MemoryBlock['scope']): number {
     case 'user': return 2;
     case 'conversation': return 5; // recent messages
     case 'knowledge': return 4;
+    case 'summary': return 3; // M9-P2：摘要版本段（高优先于 knowledge、低于 memory）
   }
-  return 3; // summary 等未知源默认中位
+  return 3; // 未知源默认中位
 }
 
 /**
@@ -37,6 +38,8 @@ export function scopePriority(scope: MemoryBlock['scope']): number {
  * - system 块本身超过预算 → 抛 CONTEXT_BUDGET_EXCEEDED（绝不静默删除 System Prompt）；
  * - recent_messages 组内：**从最新向前保留**（blocks 为时间正序 → 从末尾取），输出保持时间正序；
  * - knowledge 组内：保持输入顺序（KnowledgeSource 已按 similarity 降序）→ 高相似度优先；
+ * - summary 组（M9-P2）：块携带版本段（block.source.segments，最早→最新）时，超预算**裁掉最早版本段**
+ *   ——保留最新段（最近的对话信息），仍然超预算的那一段才走通用比例截断；
  * - 单块超过剩余预算 → 按比例确定性截断 content 并重估 tokenCount（不丢消息、不破坏配对）；
  * - 同输入同预算 → 同输出。
  */
@@ -85,6 +88,12 @@ export class ContextBudgetService {
         } else if (priority === 5) {
           truncated = true; // recent 组：预算不足 → 丢弃（更旧的更不可能保留）
           continue;
+        } else if (block.scope === 'summary' && Array.isArray(block.source?.segments)) {
+          // summary 组：裁掉最早版本段（保留最新段——最近的对话上下文更相关）
+          const trimmed = this.trimSummarySegments(block, remaining);
+          kept.push(trimmed);
+          remaining = Math.max(0, remaining - this.tokensOf(trimmed));
+          truncated = true;
         } else {
           // 非 recent 组（memory/knowledge/summary）：单块超剩余 → 按比例确定性截断内容（保留头部）
           const ratio = Math.max(0.05, remaining / tokens);
@@ -107,5 +116,29 @@ export class ContextBudgetService {
 
   private tokensOf(b: MemoryBlock): number {
     return b.tokenCount ?? this.estimator.estimate(b.content);
+  }
+
+  /**
+   * 摘要块超预算 → 裁掉最早版本段（确定性：同输入同输出）。
+   * 仍不放下最后一段时，对该段走通用比例截断（保留头部），绝不删除整块（摘要比旧消息更值钱）。
+   */
+  private trimSummarySegments(block: MemoryBlock, remaining: number): MemoryBlock {
+    const segments = (block.source?.segments as string[]).filter((s) => typeof s === 'string');
+    const full = segments.join('\n');
+    // 块前缀（如【对话摘要】）不在版本段里：按"内容以全文结尾"还原，保持注入标记不变
+    const prefix = block.content.endsWith(full) ? block.content.slice(0, block.content.length - full.length) : '';
+    const kept = [...segments];
+    while (kept.length > 1 && this.estimator.estimate(prefix + kept.join('\n')) > remaining) kept.shift();
+    let content = prefix + kept.join('\n');
+    if (this.estimator.estimate(content) > remaining) {
+      const ratio = Math.max(0.05, remaining / Math.max(1, this.estimator.estimate(content)));
+      content = content.slice(0, Math.max(1, Math.floor(content.length * ratio)));
+    }
+    return {
+      ...block,
+      content,
+      tokenCount: this.estimator.estimate(content),
+      source: { ...(block.source ?? {}), segments: kept, trimmedSegments: segments.length - kept.length },
+    };
   }
 }

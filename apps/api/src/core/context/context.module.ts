@@ -6,13 +6,15 @@ import { PrismaService } from '../../modules/prisma/prisma.service';
 import { MemoryModule } from '../memory/memory.module';
 import { KnowledgeModule } from '../knowledge/knowledge.module';
 import { MemoryService } from '../memory/memory.service';
+import { SummaryRefinerService } from '../memory/summary-refiner.service';
 import { KnowledgeService } from '../knowledge/knowledge.service';
 import { ProjectMemorySource, UserMemorySource } from './sources/memory.sources';
 import { KnowledgeSource } from './sources/knowledge.source';
+import { ConversationSummarySource } from './sources/summary.source';
 
 /**
- * 上下文组装模块：内置最近消息源 + ProjectMemorySource / UserMemorySource / KnowledgeSource
- * + ContextBudgetService（统一预算决策）。未来 SummarySource / SystemPromptSource 在此注册。
+ * 上下文组装模块：内置最近消息源 + ProjectMemorySource / UserMemorySource / ConversationSummarySource
+ * / KnowledgeSource + ContextBudgetService（统一预算决策）。未来 SystemPromptSource 在此注册。
  */
 @Module({
   imports: [MemoryModule, KnowledgeModule],
@@ -21,11 +23,12 @@ import { KnowledgeSource } from './sources/knowledge.source';
     ContextBudgetService,
     {
       provide: ContextAssembler,
-      inject: [PrismaService, MemoryService, KnowledgeService, ContextBudgetService],
-      useFactory: (prisma: PrismaService, memories: MemoryService, knowledge: KnowledgeService, budget: ContextBudgetService) => {
+      inject: [PrismaService, MemoryService, KnowledgeService, ContextBudgetService, SummaryRefinerService],
+      useFactory: (prisma: PrismaService, memories: MemoryService, knowledge: KnowledgeService, budget: ContextBudgetService, summaries: SummaryRefinerService) => {
         const assembler = new ContextAssembler(prisma, budget);
         assembler.register(new ProjectMemorySource(memories));
         assembler.register(new UserMemorySource(memories));
+        assembler.register(new ConversationSummarySource(summaries));
         assembler.register(new KnowledgeSource(knowledge));
         return assembler;
       },
