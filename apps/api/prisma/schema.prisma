@@ -177,6 +177,8 @@ model User {
   evaluationRuns EvaluationRun[]
   evaluators Evaluator[]
   experiments Experiment[]
+  extensionPublications ExtensionPublication[]
+  extensionReviews ExtensionReview[]
 }
 
 model Session {
@@ -1436,6 +1438,7 @@ model Organization {
   evaluationRuns EvaluationRun[]
   evaluators Evaluator[]
   experiments Experiment[]
+  extensionPublications ExtensionPublication[]
   invoices     Invoice[]
   paymentEvents PaymentEvent[]
   @@index([ownerUserId])
@@ -1733,6 +1736,40 @@ model MemoryCandidate {
   createdAt       DateTime @default(now())
   promotedAt      DateTime?
   @@index([userId, status])
+}
+
+// ===== M9-P6 Marketplace 公开层（Coordinator 预整合；评分绝不提升权限——权限仍 = manifest ∩ 平台白名单 ∩ 组织策略）=====
+model ExtensionPublication {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  extensionId    String   @unique // 一个扩展一份发布
+  status         String   @default("draft") // draft|published|rejected
+  category       String
+  description    String
+  changelog      Json?    // [{version, notes}]
+  compatibility  Json?    // 平台版本兼容性声明
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  reviews        ExtensionReview[]
+  @@index([organizationId])
+  @@index([status, category])
+}
+
+model ExtensionReview {
+  id               String   @id @default(uuid())
+  publicationId    String
+  publication      ExtensionPublication @relation(fields: [publicationId], references: [id], onDelete: Cascade)
+  userId           String
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  rating           Int      // 1~5（服务层校验）
+  body             String?
+  moderationStatus String   @default("pending") // pending|approved|rejected
+  createdAt        DateTime @default(now())
+  @@unique([publicationId, userId])
+  @@index([publicationId, moderationStatus])
 }
 
 // ===== M8-P3~P7 平台层（Coordinator 预整合 schema；各 Phase 并行实现业务）=====
