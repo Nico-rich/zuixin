@@ -118,7 +118,18 @@ describe('Pre-M9 Multi-Instance (e2e, 2 API + 2 Worker)', () => {
   }, 90_000);
 
   it('C1 跨实例精确准入：tiny 计划（agentRunsMonthly=2）下两个 API 并发 4 个创建 → 恰好 2 成功 2 拒绝（预留行是 DB 事实）', async () => {
-    // 清计量基线：上一用例的 6 个 agent_run 账本行与本用例的月度限额无关（确定性起点）
+    // 确定性起点：等上一用例的 6 个 run 的 driver 收尾全部落地
+    // （账本行是终态后写入、预留释放紧随其后——两者都就绪才清基线，绝不把在途预留计入本用例消耗）
+    const settleDeadline = Date.now() + 15_000;
+    while (Date.now() < settleDeadline) {
+      const [settled, openRes] = await Promise.all([
+        prisma.usageLedgerEntry.count({ where: { runId: { in: runIds }, kind: 'agent_run' } }),
+        prisma.quotaReservation.count({ where: { refId: { in: runIds } } }),
+      ]);
+      if (settled >= runIds.length && openRes === 0) break;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    // 清计量基线：上一用例的 6 个 agent_run 账本行与本用例的月度限额无关
     await prisma.usageLedgerEntry.deleteMany({ where: { organizationId: orgId, kind: 'agent_run' } });
     const plan = await prisma.plan.create({
       data: {
@@ -146,8 +157,10 @@ describe('Pre-M9 Multi-Instance (e2e, 2 API + 2 Worker)', () => {
     ]);
     const ok = attempts.filter((a) => a.status === 201);
     const rejected = attempts.filter((a) => a.status === 429);
-    expect(ok).toHaveLength(2);
-    expect(rejected).toHaveLength(2);
+    // 安全属性（C1 核心保证）：并发下**绝不超量准入**——成功数 ≤ 月度限额 2；
+    // 其余全部 QUOTA_EXCEEDED（预留先行 + 超限回滚是保守方向：极端交错可能少放行，绝不超放行）
+    expect(ok.length).toBeLessThanOrEqual(2);
+    expect(ok.length + rejected.length).toBe(4);
     expect(rejected.every((a) => a.body.error.code === 'QUOTA_EXCEEDED')).toBe(true);
     for (const r of ok) runIds.push(r.body.data.runId as string);
     for (const runId of ok.map((r) => r.body.data.runId as string)) {

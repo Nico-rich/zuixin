@@ -110,9 +110,16 @@ describe('M6-P3 异步 AgentRun (e2e, 真实 Queue + Worker)', () => {
     expect(roles).toContain('assistant');
     expect(roles).toContain('tool');
     expect(run!.messages.find((m) => m.role === 'assistant' && m.toolCalls != null)).toBeTruthy();
-    // assistant Message 由 driver 落库 completed + content
+    // assistant Message 由 driver 落库 completed + content——run 终态翻转后写入（按设计的最终一致，
+    // 全量负载下窗口拉宽，必须轮询而非即时断言）
     const metadata = run!.metadata as { assistantMessageId: string };
-    const assistant = await prisma.message.findUnique({ where: { id: metadata.assistantMessageId } });
+    const msgDeadline = Date.now() + 10_000;
+    let assistant: { status: string; content: string } | null = null;
+    while (Date.now() < msgDeadline) {
+      assistant = await prisma.message.findUnique({ where: { id: metadata.assistantMessageId }, select: { status: true, content: true } });
+      if (assistant?.status === 'completed') break;
+      await new Promise((r) => setTimeout(r, 200));
+    }
     expect(assistant?.status).toBe('completed');
     expect(assistant?.content.length).toBeGreaterThan(0);
     // usage：LLM 回合 + 媒体任务归因 runId
