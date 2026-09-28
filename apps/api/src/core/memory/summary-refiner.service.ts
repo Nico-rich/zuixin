@@ -14,6 +14,8 @@ import { SimpleTokenEstimator } from '../context/token-estimator';
  * - 增量：新消息达到阈值 → 新建一行；`summary` 文本 = 前版全文 + 新消息段的增量提炼（追加不变式，见 segmentsOf）；
  *   `parentSummaryId` 链上前版；`tokenCount` 记录全文 token 估算（供上下文预算）。
  * - 回滚：删除最新版 → 前版自动恢复为 current（rollback）。
+ * - 降级（D29）：LLM 不可用 → 确定性兜底段（段首 DEGRADED_SUMMARY_MARKER）标记为降级；
+ *   `SummaryChain.degraded` 随链下行 → 上下文侧降权 + 置尾（绝不与正常摘要同权）。
  * - 陈旧：区间内消息被编辑/删除 → stale=true（markStale/detectStale）→ 重算（recomputeStale 删旧链后重建）；
  * - 隐私删除传播：会话删除 → purgeConversation（软删除不触发 FK 级联，必须显式清除）。
  *
@@ -22,6 +24,14 @@ import { SimpleTokenEstimator } from '../context/token-estimator';
  * （记忆候选走 MemoryCandidateService，只读真实 Message 行）。
  */
 export const DEFAULT_SUMMARY_REFINE_THRESHOLD = 6;
+/**
+ * D29 降级兜底段的**显式标记**：LLM 不可用时按消息原文压缩的段以此开头。
+ *
+ * 标记即事实来源（无 schema 变更）：`isDegradedSummarySegment()` 是唯一判定入口，
+ * 上下文侧（ConversationSummarySource / ContextBudgetService）据此把含降级段的摘要**降权 + 置尾**，
+ * 绝不与正常摘要同权进入上下文排序。
+ */
+export const DEGRADED_SUMMARY_MARKER = '【摘要降级：模型不可用，按消息原文压缩】';
 /** 单次建段的输入消息上限（超长会话按段推进，避免一次灌爆 prompt） */
 const MAX_MESSAGES_PER_SEGMENT = 40;
 /** 单条消息进入 prompt 的截断长度 */
@@ -34,6 +44,14 @@ const FALLBACK_LINE_CHARS = 120;
 const MAX_CHAIN_DEPTH = 50;
 /** 单会话版本行读取上限 */
 const MAX_VERSIONS = 200;
+
+/**
+ * 段是否为降级兜底产物（D29）。
+ * 容错：段的截断（MAX_SEGMENT_CHARS，标记在段首）与外部拼装造成的空白都不影响判定。
+ */
+export function isDegradedSummarySegment(segment: string): boolean {
+  return typeof segment === 'string' && segment.trimStart().startsWith(DEGRADED_SUMMARY_MARKER);
+}
 
 export const SUMMARY_SYSTEM_PROMPT = `你是对话摘要器。把"新增对话"压缩为一段增量摘要，追加到已有摘要之后。
 只输出新增部分的摘要文本（纯文本，不要 JSON、不要标题、不要重复已有摘要内容）。
@@ -55,6 +73,11 @@ export interface SummaryChain {
    */
   segments: string[];
   tokenCount: number;
+  /**
+   * D29：链上**存在**降级兜底段（LLM 不可用 → 按消息原文压缩）→ 该摘要整体按降级处理。
+   * 上下文侧据此降权/置尾（ContextBudgetService：最低优先级、预算不足直接丢弃），绝不与正常摘要同权。
+   */
+  degraded: boolean;
 }
 
 export interface RefineOptions {
@@ -113,6 +136,8 @@ export class SummaryRefinerService {
     return {
       summaryId: usable.id, version: chain.length, text, segments,
       tokenCount: usable.tokenCount || this.estimator.estimate(text),
+      // D29：链上任一段为降级兜底 → 整体降级（保守：含原文压缩段的摘要整体降权，绝不与正常摘要同权）
+      degraded: segments.some(isDegradedSummarySegment),
     };
   }
 
@@ -398,12 +423,15 @@ export class SummaryRefinerService {
     return delta.slice(0, MAX_SEGMENT_CHARS);
   }
 
-  /** 确定性兜底段：真实消息行逐条压缩（无 LLM 也可用；绝不引入摘要文本自身） */
+  /**
+   * 确定性兜底段：真实消息行逐条压缩（无 LLM 也可用；绝不引入摘要文本自身）。
+   * D29：段首固定为 DEGRADED_SUMMARY_MARKER——上下文侧据此识别并降权/置尾（标记不被截断丢失：标记在段首）。
+   */
   private fallbackDelta(messages: MessageRow[]): string {
     const lines = messages.map((m) => {
       const oneLine = m.content.replace(/\s+/g, ' ').trim().slice(0, FALLBACK_LINE_CHARS);
       return `${m.role === 'user' ? '用户' : '助手'}：${oneLine}`;
     });
-    return `【摘要降级：模型不可用，按消息原文压缩】\n${lines.join('\n')}`.slice(0, MAX_SEGMENT_CHARS);
+    return `${DEGRADED_SUMMARY_MARKER}\n${lines.join('\n')}`.slice(0, MAX_SEGMENT_CHARS);
   }
 }

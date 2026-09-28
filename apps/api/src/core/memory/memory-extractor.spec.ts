@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { Logger } from '@nestjs/common';
 import { LLMMemoryExtractor } from './memory-extractor';
 
 function makeExtractor(llmReply: string, opts: { failChat?: boolean; count?: number; limit?: number } = {}) {
@@ -65,6 +66,27 @@ describe('LLMMemoryExtractor', () => {
     const saved = await svc.extractCandidates(input);
     expect(saved).toBe(0);
     expect(prisma.memory.create).not.toHaveBeenCalled();
+  });
+
+  it('D30：非法 JSON / 不合 schema 都有 warn 日志（不再静默 0 候选），且不落模型原文', async () => {
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    try {
+      const bad = makeExtractor('不是JSON');
+      expect(await bad.svc.extractCandidates(input)).toBe(0);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('不是合法 JSON'))).toBe(true);
+
+      // JSON 合法但结构不符（memories 缺 importance/confidence）
+      const snowflake = '{"memories":[{"content":"泄露候选文本","category":"preference"}]}';
+      const mismatch = makeExtractor(snowflake);
+      expect(await mismatch.svc.extractCandidates(input)).toBe(0);
+      const schemaWarn = warn.mock.calls.map((c) => String(c[0])).find((m) => m.includes('不符合约定 schema'));
+      expect(schemaWarn).toBeTruthy();
+      expect(schemaWarn).toContain('memories.0.importance'); // 只记 issue 路径/码
+      expect(schemaWarn).not.toContain('泄露候选文本'); // 脱敏：模型原文绝不进日志
+      expect(mismatch.prisma.memory.create).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('LLM 抛错 → 0 候选（不阻断聊天）', async () => {

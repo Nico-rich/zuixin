@@ -45,7 +45,14 @@ export interface UpdateMemoryInput {
 export class MemoryService {
   constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
 
-  /** 列表 + PG 普通文本搜索（ILIKE，M2 不做 embedding） */
+  /**
+   * 列表 + PG 普通文本搜索（ILIKE，M2 不做 embedding）。
+   *
+   * 排序（D15）：importance 主序 → lastUsedAt 次序（**最近被上下文用过者优先**，从未用过者最后，
+   * 即 lastUsedAt IS NULL 恒排在非 NULL 之后——绝不因 PG 默认 NULLS FIRST 让"没用过的"盖过"用过的"）
+   * → createdAt 兜底（同分同用量时新记忆优先，排序确定可复现）。
+   * 上下文组装读的正是本方法 → 近期真正被用到的记忆更可能进入下一轮上下文。
+   */
   list(userId: string, filter: MemoryListFilter = {}) {
     const where: Prisma.MemoryWhereInput = { userId };
     if (filter.scope) where.scope = filter.scope;
@@ -54,7 +61,11 @@ export class MemoryService {
     if (filter.q) where.content = { contains: filter.q, mode: 'insensitive' };
     return this.prisma.memory.findMany({
       where,
-      orderBy: { importance: 'desc' },
+      orderBy: [
+        { importance: 'desc' },
+        { lastUsedAt: { sort: 'desc', nulls: 'last' } },
+        { createdAt: 'desc' },
+      ],
       take: 100,
     });
   }
@@ -109,7 +120,7 @@ export class MemoryService {
     await this.prisma.memory.delete({ where: { id } });
   }
 
-  /** 上下文组装使用后刷新 lastUsedAt（暂不参与排序，供使用统计/淘汰预留） */
+  /** 上下文组装使用后刷新 lastUsedAt（D15：已参与 list 排序——importance 相同时最近使用者优先） */
   async markUsed(ids: string[]): Promise<void> {
     if (!ids.length) return;
     await this.prisma.memory.updateMany({

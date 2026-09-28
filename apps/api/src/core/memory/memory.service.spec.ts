@@ -50,8 +50,22 @@ describe('MemoryService.list/search', () => {
         userId: 'u1', scope: 'user', status: 'active',
         content: { contains: '主图', mode: 'insensitive' },
       }),
-      orderBy: { importance: 'desc' },
+      orderBy: [
+        { importance: 'desc' },
+        { lastUsedAt: { sort: 'desc', nulls: 'last' } }, // D15：最近被用过的优先，从未用过的最后
+        { createdAt: 'desc' },
+      ],
     }));
+  });
+
+  it('D15：lastUsedAt 参与排序，且 NULLS LAST（绝不让"没用过的"盖过"用过的"）', async () => {
+    const { svc, prisma } = make();
+    await svc.list('u1', {});
+    const orderBy = prisma.memory.findMany.mock.calls[0][0].orderBy as Array<Record<string, unknown>>;
+    expect(orderBy).toHaveLength(3);
+    expect(orderBy[0]).toEqual({ importance: 'desc' }); // 主序不变：importance 仍是第一关键字
+    expect(orderBy[1]).toEqual({ lastUsedAt: { sort: 'desc', nulls: 'last' } }); // 次序：使用新鲜度
+    expect(orderBy[2]).toEqual({ createdAt: 'desc' }); // 兜底：排序确定可复现
   });
 
   it('projectId 越权 → 返回空（按 userId+projectId 双条件）', async () => {

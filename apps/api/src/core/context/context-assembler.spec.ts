@@ -70,4 +70,53 @@ describe('ContextAssembler（内置最近消息源，行为与 M1 buildHistory �
     expect(blocks.map((b) => b.content)).toEqual(['系统提示', '用户记忆', '倒数第2条', '倒数第1条（最新）']);
     expect(messages[0]).toEqual({ role: 'system', content: '系统提示' });
   });
+
+  it('D29 降级摘要：正常摘要排原位（order 30），降级块置尾（order 110）——绝不与正常摘要同权', async () => {
+    const { svc } = makeAssembler();
+    svc.register({
+      scope: 'summary' as const,
+      collect: async (): Promise<MemoryBlock[]> => [
+        {
+          scope: 'summary', role: 'user', content: '【对话摘要】【摘要降级：模型不可用，按消息原文压缩】\n用户：旧内容',
+          order: 110, priority: 6, degraded: true, tokenCount: 40,
+          source: { summaryId: 's-old', version: 1, segments: ['【摘要降级：模型不可用，按消息原文压缩】\n用户：旧内容'] },
+        },
+        {
+          scope: 'summary', role: 'user', content: '【对话摘要】正常摘要', order: 30, tokenCount: 6,
+          source: { summaryId: 's-new', version: 2, segments: ['正常摘要'] },
+        },
+      ],
+    });
+    const { messages, blocks } = await svc.assemble({ userId: 'u1', conversationId: 'c1' });
+    expect(blocks.map((b) => b.content)).toEqual([
+      '【对话摘要】正常摘要',
+      '倒数第2条',
+      '倒数第1条（最新）',
+      '【对话摘要】【摘要降级：模型不可用，按消息原文压缩】\n用户：旧内容', // 降级 → 置尾
+    ]);
+    expect(messages.at(-1)!.content).toContain('摘要降级');
+  });
+
+  it('D29 降级摘要：预算不足时整块被丢弃（正常摘要与最近消息保留）', async () => {
+    const { svc, prisma } = makeAssembler();
+    // 预算只够 正常摘要(6) + 最近消息(10+10)，降级块(60) 放不下
+    prisma.systemSetting.findUnique.mockResolvedValue({ key: 'limits', value: { contextBudgetTokens: 26 } });
+    svc.register({
+      scope: 'summary' as const,
+      collect: async (): Promise<MemoryBlock[]> => [
+        {
+          scope: 'summary', role: 'user', content: '【对话摘要】【摘要降级】兜底原文', order: 110, degraded: true, tokenCount: 60,
+          source: { summaryId: 's-old', version: 1, segments: ['【摘要降级】兜底原文'] },
+        },
+        {
+          scope: 'summary', role: 'user', content: '【对话摘要】正常摘要', order: 30, tokenCount: 6,
+          source: { summaryId: 's-new', version: 2, segments: ['正常摘要'] },
+        },
+      ],
+    });
+    const { blocks, truncated } = await svc.assemble({ userId: 'u1', conversationId: 'c1' });
+    expect(truncated).toBe(true);
+    expect(blocks.some((b) => b.degraded === true)).toBe(false); // 降级块绝不挤占正常内容预算
+    expect(blocks.map((b) => b.content)).toContain('【对话摘要】正常摘要');
+  });
 });

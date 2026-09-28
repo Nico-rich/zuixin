@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { SummaryRefinerService } from './summary-refiner.service';
+import { DEGRADED_SUMMARY_MARKER, isDegradedSummarySegment, SummaryRefinerService } from './summary-refiner.service';
 
 /**
  * 内存 fake Prisma（只实现本服务用到的语义：会话摘要版本行 / 消息 / 候选 / systemSetting）。
@@ -222,6 +222,38 @@ describe('SummaryRefinerService（增量摘要版本链）', () => {
     expect(v1.summary).toContain('内容1');
     expect(v1.summary).toContain('用户：');
     expect(v1.tokenCount).toBeGreaterThan(0);
+  });
+
+  it('D29：兜底段 = 显式降级标记；latestUsable 报 degraded=true（正常摘要为 false）', async () => {
+    const degradedDb = makeDb({ messages: segment(6, 0) });
+    const degraded = makeRefiner(degradedDb, new Error('provider down'));
+    await degraded.svc.maybeRefine(CONV);
+    const withFallback = await degraded.svc.latestUsable(CONV);
+    expect(withFallback!.segments[0].startsWith(DEGRADED_SUMMARY_MARKER)).toBe(true);
+    expect(withFallback!.degraded).toBe(true);
+
+    const normalDb = makeDb({ messages: segment(6, 0) });
+    const normal = makeRefiner(normalDb, '正常摘要');
+    await normal.svc.maybeRefine(CONV);
+    expect((await normal.svc.latestUsable(CONV))!.degraded).toBe(false);
+  });
+
+  it('D29：降级段之后追加正常段 → 链整体仍按降级处理（保守，绝不与正常摘要同权）', async () => {
+    const db = makeDb({ messages: segment(6, 0) });
+    await makeRefiner(db, new Error('provider down')).svc.maybeRefine(CONV); // v1 = 兜底段
+    append(db, 6, 6, 7);
+    await makeRefiner(db, '正常增量摘要').svc.maybeRefine(CONV); // v2 = 正常段（追加在降级段之后）
+    const chain = await makeRefiner(db).svc.latestUsable(CONV);
+    expect(chain!.segments).toHaveLength(2);
+    expect(chain!.segments[1]).not.toContain(DEGRADED_SUMMARY_MARKER);
+    expect(chain!.degraded).toBe(true);
+  });
+
+  it('D29：isDegradedSummarySegment 只认段首标记（正文里提到标记不算降级）', () => {
+    expect(isDegradedSummarySegment(DEGRADED_SUMMARY_MARKER)).toBe(true);
+    expect(isDegradedSummarySegment(`\n ${DEGRADED_SUMMARY_MARKER}\n用户：内容1`)).toBe(true); // 容错前导空白
+    expect(isDegradedSummarySegment('用户偏好黑金配色')).toBe(false);
+    expect(isDegradedSummarySegment(`前文提到的${DEGRADED_SUMMARY_MARKER}不算降级`)).toBe(false);
   });
 
   it('防循环污染：摘要过程绝不写 Message 表（摘要不回流成对话输入）', async () => {
