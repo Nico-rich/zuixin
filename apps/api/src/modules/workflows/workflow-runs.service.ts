@@ -40,6 +40,13 @@ export class WorkflowRunsService {
   private async publishedVersion(userId: string, workflowId: string) {
     const wf = await this.prisma.workflow.findFirst({ where: { id: workflowId, userId } });
     if (!wf) throw new AppError(ErrorCode.NOT_FOUND, '工作流不存在');
+    // M10-P15（BUG-10）：**归档必须撤销全部触发路径**。归档只改 `Workflow.status`，而版本行仍是
+    // published → 仅凭"版本已发布"判断，归档后 webhook/manual/retry 仍能创建 run（"关闭"形同虚设）。
+    // `tickScheduled`/`handleEvent` 各自判定过 status，本处是四条触发路径（manual/webhook/schedule/event）
+    // + retry 的**共同入口**，在此裁决一次即全覆盖（错误码与 schedule/event 路径一致：409）。
+    if (wf.status !== 'published') {
+      throw new AppError(ErrorCode.WORKFLOW_NOT_PUBLISHED, '工作流未发布或已归档，拒绝触发');
+    }
     const version = await this.prisma.workflowVersion.findFirst({
       where: { workflowId, status: 'published' },
       orderBy: { version: 'desc' },

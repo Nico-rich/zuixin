@@ -100,7 +100,15 @@ export class ExperimentsService {
       throw new AppError(ErrorCode.VALIDATION_ERROR, `变体流量之和不得超过 100%（已用 ${usedTraffic}%）`);
     }
     if (dto.agentVersionId) {
-      const version = await this.prisma.agentVersion.findUnique({ where: { id: dto.agentVersionId }, select: { id: true } });
+      // M10-P15（IDOR）：**必须带归属谓词**（与 EvaluationRunsService 建 run 时同一可见性口径：
+      // 本组织版本 ∨ 系统级版本）。此前按 `findUnique({id})` 全局查 → 传入他组织的版本会 201
+      // （外键被落库），传入不存在的版本才 404：两者状态码不同 ⇒ 跨租户存在性 oracle；
+      // 且变体挂载了他人版本。系统级版本（organizationId=null, scope='system'）是平台目录，
+      // 与 run 口径一致必须放行——只认 organizationId 会把正常流程误杀成 404。
+      const version = await this.prisma.agentVersion.findFirst({
+        where: { id: dto.agentVersionId, agent: { OR: [{ organizationId }, { scope: 'system' }] } },
+        select: { id: true },
+      });
       if (!version) throw new AppError(ErrorCode.NOT_FOUND, 'Agent 版本不存在');
     }
     const isBaseline = dto.isBaseline ?? existing.length === 0;

@@ -165,4 +165,23 @@ describe('MarketplaceAccessService（治理显式判定 + 防枚举）', () => {
     await expect(makeHarness({ role: 'owner', orgExists: false }).service.assertPublicationWrite('u1', pub()))
       .rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
+
+  it('⑧ M10-P15（BUG-13）文案级存在性 oracle：非成员 404 必须复用调用方"行不存在"的文案', async () => {
+    // 调用方（publications/reviews/catalog）先按 id 取行：取不到 → 404「发布条目不存在」。
+    // 若此处非成员 404 用另一套文案（"资源不存在"），跨租户者即可凭**错误文案**逐字区分
+    // "条目不存在"与"条目存在但我不属该组织" —— 存在性 oracle，使 404 折叠形同虚设。
+    const MESSAGE = '发布条目不存在';
+    for (const method of ['assertPublicationWrite', 'assertModerationRights'] as const) {
+      await expect(makeHarness({ role: null }).service[method]('u-x', pub(), MESSAGE))
+        .rejects.toMatchObject({ code: 'NOT_FOUND', message: MESSAGE });
+    }
+    // 未发布条目（可见性路径）同一口径
+    await expect(makeHarness({ role: null }).service.assertVisible('u-x', pub({ status: 'draft' }), MESSAGE))
+      .rejects.toMatchObject({ code: 'NOT_FOUND', message: MESSAGE });
+    // 缺省仍为通用文案（无调用方指定时不留空文案）
+    await expect(makeHarness({ role: null }).service.assertPublicationWrite('u-x', pub()))
+      .rejects.toMatchObject({ code: 'NOT_FOUND', message: '资源不存在' });
+    // 有成员身份的路径不受影响（合法成员照常放行/按权限位裁决）
+    await expect(makeHarness({ role: 'owner' }).service.assertPublicationWrite('u1', pub(), MESSAGE)).resolves.toBe('owner');
+  });
 });

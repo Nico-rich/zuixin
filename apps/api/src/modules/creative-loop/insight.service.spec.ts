@@ -143,7 +143,7 @@ describe('InsightService（事实聚合 + 解读分层隔离）', () => {
     expect(next.facts).toEqual(doc.facts);
     expect(next.derived).toEqual(doc.derived);
     expect(next.interpretation?.source).toBe('llm-interpretation');
-    expect(h.access.authorizeResource).toHaveBeenCalledWith('u1', { organizationId: DOMAIN, userId: 'u1' }, 'workflow.write');
+    expect(h.access.authorizeResource).toHaveBeenCalledWith('u1', { organizationId: DOMAIN, userId: 'u1' }, 'workflow.write', '洞察不存在');
   });
 
   it('attachInterpretation：事实层已更新（factsHash CAS 未命中）→ 400，拒绝用旧事实承载新解读', async () => {

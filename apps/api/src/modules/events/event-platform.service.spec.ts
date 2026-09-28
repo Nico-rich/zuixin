@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventPlatformService, EventConsumer, eventChannel } from './event-platform.service';
+import { AppError, ErrorCode } from '../../common/errors/app-error';
 
 function makeEnvelope(over: Record<string, unknown> = {}) {
   return {
@@ -19,7 +20,13 @@ function makeService() {
       findMany: vi.fn().mockResolvedValue([]),
     },
   };
-  const auth = { require: vi.fn().mockResolvedValue('owner') };
+  // M10-P15（BUG-11）：redeliver 改为 membership（非成员折 404）+ authorize(workflow.write)（viewer 403）
+  const auth = {
+    require: vi.fn().mockResolvedValue('owner'),
+    /* 显式返回类型：非成员分支需要 `mockResolvedValueOnce(null)` */
+    membership: vi.fn(async (): Promise<{ role: string; orgStatus: string } | null> => ({ role: 'owner', orgStatus: 'active' })),
+    authorize: vi.fn(async () => 'owner'),
+  };
   const bus = { publish: vi.fn().mockResolvedValue(undefined), subscribe: vi.fn().mockResolvedValue(undefined), unsubscribe: vi.fn() };
   const svc = new EventPlatformService(prisma as never, auth as never, bus as never);
   return { svc, prisma, bus, auth };
@@ -163,6 +170,44 @@ describe('EventPlatformService（M8-P5 事件平台：幂等/重试/死信/重�
     prisma.eventEnvelope.findUnique.mockResolvedValueOnce(makeEnvelope({ status: 'published' }));
     prisma.eventEnvelope.updateMany.mockResolvedValueOnce({ count: 0 });
     await expect(svc.redeliver('u1', 'evt-1')).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+
+  it('M10-P15（BUG-11）：重投是**写**操作 —— viewer 403；非成员折 404（反枚举）；禁用组织 403 ORG_DISABLED', async () => {
+    // viewer（只读角色）此前能重投：走的是 membership 而非 workflow.write
+    const viewer = makeService();
+    viewer.auth.authorize.mockRejectedValueOnce(new AppError(ErrorCode.FORBIDDEN, '权限不足'));
+    viewer.prisma.eventEnvelope.findUnique.mockResolvedValueOnce(makeEnvelope({ status: 'dead' }));
+    await expect(viewer.svc.redeliver('u-viewer', 'evt-1')).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(viewer.prisma.eventEnvelope.updateMany).not.toHaveBeenCalled(); // 越权判定先于任何写入
+
+    // 非成员：与"事件不存在"同一 404（零信息差，不留存在性 oracle）
+    const foreign = makeService();
+    foreign.auth.membership.mockResolvedValueOnce(null);
+    foreign.prisma.eventEnvelope.findUnique.mockResolvedValueOnce(makeEnvelope({ status: 'dead' }));
+    await expect(foreign.svc.redeliver('u-foreign', 'evt-1')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(foreign.prisma.eventEnvelope.updateMany).not.toHaveBeenCalled();
+
+    // 禁用组织：与组织级读写的冻结口径一致（HttpException(403, {code:'ORG_DISABLED'})）
+    const disabled = makeService();
+    disabled.auth.membership.mockResolvedValueOnce({ role: 'owner', orgStatus: 'disabled' });
+    disabled.prisma.eventEnvelope.findUnique.mockResolvedValueOnce(makeEnvelope({ status: 'dead' }));
+    await expect(disabled.svc.redeliver('u1', 'evt-1'))
+      .rejects.toMatchObject({ status: 403, response: { code: 'ORG_DISABLED' } });
+  });
+
+  it('M10-P15（BUG-11）：平台级（无组织）事件仅平台管理员可重投 —— 普通登录用户不再能拉活', async () => {
+    const { svc, prisma } = makeService();
+    prisma.eventEnvelope.findUnique.mockResolvedValueOnce(makeEnvelope({ organizationId: null, status: 'dead' }));
+    await expect(svc.redeliver('u-any', 'evt-1')).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(prisma.eventEnvelope.updateMany).not.toHaveBeenCalled();
+
+    const admin = makeService();
+    admin.prisma.eventEnvelope.findUnique
+      .mockResolvedValueOnce(makeEnvelope({ organizationId: null, status: 'dead' }))
+      .mockResolvedValueOnce(makeEnvelope({ organizationId: null, status: 'published' }));
+    const res = await admin.svc.redeliver('u-admin', 'evt-1', { platformAdmin: true });
+    expect(res.redelivered).toBe(true);
+    expect(admin.auth.membership).not.toHaveBeenCalled();
   });
 
   it('list/deadLetterList：组织维度 + 状态过滤（成员身份经 auth 校验）', async () => {

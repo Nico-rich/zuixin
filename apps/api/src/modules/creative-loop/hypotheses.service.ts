@@ -243,7 +243,8 @@ export class HypothesesService {
   async requireReadable(userId: string, id: string): Promise<StoredDoc<HypothesisDoc>> {
     const stored = await this.store.get(id);
     if (!stored) throw new AppError(ErrorCode.NOT_FOUND, '假设不存在');
-    await this.access.authorizeResource(userId, { organizationId: stored.doc.organizationId, userId: stored.userId }, 'workflow.read');
+    // M10-P15（BUG-12）：非成员 404 的文案必须与上方"假设不存在"逐字相同（否则文案成为存在性信道）
+    await this.access.authorizeResource(userId, { organizationId: stored.doc.organizationId, userId: stored.userId }, 'workflow.read', '假设不存在');
     return stored;
   }
 
@@ -251,7 +252,7 @@ export class HypothesesService {
   async requireWritable(userId: string, id: string): Promise<StoredDoc<HypothesisDoc>> {
     const stored = await this.store.get(id);
     if (!stored) throw new AppError(ErrorCode.NOT_FOUND, '假设不存在');
-    await this.access.authorizeResource(userId, { organizationId: stored.doc.organizationId, userId: stored.userId }, 'workflow.write');
+    await this.access.authorizeResource(userId, { organizationId: stored.doc.organizationId, userId: stored.userId }, 'workflow.write', '假设不存在');
     return stored;
   }
 

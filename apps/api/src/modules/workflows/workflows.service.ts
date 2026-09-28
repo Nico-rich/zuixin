@@ -4,6 +4,7 @@ import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { WorkflowDefinition, validateDefinition } from './workflow-types';
 import { WorkflowTriggersService } from './workflow-triggers.service';
 import { OrganizationsService } from '../organizations/organizations.service';
+import { orgDisabledError } from '../../common/guards/org-status.guard';
 
 /**
  * M7-P6 Workflow 读写（版本不可变：编辑 = 新版本；Run 锁定 versionId）：
@@ -45,6 +46,16 @@ export class WorkflowsService {
       include: { versions: { orderBy: { version: 'desc' } } },
     });
     if (!w) throw new AppError(ErrorCode.NOT_FOUND, '工作流不存在');
+    // M10-P15（BUG-9）：组织禁用态对**读**路径同样冻结。
+    // 归属谓词只查了 `organization.deletedAt`，未查 `status` → 禁用组织的成员仍可 200 读出
+    // 工作流全文（含 definition/versions），而所有写路径经 `orgs.requirePermission` 已 403。
+    // 与 M10-P14 冻结口径、以及 scheduler/marketplace 的读路径修复同一错误码（403 ORG_DISABLED）。
+    if (w.organizationId) {
+      const org = await this.prisma.organization.findUnique({
+        where: { id: w.organizationId }, select: { status: true },
+      });
+      if (org?.status === 'disabled') throw orgDisabledError('组织已被禁用，无法访问其资源');
+    }
     return w;
   }
 
@@ -66,7 +77,10 @@ export class WorkflowsService {
 
   async list(userId: string) {
     return this.prisma.workflow.findMany({
-      where: { userId },
+      // M10-P15（BUG-9 同源）：列表也是读路径 —— 归属谓词只查 deletedAt，会让**禁用组织**的
+      // 工作流（含名称/描述/最新版本态/run 计数）继续出现在列表里，与 get() 的 403 冻结自相矛盾。
+      // 无组织归属的历史个人流程行（organizationId=null）不受组织治理态影响。
+      where: { userId, OR: [{ organizationId: null }, { organization: { status: 'active' } }] },
       orderBy: { updatedAt: 'desc' },
       include: {
         versions: { orderBy: { version: 'desc' }, take: 1, select: { id: true, version: true, status: true } },

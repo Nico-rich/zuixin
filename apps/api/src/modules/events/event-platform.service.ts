@@ -6,6 +6,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AuthorizationService } from '../organizations/authorization.service';
 import { EventBusService } from '../../core/events/event-bus.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
+import { orgDisabledError } from '../../common/guards/org-status.guard';
 
 export interface PublishEventInput {
   /** 幂等键（生产者提供；同 eventId 只入一次） */
@@ -314,14 +315,27 @@ export class EventPlatformService implements OnModuleInit {
    * 重投（死信恢复）：dead → published（attempts 归零）→ 重新通知消费者。
    * 已 consumed → 400（绝不二次消费）；非 dead → 400（避免掩盖未决状态）。
    */
-  async redeliver(userId: string, eventId: string): Promise<{ event: EventEnvelope; redelivered: boolean; consumers: number }> {
+  async redeliver(
+    userId: string,
+    eventId: string,
+    opts: { platformAdmin?: boolean } = {},
+  ): Promise<{ event: EventEnvelope; redelivered: boolean; consumers: number }> {
     const row = await this.prisma.eventEnvelope.findUnique({ where: { eventId } });
     if (!row) throw new AppError(ErrorCode.NOT_FOUND, '事件不存在');
     if (!row.organizationId) {
-      // 无组织事件：仅平台/拥有者可重投（audit 类）；此处按事件表无 owner 字段 → 退化为需登录
-      if (!userId) throw new AppError(ErrorCode.FORBIDDEN, '无权重投该事件');
+      // M10-P15（BUG-11）：**无组织（平台级）事件的重投是平台管理动作**。
+      // 此前是 `if (!userId) throw` —— 在 JwtAuthGuard 之后 userId 恒定非空 → 该判断恒为 false，
+      // 于是**任意登录用户**都能把任意平台级 dead 事件拉回 published 并触发消费者（越权写 + 放大攻击面）。
+      if (!opts.platformAdmin) throw new AppError(ErrorCode.FORBIDDEN, '平台级事件仅平台管理员可重投');
     } else {
-      await this.auth.require(userId, row.organizationId);
+      // M10-P15（BUG-11）：重投是**写**操作（dead → published + 重新投递）——此前只要求 membership，
+      // 于是组织内 viewer（只读角色）也能重投，与控制器声明的"复用 workflow.read/write 语义"不符；
+      // 且"非成员 403 vs 事件不存在 404"本身构成存在性 oracle。此处与组织的写路径口径对齐：
+      // 非成员折成 404（与 NOT_FOUND 不可区分），缺少 workflow.write → 403，禁用组织 → 403 ORG_DISABLED。
+      const m = await this.auth.membership(userId, row.organizationId);
+      if (!m) throw new AppError(ErrorCode.NOT_FOUND, '事件不存在');
+      if (m.orgStatus === 'disabled') throw orgDisabledError('组织已被禁用，无法访问其资源');
+      await this.auth.authorize(userId, row.organizationId, 'workflow.write');
     }
     if (row.status === 'consumed') throw new AppError(ErrorCode.VALIDATION_ERROR, '事件已消费，不可重投');
     const done = await this.prisma.eventEnvelope.updateMany({

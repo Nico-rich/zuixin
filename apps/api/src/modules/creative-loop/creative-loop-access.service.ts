@@ -60,14 +60,30 @@ export class CreativeLoopAccessService {
     return this.orgs.requirePermission(userId, organizationId, 'workflow.write');
   }
 
-  /** 资源级裁决：404 防枚举 → 权限位（读路径同样要求成员身份，绝不因知道 id 而放行） */
+  /**
+   * 资源级裁决：404 防枚举 → 权限位（读路径同样要求成员身份，绝不因知道 id 而放行）。
+   *
+   * M10-P15（BUG-12）：`notFoundMessage` 让"非成员"与"资源不存在"**逐字节同形**。
+   * 此前所有调用方都先自查 `store.get(id) === null` → 抛资源专属文案（如「假设不存在」），
+   * 而这里的非成员分支经 `assertCanAccess` 抛「资源不存在」——两者同为 404 但**文案不同**，
+   * 于是文案本身成了"该 id 是否存在（于他人组织）"的枚举信道。调用方传入与自查同源的文案即可闭合。
+   */
   async authorizeResource(
     userId: string,
     row: { organizationId: string; userId?: string } | null,
     action: 'workflow.read' | 'workflow.write',
+    notFoundMessage = '资源不存在',
   ): Promise<void> {
-    if (!row) throw new AppError(ErrorCode.NOT_FOUND, '资源不存在');
-    await this.orgs.assertCanAccess(userId, row.organizationId);
+    if (!row) throw new AppError(ErrorCode.NOT_FOUND, notFoundMessage);
+    try {
+      await this.orgs.assertCanAccess(userId, row.organizationId);
+    } catch (err) {
+      // assertCanAccess 的唯一抛出就是"非成员 → 404"：折成与自查分支同一文案（状态码/错误码一致）
+      if (err instanceof AppError && err.code === ErrorCode.NOT_FOUND) {
+        throw new AppError(ErrorCode.NOT_FOUND, notFoundMessage);
+      }
+      throw err;
+    }
     await this.orgs.requirePermission(userId, row.organizationId, action);
   }
 }

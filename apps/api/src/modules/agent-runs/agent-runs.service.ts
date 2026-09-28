@@ -104,6 +104,15 @@ export class AgentRunsService {
    * 串行往返 14-17 → 7-9（配额断言仍在 run 创建之前，取值与顺序语义不变）。
    */
   async createAsync(userId: string, dto: CreateAgentRunDto) {
+    // M10-P15（IDOR 全端点矩阵）：客户端提供的 `projectId` 是**配额/用量/分析的租户归属来源**
+    // （`BillingService.organizationFor(projectId)`、`UsageService.resolveOrganizationId`、
+    // `AnalyticsService.attributionClauses` 都从 project 行反查 organizationId），因此必须先做归属校验。
+    //
+    // 此前只在"无 conversationId"分支（`createConversation`）校验；当请求**自带自己名下的
+    // 无项目会话**（`conversation.projectId === null`）时，`:124` 的一致性守卫被短路，
+    // 未校验的 `dto.projectId` 被直接落库 → 跨租户写：他人组织的配额被消耗、账单/用量/分析被污染。
+    // 现改为统一前置校验（与 `createConversation` 同一谓词），且**先于配额预留**——绝不先扣后拒。
+    if (dto.projectId) await this.requireProject(userId, dto.projectId);
     // M8-P2：配额裁决在创建入口（服务端；LLM 绝不决定是否超额）；
     // Pre-M9 C1：runId 预生成作预留 refId（Driver 终态 release；TTL 兜底）
     // P1：仍**先于 run 创建**（失败即不建 run、不入队、不消耗预留）；绝不与建 run 并行。
@@ -305,11 +314,15 @@ export class AgentRunsService {
     return c;
   }
 
+  /** 项目归属校验（与 createConversation 同一谓词：他人项目与不存在项目一律 404，防枚举） */
+  private async requireProject(userId: string, projectId: string) {
+    const p = await this.prisma.project.findFirst({ where: { id: projectId, userId, deletedAt: null } });
+    if (!p) throw new AppError(ErrorCode.NOT_FOUND, '项目不存在');
+    return p;
+  }
+
   private async createConversation(userId: string, projectId: string | null) {
-    if (projectId) {
-      const p = await this.prisma.project.findFirst({ where: { id: projectId, userId, deletedAt: null } });
-      if (!p) throw new AppError(ErrorCode.NOT_FOUND, '项目不存在');
-    }
+    if (projectId) await this.requireProject(userId, projectId);
     return this.prisma.conversation.create({ data: { userId, projectId } });
   }
 }

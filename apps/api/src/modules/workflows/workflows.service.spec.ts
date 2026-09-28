@@ -18,10 +18,13 @@ function makeService(row: Record<string, unknown> | null = ROW) {
   const prisma = {
     workflow: {
       findFirst: vi.fn(async () => row),
+      findMany: vi.fn(async () => (row ? [row] : [])),
       create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => ({ id: 'wf-1', ...data })),
       update: vi.fn(async ({ data }: { data: Record<string, unknown> }) => ({ id: 'wf-1', ...data })),
       delete: vi.fn(async () => ({ id: 'wf-1' })),
     },
+    // M10-P15（BUG-9）：读路径现在裁决组织治理态（禁用组织 → 403 ORG_DISABLED）
+    organization: { findUnique: vi.fn(async () => ({ status: 'active' })) },
     workflowVersion: {
       update: vi.fn(async () => ({ id: 'v1' })),
       create: vi.fn(async () => ({ id: 'v2' })),
@@ -156,5 +159,29 @@ describe('WorkflowsService webhook 密钥轮换 RBAC（M10-P5 SA-18）', () => {
     const legacy = makeService({ ...ROW, organizationId: null, userId: 'someone-else' });
     await expect(legacy.svc.rotateWebhookSecret('owner-1', 'wf-1')).rejects.toMatchObject({ code: 'NOT_FOUND' });
     expect(legacy.triggers.rotateWebhook).not.toHaveBeenCalled();
+  });
+
+  it('M10-P15（BUG-9）：组织禁用 → **读**路径同样冻结（403 ORG_DISABLED，零副作用）', async () => {
+    const disabled = makeService();
+    disabled.prisma.organization.findUnique.mockResolvedValueOnce({ status: 'disabled' });
+    // 错误形状与 OrgStatusGuard/orgDisabledError 同源：HttpException(403, { code: 'ORG_DISABLED' })
+    const err = await disabled.svc.get('owner-1', 'wf-1').catch((e: unknown) => e);
+    expect(err).toMatchObject({ status: 403, response: { code: 'ORG_DISABLED' } });
+    expect(disabled.prisma.workflow.update).not.toHaveBeenCalled();
+
+    // 归属谓词命中但组织禁用 → 读详情绝不返回工作流全文
+    expect(JSON.stringify(err)).not.toContain('definition');
+  });
+
+  it('M10-P15（BUG-9 同源）：列表也是读路径 —— 禁用组织的行必须被 where 排除（不靠调用方过滤）', async () => {
+    const { svc, prisma } = makeService();
+    await svc.list('owner-1');
+    expect(prisma.workflow.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: {
+        userId: 'owner-1',
+        // 无组织归属的历史个人流程行不受组织治理态影响；有组织的行要求组织处于 active
+        OR: [{ organizationId: null }, { organization: { status: 'active' } }],
+      },
+    }));
   });
 });

@@ -147,4 +147,15 @@ describe('ConnectionsService（M7-P2 OAuth 生命周期）', () => {
     await expect(svc.revoke('u2', 'c1')).rejects.toMatchObject({ code: 'NOT_FOUND' });
     await expect(svc.remove('u2', 'c1')).rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
+
+  it('M10-P15（BUG-14）：连接是**用户级**资源 —— 读面与写面同谓词（仅 `{ id, userId }`，组织成员不例外）', async () => {
+    const { svc, prisma } = makeService();
+    prisma.connection.findFirst.mockResolvedValue({ id: 'c1', userId: 'u1' });
+    await svc.get('u1', 'c1');
+    // 旧实现为 `OR: [{ userId }, { organization: { members: { some: { userId } } } }]`：
+    // 同组织的其他成员（甚至 viewer）可读到同事连接的 providerAccountId/scope/expiresAt。
+    const where = (prisma.connection.findFirst.mock.calls.at(-1)?.[0] as { where: Record<string, unknown> }).where;
+    expect(where).toEqual({ id: 'c1', userId: 'u1' });
+    expect(JSON.stringify(where)).not.toContain('organization');
+  });
 });

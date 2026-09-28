@@ -172,7 +172,7 @@ export class MarketplaceCatalogService {
   async detail(userId: string, id: string): Promise<PublicationDetail> {
     const row = await this.prisma.extensionPublication.findUnique({ where: { id } });
     if (!row) throw new AppError(ErrorCode.NOT_FOUND, '发布条目不存在');
-    const viewer = await this.access.assertVisible(userId, row);
+    const viewer = await this.access.assertVisible(userId, row, '发布条目不存在');
     const [item] = await this.hydrate([row]);
     const [reviews, myReview] = await Promise.all([
       this.reviews.listApproved(id, REVIEW_PREVIEW_LIMIT),

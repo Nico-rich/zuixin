@@ -89,7 +89,7 @@ describe('HypothesesService（CRUD + 状态机 + 归属）', () => {
 
     await h.service.get('u1', 'hyp-1');
     expect(h.access.authorizeResource).toHaveBeenCalledWith(
-      'u1', { organizationId: 'org1', userId: 'u1' }, 'workflow.read',
+      'u1', { organizationId: 'org1', userId: 'u1' }, 'workflow.read', '假设不存在',
     );
   });
 

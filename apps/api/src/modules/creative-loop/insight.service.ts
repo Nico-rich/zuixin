@@ -204,14 +204,15 @@ export class InsightService {
   async requireReadable(userId: string, id: string): Promise<StoredDoc<InsightDoc>> {
     const stored = await this.store.get(id);
     if (!stored) throw new AppError(ErrorCode.NOT_FOUND, '洞察不存在');
-    await this.access.authorizeResource(userId, { organizationId: stored.doc.organizationId, userId: stored.userId }, 'workflow.read');
+    // M10-P15（BUG-12）：非成员 404 的文案与上方"洞察不存在"逐字相同（反枚举）
+    await this.access.authorizeResource(userId, { organizationId: stored.doc.organizationId, userId: stored.userId }, 'workflow.read', '洞察不存在');
     return stored;
   }
 
   private async requireWritable(userId: string, id: string): Promise<StoredDoc<InsightDoc>> {
     const stored = await this.store.get(id);
     if (!stored) throw new AppError(ErrorCode.NOT_FOUND, '洞察不存在');
-    await this.access.authorizeResource(userId, { organizationId: stored.doc.organizationId, userId: stored.userId }, 'workflow.write');
+    await this.access.authorizeResource(userId, { organizationId: stored.doc.organizationId, userId: stored.userId }, 'workflow.write', '洞察不存在');
     return stored;
   }
 
