@@ -4,12 +4,20 @@ import { ChevronDown, ChevronRight } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
 import { RunTimeline as RunTimelineData, TimelineItem } from './types';
 
+/**
+ * 时间线项图标（api 侧 TimelineItemType 全类型覆盖；未命中才回退 '•'）。
+ * M10-P13（审计 M9-18）：补上 run.waiting 与 approval.* 的专属图标——此前这些项一律显示兜底 '•'，
+ * 用户看不出"等待任务"与"等待审批"的区别（M6-P4 任务等待、M7-P1 人工审批都会产出这些项）。
+ */
 const ICONS: Record<string, string> = {
   'run.started': '▶', 'run.completed': '✅', 'run.failed': '❌', 'run.cancelled': '⏹', 'run.timeout': '⏰',
+  'run.waiting': '⏸',
   'step.tool_call': '▸', 'step.final': '💬',
   'tool.started': '🔧', 'tool.completed': '🔧', 'tool.failed': '🔧',
   'task.created': '⏳', 'task.completed': '🖼', 'task.failed': '❌',
   'artifact.created': '📄',
+  'approval.requested': '🙋', 'approval.approved': '👍', 'approval.rejected': '👎',
+  'approval.expired': '⌛', 'approval.cancelled': '🚫',
   'usage.summary': '📊',
 };
 

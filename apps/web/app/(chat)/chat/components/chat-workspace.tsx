@@ -7,7 +7,7 @@ import { consumeSSE } from '@/lib/sse';
 import { Sidebar } from './sidebar';
 import { ChatInput } from './chat-input';
 import { MessageBubble } from './message-bubble';
-import { TaskCard } from './task-card';
+import { TaskCard, type TaskStreamEvent } from './task-card';
 import { RunTimeline } from './run-timeline';
 import { ActiveTask, AttachmentView, ChatMessage, ChatStreamEventMap } from './types';
 
@@ -24,6 +24,8 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
   const queryClient = useQueryClient();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [tasks, setTasks] = useState<ActiveTask[]>([]);
+  // M10-P13（ARCH-07）：task 通道 SSE 事件（taskId → 最新事件），透传给对应 TaskCard 免轮询
+  const [taskEvents, setTaskEvents] = useState<Record<string, TaskStreamEvent>>({});
   const [thinking, setThinking] = useState('');
   const [currentTool, setCurrentTool] = useState('');
   const [runIds, setRunIds] = useState<Record<string, string>>({});
@@ -127,6 +129,18 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
             setTasks((prev) => [...prev, { taskId: d.taskId, kind: d.kind }]);
             break;
           }
+          // M10-P13（ARCH-07）：任务进度/完成由 api 从 Redis `task` 通道转发到本 SSE 流
+          // （不落库判断，只做展示与对账触发——DB 仍是任务事实源）
+          case 'task.progress': {
+            const d = data as ChatStreamEventMap['task_progress'];
+            setTaskEvents((prev) => ({ ...prev, [d.taskId]: { ...d, type: 'task.progress' } }));
+            break;
+          }
+          case 'task.completed': {
+            const d = data as ChatStreamEventMap['task_completed'];
+            setTaskEvents((prev) => ({ ...prev, [d.taskId]: { ...d, type: 'task.completed' } }));
+            break;
+          }
           case 'message_end': {
             const d = data as ChatStreamEventMap['message_end'];
             flushDelta(d.messageId);
@@ -196,7 +210,7 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
               </div>
             ))}
             {tasks.map((t) => (
-              <TaskCard key={t.taskId} taskId={t.taskId} kind={t.kind} onDone={onTaskDone} />
+              <TaskCard key={t.taskId} taskId={t.taskId} kind={t.kind} onDone={onTaskDone} event={taskEvents[t.taskId] ?? null} />
             ))}
             {currentTool && (
               <div className="flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-400">

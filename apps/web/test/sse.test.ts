@@ -90,3 +90,54 @@ describe('consumeSSE 分帧解析', () => {
     await expect(consumeSSE(stream, () => { throw new Error('handler boom'); })).rejects.toThrow('handler boom');
   });
 });
+
+/**
+ * M10-P13（审计 M9-20）：CRLF 分帧。
+ * SSE 规范允许 `\r\n` 行结束符；代理/网关可能把 LF 重写为 CRLF，而原实现只按 `\n\n` 切帧
+ * → CRLF 流一条事件都收不到（内容全部滞留到流结束被丢弃）。
+ */
+describe('consumeSSE CRLF 兼容（M9-20）', () => {
+  /** 线上 CRLF 帧：`event: <name>\r\ndata: <json>\r\n\r\n` */
+  const crlfFrame = (name: string, data: unknown) => `event: ${name}\r\ndata: ${JSON.stringify(data)}\r\n\r\n`;
+
+  it('纯 CRLF 流：帧正常切分并派发（旧实现在此完全静默）', async () => {
+    const events = await collect([
+      crlfFrame('task.progress', { type: 'task.progress', taskId: 't1', progress: 30 }),
+      crlfFrame('task.completed', { type: 'task.completed', taskId: 't1' }),
+    ]);
+    expect(events.map(([e]) => e)).toEqual(['task.progress', 'task.completed']);
+    expect(JSON.parse(events[0][1])).toEqual({ type: 'task.progress', taskId: 't1', progress: 30 });
+  });
+
+  it('CRLF 与 LF 混用（逐帧不同）都能识别', async () => {
+    const events = await collect([
+      crlfFrame('message_start', { messageId: 'm1' }),
+      frame('message_end', { status: 'completed' }),
+    ]);
+    expect(events).toEqual([['message_start', '{"messageId":"m1"}'], ['message_end', '{"status":"completed"}']]);
+  });
+
+  it('`\\r\\n` 恰被 TCP 分片切开（chunk 以 \\r 结尾，下一 chunk 以 \\n 开头）不漏帧、不早派发', async () => {
+    const raw = crlfFrame('x', { a: 1 }) + crlfFrame('y', { b: 2 });
+    const cut = raw.indexOf('\r\n\r\n'); // 第一帧的帧尾 CRLF
+    const chunks = [raw.slice(0, cut + 1), raw.slice(cut + 1)]; // 切开 "\r" | "\n\r\n..."
+    expect(chunks[0].endsWith('\r')).toBe(true);
+    expect(chunks[1].startsWith('\n')).toBe(true);
+
+    const seen: Array<[string, string]> = [];
+    await consumeSSE(new ReadableStream<Uint8Array>({
+      start(c) { for (const ch of chunks) c.enqueue(new TextEncoder().encode(ch)); c.close(); },
+    }), (e, d) => { seen.push([e, d]); });
+    expect(seen).toEqual([['x', '{"a":1}'], ['y', '{"b":2}']]);
+  });
+
+  it('CRLF 流中的多行 data: 仍按 \\n 拼接（归一化不改变 data 语义）', async () => {
+    const events = await collect(['event: x\r\ndata: line1\r\ndata: line2\r\n\r\n']);
+    expect(events).toEqual([['x', 'line1\nline2']]);
+  });
+
+  it('CRLF 心跳注释帧不派发事件', async () => {
+    const events = await collect([': ping\r\n\r\n', crlfFrame('status', { stage: 'thinking', message: '分析中' })]);
+    expect(events).toEqual([['status', '{"stage":"thinking","message":"分析中"}']]);
+  });
+});

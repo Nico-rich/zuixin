@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, apiFetch, uploadAttachment } from '@/lib/api';
+import { ApiError, apiFetch, isAuthEndpoint, uploadAttachment } from '@/lib/api';
 import { jsonResponse } from './helpers';
 
 type FetchCall = [RequestInfo | URL, RequestInit | undefined];
@@ -52,18 +52,48 @@ describe('apiFetch 鉴权与错误归一化', () => {
     expect(mock).toHaveBeenCalledTimes(5); // 2 次原始 401 + 1 次 refresh + 2 次重放
   });
 
-  // 【已知缺陷记录，非期望行为】lib/api.ts 的守卫写作 `!path.startsWith('/auth/')`，
-  // 但真实鉴权路径是 `/api/v1/auth/*`（api 全局前缀 api/v1 + auth 控制器）——守卫恒为 false（死条件），
-  // 因此 auth 端点自身 401 也会额外打一次 /auth/refresh。本用例锁定“不死循环”的既有事实：
-  // refresh 也 401 时不再重放原请求，最终仍抛原始 401 的 ApiError。修复该守卫后本用例需同步更新。
-  it('【缺陷记录】auth 端点 401 的守卫失效：额外触发一次 refresh，但不成环', async () => {
+  // M10-P13（审计 M9-17）修复：守卫原写作 `!path.startsWith('/auth/')`，与真实路径 `/api/v1/auth/*`
+  // 不匹配 → 死条件（auth 端点自身 401 也会多打一次 refresh）。现按真实前缀判断。
+  it('auth 端点自身 401 → 不触发 refresh，直接抛原始 ApiError（只 1 次请求）', async () => {
     const mock = stubFetch(() => jsonResponse({ error: { code: 'UNAUTHORIZED', message: '未登录' } }, 401));
     await expect(apiFetch('/api/v1/auth/me')).rejects.toMatchObject({ name: 'ApiError', code: 'UNAUTHORIZED', message: '未登录' });
-    expect(mock).toHaveBeenCalledTimes(2);
+    expect(mock).toHaveBeenCalledTimes(1);
     expect(url(mock.mock.calls[0] as FetchCall)).toBe('/api/v1/auth/me');
-    expect(url(mock.mock.calls[1] as FetchCall)).toBe('/api/v1/auth/refresh');
-    // 无递归：refresh 不会再触发 refresh，也没有第二次重放
-    expect(mock.mock.calls.filter((c) => url(c as FetchCall).includes('refresh'))).toHaveLength(1);
+  });
+
+  it('兄弟端点 /api/v1/auth/login 与 /api/v1/auth 本身同样被守卫（不触发 refresh）', async () => {
+    const mock = stubFetch(() => jsonResponse({ error: { code: 'UNAUTHORIZED', message: '凭据无效' } }, 401));
+    await expect(apiFetch('/api/v1/auth/login', { method: 'POST' })).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    await expect(apiFetch('/api/v1/auth')).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    expect(mock.mock.calls.map((c) => url(c as FetchCall))).toEqual(['/api/v1/auth/login', '/api/v1/auth']);
+  });
+
+  it('前缀相似但非 auth 的路径（/api/v1/authx/*）不误判 → 仍走 refresh 重试', async () => {
+    const mock = stubFetch((u) => (u.endsWith('/api/v1/auth/refresh')
+      ? jsonResponse({ data: { ok: true } })
+      : mock.mock.calls.filter((c) => url(c as FetchCall) === u).length === 1
+        ? jsonResponse({ error: { code: 'UNAUTHORIZED', message: '过期' } }, 401)
+        : jsonResponse({ data: { path: u } })));
+    await expect(apiFetch<{ data: { path: string } }>('/api/v1/authx/config')).resolves.toEqual({ data: { path: '/api/v1/authx/config' } });
+    expect(mock.mock.calls.map((c) => url(c as FetchCall))).toEqual(['/api/v1/authx/config', '/api/v1/auth/refresh', '/api/v1/authx/config']);
+  });
+
+  it('查询串/无前导斜杠写法不影响守卫判定', async () => {
+    const mock = stubFetch(() => jsonResponse({ error: { code: 'UNAUTHORIZED', message: '未登录' } }, 401));
+    await expect(apiFetch('/api/v1/auth/me?ts=1')).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    await expect(apiFetch('api/v1/auth/logout')).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    expect(mock).toHaveBeenCalledTimes(2); // 两次都没有 refresh
+  });
+
+  it('isAuthEndpoint：判定逻辑覆盖真实前缀/边界（大小写与相似前缀不误伤）', () => {
+    expect(isAuthEndpoint('/api/v1/auth')).toBe(true);
+    expect(isAuthEndpoint('/api/v1/auth/refresh')).toBe(true);
+    expect(isAuthEndpoint('/api/v1/auth/me?x=1#f')).toBe(true);
+    expect(isAuthEndpoint('api/v1/auth/me')).toBe(true);
+    expect(isAuthEndpoint('/api/v1/authx/me')).toBe(false);
+    expect(isAuthEndpoint('/api/v1/authentication')).toBe(false);
+    expect(isAuthEndpoint('/api/v1/conversations')).toBe(false);
+    expect(isAuthEndpoint('/api/v1/tasks/t-1')).toBe(false);
   });
 
   it('refresh 失败（非 2xx）→ 抛原始 401 的 ApiError，且不再重放', async () => {

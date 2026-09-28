@@ -37,6 +37,10 @@ async function setupChatHarness(chatStatus = 200, chatErrorBody: unknown = null)
       return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
     }
     if (url.includes('/api/v1/conversations') || url.includes('/api/v1/projects')) return jsonResponse({ data: [] });
+    // 任务卡片的兜底轮询（ARCH-07：SSE 为主、轮询兜底）
+    if (url.includes('/api/v1/tasks/')) {
+      return jsonResponse({ data: { id: 't-1', type: 'image', status: 'processing', progress: 10, statusMessage: '启动中', errorMessage: null } });
+    }
     if (url.includes('/api/v1/auth/me')) return jsonResponse({ data: { user: { email: 'dev@example.com', displayName: null } } });
     return jsonResponse({ data: null });
   });
@@ -150,6 +154,31 @@ describe('ChatWorkspace 消息流（SSE 解析 → 渲染）', () => {
       await Promise.resolve();
     });
     await until(() => h.fetchMock.mock.calls.some((c) => String(c[0]).includes('/api/v1/agent-runs/run-7/timeline')));
+  });
+
+  it('ARCH-07：task.created 渲染任务卡；task.progress 帧经 SSE 贯通到卡片（不等 2s 轮询）', async () => {
+    const h = await setupChatHarness();
+    await sendMessage('帮我做一张图');
+    await h.push(frame('message_start', { messageId: 'm-1', conversationId: 'c', createdAt: 'T' }));
+    await h.push(frame('task.created', { taskId: 't-1', kind: 'image' }));
+    await screen.findByText('图片生成');
+    await screen.findByText('启动中'); // 初始态来自兜底轮询（DB）
+
+    await h.push(frame('task.progress', { taskId: 't-1', progress: 66, message: '生成中 66%' }));
+    await screen.findByText('生成中 66%'); // 事件即时上屏（无需等下一轮轮询）
+    expect((document.querySelector('.bg-zinc-400') as HTMLElement).style.width).toBe('66%');
+  });
+
+  it('ARCH-07：task.completed 帧 → 卡片转完成态（信号来自 SSE，终态以 DB 对账收尾）', async () => {
+    const h = await setupChatHarness();
+    await sendMessage('帮我做一张图');
+    await h.push(frame('message_start', { messageId: 'm-1', conversationId: 'c', createdAt: 'T' }));
+    await h.push(frame('task.created', { taskId: 't-1', kind: 'image' }));
+    await screen.findByText('图片生成');
+    await h.push(frame('task.completed', { taskId: 't-1', progress: 100 }));
+    await screen.findByText('✅ 完成');
+    // 事件驱动的即时对账：GET /tasks/t-1 被再拉取一次（DB 是事实源）
+    await until(() => h.fetchMock.mock.calls.filter((c) => String(c[0]).includes('/api/v1/tasks/t-1')).length >= 2);
   });
 
   it('无法 JSON.parse 的 data 帧被忽略，不影响后续正常帧', async () => {

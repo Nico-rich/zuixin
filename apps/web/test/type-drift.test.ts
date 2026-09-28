@@ -27,6 +27,8 @@ const WEB_TO_WIRE: Record<keyof ChatStreamEventMap, string> = {
   message_end: 'message_end',
   status: 'status',
   task_created: 'task.created',
+  task_progress: 'task.progress',
+  task_completed: 'task.completed',
   error: 'error',
   agent_start: 'agent.start',
   agent_end: 'agent.end',
@@ -46,6 +48,8 @@ const WEB_DECLARED_FIELDS: WebFieldMap = {
   message_end: ['messageId', 'status'],
   status: ['stage', 'message'],
   task_created: ['taskId', 'kind'],
+  task_progress: ['taskId', 'progress', 'message'],
+  task_completed: ['taskId'],
   error: ['code', 'message', 'requestId'],
   agent_start: ['agentId', 'runId'],
   agent_end: ['agentId', 'runId', 'status'],
@@ -69,6 +73,8 @@ const EXPECTED_SHARED_ONLY: Record<string, string[]> = {
   message_end: ['type'],
   status: ['type'],
   'task.created': ['type'],
+  'task.progress': ['type'],
+  'task.completed': ['type', 'artifact'],
   error: ['type'],
   'agent.start': ['type'],
   'agent.end': ['type'],
@@ -80,7 +86,8 @@ const EXPECTED_SHARED_ONLY: Record<string, string[]> = {
 };
 
 /** 注册表已锁定、web 尚未消费的线上事件（新增事件时会失败 → 提示前端评估是否需要渲染） */
-const REGISTRY_ONLY_EVENTS = ['task.progress', 'task.completed', 'task.failed', 'artifact.created', 'approval.requested'];
+// M10-P13（ARCH-07）：task.progress / task.completed 已由 web 消费（TaskCard SSE 化）→ 从本清单移出
+const REGISTRY_ONLY_EVENTS = ['task.failed', 'artifact.created', 'approval.requested'];
 
 describe('ChatStreamEventMap ↔ shared ChatStreamEventSchema 结构对比', () => {
   it('shared 导出可读（防线有效性前置检查：解析器/注册表存在且能校验真实帧）', () => {

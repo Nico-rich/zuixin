@@ -121,7 +121,15 @@ export class AgentRunsController {
         // Pre-M9 G4 降级（fail-open）：实时订阅建立失败/超时（Redis 不可用）→ 本连接退化为"仅快照"。
         // 理由：run 的**事实源是 DB timeline 投影**（快照已在上面发出），实时转发只是观察面加速；
         // 已建立的 SSE 绝不因总线故障变 5xx，也绝不无限等待订阅结果（subscribe 自带调用面上界）。
+        // M10-P13（D11）：降级必须**客户端可见**（不能只留在服务端日志）——收流前补发一条
+        // `status` 帧（shared/events.ts 既有事件名与 {stage,message} 字段，不新造契约），
+        // 客户端据此提示"实时事件不可用、请以快照/轮询为准"，而不是静默停在快照上。
         this.logger.warn(`实时事件订阅失败，降级为仅快照（run=${id}）: ${(err as Error).message}`);
+        writer.event('status', {
+          type: 'status',
+          stage: 'sse.degraded',
+          message: '实时事件订阅不可用，本连接已降级为快照模式（事实源为 DB 时间线）',
+        });
         return;
       }
       await new Promise<void>((resolve) => {
