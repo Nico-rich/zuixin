@@ -41,6 +41,14 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
     # --- 不在此处限流：per-IP 全局限流在应用内（M10-P8 RateLimitGuard）。
     #     两处同时限流会让"到底谁拒的"变成排障谜题；如需边缘防护请单独评估并在 runbook §4 记录。
+    #
+    # --- 刻意**不设** `use-forwarded-headers`（保持 ingress-nginx 默认 false）：
+    #     默认行为下本层会用"直连对端地址"**覆盖**客户端传来的 X-Forwarded-For，于是 XFF 链最右一跳
+    #     必然是真实客户端 IP —— 这正是 configmap.yaml 里 `TRUSTED_PROXY_HOPS: "1"` 成立的前提
+    #     （全局限流取 XFF 右起第 1 跳，见 runbook §7.4）。
+    #     ⚠️ 若将来在前面加 CDN/第二级 LB：必须**同时**改两处，否则限流分桶会错——
+    #        ① 这里加 `nginx.ingress.kubernetes.io/use-forwarded-headers: "true"`（否则真实客户端 IP 丢失）；
+    #        ② `TRUSTED_PROXY_HOPS` 改为 2（每多一层可信代理 +1）。只改一处 = 所有用户共用一个桶。
 spec:
   ingressClassName: nginx
   tls:

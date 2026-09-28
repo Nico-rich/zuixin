@@ -548,7 +548,7 @@ docker exec docker-redis-1 redis-cli --scan --pattern 'ratelimit:global:auth:*'
 | `.env` 备份的加密与取回（§3.3/§3.4） | ❌ 纯流程项，未演练 | 与运维确认工具链后走一次完整"导出→加密→异地→取回→核对指纹" |
 | 告警规则里的 `[待导出]` 项 | ⛔ 未生效 | 见 §7.3；生效前用 §7.2 的人工判据 |
 | 多副本下的 /ready 与滚动更新行为 | ❌ 未验证 | 需在集群里做一次滚动更新，观察摘流顺序与 SSE 断线重连（客户端依赖 `last-event-id` 续传） |
-| 全局限流在**真实代理层数**下的分桶（`TRUSTED_PROXY_HOPS=1`） | ❌ 未验证 | 本机没有 Ingress，且 `NODE_ENV≠production` 时阈值 ×100；需在预发用真实 Ingress 抓一次 `X-Forwarded-For` 链长，并核对 `ratelimit:global:*` 的键里出现的是客户端 IP 而不是 Ingress Pod IP。`k8s/ingress.yaml` 的 `use-forwarded-headers` 等注解也需实机确认（§6.4） |
+| 全局限流在**真实代理层数**下的分桶（`TRUSTED_PROXY_HOPS=1`） | ❌ 未验证 | 本机没有 Ingress，且 `NODE_ENV≠production` 时阈值 ×100。需在预发核对两件事：① 真实 `X-Forwarded-For` 链长（`k8s/ingress.yaml` 刻意**不设** `use-forwarded-headers`，靠 ingress-nginx 默认行为"用直连对端地址覆盖 XFF" ⇒ 右起第 1 跳 = 真实客户端）；② `ratelimit:global:*` 的键里出现的是**客户端 IP** 而不是 Ingress Pod IP。若前面加了 CDN，`use-forwarded-headers` 与 `TRUSTED_PROXY_HOPS` 必须**成对**改（§6.2、§7.4） |
 
 ## 10. 边界与依赖
 
