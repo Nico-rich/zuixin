@@ -18,6 +18,19 @@ export interface RunAttribution {
 }
 
 /**
+ * M11-P8（维度2#10）：**保留/归档**两类周期作业的观测面（本节唯一新增指标，绝不动既有采样/读取路径）。
+ * 两者都是**平台级**事实（organizationId 显式 null——不是任何租户的数据），value = 本次执行的行数（含 0）：
+ * - `event_archive_count`：EventEnvelope 归档周期任务每次执行归档（published → consumed）的行数；
+ * - `metric_sample_purge_count`：MetricSample 保留策略每次执行删除的超期样本行数。
+ * 0 值样本是**活性信号**（"任务还在跑、只是没活儿"）——导出面（monitoring/alerts.yml，P10）如要告警，
+ * 应基于"样本缺失/停止增长"而非阈值（指标名对齐后导出器一落地即可用）。
+ */
+export const RETENTION_METRIC_NAMES = {
+  eventArchiveCount: 'event_archive_count',
+  metricSamplePurgeCount: 'metric_sample_purge_count',
+} as const;
+
+/**
  * M8-P3 指标采样（MetricSample，append-only 观测事实）：
  * - recordMetric 一律 best-effort：观测写入失败绝不阻断主流程（仅 warn）；
  * - organizationId 缺省从 TraceContext 取（HTTP/Worker 上下文已建立），HTTP 样本由中间件按 userId 归属；
