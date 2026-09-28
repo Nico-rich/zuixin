@@ -10,7 +10,8 @@ import { MarketplaceCatalogService } from './marketplace-catalog.service';
  * M9-P6 Marketplace 服务层（API 与 Worker 共用；HTTP 面在 MarketplaceApiModule）。
  *
  * 复用（**绝不重复实现**）：
- * - OrganizationsModule → AuthorizationService（M8-P1 RBAC 矩阵；本模块不新增权限位）；
+ * - OrganizationsModule → AuthorizationService（M8-P1 RBAC 矩阵；本模块读/写面复用既有位，
+ *   治理面用 M11-P12 新增的 **`marketplace.moderate`** 专用位——矩阵定义仍唯一在 authorization.service.ts）；
  * - ToolsModule → ToolRegistry（权限披露现算：effective = 请求 ∩ 注册表 ∩ 可包装面——唯一实现
  *   `resolveEffectiveAgentTools`，见 extensions/effective-agent-tools.ts）；
  * - extensions/manifest.ts 导出的 `parseManifest` / `verifySignature`：上架门禁的平台校验复算

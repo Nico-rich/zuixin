@@ -3,15 +3,18 @@ import { Logger } from '@nestjs/common';
 import { OrganizationRole } from '@prisma/client';
 import { AuthorizationService } from '../organizations/authorization.service';
 import { MarketplaceAccessService, PublicationScopeRow } from './marketplace-access.service';
+import { MODERATION_PERMISSION } from './marketplace-moderation';
 
 /**
- * M10-P6 归属/治理裁决单测（此前缺失的一层：e2e 之外没有 access 服务的直接覆盖）。
+ * M10-P6 / M11-P12 归属/治理裁决单测（e2e 之外 access 服务的直接覆盖层）。
  *
  * 关键断言：
- * ① 治理裁决走**显式函数**（role ∈ owner/admin），**绝不**再借 `auth.authorize(..., 'member.write')`；
- * ② **矩阵放宽模拟**：即使矩阵把 member.write 授予 member（或授予全部角色），member 仍 403（fail-closed）；
- * ③ 矩阵收紧模拟：治理角色失去该位仍可治理（判定与矩阵解耦）；漂移仅告警（不降级）；
- * ④ 防枚举口径不变（非成员 404 / 成员无治理角色 403）；viewer 能力与裁决同源（无口径分叉）。
+ * ① 治理裁决走**治理位判定**（`marketplace.moderate`，M11-P12 专用位），**绝不**借
+ *    `auth.authorize(..., 'member.write')` 的权限位抛错路径；
+ * ② tripwire 新口径：member 获得**旧借用位** member.write **不**改变治理权（仍 403）；
+ *    member 获得**专用位** marketplace.moderate **才**改变（放行）+ 漂移告警 leaked=[member]；
+ * ③ 专用位收紧（治理角色失去该位）→ 治理权随之收紧（403，fail-closed）；漂移告警（missing）；
+ * ④ 防枚举口径不变（非成员 404 / 成员未持治理位 403）；viewer 能力与裁决同源（无口径分叉）。
  *
  * 真实矩阵 + 真实 AuthorizationService（prisma 仅提供 membership/user 假行，无 IO）。
  */
@@ -37,10 +40,18 @@ function makeHarness(opts: {
   return { service, prisma, auth };
 }
 
-/** 矩阵改动模拟：仅覆盖 `can`（裁决若仍依赖矩阵，就会在此暴露） */
-function widenMatrix(auth: AuthorizationService): void {
+/**
+ * 矩阵改动模拟：把 `action` 位授予全部角色（裁决/审计都读注入的 `auth.can`，故此处即"矩阵被改"）。
+ */
+function grantToAll(auth: AuthorizationService, action: string): void {
   const original = auth.can.bind(auth);
-  vi.spyOn(auth, 'can').mockImplementation((r, a) => (a === 'member.write' ? true : original(r, a)));
+  vi.spyOn(auth, 'can').mockImplementation((r, a) => (a === action ? true : original(r, a)));
+}
+
+/** 矩阵改动模拟：从全部角色撤走 `action` 位 */
+function revokeFromAll(auth: AuthorizationService, action: string): void {
+  const original = auth.can.bind(auth);
+  vi.spyOn(auth, 'can').mockImplementation((r, a) => (a === action ? false : original(r, a)));
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -63,46 +74,51 @@ describe('MarketplaceAccessService（治理显式判定 + 防枚举）', () => {
       .rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
 
-  it('① 治理裁决**不再**借用 member.write：不调用 auth.authorize（权限位路径）', async () => {
+  it('① 治理裁决按治理位裁决：不经 auth.authorize（抛错路径），但确实读 marketplace.moderate', async () => {
     const h = makeHarness({ role: 'owner' });
-    const spy = vi.spyOn(h.auth, 'authorize');
+    const authorizeSpy = vi.spyOn(h.auth, 'authorize');
+    const canSpy = vi.spyOn(h.auth, 'can');
     await h.service.assertModerationRights('u1', pub());
-    expect(spy).not.toHaveBeenCalled();
-    // 对照：发布者写权仍走权限位路径（未被本 Phase 改动）
+    expect(authorizeSpy).not.toHaveBeenCalled();
+    // 治理位被真正消费（M11-P12：放行来自 marketplace.moderate，而非角色硬编码）
+    expect(canSpy).toHaveBeenCalledWith('owner', MODERATION_PERMISSION);
+    // 对照：发布者写权仍走权限位抛错路径（未被本 Phase 改动）
     await h.service.assertPublicationWrite('u1', pub());
-    expect(spy).toHaveBeenCalledWith('u1', ORG, 'agent.write');
+    expect(authorizeSpy).toHaveBeenCalledWith('u1', ORG, 'agent.write');
   });
 
-  it('② 矩阵放宽模拟（member 获得 member.write）→ member 仍 403，治理权绝不静默放宽', async () => {
+  it('② tripwire：member 获**旧借用位** member.write → 仍 403（该位已与治理彻底解耦）', async () => {
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     const h = makeHarness({ role: 'member' });
     expect(h.auth.can('member', 'member.write')).toBe(false); // 当前矩阵事实
-    widenMatrix(h.auth);
-    expect(h.auth.can('member', 'member.write')).toBe(true); // 模拟未来矩阵改动
+    grantToAll(h.auth, 'member.write');
+    expect(h.auth.can('member', 'member.write')).toBe(true); // 模拟矩阵改动
     await expect(h.service.assertModerationRights('u1', pub()))
       .rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(warn).not.toHaveBeenCalled(); // 旧位与治理位无关 → 审计不一致都不发生
   });
 
-  it('② 矩阵全量放宽（所有角色持有 all 位）→ 非治理角色一律 403（防枚举口径不变）', async () => {
-    for (const role of ['member', 'viewer'] as const) {
-      const h = makeHarness({ role });
-      vi.spyOn(h.auth, 'can').mockReturnValue(true);
-      await expect(h.service.assertModerationRights('u1', pub()))
-        .rejects.toMatchObject({ code: 'FORBIDDEN' });
-    }
+  it('② tripwire：member 获**专用位** marketplace.moderate → 放行（显式授权改变治理权）+ 漂移告警', async () => {
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const h = makeHarness({ role: 'member' });
+    grantToAll(h.auth, MODERATION_PERMISSION);
+    await expect(h.service.assertModerationRights('u1', pub())).resolves.toBe('member');
+    // 同一改动必须被审计暴露（leaked=member/viewer）→ 单测（真实矩阵）同时变红强制人工复核
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('leaked=[member,viewer]'));
   });
 
-  it('③ 矩阵收紧模拟（治理角色失去该位）→ owner/admin 仍可治理；漂移仅告警不降级', async () => {
+  it('③ 专用位收紧（治理角色失去该位）→ 治理权随之收紧（fail-closed，绝不越权放行）+ 漂移告警', async () => {
     const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     const h = makeHarness({ role: 'admin' });
-    const original = h.auth.can.bind(h.auth);
-    vi.spyOn(h.auth, 'can').mockImplementation((r, a) => (a === 'member.write' ? false : original(r, a)));
-    await expect(h.service.assertModerationRights('u1', pub())).resolves.toBe('admin');
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('权限矩阵漂移'));
+    revokeFromAll(h.auth, MODERATION_PERMISSION);
+    await expect(h.service.assertModerationRights('u1', pub()))
+      .rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('missing=[owner,admin]'));
 
-    // 当前矩阵一致 → 无告警（本用例同时锁定"漂移才告警"）
+    // 当前矩阵一致 → 无告警（本用例同时锁定"仅漂移才告警"）
     warn.mockClear();
     const clean = makeHarness({ role: 'admin' });
-    await clean.service.assertModerationRights('u1', pub());
+    await expect(clean.service.assertModerationRights('u1', pub())).resolves.toBe('admin');
     expect(warn).not.toHaveBeenCalled();
   });
 
@@ -133,10 +149,19 @@ describe('MarketplaceAccessService（治理显式判定 + 防枚举）', () => {
       else if (role === null) await expect(ruling).rejects.toMatchObject({ code: 'NOT_FOUND' });
       else await expect(ruling).rejects.toMatchObject({ code: 'FORBIDDEN' });
     }
-    // member 即便矩阵放宽，回显口径同样不放宽（否则前端会显示"可审核"但请求 403）
-    const widened = makeHarness({ role: 'member' });
-    widenMatrix(widened.auth);
-    expect(await widened.service.assertVisible('u1', pub())).toMatchObject({ canModerate: false });
+    // 旧借用位放宽 → 回显口径同样不放宽（否则前端会显示"可审核"但请求 403）
+    const oldBit = makeHarness({ role: 'member' });
+    grantToAll(oldBit.auth, 'member.write');
+    const oldCaps = await oldBit.service.assertVisible('u1', pub());
+    expect(oldCaps).toMatchObject({ canModerate: false });
+    // 专用位显式授予 → 回显与裁决**同源**放宽（口径分叉在这两个方向上都被本用例挡住）
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined); // 该矩阵必然漂移告警
+    const granted = makeHarness({ role: 'member' });
+    grantToAll(granted.auth, MODERATION_PERMISSION);
+    const caps = await granted.service.assertVisible('u1', pub());
+    expect(caps).toMatchObject({ canModerate: true });
+    await expect(granted.service.assertModerationRights('u1', pub())).resolves.toBe('member');
+    warn.mockRestore();
   });
 
   it('⑤ 平台管理员回显 canModerate=true 且平台级条目详情可见', async () => {

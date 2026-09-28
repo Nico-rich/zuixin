@@ -208,7 +208,7 @@ export class PublicationsService {
 
   /**
    * 驳回（治理侧下架）：published → rejected。
-   * 治理权经 `access.assertModerationRights`（M10-P6 显式判定：owner/admin 或平台管理员）——
+   * 治理权经 `access.assertModerationRights`（M11-P12 专用治理位 `marketplace.moderate`，矩阵口径 owner/admin；或平台管理员）——
    * 与评审审核**同一判定入口**，绝不各自推导（审计 D7 / M9-02）。
    */
   async reject(userId: string, id: string, dto: RejectPublicationDto): Promise<PublicationRow> {

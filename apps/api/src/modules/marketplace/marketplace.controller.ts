@@ -13,13 +13,14 @@ import {
 } from './marketplace.dto';
 
 /**
- * M9-P6 Marketplace API（JWT + 组织 RBAC；**复用既有权限位，不新增**）。
+ * M9-P6 Marketplace API（JWT + 组织 RBAC；读/写面复用既有权限位，治理面用 M11-P12 专用位）。
  *
  * - 目录/详情/评审读：任何已登录用户可读 public 面（published）；未上架条目仅发布者组织成员
  *   （非成员 404 防枚举——由服务层裁决，控制器不做可见性判断）；
  * - 发布者写（建条目/编辑/发布/撤回/修订）：发布者组织 `agent.write`（与 extensions 同口径）；
- * - 治理（评审审核 / 条目驳回）：发布者组织 **owner/admin** 或平台管理员——M10-P6 起为**显式判定**
- *   （`marketplace-moderation.ts`，不再借用 `member.write` 的隐式推论）；控制器只转发，绝不自行推导；
+ * - 治理（评审审核 / 条目驳回）：发布者组织持有 **`marketplace.moderate`**（M11-P12 专用治理位，
+ *   矩阵口径 owner/admin）或平台管理员——判定唯一入口 `marketplace-moderation.ts`；控制器只转发，
+ *   绝不自行推导；
  * - 控制器**绝不直接写库**：全部经服务层（状态机 + CAS + 审计）；
  * - **绝不执行扩展内容**：本模块只读写声明式元数据与评审，权限始终由 M8-P6 物化路径决定。
  */

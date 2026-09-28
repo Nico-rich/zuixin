@@ -13,7 +13,10 @@ export type OrgPermission =
   | 'connection.read' | 'connection.write'
   | 'billing.read' | 'billing.write'
   // M9-P1：Evaluation / Experimentation（写 = owner/admin；读 = 全部成员）
-  | 'evaluation.read' | 'evaluation.write';
+  | 'evaluation.read' | 'evaluation.write'
+  // M11-P12：Marketplace **专用治理位**（审核评审 / 驳回条目；owner/admin = 有、member/viewer = 无）。
+  // 读面仍走 agent.read、发布者写面仍走 agent.write —— 本位置只覆盖治理动作，绝不覆盖内容编辑/发布。
+  | 'marketplace.moderate';
 
 const ALL: OrgPermission[] = [
   'organization.read', 'organization.write', 'member.read', 'member.write',
@@ -21,6 +24,7 @@ const ALL: OrgPermission[] = [
   'workflow.read', 'workflow.write', 'connection.read', 'connection.write',
   'billing.read', 'billing.write',
   'evaluation.read', 'evaluation.write',
+  'marketplace.moderate',
 ];
 
 /** M8-P1 RBAC 矩阵（deny-by-default：未列出的权限一律拒绝） */
@@ -38,6 +42,21 @@ const ROLE_PERMISSIONS: Record<OrganizationRole, OrgPermission[]> = {
   ],
   viewer: ['organization.read', 'project.read', 'agent.read', 'workflow.read', 'connection.read', 'evaluation.read'],
 };
+
+/**
+ * 权限矩阵**纯查询**（无 IO、无实例状态）——矩阵的唯一读取入口。
+ *
+ * M11-P12 起被两处共用（**单一事实源**，不得各自复制矩阵）：
+ * - 本服务的 `can` / `authorize`（组织 RBAC）；
+ * - `marketplace/marketplace-moderation.ts` 的治理判定（`marketplace.moderate` 位 = 治理权的唯一口径；
+ *   该模块的 `MODERATION_ROLES` 仅作矩阵审计对照，不再单独决定放行）。
+ *
+ * fail-closed：未知角色字面量（Prisma 枚举未来新增而矩阵未显式归类）→ `false`，
+ * 既不抛出也不放行（deny-by-default 不因"查不到"被绕过；由 `authorize` 统一转 403）。
+ */
+export function roleHasPermission(role: OrganizationRole, action: OrgPermission): boolean {
+  return (ROLE_PERMISSIONS[role] ?? []).includes(action);
+}
 
 /**
  * M8-P1 统一授权（服务端最终决定权限；deny-by-default）：
@@ -75,11 +94,12 @@ export class AuthorizationService {
 
   async authorize(userId: string, organizationId: string, action: OrgPermission): Promise<OrganizationRole> {
     const role = await this.require(userId, organizationId);
-    if (!ROLE_PERMISSIONS[role].includes(action)) throw new AppError(ErrorCode.FORBIDDEN, '权限不足');
+    if (!roleHasPermission(role, action)) throw new AppError(ErrorCode.FORBIDDEN, '权限不足');
     return role;
   }
 
+  /** 纯查询（无 IO）：委托 `roleHasPermission`（矩阵唯一读取入口，未知角色 → false） */
   can(role: OrganizationRole, action: OrgPermission): boolean {
-    return ROLE_PERMISSIONS[role].includes(action);
+    return roleHasPermission(role, action);
   }
 }
