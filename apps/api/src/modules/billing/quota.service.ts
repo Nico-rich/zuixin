@@ -24,12 +24,14 @@ const ENTITLEMENT_KEY: Partial<Record<LedgerKind, string>> = {
   image_generation: 'imageMonthly', video_seconds: 'videoSecondsMonthly',
   external_api_call: 'externalApiMonthly', agent_run: 'agentRunsMonthly',
   workflow_run: 'workflowRunsMonthly', storage: 'storageMb', seat: 'seats',
+  attachment_upload: 'attachmentsMonthly', // M10 W0 预置（P7）
 };
 
 const DAILY_KEY: Record<string, string> = {
   agent_run: 'agentRunsDaily', workflow_run: 'workflowRunsDaily',
   // Pre-M9 A3：媒体日限读计划权益（imageDaily/videoDaily——套餐升级即放宽）
   image_generation: 'imageDaily', video_seconds: 'videoDaily',
+  attachment_upload: 'attachmentsDaily', // M10 W0 预置（P7）
 };
 
 /**

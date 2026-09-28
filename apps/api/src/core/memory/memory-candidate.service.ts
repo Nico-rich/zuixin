@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
+import { createHash } from 'node:crypto';
 import { MemoryCategory, MessageRole, MessageStatus, Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { PrismaService } from '../../modules/prisma/prisma.service';
@@ -35,6 +36,11 @@ const MAX_ITEMS_PER_SUMMARY = 20;
 const MAX_MESSAGES = 200;
 /** 单条消息进 prompt 的截断长度 */
 const MAX_MESSAGE_CHARS = 500;
+
+/** M10 W0：候选内容指纹（DB UNIQUE(userId, contentHash) 去重锚点；与迁移 SQL 的 sha256 口径一致） */
+export function memoryContentHash(content: string): string {
+  return createHash('sha256').update(content, 'utf8').digest('hex');
+}
 
 export interface ExtractResult {
   summaryId: string | null;
@@ -126,6 +132,7 @@ export class MemoryCandidateService {
             projectId: conversation.projectId,
             sourceSummaryId: summary.id,
             content: item.content,
+            contentHash: memoryContentHash(item.content), // M10 W0：去重锚点（A11 语义补强）
             category: item.category as MemoryCategory,
             importance: item.importance,
             confidence: item.confidence,

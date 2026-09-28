@@ -5,7 +5,8 @@ import { OrganizationsService } from '../organizations/organizations.service';
 
 export type LedgerKind =
   | 'llm_tokens' | 'llm_cost' | 'image_generation' | 'video_seconds'
-  | 'external_api_call' | 'agent_run' | 'workflow_run' | 'storage' | 'seat';
+  | 'external_api_call' | 'agent_run' | 'workflow_run' | 'storage' | 'seat'
+  | 'attachment_upload'; // M10 W0 预置（P7 每用户附件配额——A7 消费，A10 不碰）
 
 export interface RecordUsageInput {
   userId: string;
@@ -46,6 +47,8 @@ const DEFAULT_ENTITLEMENTS = {
   llmTokensMonthly: 1_000_000_000, imageMonthly: 1_000_000,
   videoSecondsMonthly: 1_000_000, externalApiMonthly: 1_000_000,
   storageMb: 100_000, seats: 100,
+  // M10 W0 预置（P7 附件配额；A7 消费）
+  attachmentsMonthly: 100_000, attachmentsDaily: 5_000,
   // Pre-M9 A3：媒体日限并入计划权益（原 systemSetting 全局日限 50/10 语义保留为 free 默认）
   imageDaily: 50, videoDaily: 10,
 };

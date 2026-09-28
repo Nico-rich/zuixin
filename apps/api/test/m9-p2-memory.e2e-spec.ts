@@ -392,7 +392,7 @@ describe('M9-P2 Advanced Memory（增量摘要 × 候选提炼 × 上下文注�
       data: { userId: temp.id, scope: 'user', content: '级联校验记忆', category: 'other', importance: 50, status: 'active', source: 'manual' },
     });
     await prisma.memoryCandidate.create({
-      data: { userId: temp.id, content: '级联校验候选', category: 'other', importance: 50, confidence: 0.5, status: 'candidate' },
+      data: { userId: temp.id, content: '级联校验候选', contentHash: 'cascade-check-hash', category: 'other', importance: 50, confidence: 0.5, status: 'candidate' },
     });
     await prisma.user.delete({ where: { id: temp.id } });
     expect(await prisma.memory.count({ where: { userId: temp.id } })).toBe(0);

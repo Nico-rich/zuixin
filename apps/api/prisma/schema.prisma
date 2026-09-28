@@ -173,6 +173,8 @@ model User {
   knowledgeBases KnowledgeBase[]
   documents      Document[]
   memoryCandidates MemoryCandidate[]
+  creativeHypotheses CreativeHypothesis[] // M10-P4
+  creativeInsights CreativeInsight[]       // M10-P4
   evaluationDatasets EvaluationDataset[]
   evaluationRuns EvaluationRun[]
   evaluators Evaluator[]
@@ -229,6 +231,7 @@ model Message {
   status           MessageStatus   @default(completed)
   errorCode        String?
   tokenUsage       Json?
+  editedAt         DateTime?       // M10-P3：用户编辑时间（仅本人 user 消息可编辑；null = 未编辑）
   createdAt        DateTime        @default(now())
   attachments      Attachment[]
   tasks            GenerationTask[]
@@ -428,6 +431,8 @@ model Project {
   knowledgeBases KnowledgeBase[]
   documents       Document[]
   memoryCandidates MemoryCandidate[]
+  creativeHypotheses CreativeHypothesis[] // M10-P4
+  creativeInsights CreativeInsight[]       // M10-P4
   @@index([userId, updatedAt])
   @@index([organizationId])
 }
@@ -678,6 +683,7 @@ model Credential {
   connection     Connection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
   type           String     // access_token | refresh_token
   encryptedValue String
+  keyVersion     Int        @default(1) // M10-P1：加密密钥版本（轮换后 rewrap 迁移；绝不静默混用）
   expiresAt      DateTime?
   createdAt      DateTime   @default(now())
   @@index([connectionId, type])
@@ -1233,6 +1239,7 @@ model WorkflowRun {
   heartbeatAt        DateTime?
   waitingOnApprovalId String?
   waitingOnAgentRunId String? // agent 步骤的子 AgentRun 终态唤醒
+  definitionSnapshot  Json?   // M10-P5：run 创建时锁定定义快照（真实快照；为 null 的历史 run 读 version 行兜底）
   approvals           Approval[]
   startedAt          DateTime          @default(now())
   completedAt        DateTime?
@@ -1412,6 +1419,7 @@ model Organization {
   slug        String                 @unique
   isPersonal  Boolean                @default(false) // 个人默认组织（每用户一个，backfill + 懒创建）
   ownerUserId String
+  status      OrganizationStatus     @default(active) // M10-P14：禁用态（全入口守卫拒绝；deletedAt 之外的第二治理态）
   deletedAt   DateTime?              // soft delete
   createdAt   DateTime               @default(now())
   updatedAt   DateTime               @updatedAt
@@ -1439,6 +1447,9 @@ model Organization {
   evaluators Evaluator[]
   experiments Experiment[]
   extensionPublications ExtensionPublication[]
+  creativeHypotheses CreativeHypothesis[] // M10-P4
+  creativeInsights   CreativeInsight[]     // M10-P4
+  extensionAllowlist ExtensionOrgAllowlist[] // M10-P14
   invoices     Invoice[]
   paymentEvents PaymentEvent[]
   @@index([ownerUserId])
@@ -1733,9 +1744,11 @@ model MemoryCandidate {
   importance      Int      @default(50)
   confidence      Float    @default(0.5)
   status          String   @default("candidate") // candidate|active|rejected
+  contentHash     String   // M10-P11：content sha256（去重约束锚点）
   createdAt       DateTime @default(now())
   promotedAt      DateTime?
   @@index([userId, status])
+  @@unique([userId, contentHash]) // M10-P11：同一用户同内容候选绝不重复
 }
 
 // ===== M9-P6 Marketplace 公开层（Coordinator 预整合；评分绝不提升权限——权限仍 = manifest ∩ 平台白名单 ∩ 组织策略）=====
@@ -1878,6 +1891,7 @@ model Extension {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
   versions    ExtensionVersion[]
+  allowlistedOrgs ExtensionOrgAllowlist[] // M10-P14：组织级使用白名单
   @@index([organizationId, status])
 }
 
@@ -1970,4 +1984,83 @@ model RoutingDecision {
   @@index([organizationId, decidedAt])
   @@index([runId])
   @@index([providerId, decidedAt])
+}
+
+// ===== M10 W0（Coordinator 单点预整合）：P4 创意假设/洞察专表 + P14 扩展白名单 + P14 组织状态枚举 =====
+
+enum OrganizationStatus {
+  active
+  disabled // M10-P14：禁用态——所有入口守卫拒绝；与 deletedAt（软删）是不同治理动作
+}
+
+enum CreativeHypothesisStatus {
+  draft
+  ready
+  running
+  validated
+  rejected
+}
+
+// M10-P4：创意假设专表（替代 Artifact(type='other') JSONB 容器——DB 级 CHECK/外键/组织直列/版本列）
+model CreativeHypothesis {
+  id              String                   @id @default(uuid())
+  organizationId  String
+  organization    Organization             @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  projectId       String?
+  project         Project?                 @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  userId          String
+  user            User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status          CreativeHypothesisStatus @default(draft)
+  statement       String                   @db.Text
+  rationale       String?
+  target          String?
+  platform        String?
+  insightId       String? // 来源洞察引用（仅引用，绝不改写洞察事实）
+  successCriteria Json?
+  loop            Json?   // HypothesisLoopRef（workflowId/runId/attempts/startedAt——loop 执行记录由 WorkflowRun 承载，不建冗余表）
+  evaluationRunId String?
+  baselineRunId   String?
+  experimentId    String?
+  verdict         Json?
+  history         Json?   // 状态历史（from/to/at/by）
+  version         Int      @default(1) // 非状态字段 CAS 锚点（状态维度由 status CAS 保证）
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  @@index([organizationId, status])
+  @@index([projectId])
+  @@index([organizationId, createdAt])
+}
+
+// M10-P4：创意洞察专表（facts/derived/interpretation 三层隔离 + factsHash CAS 锚点）
+model CreativeInsight {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  projectId      String?
+  project        Project?     @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  window         Json
+  filters        Json
+  facts          Json
+  derived        Json
+  factsHash      String
+  interpretation Json?
+  layering       Json
+  version        Int          @default(1)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  @@index([organizationId, createdAt])
+  @@index([organizationId, factsHash])
+}
+
+// M10-P14：扩展的组织级使用白名单（resolveEffectiveAgentTools 的 orgAllowlist 参数落点）
+model ExtensionOrgAllowlist {
+  id             String       @id @default(uuid())
+  extensionId    String
+  extension      Extension    @relation(fields: [extensionId], references: [id], onDelete: Cascade)
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdAt      DateTime     @default(now())
+  @@unique([extensionId, organizationId])
 }

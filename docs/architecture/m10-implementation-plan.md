@@ -23,10 +23,10 @@
 | **P1** 生产安全守卫与密钥治理 | NODE_ENV=production 下 JWT_SECRET/ENCRYPTION_KEY 默认值 fail-fast；mock adapter/SEED 默认口令/MOCK_DELAY_MS 生产禁用；mock* SSRF 白名单收紧为精确枚举；audit 写失败 warn；memory-extractor 非法 JSON warn；helmet 逐项审计固化；会话撤销 Redis pub/sub 跨实例传播 + 会话并发上限/按设备下线/token 轮换黑名单；DNS rebinding 连接固定（socket pin）；ENCRYPTION_KEY 版本化 + rewrap 工具 | D2/D8/D13/D23/D24/D30/PR-8/SA-24/SA-1/X-10/SA-4/X-20/M9-07/SA-13/SA-12 | S9 Credential.keyVersion |
 | **P2** Provider HTTP Contract 验证层 | 本地脚本化 OpenAI-compatible HTTP 假服务器（真实 HTTP/fetch/流式/错误/超时，非 mock adapter）；e2e 让 openai-compatible adapter 全链路（流式、四层超时、重试退避、usage 块、SSRF 逐跳校验、manualRedirectFetch）走真实网络；provider 启动配置校验告警（buildAdapter 失败标记 degraded 而非静默跳过）；queryRemoteStatus 契约补全 | D3/M9-03/M9-14/G5/G6/X-28/D12/D18 | — |
 | **P3** 消息编辑/删除端点 + 游标分页 | chat PATCH/DELETE 端点（仅本人消息、org 隔离、IDOR 测试）；接线 summary-refiner stale 自愈链（detectStale/recomputeStale 生产调用方）；conversations/messages 游标分页替代 take 固定值 | D5/D6/M9-08/ARCH-11 | S4 Message.editedAt |
-| **P4** CreativeLoop 专表 | CreativeHypothesis/CreativeLoop/Insight 三表（organizationId 直列 + 版本列 + DB CHECK/FK）；store 层从 Artifact JSONB 容器迁移；存量数据回填；P5 补偿链 e2e 补真实触发断言 | D1/M9-21/D14/M9-09 | S1 |
+| **P4** CreativeLoop 专表 | CreativeHypothesis/CreativeInsight 两表（organizationId 直列 + 版本列 + DB CHECK/FK；loop 执行记录由既有 WorkflowRun 承载，不建冗余表）；store 层从 Artifact JSONB 容器迁移；存量数据回填；P5 补偿链 e2e 补真实触发断言 | D1/M9-21/D14/M9-09 | S1 |
 | **P5** Workflow 快照与调度补强 | WorkflowRun.definitionSnapshot 列 + run 创建快照 + 执行器读快照（替代 version 行只读降级）；schedule repeatable 更新 cron 时重新注册；webhook 速率上限 + secret 轮换（双 secret）+ 429 e2e 断言 | D4/M9-01/X-06/SA-16/SA-17/SA-18 | S2 |
 | **P6** Marketplace Moderation 显式权限 | moderation 判定显式化（专用判定函数 + 测试锁定权限矩阵变更不得静默放宽治理权） | D7/M9-02 | — |
-| **P7** 附件内容安全 + S3 驱动 e2e | zip 解压炸弹防护（解压前后体积比校验）；EXIF 元数据清洗；每用户附件配额（C1 预留）；attachments e2e 用 STORAGE_DRIVER=s3 指向真实 MinIO 跑全量 | SA-19/X-18/SA-20 | — |
+| **P7** 附件内容安全 + S3 驱动 e2e | zip 解压炸弹防护（解压前后体积比校验）；EXIF 元数据清洗；每用户附件配额（C1 预留，quota kind `attachment_upload` 已由 W0 预置）；attachments e2e 用 STORAGE_DRIVER=s3 指向真实 MinIO 跑全量 | SA-19/X-18/SA-20 | W0 预置 quota kind |
 | **P8** 全局 per-IP 限流 | RateLimitGuard 全局挂载 + per-IP 维度（登录失败计数之外的面）；app.module 唯一改动权归本 Phase | SA-25 | — |
 | **P9** 运维脚本与 Runbook | scripts/backup.ts、scripts/restore.ts、MinIO mirror 脚本、.env（含 ENCRYPTION_KEY）备份清单、季度演练 runbook、k8s manifests（terminationGracePeriodSeconds≥35）、Prometheus 告警规则模板（/ready 503、queue depth、scheduler dead、phase timeout） | DR-13/PR-6/PR-7/PR-10/DR-6 | — |
 | **P10** Runtime 可靠性补强 + 事件归档 | AgentRunProcessor active 单值→集合（cancel/shutdown 作用于全部 in-flight）；LLM 单回合 watchdog（agentRunLlmTurnMs）；tool.retryPolicy 默认消费瞬态码；委派 child-run 观察订阅随唤醒清理；quota 背压口径计入 paused；EventEnvelope 归档消费者（scheduler 周期任务，published→consumed） | X-01/X-02/X-04/X-05/X-27/PR-3/M9-11 | — |
@@ -95,7 +95,7 @@ Final Audit（七维） → 自动修复循环 → 最终验收
 
 Coordinator 单点预整合（W0，一个 commit，含全部 M10 schema）：
 
-- **S1** CreativeHypothesis/CreativeLoop/Insight 三表（org 归属、版本列、CHECK）
+- **S1** CreativeHypothesis/CreativeInsight 两表（org 归属、版本列、DB CHECK；loop 引用留 hypothesis.loop JSON，执行记录由 WorkflowRun 承载——不建冗余表）
 - **S2** WorkflowRun.definitionSnapshot JSONB（可空，存量 run 保持读 version 行兜底）
 - **S3** MemoryCandidate 去重 UNIQUE（先清重数据再建约束；幂等迁移模式）
 - **S4** Message.editedAt
