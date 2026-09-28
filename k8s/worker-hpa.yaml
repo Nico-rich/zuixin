@@ -8,7 +8,7 @@
 #     （直接查 Redis/BullMQ 队列长度）。两者都需要集群侧组件，本 Phase 不新增基础设施。
 # 因此这里先给一个 CPU 版 HPA 作为**代理信号**：它能应对"单个 job 吃满 CPU"这类积压（是常见形态），
 # 但**不等于**按积压缩放——CPU 空转型的积压（例如等 LLM 响应）它不会扩。积压场景请同时依赖
-# monitoring/alerts.yml 的 queue_depth 告警 + runbook §4 的人工介入。
+# monitoring/alerts.yml 的 queue_depth 告警 + runbook §7.2 的人工介入。
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:

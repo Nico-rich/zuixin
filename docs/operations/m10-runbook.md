@@ -131,9 +131,9 @@ manifest 是整个流程的关键：**恢复前后不必再去翻日志**，"这
 | `pg_dump` 版本 | PostgreSQL 16.15（Debian），经 `docker exec docker-postgres-1` |
 | 明文 dump | **13,584,317 字节（12.96 MB）**，50,836 行 |
 | 耗时：dump / 统计 / gzip-6 | **729ms / 52ms / 141ms**（合计 **1,115ms**） |
-| 结构统计 | 88 张表、88 个 COPY 段、44,072 行数据、192 条索引语句、33 行 `_prisma_migrations` |
+| 结构统计 | 88 张表、88 个 COPY 段、44,072 行数据、192 条索引语句、38 行 `_prisma_migrations`（M11-P10 更新；dev 库当前实测 **39 行**——多出的 1 条是 W0 首次应用的 `rolled_back_at` 留痕，见 §4.4 注） |
 | 扩展 | `pgcrypto`、`vector` |
-| 关键表行数 | User=611、Organization=551、AgentRun=884、UsageRecord=1264、Credential=2、`_prisma_migrations`=33 |
+| 关键表行数 | User=611、Organization=551、AgentRun=884、UsageRecord=1264、Credential=2、`_prisma_migrations`=38（见上注） |
 | gz 产物 | 2,356,235 字节（压缩比 **5.77×**），sha256 `560fa815d560a1df44fcfd232b28fccd18c804eaad822e9d7d569870487cdf34` |
 | 校验结论 | 4/4 通过：file-non-empty / has-tables / copy-segments-match-tables / row-count-floor |
 
@@ -281,9 +281,9 @@ D 层的两个关键取舍：
 | --- | --- | --- |
 | 建库 | `CREATE DATABASE <临时库> TEMPLATE template0`（模板库隔离，不受生产模板污染） | 同 |
 | 回灌 | `psql -v ON_ERROR_STOP=1 -f -` 退出码 0，**stderr 0 字节**，耗时 **3,336ms** | 退出码 0，stderr 0 字节，耗时 **2.80s / 4.16s** |
-| A 指纹（七项） | 表 88 / 列 1026 / 索引 280 / 枚举 38 / 外键 152 / 迁移行 33 / 扩展 `pgcrypto,plpgsql,vector` | 同（逐项相同） |
+| A 指纹（七项） | 表 88 / 列 1026 / 索引 280 / 枚举 38 / 外键 152 / 迁移行 38 / 扩展 `pgcrypto,plpgsql,vector` | 同（逐项相同） |
 | B 逐表行数 | **88/88 张表全部一致**，恢复库合计 44,072 行 == dump 44,072 行 | 同 |
-| C 关键表 | User 611/611、Organization 551/551、AgentRun 884/884、UsageRecord 1264/1264、Credential 2/2、`_prisma_migrations` 33/33 | 同 |
+| C 关键表 | User 611/611、Organization 551/551、AgentRun 884/884、UsageRecord 1264/1264、Credential 2/2、`_prisma_migrations` 38/38 | 同 |
 | **D 抽样内容** | —（该轮尚未实现） | 抽中 **User 611 行、Organization 551 行、Plan 36 行**：三张表**逐行原样文本全部一致** |
 | 结论 | `verdict: PASS`，报告 `totalMs` **4,988ms** | `verdict: PASS`，报告 `totalMs` **4,321ms / 6,758ms**（进程总耗时 4.89s / 8.15s，含 env 加载与报告落盘） |
 | 清理 | 临时库已 DROP；`pg_database` 仅剩 `agent_platform`、`agent_platform_shadow`、`postgres`、`template0/1` | 同（三次演练后再次核对，仍只剩这 5 项）——**dev 主库全程未被触碰** |
@@ -295,6 +295,16 @@ D 层的两个关键取舍：
 > 注意指纹里的 `plpgsql`：它在恢复库中作为扩展出现（template0 自带），dump 侧只记录 `pgcrypto,vector`。
 > 脚本据此只比对 dump 声明过的扩展，不会把这种模板差异误报为失败——但**值得知道**，
 > 否则人工比对时会以为"多了个扩展=恢复出错"。
+
+> **迁移行数 38 的口径（M11-P10 更新，别把这行读错）**：本节四处 `33` 是更新前的旧值
+> （未随 M10 收尾与 M11 W0 的新增迁移同步，**不要反推成"演练当日库里就有 38 行"**）；
+> 现在写的 `38` 是**代码侧事实**——
+> `apps/api/prisma/migrations/` 下的迁移目录数（M10 冻结时 37 + M11 W0 `20260928170302_m11_w0_schema`）。
+> 而本机 dev 库的 `_prisma_migrations` **实测 39 行**：多出的那条是 W0 首次应用的失败留痕
+> （`rolled_back_at` 非空、`applied_steps_count=0`，同名的成功行紧随其后），不是漏应用也不是重复应用。
+> 由此两个实务推论：① 演练时不要拿 `38` 去硬比恢复库的行数——A 层指纹比的是"dump ↔ 恢复库"两边的同一份快照
+> （都来自同一份 dump，因此是 39 ↔ 39，必然一致；脚本也没有 `--expect-migrations-rows` 这个参数）；
+> ② **fresh 全链重放**（无 rolled_back 留痕）出来的新库才是 38 行。差异出现时先分清是这两者中的哪一种。
 
 ### 4.5 恢复后必做：凭证解密抽查（脚本只打印步骤，不代做）
 
@@ -367,6 +377,19 @@ kubectl apply -k k8s/        # 渲染校验：kubectl kustomize k8s/
 密钥由 External Secrets / Sealed Secrets / `kubectl create secret` 单独创建。
 Secret 缺席时 Pod 停在 `CreateContainerConfigError`——**这是期望行为**：宁可起不来，也不要静默空密钥启动。
 
+**启动期生产安全守卫（M11-P10 E-08 起 Worker 也已接线）**：API 与 Worker 都在 bootstrap 的**首行**执行
+`assertProductionSafety()`（`apps/api/src/main.ts:78` 与 `apps/api/src/worker.ts`，同一份实现
+`modules/security/production-guards.ts`）。`NODE_ENV=production` 下，下列任一情况都会让**两个** Deployment
+（API 与 Worker）一起 `CrashLoopBackOff`，日志里会出现「生产环境安全守卫失败（NODE_ENV=production），拒绝启动」
+（由 `main.ts` / `worker.ts` 的 `bootstrap().catch` 打印，前缀分别是「[bootstrap] 启动失败，进程退出:」与
+「[bootstrap] Worker 启动失败，进程退出:」）：
+① `JWT_SECRET`/`ENCRYPTION_KEY` 缺失、占位（含 `change_me`/`replace_me` 等子串）或长度/编码不合规；
+② 任何开发替身开关被置值（`MOCK_DELAY_MS`/`MOCK_LLM_FAILURE`/`MOCK_LLM_STALL_MS`/`MOCK_EMBEDDING_DIMS`/`LLM_RETRY_BACKOFF_MS`）；
+③ **`SEED_ADMIN_PASSWORD` 缺失、占位或落在开发默认名单**——这就是"这个键为什么必须常驻 Secret"的原因，
+取舍与两种落地方式见 `k8s/secret.example.yaml` 的 seed 段注释。
+排障口诀：Pod 起不来先看**是不是守卫拦的**（日志里有上面那句话 ⇒ 改 Secret/ConfigMap，不要重启 Pod、不要查代码）；
+守卫只读**配置面**、不访问 DB/Redis，因此"守卫失败"永远不是下游依赖或镜像问题。
+
 **当前没有 Dockerfile**（仓库内不存在，本 Phase 只交付编排对象）。镜像名/标签是占位符，
 apply 前必须替换；构建要点见 `k8s/api-deployment.yaml` 的注释（`node dist/main.js` / `dist/worker.js`、
 USER 非 root、`.dockerignore` 排除 `.env`）。**特别注意**：`apps/api/src/env.ts` 加载 `.env` 时
@@ -406,6 +429,46 @@ nginx.ingress.kubernetes.io/proxy-http-version: "1.1"   # 1.0 会退化，失去
 本机**没有可用集群**（`kubectl cluster-info` 连接被拒），清单只做了 `kubectl kustomize` 渲染校验与
 YAML 解析校验，**未**做过 `kubectl apply` / 探针行为 / HPA 缩放 / Ingress SSE 的实机验证（§9）。
 
+### 6.5 库侧前置（生产 `migrate deploy` 之前必做）：扩展与角色权限
+
+**结论先给**：生产库必须先由有权限的角色**预建扩展**（`pgcrypto`，以及 `vector`），否则 `prisma migrate deploy`
+会在历史迁移处失败——这不是"迁移写错了"，而是托管 PG 的权限模型决定的前置条件。
+
+**为什么 `pgcrypto` 必须预建**：
+- 迁移 `apps/api/prisma/migrations/20260928130507_m10_w0_platform_foundation/migration.sql` 的**第 2 行**就是
+  `CREATE EXTENSION IF NOT EXISTS pgcrypto;`（该文件头注释写明是"自声明依赖（sha256 回填用）；fresh DB 重放必备"），
+  同一个迁移里紧接着用 `digest()` 做 `MemoryCandidate.contentHash` 的 sha256 回填；**整个迁移历史里只有这一处
+  `CREATE EXTENSION`**（`grep -rni "create extension" apps/api/prisma/migrations/` 只有 1 行）。
+- `CREATE EXTENSION` 是**数据库级**动作：角色需要该库的 `CREATE` 权限；`pgcrypto` 自 PG13 起是
+  **trusted extension**（不必是超级用户），但安装位置默认是 `public` schema，因此还要对该 schema 有 `CREATE`
+  ——PG15+ 已把 `public` 的 CREATE 从 `PUBLIC` 收回，托管平台（RDS/Cloud SQL/阿里云等）给应用角色的通常是最小权限角色。
+  权限不足时的报错长这样：`permission denied to create extension "pgcrypto"`（或缺 `schema public` 的 CREATE）。
+
+**两条落地路径**（任选其一，推荐 ①）：
+1. **DBA 预建一次**（推荐）：`psql -d <生产库> -c 'CREATE EXTENSION IF NOT EXISTS pgcrypto;'`。
+   迁移里的 `IF NOT EXISTS` 随后自然 no-op，应用侧角色无需任何额外权限，事后也不必提权。
+2. **临时提权**：给迁移角色临时的建扩展能力（自建库：超级用户；RDS：`rds_superuser`；Cloud SQL：`cloudsqlsuperuser`），
+   `migrate deploy` 完成后**立即收回**。别把提权留在常态配置里。
+
+**`vector`（pgvector）同样要预建，且更容易被忽略**：
+- **没有任何迁移创建它**（同上，全历史只有 1 处 `CREATE EXTENSION`），但迁移从很早就依赖这个类型：
+  `20260923150000_m5_agent_version_knowledge` 建表时就有 `"embedding" vector`，`20260925073500_pre_m9_knowledge_hnsw`
+  又用 `vector(1536)` + HNSW 索引 —— 服务端没装 pgvector / 没建扩展，fresh 重放会在这几处直接失败。
+- 本机 dev 靠 `pgvector/pgvector:pg16` 镜像 + 手动建扩展；`apps/api/prisma.config.ts` 的 `initShadowDb`
+  只负责给**shadow 库**建 `vector`（那是 `migrate dev` 的路径，与生产的 `migrate deploy` 无关，别混淆）。
+- 托管 PG 上必须由 DBA 安装 pgvector 扩展包**并**预建：`CREATE EXTENSION IF NOT EXISTS vector;`。
+
+**部署前 30 秒自检（两条命令，结果都要非空）**：
+```bash
+psql "$DATABASE_URL" -c "select extname from pg_extension order by 1"     # 期望含 pgcrypto 与 vector
+psql "$DATABASE_URL" -c "select has_database_privilege(current_user, current_database(), 'CREATE') as db_create"
+```
+`db_create` 为 `t` ⇒ 预建路径 ② 可行；为 `f` ⇒ 只能走路径 ①（DBA 预建）。扩展齐了再 `migrate deploy`，
+之后按 §2.2 立即做一次 `--label pre-migration` 备份（迁移前有备份才有回滚选项）。
+
+> 与 §9 的口径一致：本节给的是**前置条件与命令**，本机没有生产形态的库（无托管 PG、无受限角色），
+> 因此"受限角色跑 `migrate deploy` 失败 → DBA 预建 → 成功"这条链路**未在本机演练过**（未验证项见 §9）。
+
 ## 7. 告警响应表（`monitoring/alerts.yml`）
 
 ### 7.1 规则状态（**先看这列，避免误以为已覆盖**）
@@ -433,6 +496,7 @@ YAML 解析校验，**未**做过 `kubectl apply` / 探针行为 / HPA 缩放 / 
 | `GracefulShutdownTimeout` | 30s 内没关完，被强退 ⇒ 在途 job 被打断、lease 靠 `recoverStale` 兜底 | 日志搜「优雅停机超时」/ `phase=timeout` | 查谁挂住了：Redis/PG 半开导致 `close()` 挂住、长任务远超窗口 | **不要靠调大 `terminationGracePeriodSeconds` 掩盖**——先找到挂住的钩子 |
 | 队列积压（`queue.depth/maxDepth > 0.5`，人工判据：`curl /api/v1/health`） | 消费跟不上生产，涨到 maxDepth 即 429 | Worker 副本是否被 HPA 顶到上限；单 run 是否长尾；provider 错误率 | 扩容 Worker（`kubectl scale deploy/worker`）；修 provider/超时问题 | 抬高 `AGENT_RUN_QUEUE_MAX_DEPTH` 只是把 429 推迟，不解决吞吐 |
 | 队列已满（`depth ≥ maxDepth`） | 用户侧**已在**被 429 拒绝 | 同上一行 | 先止血（扩容/抬水位）再找根因 | 不要只看队列数字——用户可见失败已经发生，别当预警处理 |
+| `Provider 故障/限流`（无 Prometheus 规则；**人工判据**：run 以 `PROVIDER_UNAVAILABLE`/HTTP 503 失败、日志「无可用 provider」、`RoutingDecision.reasonCode` 里 `circuit_open`/`denied` 变多） | 上游 LLM/媒体 provider 失败或限流触发**熔断**：连续失败达阈值（默认 5 次）→ 该 provider 在冷却期（默认 60s）内被路由层剔除；**全部候选都被剔除时 `route()` 抛 `PROVIDER_UNAVAILABLE`（不是"返回空/返回 null"）**，run 以 503 收场——所以它既是"队列积压③"的根因，也是用户侧可见失败 | ① `SELECT "reasonCode", count(*) FROM "RoutingDecision" WHERE "decidedAt" > now() - interval '15 min' GROUP BY 1 ORDER BY 2 DESC;`——`denied` = 那一刻没有任何可用 provider，`candidates` JSON 里有每个候选的被拒原因（`circuit_open`/`unhealthy`/`policy_deny`/`cost_ceiling`/`disabled`/`no_model`，词汇表见 `provider-routing.types.ts` 的 `CandidateReasonCode`）；② Redis 里的熔断事实（与 §7.4 同一个 DB 段）：`docker exec docker-redis-1 redis-cli keys 'cb:*'`、`get cb:<providerId>:consecutiveFailures`、`get cb:<providerId>:openedAt`（读数要点：`openedAt` 存的是**毫秒时间戳**，判据是 `now - openedAt >= cooldownSec×1000` ⇒ 派生为 `half_open`，**别拿键的 TTL 当冷却剩余时间**——TTL = 冷却期 + 观察窗 600s，观察窗内没有探测成功才会自然过期并自愈回 `healthy`；`consecutiveFailures` 的计数窗口是 60s；`cb:<providerId>:probe` 是半开探测槽，TTL 30s，键存在 = 已有在途探测，**不表示故障**） | 先分两类成因：**provider 侧真故障**（5xx/超时/欠费）→ 修 provider 或换凭证，冷却期结束后半开探测会自愈（半开是**单飞**探针，别并发打）；**上游限流** → 降并发/退避（别再叠加重试风暴），等待窗口过去即可。两条路都**不需要**改路由代码：路由按能力声明 + 组织策略 + 健康分 + 熔断状态**服务端**裁决 | **不要**手动删 `cb:*` 键"救活"provider——真故障还在，只是把探测提前，同时把失败计数这条唯一证据丢了；**不要**让用户"重试一下"——`PROVIDER_UNAVAILABLE` 是服务端裁决（503，非客户端错误），重试只会继续打熔断中的 provider；**不要**为了"看起来可用"加兜底假 provider（LLM/用户都无权指定 provider，这是 M8-P7 的冻结边界） |
 | 用户报 429 `RATE_LIMITED`（非队列满） | 命中**限流**：全局 per-IP 桶（M10-P8）或端点级 `@RateLimit` 桶 | Redis 里 `SCAN` 匹配 `ratelimit:global:*`（按桶 `ratelimit:global:write:*` 等）看是哪个 IP/路由在涨、`TTL` 还剩多久；同时看 API 日志有无「限流器异常/超时（放行）」 | 见 **§7.4**：先分清"脚本/攻击"与"自己人（共享出口 IP）"，前者交上游 WAF/Ingress，后者调阈值或修 `TRUSTED_PROXY_HOPS` | **不要** `DEL ratelimit:*` 当修复——那只是抹掉观测证据，几秒后计数照涨；也**不要**把 `GLOBAL_RATE_LIMIT_ENABLED=false` 当默认状态 |
 | `SchedulerJobDead`（人工判据：`SELECT count(*) FROM "ScheduledJob" WHERE status='dead' AND "completedAt" > now() - interval '1 day'`；或查 `"EventEnvelope"` 里 `eventType='scheduler.job.dead'`） | 周期性作业**已停摆**，dead 是终态、不自动重投 | `ScheduledJob.lastError`：心跳中断（worker 失联/长任务超时）还是重试超限 | 先修 worker 侧的根因，再用人工显式路径重投 | 不要批量把 dead 改回 scheduled——那会跳过"为什么死"这个信息 |
 | `StorageDependencyDegraded`（人工判据：`curl /api/v1/health` 的 `storage.state`） | 对象存储降级：上传/生成受影响，核心路径仍可用 | MinIO/S3 端点与凭证 | 修端点/凭证；若桶被误删 → 用 `minio-mirror.ts` 回灌到**新桶**再切 | **不要**因此摘 API 流量（非关键依赖，摘流量只会放大故障） |
@@ -470,8 +534,24 @@ ratelimit:global:{bucket}:{ip}:{method}:{route}
 | `read` | 其余（含 GET） | 300 |
 
 **豁免（绝不计数，也就绝不会出现它们的键）**：健康探针（`/health`、`/live`、`/ready`）、CORS 预检、
-`hooks/*`（webhook 另有 per-token 桶）、SSE 长连接（`/:id/events`、`/stream`）。
+`hooks/*`（webhook 走下面两个专用桶）、SSE 长连接（`/:id/events`、`/stream`）。
 ⇒ **若探针或 SSE 报 429**，那不是全局桶干的（去查端点级 `@RateLimit` 或上游 WAF），别在 `ratelimit:global:*` 里浪费时间。
+
+**webhook 面的两个桶（M10-P5 SA-16/SA-17；不是 per-IP 维度，别去 `ratelimit:global:*` 里找）**：
+
+| 键 | 来源 | 阈值（每分钟） |
+| --- | --- | --- |
+| `ratelimit:webhook:{token}` | `modules/workflows/workflow-hooks.controller.ts` 的端点级 `@RateLimit`（键取自 URL 里的 token，取不到时用 `anon`） | 120 |
+| `ratelimit:webhook:global` | `modules/workflows/webhook-global-throttle.guard.ts` 的**全站总闸**：单一共享桶，与 token/IP 无关——存在的理由正是"不持有效 token 的人可以每次换 token"，per-token 维度对那种风暴零约束 | 3000（env `WEBHOOK_GLOBAL_LIMIT`；窗口 env `WEBHOOK_GLOBAL_WINDOW_MS`，默认 60s） |
+
+```bash
+# 看 webhook 面是否被限（per-token 桶涨 = 单个 token 被打；global 桶涨 = 有人在不换 token 地刷总量）
+docker exec docker-redis-1 redis-cli --scan --pattern 'ratelimit:webhook:*'
+docker exec docker-redis-1 redis-cli get 'ratelimit:webhook:global'
+```
+两个桶都走同一个 `RateLimitService.consume`，因此**同样 fail-open**（Redis 不可用/超时 → 放行 + warn）：
+Redis 故障期间 webhook 的这两道闸一起失效，判据与本节的 fail-open 说明完全一致（那时该看的是 `/ready` 与 Redis，
+不是"怎么没有 429"）。
 
 **今天就能用的三条命令**（本机 Redis 在容器里；生产把 `docker exec` 换成对 Redis 的直接 `redis-cli`）：
 
@@ -491,6 +571,11 @@ docker exec docker-redis-1 redis-cli --scan --pattern 'ratelimit:global:auth:*'
 > 游标实现，但仍会遍历全部键空间），并在 Redis 负载低时做，别在故障复盘的高峰期全量扫。
 > 另外：多实例/多环境共用 Redis 时按 **DB 段**隔离 keyspace（`REDIS_URL` 尾部的 `/<db>`），
 > 排查前先确认自己连的是应用的**那个 DB 段**，否则会得出"一个键都没有"的错误结论。
+>
+> ⚠️ 但 **DB 段只隔离 keyspace，隔离不了 Pub/Sub**：Redis 的发布/订阅是**全局命名空间**（与 `SELECT` 的 DB 号无关），
+> `EventBus` 的频道名也只有固定前缀 `agent:events:`（`core/events/event-bus.service.ts:5`）——因此
+> **同一 Redis 实例上，跨 DB 段的订阅者会互相看到事件**。演练环境与生产若共用实例，别指望"用 `/1`、`/2`
+> 就能让两边的事件互不可见"：真要隔离，用**不同实例**（或在 Redis 侧用 ACL/独立实例 + 改频道前缀，属代码改动）。
 
 **fail-open 语义（必须知道，否则会误判）**：`RateLimitService.consume` 在 **Redis 不可用/命令超时**时
 **返回放行**（`true`）并打一条 `限流器异常/超时（放行）` 的 warn。这是 M7-P9/Pre-M9 G4 以来的既定口径：
@@ -549,6 +634,7 @@ docker exec docker-redis-1 redis-cli --scan --pattern 'ratelimit:global:auth:*'
 | 告警规则里的 `[待导出]` 项 | ⛔ 未生效 | 见 §7.3；生效前用 §7.2 的人工判据 |
 | 多副本下的 /ready 与滚动更新行为 | ❌ 未验证 | 需在集群里做一次滚动更新，观察摘流顺序与 SSE 断线重连（客户端依赖 `last-event-id` 续传） |
 | 全局限流在**真实代理层数**下的分桶（`TRUSTED_PROXY_HOPS=1`） | ❌ 未验证 | 本机没有 Ingress，且 `NODE_ENV≠production` 时阈值 ×100。需在预发核对两件事：① 真实 `X-Forwarded-For` 链长（`k8s/ingress.yaml` 刻意**不设** `use-forwarded-headers`，靠 ingress-nginx 默认行为"用直连对端地址覆盖 XFF" ⇒ 右起第 1 跳 = 真实客户端）；② `ratelimit:global:*` 的键里出现的是**客户端 IP** 而不是 Ingress Pod IP。若前面加了 CDN，`use-forwarded-headers` 与 `TRUSTED_PROXY_HOPS` 必须**成对**改（§6.2、§7.4） |
+| 生产库上 `migrate deploy` 的**库侧前置**（受限角色 × 预建扩展，§6.5） | ❌ 未验证（本机是超级用户形态的 dev 库，无托管 PG、无受限角色） | 预发用**最小权限角色**跑一次 `migrate deploy`：先确认"不预建就失败"（记下报错原文 `permission denied to create extension "pgcrypto"`），再由 DBA 预建 `pgcrypto`/`vector` 后成功；把两个数字/报错更新回 §6.5 |
 
 ## 10. 边界与依赖
 

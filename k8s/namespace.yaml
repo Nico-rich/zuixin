@@ -1,6 +1,6 @@
 # M10-P9 运维交付：命名空间。
 # 只放本平台自己的对象；PG/Redis/对象存储等有状态服务不进这个命名空间
-# （生产用托管服务或独立 Operator 管理，见 docs/operations/m10-runbook.md §1）。
+# （生产用托管服务或独立 Operator 管理，见 docs/operations/m10-runbook.md §10「边界与依赖」）。
 apiVersion: v1
 kind: Namespace
 metadata:
