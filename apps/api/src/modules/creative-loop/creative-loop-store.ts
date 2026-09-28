@@ -1,40 +1,34 @@
 /**
- * M9-P5 持久化落点（**已知 schema 缺口的最小实现——缺口如实记录，绝不伪造**）。
+ * M10-P4 持久化落点（**专表**：`CreativeHypothesis` / `CreativeInsight`，W0 预整合 schema）。
  *
- * 设计文档（docs/architecture/m9-phase4-6-design.md M9-P5 节）要求新模块持有"假设 CRUD + 状态机"，
- * 但本 Phase 的硬约束是 **禁止修改 schema.prisma / migrations / packages/shared，禁止 prisma 命令**，
- * 而当前 schema **不存在** CreativeHypothesis / CreativeInsight / CreativeLoop 任何表
- * （全仓 grep 无命中；M9 的预整合只覆盖了 P1/P2/P3 与 P6 的表）。故本 Phase 采用既有通用文档容器
- * `Artifact`（type='other'，M2 表，**不改列不改索引**）承载两类文档：
+ * M9-P5 曾以通用文档容器 `Artifact(type='other', content.kind=...)` 承载（当时 schema 冻结），
+ * 本文件把读写切换为专表——**容器污染防护由表结构天然保证**（不再有 kind 判别误读）：
+ * - 组织归属 = `organizationId` 直列（**查询一律 server-side scope**，删除 JSON path 谓词）；
+ * - 生命周期/判定事实（status/statement/successCriteria/loop/verdict/history）逐列落库，
+ *   数据库级 CHECK（enum）与外键（组织/项目/用户）保证合法值与归属；
+ * - 状态推进仍为 **status CAS**（`updateMany` + status 谓词，count=0 → 调用方转 400/409）；
+ * - 非状态字段更新为 **version CAS**（读时版本 → `where.version` 条件 + `version = version+1`），
+ *   并发状态推进/并发编辑一律不被盲目覆盖；
+ * - 洞察解读写入仍锚定 `factsHash`（事实层变化后旧解读拒绝落库——隔离不变量不变）。
  *
- * - `content.kind = 'creative_hypothesis'`：假设文档（状态机、判据、loop/evaluation/experiment 引用、判定事实）；
- * - `content.kind = 'creative_insight'`：洞察文档（facts/derived/interpretation 分层 + factsHash 指纹）。
+ * 存量回填（一次性、幂等）：dev 库中既有的旧容器行（`Artifact(type='other')` + `content.kind` ∈
+ * {creative_hypothesis, creative_insight}）在**首次访问本 store** 时按 id 原样搬入专表
+ * （`createMany({ skipDuplicates: true })` → 重复执行安全）；旧行**只读不删**（保留审计痕迹，
+ * 模块此后不再读取它们）。回填失败按行记警告并跳过（绝不因历史脏数据阻塞模块启动），
+ * 失败不缓存（下次访问重试）。
  *
- * 安全与语义约束（与"新建专表"等价的部分）：
- * - 会话内制品可见性：本模块写入的行一律 `conversationId = null`、`storageKey = null`，
- *   既有制品读路径（ArtifactService.listByConversation / getById）**看不到**这些行，
- *   绝不污染用户制品列表（全仓只有这两处读 Artifact，已核验）；
- * - 归属：`content.organizationId` + `content.projectId` 记录组织/项目 scope，服务层按 workflow.read/write 裁决；
- * - 状态推进：一律 **条件更新**（`updateMany` + JSON path 谓词，锚点 = kind + 当前 status）——
- *   CAS 失败（count=0，并发/状态已变）由调用方转 409，绝不盲目覆盖；
- * - 事实/解读隔离：洞察解读写入的 CAS 谓词含 `factsHash`——事实层变化后旧解读**拒绝落库**（见 insight.service）。
- *
- * 已知缺口（交付说明中如实列出，需 Coordinator 在后续 Phase 预整合专表后切换存储实现）：
- * ① 无独立表 → 无数据库级 CHECK/外键约束，状态机由服务层 + 条件更新保证；
- * ② 无 `organizationId` 列 → 组织过滤走 `content.path` JSON 谓词（Postgres JSONB，已实测）；
- * ③ 无 `updatedAt` 之外的版本列 → 状态维度由 status CAS 保证，非状态字段为最后写入者胜。
- * 切换成本受控：本文件是唯一持久化实现（HypothesisStore/InsightStore 全部读写集中于此），
- * 专表落库后只需替换本文件实现（服务层零改动）。
+ * 服务层接口（StoredDoc / HypothesisStore / InsightStore）公开方法签名保持不变
+ * （仅 `StoredDoc` 增补 `version`——CAS 锚点；服务层改动限于把"非状态字段更新"改走 version CAS）。
  */
 
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { HypothesisStatus, isHypothesisStatus } from './hypothesis-status';
 import { SuccessCriteria } from './insight-rules';
 
-/** 承载容器：ArtifactType 枚举无 creative-loop 专用值（枚举冻结）→ 统一用 'other' + content.kind 判别 */
+/** 旧容器判别（**仅存量回填使用**；新读写一律走专表，绝不读 Artifact） */
 export const CREATIVE_LOOP_ARTIFACT_TYPE = 'other';
 export const HYPOTHESIS_KIND = 'creative_hypothesis';
 export const INSIGHT_KIND = 'creative_insight';
@@ -124,67 +118,286 @@ export interface StoredDoc<T> {
   doc: T;
   createdAt: Date;
   updatedAt: Date;
+  /** 行版本（M10-P4：非状态字段更新的 CAS 锚点；每次写入 +1） */
+  version: number;
 }
 
-interface ArtifactRow {
-  id: string;
-  userId: string;
-  content: unknown;
-  createdAt: Date;
-  updatedAt: Date;
+/** 旧容器行的内容形状（回填时按字段尽可能还原；缺字段一律按空值处理） */
+type LegacyDoc = Record<string, unknown>;
+
+// ===== 存量回填（幂等；首次访问触发，失败不缓存） =====
+
+/** 每个 PrismaService 实例一份（进程内共享；失败不缓存 → 下次访问重试） */
+const backfill = new WeakMap<PrismaService, Promise<void>>();
+const backfillLogger = new Logger('CreativeLoopBackfill');
+
+/**
+ * 旧容器行 → 专表（**只读迁移**：不删旧行、按 id 幂等插入、单行失败不阻塞其余行）。
+ * 组织归属取 `content.organizationId`（旧实现的组织判别同源），缺失/失联（外键不成立）→ 跳过并告警。
+ */
+async function runLegacyBackfill(prisma: PrismaService): Promise<void> {
+  const rows = await prisma.artifact.findMany({
+    where: {
+      type: CREATIVE_LOOP_ARTIFACT_TYPE as never,
+      OR: [kindEquals(HYPOTHESIS_KIND), kindEquals(INSIGHT_KIND)],
+    },
+    select: { id: true, userId: true, content: true, createdAt: true },
+  });
+  if (rows.length === 0) return;
+  let migrated = 0;
+  let skipped = 0;
+  for (const row of rows) {
+    const doc = (row.content ?? {}) as LegacyDoc;
+    const kind = doc.kind;
+    const organizationId = typeof doc.organizationId === 'string' ? doc.organizationId : '';
+    if (!organizationId) {
+      skipped++;
+      backfillLogger.warn({ artifactId: row.id }, '旧容器行缺少 organizationId，跳过回填（保留原行）');
+      continue;
+    }
+    try {
+      if (kind === HYPOTHESIS_KIND) {
+        const status = doc.status;
+        if (!isHypothesisStatus(status)) {
+          skipped++;
+          backfillLogger.warn({ artifactId: row.id, status }, '旧假设状态非法，跳过回填（保留原行）');
+          continue;
+        }
+        const created = await prisma.creativeHypothesis.createMany({
+          data: [{
+            id: row.id,
+            organizationId,
+            projectId: typeof doc.projectId === 'string' ? doc.projectId : null,
+            userId: row.userId,
+            status: status as never,
+            statement: typeof doc.statement === 'string' ? doc.statement : '',
+            rationale: typeof doc.rationale === 'string' ? doc.rationale : null,
+            target: typeof doc.target === 'string' ? doc.target : null,
+            platform: typeof doc.platform === 'string' ? doc.platform : null,
+            insightId: typeof doc.insightId === 'string' ? doc.insightId : null,
+            successCriteria: jsonOrNull(doc.successCriteria),
+            loop: jsonOrNull(doc.loop),
+            evaluationRunId: typeof doc.evaluationRunId === 'string' ? doc.evaluationRunId : null,
+            baselineRunId: typeof doc.baselineRunId === 'string' ? doc.baselineRunId : null,
+            experimentId: typeof doc.experimentId === 'string' ? doc.experimentId : null,
+            verdict: jsonOrNull(doc.verdict),
+            history: jsonOrEmptyArray(doc.history),
+            version: 1,
+            createdAt: row.createdAt, // 保留原时间线（updatedAt 由 Prisma @updatedAt 落为回填时刻）
+          }],
+          skipDuplicates: true, // 已回填（同 id）→ 不动既有专表行
+        });
+        migrated += created.count;
+      } else {
+        const created = await prisma.creativeInsight.createMany({
+          data: [{
+            id: row.id,
+            organizationId,
+            projectId: typeof doc.projectId === 'string' ? doc.projectId : null,
+            userId: row.userId,
+            window: jsonOrObject(doc.window),
+            filters: jsonOrObject(doc.filters),
+            facts: jsonOrObject(doc.facts),
+            derived: jsonOrObject(doc.derived),
+            factsHash: typeof doc.factsHash === 'string' ? doc.factsHash : '',
+            interpretation: jsonOrNull(doc.interpretation),
+            layering: jsonOrObject(doc.layering),
+            version: 1,
+            createdAt: row.createdAt,
+          }],
+          skipDuplicates: true,
+        });
+        migrated += created.count;
+      }
+    } catch (err) {
+      // 常见：历史行的组织/用户/项目已被删除（外键不成立）——跳过该行，绝不让历史脏数据阻塞模块
+      skipped++;
+      backfillLogger.warn({ artifactId: row.id, err: (err as Error).message }, '旧容器行回填失败，已跳过（保留原行）');
+    }
+  }
+  backfillLogger.log({ scanned: rows.length, migrated, skipped }, 'M10-P4 存量回填完成（幂等只读迁移）');
 }
 
-/** JSON path 谓词：kind 判别（所有读写都带——绝不误读其他 kind 的 'other' 制品） */
+/** 幂等触发（并发首次访问共用同一 Promise；失败不缓存 → 下次访问重试） */
+function ensureLegacyBackfill(prisma: PrismaService): Promise<void> {
+  const running = backfill.get(prisma);
+  if (running) return running;
+  const task = runLegacyBackfill(prisma).catch((err) => {
+    backfill.delete(prisma); // 失败不缓存：下次访问重试（绝不因回填失败让模块不可用）
+    backfillLogger.warn({ err: (err as Error).message }, '存量回填失败（本次跳过；下次访问重试）');
+  });
+  backfill.set(prisma, task);
+  return task;
+}
+
+/** 旧容器行判别谓词（JSONB path；**仅回填使用**） */
 function kindEquals(kind: string): Prisma.ArtifactWhereInput {
   return { content: { path: ['kind'], equals: kind } } as Prisma.ArtifactWhereInput;
 }
 
-function statusEquals(status: string): Prisma.ArtifactWhereInput {
-  return { content: { path: ['status'], equals: status } } as Prisma.ArtifactWhereInput;
+function jsonOrNull(value: unknown): Prisma.InputJsonValue {
+  return (value === undefined || value === null ? Prisma.DbNull : value) as Prisma.InputJsonValue;
 }
 
-function orgEquals(organizationId: string): Prisma.ArtifactWhereInput {
-  return { content: { path: ['organizationId'], equals: organizationId } } as Prisma.ArtifactWhereInput;
+function jsonOrObject(value: unknown): Prisma.InputJsonValue {
+  return (value && typeof value === 'object' ? value : {}) as Prisma.InputJsonValue;
 }
 
-function projectEquals(projectId: string): Prisma.ArtifactWhereInput {
-  return { content: { path: ['projectId'], equals: projectId } } as Prisma.ArtifactWhereInput;
+function jsonOrEmptyArray(value: unknown): Prisma.InputJsonValue {
+  return (Array.isArray(value) ? value : []) as Prisma.InputJsonValue;
 }
 
-function readDoc<T>(row: ArtifactRow | null, expectedKind: string): T | null {
-  if (!row) return null;
-  const doc = row.content as { kind?: string } | null;
-  if (!doc || doc.kind !== expectedKind) return null; // 容器污染防护：kind 不符一律视作不存在
-  return doc as T;
+// ===== 行 ↔ 文档映射 =====
+
+interface HypothesisRow {
+  id: string;
+  organizationId: string;
+  projectId: string | null;
+  userId: string;
+  status: string;
+  statement: string;
+  rationale: string | null;
+  target: string | null;
+  platform: string | null;
+  insightId: string | null;
+  successCriteria: unknown;
+  loop: unknown;
+  evaluationRunId: string | null;
+  baselineRunId: string | null;
+  experimentId: string | null;
+  verdict: unknown;
+  history: unknown;
+  version: number;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
-/** 假设文档读写（唯一持久化实现；见文件头"已知缺口"） */
+interface InsightRow {
+  id: string;
+  organizationId: string;
+  projectId: string | null;
+  userId: string;
+  window: unknown;
+  filters: unknown;
+  facts: unknown;
+  derived: unknown;
+  factsHash: string;
+  interpretation: unknown;
+  layering: unknown;
+  version: number;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/** 文档 → 专表列（**可写字段**：organizationId 是创建时的不可变归属，绝不因更新漂移） */
+function hypothesisColumns(doc: HypothesisDoc): Record<string, unknown> {
+  if (!isHypothesisStatus(doc.status)) {
+    throw new AppError(ErrorCode.INTERNAL, `假设状态非法: ${String(doc.status)}`);
+  }
+  return {
+    status: doc.status,
+    statement: doc.statement,
+    rationale: doc.rationale,
+    target: doc.target,
+    platform: doc.platform,
+    insightId: doc.insightId,
+    successCriteria: jsonOrNull(doc.successCriteria),
+    loop: jsonOrNull(doc.loop),
+    evaluationRunId: doc.evaluationRunId,
+    baselineRunId: doc.baselineRunId,
+    experimentId: doc.experimentId,
+    verdict: jsonOrNull(doc.verdict),
+    history: jsonOrEmptyArray(doc.history),
+  };
+}
+
+function rowToHypothesis(row: HypothesisRow): StoredDoc<HypothesisDoc> {
+  return {
+    id: row.id,
+    userId: row.userId,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    version: row.version,
+    doc: {
+      kind: HYPOTHESIS_KIND,
+      organizationId: row.organizationId,
+      projectId: row.projectId,
+      status: row.status as HypothesisStatus,
+      statement: row.statement,
+      rationale: row.rationale,
+      target: row.target,
+      platform: row.platform,
+      insightId: row.insightId,
+      successCriteria: (row.successCriteria ?? null) as SuccessCriteria | null,
+      loop: (row.loop ?? null) as HypothesisLoopRef | null,
+      evaluationRunId: row.evaluationRunId,
+      baselineRunId: row.baselineRunId,
+      experimentId: row.experimentId,
+      verdict: (row.verdict ?? null) as HypothesisVerdict | null,
+      history: (Array.isArray(row.history) ? row.history : []) as HypothesisHistoryEntry[],
+    },
+  };
+}
+
+function insightColumns(doc: InsightDoc): Record<string, unknown> {
+  return {
+    window: jsonOrObject(doc.window),
+    filters: jsonOrObject(doc.filters),
+    facts: jsonOrObject(doc.facts),
+    derived: jsonOrObject(doc.derived),
+    factsHash: doc.factsHash,
+    interpretation: jsonOrNull(doc.interpretation),
+    layering: jsonOrObject(doc.layering),
+  };
+}
+
+function rowToInsight(row: InsightRow): StoredDoc<InsightDoc> {
+  return {
+    id: row.id,
+    userId: row.userId,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    version: row.version,
+    doc: {
+      kind: INSIGHT_KIND,
+      organizationId: row.organizationId,
+      projectId: row.projectId,
+      window: jsonOrObject(row.window) as unknown as InsightDoc['window'],
+      filters: jsonOrObject(row.filters) as unknown as Record<string, unknown>,
+      facts: jsonOrObject(row.facts) as unknown as Record<string, unknown>,
+      derived: jsonOrObject(row.derived) as unknown as Record<string, unknown>,
+      factsHash: row.factsHash,
+      interpretation: (row.interpretation ?? null) as InsightInterpretation | null,
+      layering: jsonOrObject(row.layering) as unknown as Record<string, string>,
+    },
+  };
+}
+
+/** 假设专表读写（唯一持久化实现） */
 @Injectable()
 export class HypothesisStore {
   constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
 
   async create(userId: string, doc: HypothesisDoc): Promise<StoredDoc<HypothesisDoc>> {
-    const row = await this.prisma.artifact.create({
+    await ensureLegacyBackfill(this.prisma);
+    const row = await this.prisma.creativeHypothesis.create({
       data: {
-        userId,
+        organizationId: doc.organizationId,
         projectId: doc.projectId,
-        type: CREATIVE_LOOP_ARTIFACT_TYPE as never,
-        title: doc.statement.slice(0, 80),
-        summary: `创意假设（${doc.status}）`,
-        content: doc as never,
-        status: 'ready' as never, // 容器物化状态；假设生命周期在 content.status（文档头已说明）
-      },
+        userId,
+        ...hypothesisColumns(doc),
+      } as never,
     });
-    return { id: row.id, userId: row.userId, doc: doc, createdAt: row.createdAt, updatedAt: row.updatedAt };
+    return rowToHypothesis(row as unknown as HypothesisRow);
   }
 
   async get(id: string): Promise<StoredDoc<HypothesisDoc> | null> {
-    const row = await this.prisma.artifact.findFirst({
-      where: { id, type: CREATIVE_LOOP_ARTIFACT_TYPE as never, AND: [kindEquals(HYPOTHESIS_KIND)] },
-    });
-    return this.toStored(row);
+    await ensureLegacyBackfill(this.prisma);
+    const row = await this.prisma.creativeHypothesis.findUnique({ where: { id } });
+    return row ? rowToHypothesis(row as unknown as HypothesisRow) : null;
   }
 
+  /** 列表（组织/项目/状态一律 **server-side 直列谓词**——绝不 JS 侧过滤，绝不 JSON path） */
   async list(filter: {
     userId?: string;
     organizationId?: string;
@@ -192,108 +405,96 @@ export class HypothesisStore {
     status?: HypothesisStatus;
     take?: number;
   }): Promise<Array<StoredDoc<HypothesisDoc>>> {
-    const and: Prisma.ArtifactWhereInput[] = [kindEquals(HYPOTHESIS_KIND)];
-    if (filter.organizationId) and.push(orgEquals(filter.organizationId));
-    if (filter.projectId) and.push(projectEquals(filter.projectId));
-    if (filter.status) and.push(statusEquals(filter.status));
-    const rows = await this.prisma.artifact.findMany({
+    await ensureLegacyBackfill(this.prisma);
+    const rows = await this.prisma.creativeHypothesis.findMany({
       where: {
-        type: CREATIVE_LOOP_ARTIFACT_TYPE as never,
+        ...(filter.organizationId ? { organizationId: filter.organizationId } : {}),
         ...(filter.userId ? { userId: filter.userId } : {}),
-        AND: and,
+        ...(filter.projectId ? { projectId: filter.projectId } : {}),
+        ...(filter.status ? { status: filter.status as never } : {}),
       },
       orderBy: { createdAt: 'desc' },
       take: filter.take ?? 50,
     });
-    return rows.map((row) => this.toStored(row)).filter((r): r is StoredDoc<HypothesisDoc> => r !== null);
+    return rows.map((row) => rowToHypothesis(row as unknown as HypothesisRow));
   }
 
   /**
-   * 状态推进（**条件更新**）：仅当当前 kind 命中且 status ∈ from 时写入整份新文档；
-   * 返回受影响行数（0 = 并发/状态已变 → 调用方转 409，绝不盲目覆盖）。
+   * 状态推进（**status CAS**）：仅当当前 status ∈ from 时写入整份新文档。
+   * 返回受影响行数（0 = 并发/状态已变 → 调用方转错，绝不盲目覆盖）；成功则 version +1。
    */
   async cas(id: string, from: readonly HypothesisStatus[], next: HypothesisDoc): Promise<number> {
-    if (!isHypothesisStatus(next.status)) {
-      throw new AppError(ErrorCode.INTERNAL, `假设状态非法: ${String(next.status)}`);
-    }
-    const res = await this.prisma.artifact.updateMany({
+    await ensureLegacyBackfill(this.prisma);
+    const res = await this.prisma.creativeHypothesis.updateMany({
       where: {
         id,
-        type: CREATIVE_LOOP_ARTIFACT_TYPE as never,
-        AND: [kindEquals(HYPOTHESIS_KIND), { OR: from.map((s) => statusEquals(s)) }],
+        organizationId: next.organizationId, // server-side 组织 scope（归属不可变，谓词恒真；防御性收口）
+        status: { in: from as never[] },
       },
-      data: { content: next as never, title: next.statement.slice(0, 80), updatedAt: new Date() },
+      data: { ...hypothesisColumns(next), version: { increment: 1 } } as never,
+    });
+    return res.count;
+  }
+
+  /**
+   * 非状态字段更新（**version CAS**）：expectedVersion = 调用方读取时的行版本；
+   * 期间任何写入（状态推进/编辑/解读挂接）都会使 version 前移 → count=0 → 调用方转错，绝不覆盖。
+   */
+  async casFields(id: string, expectedVersion: number, next: HypothesisDoc): Promise<number> {
+    await ensureLegacyBackfill(this.prisma);
+    const res = await this.prisma.creativeHypothesis.updateMany({
+      where: { id, version: expectedVersion, organizationId: next.organizationId },
+      data: { ...hypothesisColumns(next), version: { increment: 1 } } as never,
     });
     return res.count;
   }
 
   /** 删除（仅允许草稿/已驳回：已启动过 loop 的假设行是历史事实，绝不删除） */
   async remove(id: string, allowed: readonly HypothesisStatus[]): Promise<number> {
-    const res = await this.prisma.artifact.deleteMany({
-      where: {
-        id,
-        type: CREATIVE_LOOP_ARTIFACT_TYPE as never,
-        AND: [kindEquals(HYPOTHESIS_KIND), { OR: allowed.map((s) => statusEquals(s)) }],
-      },
+    await ensureLegacyBackfill(this.prisma);
+    const res = await this.prisma.creativeHypothesis.deleteMany({
+      where: { id, status: { in: allowed as never[] } },
     });
     return res.count;
   }
-
-  private toStored(row: ArtifactRow | null): StoredDoc<HypothesisDoc> | null {
-    const doc = readDoc<HypothesisDoc>(row, HYPOTHESIS_KIND);
-    if (!row || !doc) return null;
-    return { id: row.id, userId: row.userId, doc, createdAt: row.createdAt, updatedAt: row.updatedAt };
-  }
 }
 
-/** 洞察文档读写（同上：唯一持久化实现） */
+/** 洞察专表读写（唯一持久化实现） */
 @Injectable()
 export class InsightStore {
   constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
 
   async create(userId: string, doc: InsightDoc): Promise<StoredDoc<InsightDoc>> {
-    const row = await this.prisma.artifact.create({
+    await ensureLegacyBackfill(this.prisma);
+    const row = await this.prisma.creativeInsight.create({
       data: {
-        userId,
+        organizationId: doc.organizationId,
         projectId: doc.projectId,
-        type: CREATIVE_LOOP_ARTIFACT_TYPE as never,
-        title: `创意洞察（近 ${doc.window.days} 天）`,
-        summary: doc.interpretation ? '洞察（含 LLM 解读，独立层）' : '洞察（事实层）',
-        content: doc as never,
-        status: 'ready' as never,
-      },
+        userId,
+        ...insightColumns(doc),
+      } as never,
     });
-    return { id: row.id, userId: row.userId, doc, createdAt: row.createdAt, updatedAt: row.updatedAt };
+    return rowToInsight(row as unknown as InsightRow);
   }
 
   async get(id: string): Promise<StoredDoc<InsightDoc> | null> {
-    const row = await this.prisma.artifact.findFirst({
-      where: { id, type: CREATIVE_LOOP_ARTIFACT_TYPE as never, AND: [kindEquals(INSIGHT_KIND)] },
-    });
-    const doc = readDoc<InsightDoc>(row, INSIGHT_KIND);
-    if (!row || !doc) return null;
-    return { id: row.id, userId: row.userId, doc, createdAt: row.createdAt, updatedAt: row.updatedAt };
+    await ensureLegacyBackfill(this.prisma);
+    const row = await this.prisma.creativeInsight.findUnique({ where: { id } });
+    return row ? rowToInsight(row as unknown as InsightRow) : null;
   }
 
   async list(filter: { userId?: string; organizationId?: string; projectId?: string; take?: number }): Promise<Array<StoredDoc<InsightDoc>>> {
-    const and: Prisma.ArtifactWhereInput[] = [kindEquals(INSIGHT_KIND)];
-    if (filter.organizationId) and.push(orgEquals(filter.organizationId));
-    if (filter.projectId) and.push(projectEquals(filter.projectId));
-    const rows = await this.prisma.artifact.findMany({
+    await ensureLegacyBackfill(this.prisma);
+    const rows = await this.prisma.creativeInsight.findMany({
       where: {
-        type: CREATIVE_LOOP_ARTIFACT_TYPE as never,
+        ...(filter.organizationId ? { organizationId: filter.organizationId } : {}),
         ...(filter.userId ? { userId: filter.userId } : {}),
-        AND: and,
+        ...(filter.projectId ? { projectId: filter.projectId } : {}),
       },
       orderBy: { createdAt: 'desc' },
       take: filter.take ?? 50,
     });
-    const out: Array<StoredDoc<InsightDoc>> = [];
-    for (const row of rows) {
-      const doc = readDoc<InsightDoc>(row, INSIGHT_KIND);
-      if (doc) out.push({ id: row.id, userId: row.userId, doc, createdAt: row.createdAt, updatedAt: row.updatedAt });
-    }
-    return out;
+    return rows.map((row) => rowToInsight(row as unknown as InsightRow));
   }
 
   /**
@@ -302,16 +503,10 @@ export class InsightStore {
    * 写入内容 = 原文档逐字段复制 + interpretation 覆盖（facts/derived 绝不进入本方法的构造路径）。
    */
   async saveInterpretation(id: string, factsHash: string, next: InsightDoc): Promise<number> {
-    const res = await this.prisma.artifact.updateMany({
-      where: {
-        id,
-        type: CREATIVE_LOOP_ARTIFACT_TYPE as never,
-        AND: [
-          kindEquals(INSIGHT_KIND),
-          { content: { path: ['factsHash'], equals: factsHash } } as Prisma.ArtifactWhereInput,
-        ],
-      },
-      data: { content: next as never, updatedAt: new Date() },
+    await ensureLegacyBackfill(this.prisma);
+    const res = await this.prisma.creativeInsight.updateMany({
+      where: { id, factsHash, organizationId: next.organizationId },
+      data: { ...insightColumns(next), version: { increment: 1 } } as never,
     });
     return res.count;
   }

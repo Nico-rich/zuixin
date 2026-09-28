@@ -28,7 +28,7 @@ import { HypothesesService, HypothesisView } from './hypotheses.service';
 import { HypothesisDoc, HypothesisStore, HypothesisVerdict, InsightStore, StoredDoc } from './creative-loop-store';
 import { HypothesisStatus, assertTransition } from './hypothesis-status';
 import {
-  LoopTemplateInput, buildLoopDefinition, loopRunIdempotencyKey, loopWorkflowName,
+  LOOP_STEP_IDS, LoopTemplateInput, buildLoopDefinition, loopRunIdempotencyKey, loopWorkflowName,
 } from './loop-template';
 import { derivePerfMetrics, isCriteriaSatisfied, stableStringify, sumPerfFacts } from './insight-rules';
 
@@ -93,6 +93,68 @@ export interface LoopStatusResult {
   insightId: string | null;
   insightFactsHash: string | null;
   pending: LoopPending;
+  /** 已发布内容的回滚状态（P5 补偿链事实的只读投影；无 run/未发布 → not-required） */
+  rollback: LoopRollback;
+}
+
+/** run 步骤行最小事实（本模块**只读**——步骤/补偿留痕由 M9-P4 引擎写入） */
+export interface LoopRunStepRow {
+  stepId: string;
+  stepType: string;
+  status: string;
+  externalActionId: string | null;
+  output: unknown;
+  errorCode: string | null;
+}
+
+export interface LoopRollback {
+  /** 是否有已完成的平台写操作需要回滚 */
+  required: boolean;
+  status: 'not-required' | 'pending' | 'completed' | 'failed';
+  publishActionId: string | null;
+  compensateStepId: string | null;
+  errorCode: string | null;
+  detail: string;
+}
+
+/**
+ * 已发布内容的回滚投影（纯函数，只读事实；**绝不重算、绝不代执行回滚**）。
+ *
+ * 事实源 = M9-P4 引擎写在 run 步骤行上的留痕：
+ * - 发布是否完成 = `publish_creative` 行 status='completed'（未完成 → 没有写出去的东西，无需回滚）；
+ * - 回滚是否执行过 = 回滚锚点行的 `stepType='compensation'`。正常流程里 `rollback_publish` 会被记为
+ *   skipped，但那时 stepType 仍是定义中的 'external_action'；只有补偿链**真实执行**才会留下
+ *   'compensation' 留痕（锚点行由补偿服务复用/创建）；
+ * - 回滚结果 = 锚点行 status/errorCode（补偿失败**绝不重试**，故失败必须被人看见并人工兜底）。
+ *
+ * 诚实性要求：**绝不把"没看到补偿留痕"读成"已回滚"**——已发布且无补偿留痕 = pending（待回滚）。
+ */
+export function rollbackOf(steps: readonly LoopRunStepRow[]): LoopRollback {
+  const publish = steps.find((s) => s.stepId === LOOP_STEP_IDS.publishCreative);
+  const published = publish?.status === 'completed' ? publish : undefined;
+  if (!published) {
+    return {
+      required: false, status: 'not-required', publishActionId: null, compensateStepId: null, errorCode: null,
+      detail: '平台写操作未执行，无需回滚',
+    };
+  }
+  const output = (published.output ?? null) as Record<string, unknown> | null;
+  const publishActionId = (output?.externalActionId as string | undefined) ?? published.externalActionId ?? null;
+  const anchor = steps.find((s) => s.stepId === LOOP_STEP_IDS.rollbackPublish && s.stepType === 'compensation');
+  const base = { required: true, publishActionId, compensateStepId: LOOP_STEP_IDS.rollbackPublish };
+  if (!anchor) {
+    return { ...base, status: 'pending', errorCode: null, detail: '已发布但未见补偿链留痕（待回滚/未执行）' };
+  }
+  if (anchor.status === 'completed') {
+    return { ...base, status: 'completed', errorCode: null, detail: '补偿链已回滚平台写操作' };
+  }
+  if (anchor.status === 'failed') {
+    return {
+      ...base, status: 'failed', errorCode: anchor.errorCode ?? null,
+      detail: '补偿链回滚失败（补偿绝不重试）——已发布的写操作需人工处理',
+    };
+  }
+  return { ...base, status: 'pending', errorCode: anchor.errorCode ?? null, detail: `补偿链状态 ${anchor.status}（待回滚）` };
 }
 
 @Injectable()
@@ -199,10 +261,11 @@ export class CreativeLoopOrchestrator {
     hypothesis: HypothesisView;
     run: LoopRunSummary | null;
     pending: LoopPending;
+    rollback: LoopRollback;
   }> {
     const stored = await this.hypotheses.requireReadable(userId, hypothesisId);
     const result = await this.statusOf(stored);
-    return { hypothesis: result.hypothesis, run: result.run, pending: result.pending };
+    return { hypothesis: result.hypothesis, run: result.run, pending: result.pending, rollback: result.rollback };
   }
 
   /**
@@ -307,6 +370,7 @@ export class CreativeLoopOrchestrator {
       insightId: current.doc.insightId,
       insightFactsHash: insight?.doc.factsHash ?? null,
       pending: this.pendingOf(current.doc, run),
+      rollback: rollbackOf(run?.steps ?? []),
     };
   }
 
@@ -320,7 +384,14 @@ export class CreativeLoopOrchestrator {
         : { reason: 'observing', detail: '绩效观察窗（wait 步骤）' };
     }
     if (run.status === 'cancelled') return { reason: 'cancelled-needs-verdict', detail: 'run 已取消，需人工判定' };
-    if (run.status === 'failed' || run.status === 'timeout') return { reason: 'run-failed-needs-verdict', detail: `run ${run.status}` };
+    if (run.status === 'failed' || run.status === 'timeout') {
+      // 已发布的写操作是否被回滚是**运维事实**，必须随待办一起暴露（绝不因 run 失败就默认"已回滚"）
+      const rollback = rollbackOf(run.steps ?? []);
+      return {
+        reason: 'run-failed-needs-verdict',
+        detail: `run ${run.status}${rollback.required ? `；回滚状态 ${rollback.status}` : ''}`,
+      };
+    }
     if (run.status === 'completed') {
       return doc.successCriteria
         ? { reason: 'awaiting-facts', detail: '循环已跑完，等待回流事实满足判据' }
@@ -342,14 +413,20 @@ export class CreativeLoopOrchestrator {
         await this.concludeByCriteria(stored);
         return;
       }
+      // 回滚事实随判决一并留痕：run 失败 ≠ 已发布的写操作已回滚（补偿失败绝不重试，必须人工兜底）
+      const rollback = rollbackOf(run.steps ?? []);
       await this.systemTransition(stored, 'rejected', {
         by: 'system',
         verdict: {
           decision: 'rejected',
           decidedBy: 'system',
-          reason: `loop 运行 ${run.status}${run.errorCode ? `（${run.errorCode}）` : ''}，未产出可用结果`,
+          reason: `loop 运行 ${run.status}${run.errorCode ? `（${run.errorCode}）` : ''}，未产出可用结果`
+            + (rollback.required && rollback.status !== 'completed' ? `；已发布的写操作未回滚（${rollback.status}），需人工处理` : ''),
           criteria: stored.doc.successCriteria,
-          facts: { runId: run.id, status: run.status, errorCode: run.errorCode },
+          facts: {
+            runId: run.id, status: run.status, errorCode: run.errorCode,
+            publishActionId: rollback.publishActionId, rollback: rollback.status, rollbackDetail: rollback.detail,
+          },
           evaluationRunId: stored.doc.evaluationRunId,
           experimentId: stored.doc.experimentId,
           decidedAt: new Date().toISOString(),
@@ -573,6 +650,6 @@ interface RunRow {
   steps?: Array<{
     stepId: string; stepIndex: number; stepType: string; status: string; attempt: number;
     approvalId: string | null; externalActionId: string | null; agentRunId: string | null;
-    startedAt: Date | null; completedAt: Date | null; errorCode: string | null;
+    startedAt: Date | null; completedAt: Date | null; errorCode: string | null; output: unknown;
   }>;
 }

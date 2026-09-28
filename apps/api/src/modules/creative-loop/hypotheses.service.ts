@@ -1,11 +1,13 @@
 /**
- * M9-P5 创意假设服务（CRUD + 状态机 + 归属校验）。
+ * M9-P5 创意假设服务（CRUD + 状态机 + 归属校验）；M10-P4 起落 **CreativeHypothesis 专表**。
  *
  * 不变量：
- * - 状态推进**唯一入口** = `transition`（内部走 `assertTransition` 纯规则 + `HypothesisStore.cas` 条件更新，
- *   CAS 失败 → 400"已被并发修改"，绝不盲目覆盖）；
+ * - 状态推进**唯一入口** = `transition`（内部走 `assertTransition` 纯规则 + `HypothesisStore.cas`
+ *   **status CAS**，失败 → 400"已被并发修改"，绝不盲目覆盖）；
+ * - 非状态字段更新（编辑/挂接执行引用）= `HypothesisStore.casFields` **version CAS**（读时版本锚定）；
  * - 终态只读（`isTerminal` → 编辑/删除/再推进一律拒绝）；
- * - 归属：组织/项目 scope 落库在文档 `organizationId`/`projectId`；每次读写都过 RBAC（workflow.read/write）；
+ * - 归属：组织/项目 scope = 专表直列 `organizationId`/`projectId`（查询 server-side scope）；
+ *   每次读写都过 RBAC（workflow.read/write）；
  * - 本服务**不编排**（loop 启动/收敛在 loop-orchestrator.service.ts），也不消费评测/实验事实（同上）。
  */
 
@@ -132,9 +134,10 @@ export class HypothesesService {
       ...(input.insightId !== undefined ? { insightId: input.insightId } : {}),
       ...(input.successCriteria !== undefined ? { successCriteria: input.successCriteria } : {}),
     };
-    const count = await this.store.cas(id, [stored.doc.status], next); // 条件更新：并发推进不被覆盖
+    // M10-P4：非状态字段更新 = **version CAS**（锚定读取时的行版本——并发状态推进/并发编辑一律不被覆盖）
+    const count = await this.store.casFields(id, stored.version, next);
     if (count === 0) throw new AppError(ErrorCode.VALIDATION_ERROR, '假设状态已被并发修改，请刷新后重试');
-    return this.toView({ ...stored, doc: next });
+    return this.toView({ ...stored, doc: next, version: stored.version + 1 });
   }
 
   /** 删除：仅 draft/rejected（历史事实——已启动/已验证的假设行保留，绝不删除） */
@@ -213,7 +216,7 @@ export class HypothesesService {
 
   /**
    * 内部受控写入（loop 编排/判定专用——控制器不暴露）：
-   * 仅改非状态字段，仍走条件更新（锚定当前 status，绝不与并发状态推进互相覆盖）。
+   * 仅改非状态字段，走 **version CAS**（锚定读取时的行版本——绝不与并发状态推进互相覆盖）。
    */
   async patch(
     id: string,
@@ -230,9 +233,10 @@ export class HypothesesService {
       throw new AppError(ErrorCode.VALIDATION_ERROR, `当前状态不允许该操作（${stored.doc.status}）`);
     }
     const next: HypothesisDoc = { ...stored.doc, ...patch };
-    const count = await this.store.cas(id, [stored.doc.status], next);
+    // M10-P4：非状态字段更新 = **version CAS**（并发状态推进/并发编辑的输家 count=0，绝不覆盖）
+    const count = await this.store.casFields(id, stored.version, next);
     if (count === 0) throw new AppError(ErrorCode.VALIDATION_ERROR, '假设状态已被并发修改，请刷新后重试');
-    return { ...stored, doc: next };
+    return { ...stored, doc: next, version: stored.version + 1 };
   }
 
   /** 读路径（服务层内部用；返回存储行，不含视图包装） */

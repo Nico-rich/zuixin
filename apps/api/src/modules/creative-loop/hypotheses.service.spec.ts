@@ -25,16 +25,21 @@ function makeDoc(over: Partial<HypothesisDoc> = {}): HypothesisDoc {
   };
 }
 
-function makeHarness(over: { doc?: HypothesisDoc | null; cas?: number; remove?: number; insight?: { organizationId: string } | null } = {}) {
+function makeHarness(over: { doc?: HypothesisDoc | null; cas?: number; casFields?: number; remove?: number; insight?: { organizationId: string } | null } = {}) {
   const doc = over.doc === undefined ? makeDoc() : over.doc;
   const stored: StoredDoc<HypothesisDoc> | null = doc
-    ? { id: 'hyp-1', userId: 'u1', doc, createdAt: new Date('2026-01-01T00:00:00Z'), updatedAt: new Date('2026-01-01T00:00:00Z') }
+    ? {
+      id: 'hyp-1', userId: 'u1', doc, version: 1,
+      createdAt: new Date('2026-01-01T00:00:00Z'), updatedAt: new Date('2026-01-01T00:00:00Z'),
+    }
     : null;
   const store = {
-    create: vi.fn(async (userId: string, d: HypothesisDoc) => ({ id: 'hyp-new', userId, doc: d, createdAt: new Date(), updatedAt: new Date() })),
+    create: vi.fn(async (userId: string, d: HypothesisDoc) => ({ id: 'hyp-new', userId, doc: d, createdAt: new Date(), updatedAt: new Date(), version: 1 })),
     get: vi.fn(async () => stored),
     list: vi.fn(async () => (stored ? [stored] : [])),
     cas: vi.fn(async () => over.cas ?? 1),
+    // 真实实现：非状态字段更新走 version CAS（锚定读取时版本；输家 count=0）；mock 同语义
+    casFields: vi.fn(async (_id: string, expectedVersion: number) => (stored && stored.version === expectedVersion ? over.casFields ?? 1 : 0)),
     // 真实实现按 allowed 状态做 SQL 过滤（未命中 → count 0）；mock 同语义
     remove: vi.fn(async (_id: string, allowed: readonly string[]) => (doc && allowed.includes(doc.status) ? over.remove ?? 1 : 0)),
   };
@@ -93,11 +98,12 @@ describe('HypothesesService（CRUD + 状态机 + 归属）', () => {
     await expect(h.service.get('u1', 'hyp-x')).rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
 
-  it('update：draft/ready 可编辑，走条件更新（锚定当前 status）', async () => {
+  it('update：draft/ready 可编辑，走 version CAS（锚定读取时的行版本）', async () => {
     const h = makeHarness({ doc: makeDoc({ status: 'ready' }) });
     const view = await h.service.update('u1', 'hyp-1', { statement: '新的假设陈述' });
     expect(view.statement).toBe('新的假设陈述');
-    expect(h.store.cas).toHaveBeenCalledWith('hyp-1', ['ready'], expect.objectContaining({ statement: '新的假设陈述', status: 'ready' }));
+    expect(h.store.casFields).toHaveBeenCalledWith('hyp-1', 1, expect.objectContaining({ statement: '新的假设陈述', status: 'ready' }));
+    expect(h.store.cas).not.toHaveBeenCalled(); // 非状态字段更新绝不走 status CAS
   });
 
   it('update：running/终态拒绝编辑（loop 已渲染进定义与审批理由，绝不半路改）', async () => {
@@ -105,12 +111,12 @@ describe('HypothesesService（CRUD + 状态机 + 归属）', () => {
       const h = makeHarness({ doc: makeDoc({ status }) });
       await expect(h.service.update('u1', 'hyp-1', { statement: '改一下' }))
         .rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
-      expect(h.store.cas).not.toHaveBeenCalled();
+      expect(h.store.casFields).not.toHaveBeenCalled();
     }
   });
 
-  it('update：并发冲突（CAS count=0）→ 400，绝不盲目覆盖', async () => {
-    const h = makeHarness({ cas: 0 });
+  it('update：并发冲突（version CAS count=0）→ 400，绝不盲目覆盖', async () => {
+    const h = makeHarness({ casFields: 0 });
     await expect(h.service.update('u1', 'hyp-1', { statement: '改一下' }))
       .rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
   });
@@ -181,13 +187,18 @@ describe('HypothesesService（CRUD + 状态机 + 归属）', () => {
     const ready = makeHarness({ doc: makeDoc({ status: 'ready' }) });
     await expect(ready.service.patch('hyp-1', { evaluationRunId: 'run-1' }, { allowStatuses: ['running'] }))
       .rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
-    expect(ready.store.cas).not.toHaveBeenCalled();
+    expect(ready.store.casFields).not.toHaveBeenCalled();
   });
 
-  it('patch：合法挂接走条件更新（锚定当前 status，并发推进不被覆盖）', async () => {
+  it('patch：合法挂接走 version CAS（并发状态推进/并发编辑的输家 count=0 → 400）', async () => {
     const h = makeHarness({ doc: makeDoc({ status: 'running' }) });
     const row = await h.service.patch('hyp-1', { evaluationRunId: 'eval-1' });
     expect(row.doc.evaluationRunId).toBe('eval-1');
-    expect(h.store.cas).toHaveBeenCalledWith('hyp-1', ['running'], expect.objectContaining({ evaluationRunId: 'eval-1' }));
+    expect(h.store.casFields).toHaveBeenCalledWith('hyp-1', 1, expect.objectContaining({ evaluationRunId: 'eval-1' }));
+
+    // 版本已前移（并发写入赢了）：CAS 未命中 → 400，绝不覆盖
+    const raced = makeHarness({ doc: makeDoc({ status: 'running' }), casFields: 0 });
+    await expect(raced.service.patch('hyp-1', { evaluationRunId: 'eval-1' }))
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
   });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { CreativeLoopOrchestrator } from './loop-orchestrator.service';
+import { CreativeLoopOrchestrator, rollbackOf } from './loop-orchestrator.service';
 import { HypothesisDoc, StoredDoc } from './creative-loop-store';
 import { isTerminal } from './hypothesis-status';
 import { buildLoopDefinition } from './loop-template';
@@ -83,13 +83,19 @@ function makeHarness(over: {
     doc: over.doc ?? makeDoc(),
     createdAt: NOW,
     updatedAt: NOW,
+    version: 1,
   };
   const store = {
     get: vi.fn(async () => current),
     cas: vi.fn(async (_id: string, from: readonly string[], next: HypothesisDoc) => {
       if (!current || !from.includes(current.doc.status)) return 0;
       if (over.casCount === 0) return 0;
-      current = { ...current, doc: next };
+      current = { ...current, doc: next, version: current.version + 1 };
+      return 1;
+    }),
+    casFields: vi.fn(async (_id: string, expectedVersion: number, next: HypothesisDoc) => {
+      if (!current || current.version !== expectedVersion) return 0;
+      current = { ...current, doc: next, version: current.version + 1 };
       return 1;
     }),
   };
@@ -269,7 +275,7 @@ describe('CreativeLoopOrchestrator（loop 启动 + 收敛）', () => {
       loop: { workflowId: 'wf-1', runId: 'run-1', attempts: 1, startedAt: NOW.toISOString() },
     });
     h.store.get.mockImplementation(async () => ({
-      id: 'hyp-1', userId: 'u1', doc: winner, createdAt: NOW, updatedAt: NOW,
+      id: 'hyp-1', userId: 'u1', doc: winner, createdAt: NOW, updatedAt: NOW, version: 2,
     }));
     const result = await h.service.start('u1', 'hyp-1');
     expect(h.runs.createRun).toHaveBeenCalledTimes(1);
@@ -353,6 +359,94 @@ describe('CreativeLoopOrchestrator（loop 启动 + 收敛）', () => {
     expect(cancelled.store.cas).not.toHaveBeenCalled();
     expect(cancelledResult.hypothesis.status).toBe('running');
     expect(cancelledResult.pending.reason).toBe('cancelled-needs-verdict');
+  });
+
+  it('收敛：run failed 且已发布未回滚 → 判决事实记录回滚状态 + 缘由明示（绝不默认已回滚）', async () => {
+    const doc = makeDoc({
+      status: 'running',
+      loop: { workflowId: 'wf-1', runId: 'run-1', attempts: 1, startedAt: NOW.toISOString() },
+    });
+    // 发布已成功（写操作已真实发生），补偿链真实执行但被审批绑定校验闭锁拒绝 → run failed
+    const run = makeRun({
+      status: 'failed', errorCode: 'APPROVAL_BINDING_MISMATCH',
+      steps: [
+        { stepId: 'publish_creative', stepIndex: 3, stepType: 'external_action', status: 'completed', output: { externalActionId: 'ea-1' } },
+        {
+          stepId: 'rollback_publish', stepIndex: 4, stepType: 'compensation', status: 'failed',
+          errorCode: 'APPROVAL_BINDING_MISMATCH', output: null,
+        },
+      ],
+    });
+    const h = makeHarness({ doc, run });
+    const result = await h.service.status('u1', 'hyp-1');
+    expect(result.rollback).toEqual({
+      required: true, status: 'failed', publishActionId: 'ea-1',
+      compensateStepId: 'rollback_publish', errorCode: 'APPROVAL_BINDING_MISMATCH',
+      detail: expect.stringContaining('人工处理'),
+    });
+    expect(result.hypothesis.verdict).toMatchObject({
+      decidedBy: 'system',
+      reason: expect.stringContaining('已发布的写操作未回滚'),
+      facts: { publishActionId: 'ea-1', rollback: 'failed' },
+    });
+  });
+
+  it('收敛：run failed 但从未发布 → 回滚 not-required（判决缘由不提回滚）', async () => {
+    const doc = makeDoc({
+      status: 'running',
+      loop: { workflowId: 'wf-1', runId: 'run-1', attempts: 1, startedAt: NOW.toISOString() },
+    });
+    const run = makeRun({
+      status: 'failed', errorCode: 'APPROVAL_REJECTED',
+      steps: [{ stepId: 'human_review', stepIndex: 2, stepType: 'approval', status: 'failed', output: null }],
+    });
+    const h = makeHarness({ doc, run });
+    const result = await h.service.status('u1', 'hyp-1');
+    expect(result.rollback).toMatchObject({ required: false, status: 'not-required', publishActionId: null });
+    expect(String(result.hypothesis.verdict?.reason)).not.toContain('未回滚');
+  });
+
+  it('runDetail：回滚投影随运行明细一并返回（补偿链留痕 = 事实，不重算）', async () => {
+    const doc = makeDoc({
+      status: 'running',
+      loop: { workflowId: 'wf-1', runId: 'run-1', attempts: 1, startedAt: NOW.toISOString() },
+    });
+    const h = makeHarness({
+      doc,
+      run: makeRun({
+        status: 'running',
+        steps: [{ stepId: 'publish_creative', stepIndex: 3, stepType: 'external_action', status: 'completed', output: { externalActionId: 'ea-9' } }],
+      }),
+    });
+    const detail = await h.service.runDetail('u1', 'hyp-1');
+    // 已发布 + 无补偿留痕 → pending（**绝不**读成"已回滚"）
+    expect(detail.rollback).toMatchObject({ required: true, status: 'pending', publishActionId: 'ea-9' });
+  });
+
+  it('rollbackOf（纯函数）：正常流程的 skipped 回滚行绝不读成"已回滚"', () => {
+    const publishRow = {
+      stepId: 'publish_creative', stepType: 'external_action', status: 'completed',
+      externalActionId: null, output: { externalActionId: 'ea-1' }, errorCode: null,
+    };
+    // 正常流程：rollback_publish 被跳过（stepType 仍是定义中的 external_action）→ pending，不是 completed
+    expect(rollbackOf([
+      publishRow,
+      { stepId: 'rollback_publish', stepType: 'external_action', status: 'skipped', externalActionId: null, output: { skipped: true }, errorCode: null },
+    ])).toMatchObject({ required: true, status: 'pending', publishActionId: 'ea-1' });
+
+    // 补偿链真实执行并成功（锚点行 stepType='compensation'）→ completed
+    expect(rollbackOf([
+      publishRow,
+      { stepId: 'rollback_publish', stepType: 'compensation', status: 'completed', externalActionId: null, output: null, errorCode: null },
+    ])).toMatchObject({ required: true, status: 'completed' });
+
+    // 发布步骤存在但未完成（失败/取消）→ 无需回滚
+    expect(rollbackOf([
+      { ...publishRow, status: 'failed', errorCode: 'PROVIDER_UNKNOWN' },
+    ])).toMatchObject({ required: false, status: 'not-required', publishActionId: null });
+
+    // 无任何步骤（run 刚建）→ 无需回滚
+    expect(rollbackOf([])).toMatchObject({ required: false, status: 'not-required' });
   });
 
   it('收敛：并发读同时收敛（CAS 未命中）→ 不抛错，返回当前状态', async () => {
