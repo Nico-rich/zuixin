@@ -192,8 +192,10 @@ model Session {
   revokedAt DateTime?
   userAgent String?
   ip        String?
+  deviceId  String?   // M11-P2：设备标识（按设备下线/会话管理端点；来源=登录时客户端上报，服务端不信任其内容）
   createdAt DateTime  @default(now())
   @@index([userId])
+  @@index([userId, deviceId]) // M11-P2：设备维度会话查询
 }
 
 // ===== 对话 =====
