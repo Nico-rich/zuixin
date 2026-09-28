@@ -115,67 +115,74 @@ export class AgentRunsService {
     if (dto.projectId) await this.requireProject(userId, dto.projectId);
     // M8-P2：配额裁决在创建入口（服务端；LLM 绝不决定是否超额）；
     // Pre-M9 C1：runId 预生成作预留 refId（Driver 终态 release；TTL 兜底）
-    // P1：仍**先于 run 创建**（失败即不建 run、不入队、不消耗预留）；绝不与建 run 并行。
+    // P1：仍**先于 run 创建**；M10 Final Audit H2a：预留后任何一步失败（会话/Agent 解析、
+    // 消息写入、建 run、入队）都必须在 catch 释放预留——否则预留泄漏为最长 1h 的虚假 429。
     const runId = randomUUID();
     await this.quota.assertQuota(userId, dto.projectId ?? null, 'agent_run', 1, runId).catch((err) => {
       if ((err as { code?: string }).code === 'QUOTA_EXCEEDED') throw err;
       throw err;
     });
-    // P1：会话解析与 Agent 解析互不依赖 → 并行（两次只读；失败语义不变：会话/Agent 均 404）
-    const [conversation, agent] = await Promise.all([
-      dto.conversationId
-        ? this.requireConversation(userId, dto.conversationId)
-        : this.createConversation(userId, dto.projectId ?? null),
-      // Agent 解析：enabled 系统 Agent + 本组织私有 Agent（M8-P6 扩展物化）；版本由服务端 activeVersion 解析（客户端不可指定）
-      this.resolveRunnableAgent(userId, dto.agentId),
-    ]);
-    // M4 定稿规则：projectId 与 conversation.projectId 一致
-    if (dto.projectId && conversation.projectId && dto.projectId !== conversation.projectId) {
-      throw new AppError(ErrorCode.VALIDATION_ERROR, '项目与会话归属不一致');
+    try {
+      // P1：会话解析与 Agent 解析互不依赖 → 并行（两次只读；失败语义不变：会话/Agent 均 404）
+      const [conversation, agent] = await Promise.all([
+        dto.conversationId
+          ? this.requireConversation(userId, dto.conversationId)
+          : this.createConversation(userId, dto.projectId ?? null),
+        // Agent 解析：enabled 系统 Agent + 本组织私有 Agent（M8-P6 扩展物化）；版本由服务端 activeVersion 解析（客户端不可指定）
+        this.resolveRunnableAgent(userId, dto.agentId),
+      ]);
+      // M4 定稿规则：projectId 与 conversation.projectId 一致
+      if (dto.projectId && conversation.projectId && dto.projectId !== conversation.projectId) {
+        throw new AppError(ErrorCode.VALIDATION_ERROR, '项目与会话归属不一致');
+      }
+      if (!agent) throw new AppError(ErrorCode.NOT_FOUND, 'Agent 不存在或不可用');
+      if (!agent.activeVersion) throw new AppError(ErrorCode.VALIDATION_ERROR, 'Agent 尚无已发布版本');
+      const projectId = dto.projectId ?? conversation.projectId ?? null;
+      const version = agent.activeVersion;
+      const config = (version.config ?? {}) as { maxSteps?: number };
+
+      // P1：用户消息 / assistant 占位 / 会话标题三次写互不依赖 → 并行（原串行 3 次往返）
+      const [userMessage, assistantMessage] = await Promise.all([
+        this.prisma.message.create({
+          data: { conversationId: conversation.id, userId, role: 'user', content: dto.message },
+        }),
+        this.prisma.message.create({
+          data: { conversationId: conversation.id, userId, role: 'assistant', content: '', status: 'streaming' },
+        }),
+        conversation.title === '新对话'
+          ? this.prisma.conversation.update({ where: { id: conversation.id }, data: { title: dto.message.slice(0, 30) } })
+          : Promise.resolve(null),
+      ]);
+
+      const run = await this.prisma.agentRun.create({
+        data: {
+          id: runId, // Pre-M9 C1：配额预留 refId 与 run 同 id（终态 release 精确对应）
+          userId, agentId: agent.id, agentVersionId: version.id,
+          projectId, conversationId: conversation.id,
+          status: 'queued',
+          maxSteps: config.maxSteps ?? 8,
+          metadata: { agentTools: version.tools ?? [], assistantMessageId: assistantMessage.id, userMessageId: userMessage.id, async: true },
+        },
+      });
+      // transcript：初始用户消息（seq 0；system/history 由 Worker 首次执行时 seed）
+      // P1：单次 createMany（原 append = requireRun + max(seq) + create 三次往返；单行场景 3 → 1）
+      await this.messages.seed(userId, run.id, [{ role: 'user', content: dto.message }]);
+
+      await addJobBounded(this.agentRunQueue,
+        'execute',
+        { runId: run.id }, // payload 最小化：不含身份/transcript/prompt——Worker 以 DB 为唯一事实来源
+        {
+          jobId: `run-${run.id}`, // 冒号不可用于 BullMQ jobId
+          attempts: 2, backoff: { type: 'exponential', delay: 2000 },
+          removeOnComplete: true, removeOnFail: { count: 500 },
+        },
+      );
+      return { runId: run.id, status: 'queued' };
+    } catch (err) {
+      // M10 Final Audit H2a：run 未建成/未入队 → 预留释放（幂等；绝不残留 1h 虚假占用）
+      await this.quota.release(runId, 'agent_run').catch(() => undefined);
+      throw err;
     }
-    if (!agent) throw new AppError(ErrorCode.NOT_FOUND, 'Agent 不存在或不可用');
-    if (!agent.activeVersion) throw new AppError(ErrorCode.VALIDATION_ERROR, 'Agent 尚无已发布版本');
-    const projectId = dto.projectId ?? conversation.projectId ?? null;
-    const version = agent.activeVersion;
-    const config = (version.config ?? {}) as { maxSteps?: number };
-
-    // P1：用户消息 / assistant 占位 / 会话标题三次写互不依赖 → 并行（原串行 3 次往返）
-    const [userMessage, assistantMessage] = await Promise.all([
-      this.prisma.message.create({
-        data: { conversationId: conversation.id, userId, role: 'user', content: dto.message },
-      }),
-      this.prisma.message.create({
-        data: { conversationId: conversation.id, userId, role: 'assistant', content: '', status: 'streaming' },
-      }),
-      conversation.title === '新对话'
-        ? this.prisma.conversation.update({ where: { id: conversation.id }, data: { title: dto.message.slice(0, 30) } })
-        : Promise.resolve(null),
-    ]);
-
-    const run = await this.prisma.agentRun.create({
-      data: {
-        id: runId, // Pre-M9 C1：配额预留 refId 与 run 同 id（终态 release 精确对应）
-        userId, agentId: agent.id, agentVersionId: version.id,
-        projectId, conversationId: conversation.id,
-        status: 'queued',
-        maxSteps: config.maxSteps ?? 8,
-        metadata: { agentTools: version.tools ?? [], assistantMessageId: assistantMessage.id, userMessageId: userMessage.id, async: true },
-      },
-    });
-    // transcript：初始用户消息（seq 0；system/history 由 Worker 首次执行时 seed）
-    // P1：单次 createMany（原 append = requireRun + max(seq) + create 三次往返；单行场景 3 → 1）
-    await this.messages.seed(userId, run.id, [{ role: 'user', content: dto.message }]);
-
-    await addJobBounded(this.agentRunQueue,
-      'execute',
-      { runId: run.id }, // payload 最小化：不含身份/transcript/prompt——Worker 以 DB 为唯一事实来源
-      {
-        jobId: `run-${run.id}`, // 冒号不可用于 BullMQ jobId
-        attempts: 2, backoff: { type: 'exponential', delay: 2000 },
-        removeOnComplete: true, removeOnFail: { count: 500 },
-      },
-    );
-    return { runId: run.id, status: 'queued' };
   }
 
   /**

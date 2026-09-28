@@ -3,6 +3,7 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import Redis from 'ioredis';
 import { PrismaService } from '../prisma/prisma.service';
+import { resolveStorageDriver } from '../../core/storage/storage.module';
 import { AGENT_RUN_QUEUE } from '../../core/queue/queue.module';
 import {
   DEFAULT_PROBE_TIMEOUT_MS, ProbeResult, DependencyState, probeDb, probeRedis,
@@ -167,9 +168,9 @@ export class HealthService implements OnModuleInit, OnModuleDestroy {
   }
 
   protected probeStorage(timeoutMs: number): Promise<ProbeResult> {
-    const driver = process.env.STORAGE_DRIVER ?? 'local';
-    // M10 集成：A7 扩展 s3/minio 别名——健康面驱动标识对齐（resolveStorageDriver 同源口径）
-    if (driver === 's3-compatible' || driver === 's3' || driver === 'minio') {
+    // M10 Final Audit：直接复用 resolveStorageDriver（单一口径，含 trim/小写/别名全集与未知值 fail-fast）
+    const driver = resolveStorageDriver(process.env.STORAGE_DRIVER);
+    if (driver === 's3') {
       return probeS3Storage({
         endpoint: process.env.STORAGE_ENDPOINT ?? '',
         region: process.env.STORAGE_REGION ?? 'us-east-1',

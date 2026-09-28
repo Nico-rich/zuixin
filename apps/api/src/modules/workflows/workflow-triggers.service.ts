@@ -10,6 +10,12 @@ import { addJobBestEffort, QUEUE_ADD_TIMEOUT_MS } from '../../core/queue/bounded
 import { withDeadline } from '../../core/redis/redis-resilience';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { WorkflowRunsService } from './workflow-runs.service';
+
+/** M10 Final Audit：启动自愈的队列清单快照（循环外取一次，各 workflow 复用） */
+type QueueSnapshot = {
+  schedulers: Awaited<ReturnType<Queue['getJobSchedulers']>>;
+  delayed: Awaited<ReturnType<Queue['getDelayed']>>;
+};
 import { WorkflowDefinition } from './workflow-types';
 import { AuditService } from '../audit/audit.service';
 import { WEBHOOK_LIMITS, checkJsonComplexity, isPlainPayload } from '../security/payload-guard';
@@ -114,11 +120,15 @@ export class WorkflowTriggersService implements OnModuleInit {
       where: { status: 'published' },
       include: { versions: { where: { status: 'published' }, orderBy: { version: 'desc' }, take: 1 } },
     }).catch(() => []);
+    // M10 Final Audit（Performance）：队列清单**快照一次**共享给全部工作流——
+    // 原先每个 workflow 各做一次 getJobSchedulers(0,-1)+getDelayed(0,-1)（O(N×队列作业)，
+    // 多实例/多 worker 启动风暴的放大源）
+    const snapshot = await this.fetchQueueSnapshot().catch(() => null);
     for (const wf of published) {
       const def = wf.versions[0]?.definition as unknown as WorkflowDefinition | undefined;
       if (!def) continue;
       // M10-P5 X-06：启动自愈同样走幂等同步（一并清掉 Windows 上的历史遗留重复调度器）
-      await this.syncSchedules(wf.id, scheduleCronsOf(def)).catch(() => undefined);
+      await this.syncSchedules(wf.id, scheduleCronsOf(def), snapshot).catch(() => undefined);
       for (const t of def.triggers ?? []) {
         if (t.type === 'event' && t.event) await this.registerEvent(wf.id, t.event);
       }
@@ -226,7 +236,7 @@ export class WorkflowTriggersService implements OnModuleInit {
    * 3. 时间窗 ±5min → 超窗 `WEBHOOK_TIMESTAMP_STALE`（仅"签名有效"者可达，不构成枚举信道）；
    * 4. eventId 唯一约束 → 重放 `WEBHOOK_REPLAY`(409)。
    */
-  async verifyWebhook(token: string, rawBody: Buffer, headers: { signature?: string; timestamp?: string; eventId?: string }): Promise<{ workflowId: string; eventId: string }> {
+  async verifyWebhook(token: string, rawBody: Buffer, headers: { signature?: string; timestamp?: string; eventId?: string }): Promise<{ workflowId: string; eventId: string; webhookId: string }> {
     // M8-P8：体积上限（defense in depth —— express.raw limit 之外的二次校验；超限不进入 HMAC/解析/落库）
     if (rawBody.length > WEBHOOK_MAX_BODY_BYTES) {
       throw new AppError(ErrorCode.VALIDATION_ERROR, 'webhook 载荷超过大小限制');
@@ -268,34 +278,46 @@ export class WorkflowTriggersService implements OnModuleInit {
     if (Math.abs(Date.now() - ts) > WEBHOOK_TIMESTAMP_TOLERANCE_MS) {
       throw new AppError(ErrorCode.WEBHOOK_TIMESTAMP_STALE, `webhook 时间戳超出容忍窗口（±${WEBHOOK_TIMESTAMP_TOLERANCE_MS / 60_000} 分钟）`);
     }
-    // 防重放：同一 eventId 只接受一次（UNIQUE 约束为最终防线）
+    // 防重放：同一 eventId 只接受一次（UNIQUE 约束为最终防线）。
+    // M10 Final Audit H6：先写 'received'（尚未产生 run）——载荷校验/发布态校验/createRun 失败时
+    // 绝不烧掉 eventId（发送方重试仍可继续）；run 创建成功后由 handleWebhook 提升为 'accepted'。
+    // 真正"已产生 run"的重放（accepted 行存在）才按 WEBHOOK_REPLAY 拒绝（run 级幂等键兜底 exactly-once）。
     try {
       await this.prisma.webhookDelivery.create({
         data: {
           webhookId: webhook.id, eventId,
           payloadHash: createHash('sha256').update(rawBody).digest('hex'),
-          status: 'accepted',
+          status: 'received',
         },
       });
     } catch (err) {
       if ((err as { code?: string }).code === 'P2002') {
-        await this.prisma.webhookDelivery.create({
-          data: {
-            webhookId: webhook.id, eventId: `${eventId}:dup:${Date.now()}`,
-            payloadHash: createHash('sha256').update(rawBody).digest('hex'),
-            status: 'duplicate',
-          },
-        }).catch(() => undefined);
-        throw new AppError(ErrorCode.WEBHOOK_REPLAY, '重复的 webhook 事件');
+        const accepted = await this.prisma.webhookDelivery.findFirst({
+          where: { webhookId: webhook.id, eventId, status: 'accepted' },
+          select: { id: true },
+        });
+        if (accepted) {
+          await this.prisma.webhookDelivery.create({
+            data: {
+              webhookId: webhook.id, eventId: `${eventId}:dup:${Date.now()}`,
+              payloadHash: createHash('sha256').update(rawBody).digest('hex'),
+              status: 'duplicate',
+            },
+          }).catch(() => undefined);
+          throw new AppError(ErrorCode.WEBHOOK_REPLAY, '重复的 webhook 事件');
+        }
+        // 仅存在 received 行（前次尝试在校验/建 run 前失败）→ 允许重试继续
+        this.logger.warn({ webhookId: webhook.id, eventId }, 'webhook 事件存在未完成的 received 行，允许重试');
+      } else {
+        throw err;
       }
-      throw err;
     }
-    return { workflowId: webhook.workflowId, eventId };
+    return { workflowId: webhook.workflowId, eventId, webhookId: webhook.id };
   }
 
   /** webhook 载荷 → workflow run（幂等键 = sha256(workflowId:eventId)） */
   async handleWebhook(token: string, rawBody: Buffer, headers: { signature?: string; timestamp?: string; eventId?: string }): Promise<{ runId: string }> {
-    const { workflowId, eventId } = await this.verifyWebhook(token, rawBody, headers);
+    const { workflowId, eventId, webhookId } = await this.verifyWebhook(token, rawBody, headers);
     let payload: Record<string, unknown> = {};
     try {
       const parsed = JSON.parse(rawBody.toString('utf8'));
@@ -322,6 +344,11 @@ export class WorkflowTriggersService implements OnModuleInit {
     const run = await this.runs.createRun(wf.userId, {
       workflowId, triggerType: 'webhook', triggerId: eventId, idempotencyKey, payload,
     });
+    // M10 Final Audit H6：run 已产生 → 投递行提升为 accepted（dedupe 的唯一事实锚点）
+    await this.prisma.webhookDelivery.updateMany({
+      where: { webhookId, eventId },
+      data: { status: 'accepted' },
+    }).catch(() => undefined);
     await this.prisma.workflowWebhook.update({ where: { token }, data: { lastDeliveredAt: new Date() } }).catch(() => undefined);
     await this.audit.write({
       userId: wf.userId, action: 'webhook.accepted', projectId: wf.projectId,
@@ -352,10 +379,24 @@ export class WorkflowTriggersService implements OnModuleInit {
    * - 任一次 upsert 失败且该 id 原本不存在 → 放弃清理（宁可留下旧调度器，也不冒"零调度"风险）；
    * - 单次 upsert/remove 均 best-effort（有界超时 + 告警）：发布/归档流程不因队列抖动失败。
    */
-  async syncSchedules(workflowId: string, crons: readonly string[]): Promise<void> {
+  /** M10 Final Audit：队列清单快照（启动自愈循环外取一次；null = 读取失败 → 各 workflow 只增不删） */
+  private async fetchQueueSnapshot(): Promise<QueueSnapshot | null> {
+    try {
+      const [schedulers, delayed] = await Promise.all([
+        withDeadline(this.workflowQueue.getJobSchedulers(0, -1, true), QUEUE_ADD_TIMEOUT_MS, 'getJobSchedulers:snapshot'),
+        withDeadline(this.workflowQueue.getDelayed(0, -1), QUEUE_ADD_TIMEOUT_MS, 'getDelayed:snapshot'),
+      ]);
+      return { schedulers, delayed };
+    } catch (err) {
+      this.logger.warn(`schedule 队列快照读取失败（只增不删）: ${(err as Error).message}`);
+      return null;
+    }
+  }
+
+  async syncSchedules(workflowId: string, crons: readonly string[], snapshot?: QueueSnapshot | null): Promise<void> {
     const desired = [...new Set(crons.filter((c): c is string => typeof c === 'string' && c.trim().length > 0))];
     const desiredIds = new Map(desired.map((cron, index) => [scheduleSchedulerId(workflowId, index), cron]));
-    const owned = await this.ownedSchedulers(workflowId);
+    const owned = await this.ownedSchedulers(workflowId, snapshot);
     // ① 先增：缺位或 cron 已变更的期望项（`upsertJobScheduler` 就地更新 pattern —— 变更即重发布）
     let missing = 0;
     const inPlace = new Set<string>();
@@ -386,14 +427,16 @@ export class WorkflowTriggersService implements OnModuleInit {
    * 本 workflow 现有的调度器（`{id, pattern}`，`id` 即为 `removeJobScheduler` 需要的**删除句柄**）。
    * **返回 null = 归属未知**（读取超时/失败）——调用方据此只增不删。
    */
-  private async ownedSchedulers(workflowId: string): Promise<Array<{ id: string; pattern: string | null }> | null> {
+  private async ownedSchedulers(workflowId: string, snapshot?: QueueSnapshot | null): Promise<Array<{ id: string; pattern: string | null }> | null> {
     const owned = new Map<string, string | null>();
     try {
-      const schedulers = await withDeadline(
-        this.workflowQueue.getJobSchedulers(0, -1, true),
-        QUEUE_ADD_TIMEOUT_MS,
-        `getJobSchedulers:${workflowId}`,
-      );
+      // M10 Final Audit：优先复用启动快照；无快照（发布路径）时才现取
+      const schedulers = snapshot?.schedulers
+        ?? await withDeadline(
+          this.workflowQueue.getJobSchedulers(0, -1, true),
+          QUEUE_ADD_TIMEOUT_MS,
+          `getJobSchedulers:${workflowId}`,
+        );
       for (const s of schedulers ?? []) {
         // 遗留 md5 键无 hash → transformSchedulerData 返回 undefined（数组有洞，需过滤）
         const entry = ownSchedulerEntry(s, workflowId);
@@ -401,7 +444,8 @@ export class WorkflowTriggersService implements OnModuleInit {
       }
       // 遗留（Pre-M10 裸 repeatable）：zset key 是 md5、无 hash，getJobSchedulers 无法归属
       // → 用下一轮 delayed job 反查（`repeat:<key>:<millis>` + job.data.workflowId）。
-      const delayed = await withDeadline(this.workflowQueue.getDelayed(0, -1), QUEUE_ADD_TIMEOUT_MS, `getDelayed:${workflowId}`);
+      const delayed = snapshot?.delayed
+        ?? await withDeadline(this.workflowQueue.getDelayed(0, -1), QUEUE_ADD_TIMEOUT_MS, `getDelayed:${workflowId}`);
       for (const job of delayed ?? []) {
         const key = repeatJobKeyOf(job);
         if (!key) continue;

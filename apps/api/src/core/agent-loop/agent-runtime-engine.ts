@@ -255,6 +255,9 @@ export class AgentRuntimeEngine {
         // 熔断计数：每个失败的 provider 记一次失败（失败即记，换 provider 前），成功的 provider 记一次成功——
         // 与 Pre-M9 G2「回合粒度计数」语义一致，且绝不双计（RoutingService 在本路径不写熔断计数）。
         for (let hop = 0; ; hop++) {
+          // M10 Final Audit H5：换 provider 回退前必须丢弃失败尝试的 usage——绝不把
+          // 失败 provider 的 token 用量记到下一个 provider/model 的成功行上（金额与归因双错）
+          turnUsage = undefined;
           for (let attempt = 0; attempt <= LLM_MAX_RETRIES; attempt++) {
             const contentLenAtAttempt = content.length; // 失败重试回滚本回合部分文本（避免重复计入最终回答）
             const turnLenAtAttempt = turnText.length;
@@ -284,6 +287,7 @@ export class AgentRuntimeEngine {
                 : err;
               content = content.slice(0, contentLenAtAttempt);
               turnText = turnText.slice(0, turnLenAtAttempt);
+              turnUsage = undefined; // M10 Final Audit H5：失败尝试的 usage 绝不跨尝试/跨 provider 残留
               // M6-A8：用户取消优先识别（绝不伪装 provider failure，也绝不重试已取消的回合）
               if (ctx.signal.aborted) break;
               // 按**归因后**的错误判定可重试性（watchdog 超时已归因 PROVIDER_TIMEOUT）

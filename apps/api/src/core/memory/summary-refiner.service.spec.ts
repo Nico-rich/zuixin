@@ -67,6 +67,10 @@ function makeDb(init: { messages?: Msg[]; summaries?: Row[]; candidates?: Cand[]
   };
 
   const prisma = {
+    // M10 Final Audit H4：maybeRefine 计量上下文查找（归属随真实会话行解析）
+    conversation: {
+      findUnique: vi.fn(async () => ({ userId: 'u1', projectId: null })),
+    },
     message: {
       create: vi.fn(),
       findMany: vi.fn(async ({ where, orderBy, take }: { where: Record<string, unknown>; orderBy: Array<Record<string, 'asc' | 'desc'>>; take?: number }) => {
@@ -125,8 +129,10 @@ function makeRefiner(db: ReturnType<typeof makeDb>, llmReply: string | Error = '
     if (llmReply instanceof Error) throw llmReply;
     return { content: llmReply };
   });
-  const modelResolver = { resolveDefaultLLM: vi.fn().mockResolvedValue({ adapter: { chat }, apiModelId: 'm' }) };
-  return { svc: new SummaryRefinerService(db.prisma as never, modelResolver as never), chat, modelResolver };
+  const modelResolver = { resolveDefaultLLM: vi.fn().mockResolvedValue({ adapter: { chat }, apiModelId: 'm', providerId: 'p', modelId: 'mid' }) };
+  // M10 Final Audit H4：UsageService 注入（摘要 LLM 计量；单测断言计量调用）
+  const usage = { recordChatUsage: vi.fn().mockResolvedValue(undefined) };
+  return { svc: new SummaryRefinerService(db.prisma as never, modelResolver as never, usage as never), chat, modelResolver, usage };
 }
 
 const msg = (id: string, role: 'user' | 'assistant', content: string, sec: number): Msg =>

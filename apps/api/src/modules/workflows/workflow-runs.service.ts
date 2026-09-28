@@ -94,7 +94,12 @@ export class WorkflowRunsService {
       // 并发同键：部分唯一索引（attempt=1）P2002 → 返回已有 run（绝不产生第二个）
       if ((err as { code?: string }).code === 'P2002') {
         const won = await this.prisma.workflowRun.findFirst({ where: { workflowId: wf.id, idempotencyKey } });
-        if (won) return won;
+        if (won) {
+          // M10 Final Audit H2b：败者已建预留（refId=自己的 runId）——返回赢家行前必须释放，
+          // 否则败者预留泄漏为最长 1h 的虚假 429
+          await this.quota.release(runId, 'workflow_run').catch(() => undefined);
+          return won;
+        }
       }
       throw err;
     }

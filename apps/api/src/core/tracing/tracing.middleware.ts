@@ -22,6 +22,9 @@ export class TracingMiddleware {
       ?? (typeof incomingRequestId === 'string' && incomingRequestId ? incomingRequestId : newTraceId());
     const incomingTraceId = req.headers['x-trace-id'];
     const traceId = typeof incomingTraceId === 'string' && incomingTraceId ? incomingTraceId : newTraceId();
+    // M10 Final Audit：pino 尊重预置 req.id——回写后审计/指标/TraceContext 与日志/响应头共用同一 id
+    // （此前本中间件在 pino 之前运行，req.id 恒 undefined → 无入站头时一个请求产生两个 id）
+    (req as Request & { id?: string }).id = requestId;
 
     res.setHeader('X-Request-Id', requestId);
     res.setHeader('X-Trace-Id', traceId);

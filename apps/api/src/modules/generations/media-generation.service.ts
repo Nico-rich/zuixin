@@ -111,6 +111,9 @@ export class MediaGenerationService {
       if (input.idempotencyKey && (err as { code?: string }).code === 'P2002') {
         const existing = await this.prisma.generationTask.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
         if (existing) {
+          // M10 Final Audit H2b：本调用已建预留（refId=taskId）——返回已有任务前必须释放，
+          // 否则败者预留泄漏为最长 1h 的虚假 429
+          await this.quota.release(taskId, input.type === 'image' ? 'image_generation' : 'video_seconds').catch(() => undefined);
           this.logger.warn({ taskId: existing.id }, '幂等键命中，返回已有任务');
           return existing;
         }
@@ -234,11 +237,15 @@ export class MediaGenerationService {
       this.logger.warn({ taskId: task.id }, '任务已被清扫为失败，放弃完成写入并回收附件');
       return false;
     }
+    // M10 Final Audit：usage 失败绝不上抛——任务已终态（failTask no-op），上抛会跳过 release；
+    // 媒体用量有 UsageRecord 事实（对账可发现/补账），故 catch+error 日志，release 与 usage 成败解耦。
     await this.usage.recordMediaUsage({
       userId: task.userId, conversationId: task.conversationId ?? undefined, messageId: task.messageId ?? undefined, taskId: task.id,
       kind: task.type as 'image' | 'video', providerId: result.providerId, modelId: result.modelId,
       imageCount: result.imageCount, videoSeconds: result.videoSeconds,
       latencyMs: Date.now() - startedAt, status: 'success', runId: task.runId ?? undefined,
+    }).catch((err) => {
+      this.logger.error({ taskId: task.id, reason: (err as Error).message }, '媒体用量计量失败（任务仍完成；UsageRecord 缺口由对账发现）');
     });
     await this.events.publish('task', { type: 'task.completed', taskId: task.id, progress: 100 });
     // M6-P4：任务终态单点 hook → 唤醒 waiting 的 AgentRun（waiting→queued→resume）

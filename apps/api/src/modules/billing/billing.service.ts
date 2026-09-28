@@ -141,8 +141,11 @@ export class BillingService implements OnModuleInit {
     return (await this.orgs.ensurePersonalOrganization(userId)).id;
   }
 
-  /** 计量入账（append-only + 幂等键唯一——P2002 重复键绝不重复计量；organizationId 已解析时直传） */
-  async recordUsage(input: RecordUsageInput): Promise<void> {
+  /** 计量入账（append-only + 幂等键唯一——P2002 重复键绝不重复计量；organizationId 已解析时直传）。
+   *  opts.strict：非 P2002 失败**上抛**（调用方必须感知"无账单事实"并选择重试/回滚）——
+   *  M10 Final Audit H3：附件上传属 ledger-only kind（无 UsageRecord 兜底），写失败时静默吞账本
+   *  会让"对象已入库、预留已释放、无任何账单事实"结构性不可发现。 */
+  async recordUsage(input: RecordUsageInput, opts?: { strict?: boolean }): Promise<void> {
     const organizationId = input.organizationId ?? await this.organizationFor(input.userId, input.projectId);
     try {
       await this.prisma.usageLedgerEntry.create({
@@ -158,6 +161,7 @@ export class BillingService implements OnModuleInit {
     } catch (err) {
       if ((err as { code?: string }).code === 'P2002') return; // 幂等：绝不重复计量
       this.logger.warn(`计量入账失败: ${(err as Error).message}`);
+      if (opts?.strict) throw err;
     }
   }
 

@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConversationSummary, MessageRole, MessageStatus } from '@prisma/client';
 import { PrismaService } from '../../modules/prisma/prisma.service';
 import { ModelResolverService } from '../../providers/llm/model-resolver.service';
+import { UsageService } from '../../modules/usage/usage.service';
 import { SimpleTokenEstimator } from '../context/token-estimator';
 
 /**
@@ -112,6 +113,8 @@ export class SummaryRefinerService {
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(ModelResolverService) private readonly modelResolver: ModelResolverService,
+    // M10 Final Audit H4：摘要重建 LLM 计量（UsageService 由 MemoryModule 引入）
+    @Inject(UsageService) private readonly usage: UsageService,
   ) {}
 
   /**
@@ -165,7 +168,12 @@ export class SummaryRefinerService {
 
       const segmentMessages = pending.slice(0, MAX_MESSAGES_PER_SEGMENT);
       const prevText = head?.summary ?? '';
-      const delta = await this.buildDelta(prevText, segmentMessages);
+      // M10 Final Audit H4：计量上下文（归属随真实会话行解析——绝不信任调用方传入）
+      const conv = await this.prisma.conversation.findUnique({
+        where: { id: conversationId }, select: { userId: true, projectId: true },
+      }).catch(() => null);
+      const meter = { userId: conv?.userId ?? '', conversationId, projectId: conv?.projectId ?? null };
+      const delta = await this.buildDelta(prevText, segmentMessages, meter);
       // 并发保护（乐观 CAS）：LLM 调用期间链头若已变化（另一次 refine 已建段）→ 放弃本次。
       // 否则两次 refine 会对同一区间重复建段（追加不变式被破坏、候选重复提炼）。
       const freshHead = (await this.versions(conversationId)).at(-1) ?? null;
@@ -395,24 +403,48 @@ export class SummaryRefinerService {
   }
 
   /** 生成一个版本段的增量文本：LLM 提炼 → 失败/空 → 确定性兜底（只由真实消息行压缩） */
-  private async buildDelta(prevText: string, messages: MessageRow[]): Promise<string> {
+  private async buildDelta(prevText: string, messages: MessageRow[], meter: { userId: string; conversationId: string; projectId: string | null }): Promise<string> {
     const transcript = messages
       .map((m) => `${m.role === 'user' ? '用户' : '助手'}：${m.content.slice(0, MAX_MESSAGE_CHARS)}`)
       .join('\n');
+    const userContent = `${prevText ? `已有摘要（仅供衔接，不是新事实来源）：\n${prevText}\n\n` : ''}新增对话：\n${transcript}`;
+    const started = Date.now();
     try {
-      const { adapter, apiModelId } = await this.modelResolver.resolveDefaultLLM();
+      const { adapter, apiModelId, providerId, modelId } = await this.modelResolver.resolveDefaultLLM();
       const r = await adapter.chat({
         model: apiModelId,
         temperature: 0,
         messages: [
           { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
-          { role: 'user', content: `${prevText ? `已有摘要（仅供衔接，不是新事实来源）：\n${prevText}\n\n` : ''}新增对话：\n${transcript}` },
+          { role: 'user', content: userContent },
         ],
       });
       const delta = this.sanitizeDelta(r.content ?? '', prevText);
-      if (delta) return delta;
+      if (delta) {
+        // M10 Final Audit H4：摘要重建的 LLM 调用必须计量（此前完全未计量，且 M10-P3 让用户
+        // 可通过消息编辑/删除反复触发）。token 用本地估算（provider 响应无 usage 时）；
+        // 是否纳入 llm_tokens 配额裁决属产品决策（已登记 Deferred）——至少先计量。
+        await this.usage.recordChatUsage({
+          userId: meter.userId, conversationId: meter.conversationId, projectId: meter.projectId,
+          providerId, modelId,
+          inputTokens: this.estimator.estimate(`${SUMMARY_SYSTEM_PROMPT}\n${userContent}`),
+          outputTokens: this.estimator.estimate(r.content ?? ''),
+          latencyMs: Date.now() - started, status: 'success',
+        }).catch((err) => this.logger.warn(`摘要用量计量失败（不影响聊天）：${(err as Error).message}`));
+        return delta;
+      }
+      await this.usage.recordChatUsage({
+        userId: meter.userId, conversationId: meter.conversationId, projectId: meter.projectId,
+        providerId, modelId, inputTokens: 0, outputTokens: 0,
+        latencyMs: Date.now() - started, status: 'failed', errorCode: 'SUMMARY_EMPTY_DELTA',
+      }).catch(() => undefined);
     } catch (err) {
       this.logger.warn(`摘要 LLM 提炼失败，改用确定性兜底：${(err as Error).message}`);
+      await this.usage.recordChatUsage({
+        userId: meter.userId, conversationId: meter.conversationId, projectId: meter.projectId,
+        providerId: 'unknown', modelId: 'unknown', inputTokens: 0, outputTokens: 0,
+        latencyMs: Date.now() - started, status: 'failed', errorCode: 'SUMMARY_LLM_FAILED',
+      }).catch(() => undefined);
     }
     return this.fallbackDelta(messages);
   }

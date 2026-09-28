@@ -18,7 +18,9 @@ function makeService(rows: Array<Record<string, unknown>> = []) {
     },
   };
   const events = { publish: vi.fn().mockResolvedValue(undefined) };
-  return { svc: new AgentRunLeaseService(prisma as never, queue as never, events as never), prisma, queue, events };
+  // M10 Final Audit H2c：构造注入 QuotaService（recoverStale 超时释放 C1 预留）
+  const quota = { release: vi.fn().mockResolvedValue(undefined) };
+  return { svc: new AgentRunLeaseService(prisma as never, queue as never, events as never, quota as never), prisma, queue, events, quota };
 }
 
 describe('AgentRunLeaseService（claim/renew/release + stale recovery）', () => {

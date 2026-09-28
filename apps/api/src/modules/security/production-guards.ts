@@ -111,6 +111,15 @@ export function auditProductionSafety(env: EnvLike = process.env): ProductionSaf
     } else if (!isValidEncryptionKey(enc)) {
       violations.push('ENCRYPTION_KEY 不是 base64 编码的 32 字节密钥');
     }
+  } else {
+    // M10 Final Audit：ENCRYPTION_KEYS 非空时也必须逐条校验——一个"长得像随机"的占位
+    // 多密钥配置曾可整体绕过 ② 的 fail-fast
+    for (const pair of env.ENCRYPTION_KEYS!.split(',')) {
+      const [ver, key] = pair.split(':');
+      if (!ver || !key || isPlaceholderSecret(key) || !isValidEncryptionKey(key)) {
+        violations.push(`ENCRYPTION_KEYS 含非法条目（版本 ${ver ?? '?'}：占位/非 base64-32 字节密钥）`);
+      }
+    }
   }
 
   // ③ 开发替身开关：生产启用 = 可被外部触发的故障注入面

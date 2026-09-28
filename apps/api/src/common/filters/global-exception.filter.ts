@@ -83,6 +83,8 @@ export class GlobalExceptionFilter implements ExceptionFilter {
       case 'ATTACHMENT_UNZIP_REJECTED': return HttpStatus.BAD_REQUEST; // M10-P7
       case 'ATTACHMENT_QUOTA_EXCEEDED': return HttpStatus.TOO_MANY_REQUESTS; // M10-P7
       case 'PROVIDER_CONFIG_INVALID': return HttpStatus.SERVICE_UNAVAILABLE; // M10-P2：调用期 provider 未加载
+      case 'DEVICE_REVOKED': return HttpStatus.UNAUTHORIZED; // M10 Final Audit：会话/设备撤销
+      case 'INTERNAL': return HttpStatus.INTERNAL_SERVER_ERROR; // M10 Final Audit：内部错误绝不被 502 归因错位
       default: return HttpStatus.BAD_GATEWAY; // provider 类错误
     }
   }

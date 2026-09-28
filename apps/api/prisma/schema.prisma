@@ -335,8 +335,9 @@ model GenerationTask {
   userId         String
   user           User        @relation(fields: [userId], references: [id])
   conversationId String?
+  // M10 Final Audit：消息删除时此 FK 按 SET NULL 置空（任务行保留、失去消息链接——有意语义，注册于基线）
   messageId      String?
-  message        Message?    @relation(fields: [messageId], references: [id])
+  message        Message?    @relation(fields: [messageId], references: [id], onDelete: SetNull)
   type           TaskType
   providerId     String?
   provider       Provider?   @relation(fields: [providerId], references: [id])
@@ -366,6 +367,7 @@ model GenerationTask {
   @@index([runId])
   @@index([toolCallId])
   @@index([conversationId, createdAt(sort: Desc)]) // M10-P16：任务列表端点（原全表扫）
+  @@index([messageId]) // M10 Final Audit：消息删除路径 SET NULL 全表扫修复
 }
 
 // ===== 用量与成本 =====

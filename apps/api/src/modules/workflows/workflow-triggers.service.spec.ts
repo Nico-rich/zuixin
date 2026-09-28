@@ -251,7 +251,8 @@ describe('WorkflowTriggersService webhook 双 secret（M10-P5 SA-18）', () => {
   it('current 命中：接受（并落防重放行）', async () => {
     const { svc, prisma, currentSecret } = make({ webhook: makeWebhookRow(NEW) });
     const sig = webhookSignature(NEW, RAW_TS, EVENT, BODY);
-    await expect(verify(svc, sig)).resolves.toEqual({ workflowId: WF, eventId: EVENT });
+    // M10 Final Audit H6：verifyWebhook 返回 webhookId（run 成功后投递行提升 accepted 需要）
+    await expect(verify(svc, sig)).resolves.toEqual({ workflowId: WF, eventId: EVENT, webhookId: 'wh-1' });
     expect(prisma.webhookDelivery.create).toHaveBeenCalledTimes(1);
     expect(currentSecret()).toBe(enc(NEW)); // 验签不写库
   });

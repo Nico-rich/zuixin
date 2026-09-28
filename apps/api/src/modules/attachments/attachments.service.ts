@@ -104,12 +104,13 @@ export class AttachmentsService {
         },
       });
       // 预留 → 账本（durable 计数）→ 释放：与 run/媒体任务同一套 C1 语义（终态释放，绝不残留占用）。
-      // 崩在账本与释放之间只会**多计**（预留 1h TTL 自愈），绝不漏计。
+      // M10 Final Audit H3：strict 模式——账本写失败时**不释放预留**并上抛（5xx），调用方重试
+      // （幂等键 att:{id} 保证绝不重复计量）；绝不出现"对象已入库、预留已释放、无账单事实"。
       await this.billing.recordUsage({
         userId, organizationId, kind: 'attachment_upload', quantity: 1,
         idempotencyKey: `att:${attachmentId}`,
         metadata: { attachmentId, mimeType: file.mimetype, sizeBytes: storedBytes },
-      });
+      }, { strict: true });
       await this.quota.release(attachmentId, 'attachment_upload');
       return attachment;
     } catch (err) {

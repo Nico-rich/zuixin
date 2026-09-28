@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { PrismaService } from '../../modules/prisma/prisma.service';
+import { QuotaService } from '../../modules/billing/quota.service';
 import { AGENT_RUN_QUEUE } from '../queue/queue.module';
 import { EventBusService, agentRunChannel } from '../events/event-bus.service';
 
@@ -34,6 +35,8 @@ export class AgentRunLeaseService {
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @InjectQueue(AGENT_RUN_QUEUE) private readonly agentRunQueue: Queue,
     @Inject(EventBusService) private readonly events: EventBusService,
+    // M10 Final Audit H2c：recoverStale 超时终态不经 Driver → 必须自行释放 C1 预留
+    @Inject(QuotaService) private readonly quota: QuotaService,
   ) {}
 
   private ttlMs(value: unknown, fallback: number): number {
@@ -135,6 +138,8 @@ export class AgentRunLeaseService {
         });
         if (done.count > 0) {
           timedOut++;
+          // M10 Final Audit H2c：timeout 终态不经 Driver 释放路径——这里释放 C1 预留（幂等；TTL 兜底）
+          await this.quota.release(row.id, 'agent_run').catch(() => undefined);
           this.logger.warn({ runId: row.id, status: row.status }, 'run 超过 deadline → timeout');
           // M6-P6 观察通道：SSE 订阅者实时看到 timeout 终态（并收流）
           await this.events.publish(agentRunChannel(row.id), { type: 'run.timeout', runId: row.id, status: 'timeout' }).catch(() => undefined);
