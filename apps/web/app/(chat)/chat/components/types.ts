@@ -68,6 +68,9 @@ export interface ChatStreamEventMap {
   message_end: { messageId: string; status: 'completed' | 'stopped' | 'failed' };
   status: { stage: string; message: string };
   task_created: { taskId: string; kind: 'image' | 'video' };
+  // M10-P13（ARCH-07）：worker → Redis `task` 通道 → api SSE 转发器 → 本页 SSE 流
+  task_progress: { taskId: string; progress: number; message?: string };
+  task_completed: { taskId: string };
   error: { code: string; message: string; requestId?: string };
   agent_start: { agentId: string; runId: string };
   agent_end: { agentId: string; runId: string; status: 'completed' | 'failed' | 'cancelled' | 'timeout' };

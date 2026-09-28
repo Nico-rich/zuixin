@@ -6,14 +6,34 @@ export interface SseConnectionSink {
   end(): void;
   destroy?: () => void;
   writableEnded?: boolean;
+  /** 写 SSE 帧（task 通道转发用；Express Response 天然具备） */
+  write?(chunk: string): void;
 }
 
-export interface SseConnectionInfo {
+/**
+ * 连接归属元数据（M10-P13：`task` 通道事件按 owner 路由到"相关连接"）。
+ * 未显式传入时由 add() 从 Express Response 的 `res.req` 推导（JwtAuthGuard 写入的 `req.user` 与已解析的 body）——
+ * 这样既有调用方（chat/agent-runs 控制器）无需改动即获得归属信息。
+ */
+export interface SseConnectionOwner {
+  userId?: string;
+  /** 会话归属（未知为 null/undefined；路由时只在**双侧都已知**时才要求相等） */
+  conversationId?: string | null;
+}
+
+export interface SseConnectionInfo extends SseConnectionOwner {
   id: string;
   kind: string;
   /** 建立时刻（ms） */
   openedAt: number;
   closed: boolean;
+}
+
+/** 从 Express Response 上取回请求上下文（无 req 的 fake sink → 空归属，路由时按 fail-closed 处理） */
+function deriveOwner(sink: unknown): SseConnectionOwner {
+  const req = (sink as { req?: { user?: { userId?: string }; body?: { conversationId?: string | null } } } | undefined)?.req;
+  if (!req) return {};
+  return { userId: req.user?.userId, conversationId: req.body?.conversationId ?? null };
 }
 
 /** 关闭 SSESink 的宽限期：先 end（干净 EOF，客户端可正常收尾），仍不结束则 destroy 兜底 */
@@ -51,15 +71,40 @@ export class SseRegistryService implements OnModuleInit {
 
   snapshot(): SseConnectionInfo[] { return [...this.conns.values()].map((c) => ({ ...c.info })); }
 
-  /** 登记一条 SSE 连接；返回注销函数（幂等） */
-  add(kind: string, sink: SseConnectionSink): () => void {
+  /**
+   * 登记一条 SSE 连接；返回注销函数（幂等）。
+   * `owner` 缺省时从 sink（Express Response）推导——既有控制器不改一行即带上归属，供 task 通道按 owner 路由。
+   */
+  add(kind: string, sink: SseConnectionSink, owner?: SseConnectionOwner): () => void {
     const id = `sse-${++this.seq}`;
-    const info: SseConnectionInfo = { id, kind, openedAt: Date.now(), closed: false };
+    const info: SseConnectionInfo = { id, kind, openedAt: Date.now(), closed: false, ...(owner ?? deriveOwner(sink)) };
     this.conns.set(id, { info, sink });
     return () => {
       const cur = this.conns.get(id);
       if (cur) { cur.info.closed = true; this.conns.delete(id); }
     };
+  }
+
+  /**
+   * M10-P13：按谓词向匹配连接投递一帧（task 通道转发用）。
+   * - 跳过已结束的连接（`writableEnded`）与写失败/不支持写的连接——写失败的连接视为已断开并注销（幂等）；
+   * - 单个连接异常绝不影响其他连接（异常隔离），返回成功投递条数（可观测/测试断言用）。
+   */
+  deliver(match: (info: SseConnectionInfo) => boolean, write: (sink: SseConnectionSink, info: SseConnectionInfo) => void): number {
+    let delivered = 0;
+    for (const { info, sink } of [...this.conns.values()]) {
+      if (info.closed || sink.writableEnded) continue;
+      if (!match(info)) continue;
+      try {
+        write(sink, info);
+        delivered++;
+      } catch (err) {
+        this.logger.warn(`SSE 转发失败，注销连接（${info.id}/${info.kind}）: ${(err as Error).message}`);
+        info.closed = true;
+        this.conns.delete(info.id);
+      }
+    }
+    return delivered;
   }
 
   /** 停止接受新订阅（幂等） */

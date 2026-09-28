@@ -187,3 +187,39 @@ describe('EventBusService（P5 批量发布）', () => {
     expect(received).toHaveLength(1); // 订阅已清理，不再派发
   });
 });
+
+/**
+ * M10-P13（审计 D10）：**降级不再静默**。
+ * fail-open 语义不变（Redis 故障绝不阻塞 AgentRun 收尾，事实源仍是 DB），
+ * 但失败批次/丢弃条数/最近原因必须可查询（供 /metrics 与告警判断事件面降级的规模）。
+ */
+describe('EventBusService 降级信号（D10）', () => {
+  /** 发布必失败的 pubsub 替身 */
+  const downPubSub = () => ({
+    publish: async () => { throw new Error('redis down'); },
+    publishBatch: async () => { throw new Error('redis down'); },
+    subscribe: async () => {},
+    on: () => undefined,
+    disconnect: () => undefined,
+  }) as unknown as RedisPubSubLike;
+
+  it('发布失败 → 保持 fail-open（不抛错）且计数/丢弃条数/最近原因可查', async () => {
+    const bus = new EventBusService(downPubSub());
+    await bus.publish('task', { type: 'task.progress', taskId: 't1', progress: 1 });
+    await bus.flush();
+    expect(bus.publishStats()).toEqual({ failures: 1, droppedEvents: 1, lastFailure: 'redis down', pending: 0 });
+
+    await bus.publish('task', { type: 'task.progress', taskId: 't2', progress: 2 });
+    await bus.publish('task', { type: 'task.progress', taskId: 't3', progress: 3 });
+    await bus.flush();
+    expect(bus.publishStats()).toMatchObject({ failures: 2, droppedEvents: 3 }); // 累计而非重置
+    await expect(bus.onModuleDestroy()).resolves.toBeUndefined(); // 关停不阻塞、不抛错
+  });
+
+  it('发布成功 → 降级计数保持为 0（信号只在真失败时增长）', async () => {
+    const { bus } = make();
+    await bus.publish('task', { type: 'task.progress', taskId: 't1', progress: 1 });
+    await bus.flush();
+    expect(bus.publishStats()).toEqual({ failures: 0, droppedEvents: 0, lastFailure: null, pending: 0 });
+  });
+});

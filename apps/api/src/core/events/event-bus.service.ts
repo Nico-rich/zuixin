@@ -77,6 +77,11 @@ export class EventBusService implements OnModuleDestroy {
   private timer: NodeJS.Timeout | null = null;
   /** 串行化发布链：并发 flush 绝不交错，事件顺序恒定 */
   private chain: Promise<void> = Promise.resolve();
+  // M10-P13（D10）：降级**信号**（只加可观测，不改 fail-open 语义）——发布失败不再只是一行日志，
+  // 而是可查询的累计计数与最近原因（供 /metrics、告警与运维判断"事件面降级"的规模）。
+  private publishFailures = 0;
+  private droppedEvents = 0;
+  private lastPublishFailure: string | null = null;
 
   constructor(@Optional() injected?: RedisPubSubLike) {
     if (injected) {
@@ -131,6 +136,14 @@ export class EventBusService implements OnModuleDestroy {
   /** 缓冲中的待发布事件数（可观测/测试用） */
   pendingEvents(): number { return this.buffer.length; }
 
+  /**
+   * M10-P13（D10）降级信号（可观测，不静默）：发布失败批次/丢弃事件数/最近失败原因。
+   * 语义不变——事件推送仍是"尽力而为"，**事实源是 DB**；这里只把降级事实暴露出来。
+   */
+  publishStats(): { failures: number; droppedEvents: number; lastFailure: string | null; pending: number } {
+    return { failures: this.publishFailures, droppedEvents: this.droppedEvents, lastFailure: this.lastPublishFailure, pending: this.buffer.length };
+  }
+
   private scheduleFlush(): void {
     if (this.timer) return;
     this.timer = setTimeout(() => { this.timer = null; void this.flush(); }, EVENT_BATCH_WINDOW_MS);
@@ -153,12 +166,20 @@ export class EventBusService implements OnModuleDestroy {
    * 降级（**fail-open**）：超时/失败仅记录日志并丢弃本批——事件推送是"尽力而为"的实时观察面，
    * **事实源是 DB**（AgentRun timeline 投影 + 事件表）；绝不让 Redis 故障阻塞 AgentRun 收尾、
    * lease 释放或 SSE 线程（原 `maxRetriesPerRequest: null` 下 await publish 可能永不返回）。
+   *
+   * M10-P13（D10）：降级**不再静默**——失败批次数/丢弃条数/最近原因计入 `publishStats()`（可查询、可告警），
+   * 日志带累计值（"丢了多少"比"又失败一次"对运维重要）。语义与既有 fail-open 完全一致。
    */
   private async sendBounded(batch: Array<{ channel: string; message: string }>): Promise<void> {
     try {
       await withDeadline(this.send(batch), EVENT_OP_TIMEOUT_MS, `event-bus:publish:${batch.length}`);
     } catch (err) {
-      this.logger.error(`事件发布失败/超时（${batch.length} 条，降级：丢弃本批，事实源为 DB）: ${(err as Error).message}`);
+      this.publishFailures++;
+      this.droppedEvents += batch.length;
+      this.lastPublishFailure = (err as Error).message;
+      this.logger.error(
+        `事件发布失败/超时（${batch.length} 条，降级：丢弃本批，事实源为 DB；累计失败 ${this.publishFailures} 批/丢弃 ${this.droppedEvents} 条）: ${(err as Error).message}`,
+      );
     }
   }
 

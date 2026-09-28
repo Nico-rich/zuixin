@@ -67,22 +67,43 @@ describe('RunTimeline 执行详情面板', () => {
     expect(await screen.findByText('执行失败')).toHaveClass('text-red-400');
   });
 
-  // 【缺口记录】api 的 TimelineItemType 含 run.waiting 与 approval.*（timeline.types.ts），
-  // 但 web 的 ICONS 表未覆盖这些类型 → 一律回退为 '•'。本用例把该缺口钉成可执行事实（补齐图标后需更新本用例）。
-  it('【缺口记录】approval.* / run.waiting 类型无专属图标，回退为 "•"（覆盖类型仍有图标）', async () => {
+  // M10-P13（审计 M9-18）：api 的 TimelineItemType 含 run.waiting 与 approval.*（timeline.types.ts），
+  // web 的 ICONS 表原未覆盖 → 一律回退 '•'（"等待"与"等审批"看不出区别）。本用例锁定补齐后的映射。
+  it('run.waiting / approval.* 有专属图标（M9-18 已补齐）', async () => {
     mockTimeline(timeline({
       items: [
         item({ id: 'i-1', type: 'approval.requested', status: 'running', title: '等待审批：send_email' }),
         item({ id: 'i-2', type: 'approval.approved', title: '审批通过' }),
-        item({ id: 'i-3', type: 'run.waiting', title: '等待生成任务' }),
-        item({ id: 'i-4', type: 'run.started', title: '开始执行' }),
+        item({ id: 'i-3', type: 'approval.rejected', title: '审批驳回' }),
+        item({ id: 'i-4', type: 'run.waiting', title: '等待生成任务' }),
+        item({ id: 'i-5', type: 'run.started', title: '开始执行' }),
       ],
     }));
     render(<RunTimeline runId="run-1" />);
     expand();
-    await screen.findByText('审批通过');
-    expect(screen.getAllByText('•')).toHaveLength(3);
-    expect(screen.getByText('▶')).toBeInTheDocument();
+    await screen.findByText('审批驳回');
+    expect(screen.getByText('🙋')).toBeInTheDocument(); // requested
+    expect(screen.getByText('👍')).toBeInTheDocument(); // approved
+    expect(screen.getByText('👎')).toBeInTheDocument(); // rejected
+    expect(screen.getByText('⏸')).toBeInTheDocument();  // run.waiting
+    expect(screen.getByText('▶')).toBeInTheDocument();  // run.started
+    expect(screen.queryByText('•')).not.toBeInTheDocument(); // 覆盖到时序项后不再有兜底图标
+  });
+
+  it('approval.expired / approval.cancelled 同样有图标，未登记类型才回退 "•"', async () => {
+    mockTimeline(timeline({
+      items: [
+        item({ id: 'i-1', type: 'approval.expired', title: '审批超时' }),
+        item({ id: 'i-2', type: 'approval.cancelled', title: '审批取消' }),
+        item({ id: 'i-3', type: 'future.unknown', title: '未来事件' }),
+      ],
+    }));
+    render(<RunTimeline runId="run-1" />);
+    expand();
+    await screen.findByText('审批超时');
+    expect(screen.getByText('⌛')).toBeInTheDocument();
+    expect(screen.getByText('🚫')).toBeInTheDocument();
+    expect(screen.getAllByText('•')).toHaveLength(1);
   });
 
   it('请求失败：展示“时间线加载失败”，不留空白面板，也不缓存错误结果', async () => {
