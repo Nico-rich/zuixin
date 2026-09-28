@@ -5,8 +5,11 @@ import { OrganizationsService } from '../organizations/organizations.service';
 
 export type LedgerKind =
   | 'llm_tokens' | 'llm_cost' | 'image_generation' | 'video_seconds'
-  | 'external_api_call' | 'agent_run' | 'workflow_run' | 'storage' | 'seat'
-  | 'attachment_upload'; // M10 W0 预置（P7 每用户附件配额——A7 消费，A10 不碰）
+  | 'external_api_call' | 'agent_run' | 'workflow_run'
+  | 'attachment_upload' // M10 W0 预置（P7 每用户附件配额——A7 消费，A10 不碰）
+  // M11 P3 起 'storage' | 'seat' 不再是任何写入点/配额映射的 kind（死配置摘除）；列值仍为 String，
+  // 历史行与外部直接写入的行照旧可查（对账 ledger-only 段覆盖）。
+  | 'storage' | 'seat';
 
 export interface RecordUsageInput {
   userId: string;
@@ -46,7 +49,8 @@ const DEFAULT_ENTITLEMENTS = {
   workflowRunsMonthly: 100_000, workflowRunsDaily: 50_000, concurrentWorkflowRuns: 50,
   llmTokensMonthly: 1_000_000_000, imageMonthly: 1_000_000,
   videoSecondsMonthly: 1_000_000, externalApiMonthly: 1_000_000,
-  storageMb: 100_000, seats: 100,
+  // M11 P3：storageMb/seats 摘除——全库零执行点（QuotaService 无映射、无写入器读它），
+  // 属"声明了但永不裁决"的死配置；需要时随存储/席位配额一并接线再声明。
   // M10 W0 预置（P7 附件配额；A7 消费）
   attachmentsMonthly: 100_000, attachmentsDaily: 5_000,
   // Pre-M9 A3：媒体日限并入计划权益（原 systemSetting 全局日限 50/10 语义保留为 free 默认）
@@ -55,9 +59,9 @@ const DEFAULT_ENTITLEMENTS = {
 
 const PLANS = [
   { code: 'free', name: 'Free', monthlyPrice: 0, yearlyPrice: 0, entitlements: { ...DEFAULT_ENTITLEMENTS } },
-  { code: 'pro', name: 'Pro', monthlyPrice: 99, yearlyPrice: 990, entitlements: { ...DEFAULT_ENTITLEMENTS, seats: 5, concurrentAgentRuns: 10 } },
-  { code: 'team', name: 'Team', monthlyPrice: 499, yearlyPrice: 4990, entitlements: { ...DEFAULT_ENTITLEMENTS, seats: 20, concurrentAgentRuns: 40 } },
-  { code: 'enterprise', name: 'Enterprise', monthlyPrice: 1999, yearlyPrice: 19990, entitlements: { ...DEFAULT_ENTITLEMENTS, seats: 200, concurrentAgentRuns: 200 } },
+  { code: 'pro', name: 'Pro', monthlyPrice: 99, yearlyPrice: 990, entitlements: { ...DEFAULT_ENTITLEMENTS, concurrentAgentRuns: 10 } },
+  { code: 'team', name: 'Team', monthlyPrice: 499, yearlyPrice: 4990, entitlements: { ...DEFAULT_ENTITLEMENTS, concurrentAgentRuns: 40 } },
+  { code: 'enterprise', name: 'Enterprise', monthlyPrice: 1999, yearlyPrice: 19990, entitlements: { ...DEFAULT_ENTITLEMENTS, concurrentAgentRuns: 200 } },
 ];
 
 /**

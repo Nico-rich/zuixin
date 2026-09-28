@@ -24,6 +24,7 @@ function makeService() {
     },
     paymentEvent: { create: vi.fn().mockResolvedValue({ id: 'pe-1' }), findUnique: vi.fn().mockResolvedValue({ id: 'pe-1' }) },
     project: { findFirst: vi.fn().mockResolvedValue({ organizationId: 'org-1' }) },
+    model: { updateMany: vi.fn().mockResolvedValue({ count: 0 }) },
     // Pre-M9 G8：交互式事务（回调形式）——单测里以同一 mock 作为 tx 传入，断言"事件与发票同事务"
     $transaction: vi.fn(async (arg: unknown) => (typeof arg === 'function' ? (arg as (tx: unknown) => Promise<unknown>)(prisma) : Promise.all(arg as Promise<unknown>[]))),
   };
@@ -41,7 +42,7 @@ describe('BillingService（M8-P2 计划/订阅/计量/支付）', () => {
     expect(res).toMatchObject({ planId: 'plan-free', status: 'active' });
     prisma.subscription.findUnique.mockResolvedValue({
       id: 's1', status: 'cancelled',
-      plan: { id: 'plan-pro', code: 'pro', entitlements: { seats: 5 } },
+      plan: { id: 'plan-pro', code: 'pro', entitlements: { agentRunsMonthly: 5 } },
     });
     const res2 = await svc.ensureSubscription('org-1');
     expect(res2.planId).toBe('plan-free'); // cancelled → 免费额度语义
@@ -59,10 +60,10 @@ describe('BillingService（M8-P2 计划/订阅/计量/支付）', () => {
 
   it('subscribe：upsert 订阅 + 开票 + 支付事件；重复支付事件幂等（绝不重复入账）', async () => {
     const { svc, prisma } = makeService();
-    prisma.plan.findUnique.mockResolvedValue({ id: 'plan-pro', code: 'pro', monthlyPrice: 99, entitlements: { seats: 5 }, active: true });
+    prisma.plan.findUnique.mockResolvedValue({ id: 'plan-pro', code: 'pro', monthlyPrice: 99, entitlements: { agentRunsMonthly: 5 }, active: true });
     prisma.subscription.upsert.mockResolvedValue({ id: 's1', plan: { code: 'pro' } });
     const res = await svc.subscribe('u1', 'org-1', 'plan-pro');
-    expect(res).toMatchObject({ plan: 'pro', status: 'active', entitlements: { seats: 5 } });
+    expect(res).toMatchObject({ plan: 'pro', status: 'active', entitlements: { agentRunsMonthly: 5 } });
     expect(prisma.paymentEvent.create).toHaveBeenCalledTimes(1);
     // G8：发票终态在支付事务内写入（open→paid）
     expect(prisma.invoice.updateMany).toHaveBeenCalledWith(expect.objectContaining({
@@ -133,5 +134,21 @@ describe('BillingService（M8-P2 计划/订阅/计量/支付）', () => {
     expect(await svc.organizationFor('u1', 'p1')).toBe('org-1');
     prisma.project.findFirst.mockResolvedValue(null);
     expect(await svc.organizationFor('u1', null)).toBe('org-personal');
+  });
+
+  it('M11 P3：种子计划不含 storageMb/seats 死配置（声明即承诺——不接线的配额绝不对外声称）', async () => {
+    const { svc, prisma } = makeService();
+    await svc.onModuleInit();
+    const upserts = prisma.plan.upsert.mock.calls as unknown as Array<[{ create: { code: string; entitlements: Record<string, number> } }]>;
+    expect(upserts.map(([arg]) => arg.create.code)).toEqual(['free', 'pro', 'team', 'enterprise']);
+    for (const [arg] of upserts) {
+      const ents = arg.create.entitlements;
+      expect(ents).not.toHaveProperty('storageMb');
+      expect(ents).not.toHaveProperty('seats');
+      // 有裁决路径的配额仍在（摘除只针对零执行项）
+      for (const key of ['agentRunsMonthly', 'workflowRunsMonthly', 'llmTokensMonthly', 'imageMonthly', 'videoSecondsMonthly', 'externalApiMonthly', 'attachmentsMonthly', 'imageDaily', 'videoDaily']) {
+        expect(ents).toHaveProperty(key);
+      }
+    }
   });
 });

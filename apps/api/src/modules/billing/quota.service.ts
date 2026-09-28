@@ -23,9 +23,21 @@ const ENTITLEMENT_KEY: Partial<Record<LedgerKind, string>> = {
   llm_tokens: 'llmTokensMonthly',
   image_generation: 'imageMonthly', video_seconds: 'videoSecondsMonthly',
   external_api_call: 'externalApiMonthly', agent_run: 'agentRunsMonthly',
-  workflow_run: 'workflowRunsMonthly', storage: 'storageMb', seat: 'seats',
+  workflow_run: 'workflowRunsMonthly',
   attachment_upload: 'attachmentsMonthly', // M10 W0 预置（P7）
+  // M11 P3：storage→storageMb / seat→seats 映射摘除（连同 DEFAULT_ENTITLEMENTS 声明）——
+  // 全库无写入点、无读取点，属"声明了但零执行"的死配置（死配额比无配额更危险：看着有闸实际没闸）。
 };
+
+/**
+ * UTC 日窗口（M11 P3 / 维度2#13）：**与 dayOf() 的 UTC 日键同口径**。
+ * 原实现用 `setHours(0,0,0,0)`（本地午夜）界定账本日聚合，而日键/预留 day 用 UTC 日期——
+ * 非 UTC 时区下两者错位（UTC+8 的本地 00:00 是前一日的 16:00Z），日限被跨日漏计/多计。
+ */
+export function utcDayWindow(d = new Date()): { start: Date; end: Date } {
+  const start = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  return { start, end: new Date(start.getTime() + 86_400_000) };
+}
 
 const DAILY_KEY: Record<string, string> = {
   agent_run: 'agentRunsDaily', workflow_run: 'workflowRunsDaily',
@@ -101,10 +113,11 @@ export class QuotaService {
       const dailyKey = DAILY_KEY[kind];
       const dailyLimit = dailyKey ? entitlements[dailyKey] : undefined;
       if (dailyLimit != null) {
-        const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+        // M11 P3：UTC 日窗口 [00:00Z, 次日 00:00Z)——与 dayOf()/预留 day 键同口径（原为本地午夜）
+        const { start: dayStart, end: dayEnd } = utcDayWindow();
         const [agg, reservedDaily] = await Promise.all([
           this.prisma.usageLedgerEntry.aggregate({
-            where: { organizationId, kind, createdAt: { gte: dayStart } },
+            where: { organizationId, kind, createdAt: { gte: dayStart, lt: dayEnd } },
             _sum: { quantity: true },
           }),
           this.openReservations(organizationId, kind, this.dayOf()),
