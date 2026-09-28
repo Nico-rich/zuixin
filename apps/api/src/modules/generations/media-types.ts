@@ -56,6 +56,15 @@ export interface MediaExecutor {
    * 但 provider 侧任务可能已完成；按 `remoteTaskId` 问 provider 才是权威。
    * 未实现（同步型 provider 无远端任务概念）或无法解析适配器 → 返回 `null`，
    * 调用方按"无法恢复"兜底（绝不把 null 当成失败）。
+   *
+   * M10-P2 D18（兜底语义**契约化**，与 MediaGenerationService.recoverRemoteGenerationTask 一字对应）：
+   * - `queryRemoteStatus` 为**可选**：同步型 provider（OpenAI/CogView 生图等，无远端任务概念）不实现；
+   *   异步型执行器在"无 `modelId` 归因 / 适配器无 `getStatus` / 模型已停用（resolve 抛错）"时同样返回 `null`。
+   * - **`null` 的语义 = "无法断定"（≠失败）**：调用方必须映射为 `unknown`，保持任务非终态，交由
+   *   清扫超时/护栏兜底裁决；**绝不**把 `null` 落成 failed（否则"钱花了却被判失败"）。
+   * - 适配器侧的**未知 remoteTaskId 也不得伪造成 `failed`**（provider 权威终态）：无法确认时返回
+   *   `processing`（非终态）。反面教材见替身修复：mock-video「任务不存在 → failed」会把重启后的任务判死。
+   * - 查询抛错（provider 不可达/超时）同样按 `unknown` 处理，不写任何终态。
    */
   queryRemoteStatus?(query: MediaRemoteQuery): Promise<MediaRemoteStatus | null>;
 }

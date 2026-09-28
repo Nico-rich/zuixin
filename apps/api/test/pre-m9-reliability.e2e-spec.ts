@@ -19,6 +19,7 @@ import { ExternalActionsService } from '../src/modules/external-actions/external
 import { MockExternalActionProvider } from '../src/modules/external-actions/mock-external-action.provider';
 import { MediaCleanupService } from '../src/modules/generations/media-cleanup.service';
 import { VideoManagerService } from '../src/providers/video/video-manager.service';
+import { MOCK_VIDEO_FAIL_MARKER, MOCK_VIDEO_FAIL_REASON } from '../src/providers/video/adapters/mock-video.adapter';
 import { CredentialService } from '../src/modules/connections/credentials.service';
 import { OAuthProvidersService } from '../src/modules/connections/oauth/oauth-providers.service';
 import { MockOAuthProvider } from '../src/modules/connections/oauth/mock-oauth.provider';
@@ -248,13 +249,20 @@ describe('Pre-M9 Reliability (e2e)：熔断自愈 / 远端恢复 / 支付事务 
     }, 60_000);
 
     it('远端已失败 → 落 provider 的失败原因（不是本地"任务超时"伪造）', async () => {
+      const video = app.get(VideoManagerService);
       const cleanup = app.get(MediaCleanupService);
-      const taskId = await seedCrashedTask(`g7-missing-${STAMP}`, 31 * 60_000);
+      // M10-P2 D18 起：替身**不再**对"不认识的 remoteTaskId"返回 failed（那是"未知"而非结论，
+      // 会把重启后仍在跑的任务判死）。provider 的权威失败必须由 provider 侧真实产生 ⇒ 用替身的
+      // 失败构造（提交 prompt 带 MOCK_VIDEO_FAIL_MARKER）拿到一个"远端已失败"的真实 remoteTaskId。
+      const { adapter } = await video.resolve(VIDEO_MODEL);
+      const remoteTaskId = (await (adapter as unknown as { submit(p: unknown): Promise<{ remoteTaskId: string }> })
+        .submit({ prompt: `g7 ${MOCK_VIDEO_FAIL_MARKER}`, duration: 5, aspectRatio: '16:9' })).remoteTaskId;
+      const taskId = await seedCrashedTask(remoteTaskId, 31 * 60_000);
       await cleanup.sweep();
       const row = await prisma.generationTask.findUnique({ where: { id: taskId } });
       expect(row!.status).toBe('failed');
       expect(row!.errorCode).toBe('PROVIDER_UNKNOWN');
-      expect(row!.errorMessage).toContain('任务不存在'); // 文案/错误码来自 provider 权威结论
+      expect(row!.errorMessage).toContain(MOCK_VIDEO_FAIL_REASON); // 文案/错误码来自 provider 权威结论
       expect(row!.errorCode).not.toBe('MEDIA_TASK_TIMEOUT');
     }, 60_000);
 

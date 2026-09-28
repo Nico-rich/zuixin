@@ -2,12 +2,14 @@ import { Inject, Injectable, Logger, OnModuleInit, Optional } from '@nestjs/comm
 import { PrismaService } from '../../modules/prisma/prisma.service';
 import { CryptoService } from '../../core/crypto/crypto.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
+import { ObservabilityService } from '../../core/tracing/observability.service';
 import { assertProviderBaseUrlSafe } from '../../modules/security/provider-base-url.guard';
 import { DnsResolver, nodeDnsResolver, SSRF_RESOLVER } from '../../modules/security/ssrf-guard';
 import { RoutingService } from '../../modules/provider-routing/routing.service';
 import { EmbeddingProvider } from './embedding.types';
 import { MockEmbeddingProvider } from './adapters/mock-embedding.adapter';
 import { OpenAIEmbeddingProvider } from './adapters/openai-embedding.adapter';
+import { ProviderDegradationTracker, ProviderDegradedRecorder } from '../provider-degradation';
 
 export interface ResolvedEmbedding {
   providerId: string; providerName: string;
@@ -19,6 +21,8 @@ export interface ResolvedEmbedding {
 export class EmbeddingManagerService implements OnModuleInit {
   private readonly logger = new Logger('EmbeddingManager');
   private providers = new Map<string, EmbeddingProvider>();
+  /** M10-P2 D12：配置校验失败的 provider（degraded）——不阻断启动，但可观测 + 调用期明确报错 */
+  private readonly degraded: ProviderDegradationTracker;
 
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
@@ -27,23 +31,30 @@ export class EmbeddingManagerService implements OnModuleInit {
     @Inject(RoutingService) private readonly routing: RoutingService,
     // Pre-M9 F3-B：调用期 baseUrl 校验用的 DNS 解析器
     @Optional() @Inject(SSRF_RESOLVER) private readonly resolver: DnsResolver = nodeDnsResolver,
-  ) {}
+    // M10-P2 D12：provider_degraded 计数（@Optional：观测缺失不影响加载；@Global TracingModule 提供）
+    @Optional() @Inject(ObservabilityService) private readonly metrics?: ProviderDegradedRecorder,
+  ) {
+    this.degraded = new ProviderDegradationTracker('embedding', this.logger, this.metrics);
+  }
 
   async onModuleInit() { await this.refresh(); }
 
   async refresh(): Promise<void> {
     const rows = await this.prisma.provider.findMany({ where: { type: 'embedding', enabled: true } });
     const next = new Map<string, EmbeddingProvider>();
+    this.degraded.reset();
     for (const row of rows) {
       const apiKey = row.apiKeyEncrypted ? this.crypto.decrypt(row.apiKeyEncrypted) : '';
       try {
         next.set(row.id, this.buildAdapter(row.adapter, row.baseUrl, apiKey, row.timeoutMs));
       } catch (err) {
-        this.logger.error(`embedding provider ${row.name} 初始化失败: ${(err as Error).message}`);
+        // M10-P2 D12：配置错误 → degraded（聚合告警 + 计数）；不阻断启动（见 provider-degradation.ts）
+        this.degraded.markFailed(row, err);
       }
     }
     this.providers = next;
     this.logger.log(`Embedding providers 已加载: ${this.providers.size} 个`);
+    await this.degraded.report();
   }
 
   /**
@@ -63,7 +74,16 @@ export class EmbeddingManagerService implements OnModuleInit {
     const model = await this.prisma.model.findUnique({ where: { id: modelId }, include: { provider: true } });
     if (!model || !model.enabled || !model.provider.enabled) throw new AppError(ErrorCode.PROVIDER_UNKNOWN, 'embedding 模型不可用');
     const provider = this.providers.get(model.providerId);
-    if (!provider) throw new AppError(ErrorCode.PROVIDER_UNKNOWN, `embedding provider 未加载: ${model.providerId}`);
+    // M10-P2 D12：未加载（含配置校验失败）→ PROVIDER_CONFIG_INVALID（明确错误码 + 原因），不再笼统 PROVIDER_UNKNOWN
+    if (!provider) {
+      const reason = this.degraded.reasonOf(model.providerId);
+      throw new AppError(
+        ErrorCode.PROVIDER_CONFIG_INVALID,
+        reason
+          ? `embedding provider 配置无效（启动校验失败，degraded）: ${model.provider.name}（${model.providerId}）：${reason}`
+          : `embedding provider 未加载: ${model.provider.name}（${model.providerId}）`,
+      );
+    }
     // Pre-M9 F3-B：调用前按"当前"baseUrl 重跑 SSRF 判定（fail-closed；mock adapter 跳过）
     await assertProviderBaseUrlSafe({
       providerId: model.providerId, providerName: model.provider.name,

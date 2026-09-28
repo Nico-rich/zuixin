@@ -58,6 +58,23 @@ export class ObservabilityService {
   }
 
   /**
+   * M10-P2 D12：provider 启动配置校验失败（degraded）**计数**——本 Phase 唯一新增的观测面，
+   * 不改动其他 tracing 行为（采样/归属/读取路径全部原样）。
+   * 语义：一次 refresh 中一个 provider 构建失败 = 一条 `provider_degraded`（value=1, count），
+   * labels 携带 type/providerId/adapter/reason 便于按 provider 定位；organizationId 显式 null——
+   * provider 是**平台级配置**（非租户数据），绝不借用调用者 trace 上下文的组织归属。
+   * best-effort：recordMetric 内部吞异常，观测失败绝不影响 provider 加载结果。
+   */
+  async recordProviderDegraded(input: {
+    type: string; providerId: string; providerName: string; adapter: string; reason: string;
+  }): Promise<void> {
+    await this.recordMetric('provider_degraded', 1, 'count', {
+      type: input.type, providerId: input.providerId, providerName: input.providerName,
+      adapter: input.adapter, reason: input.reason,
+    }, null);
+  }
+
+  /**
    * Worker 侧：run 执行时长采样（agent_run_duration_ms / workflow_duration_ms）。
    * 归属（organizationId + userId）由 run 行解析——AgentRun/WorkflowRun 无 organizationId 列，
    * AgentRun 走 project.organizationId，WorkflowRun 走 workflow.organizationId（与 Billing 归因同源）。
