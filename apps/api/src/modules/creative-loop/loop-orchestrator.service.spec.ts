@@ -87,8 +87,10 @@ function makeHarness(over: {
   };
   const store = {
     get: vi.fn(async () => current),
-    cas: vi.fn(async (_id: string, from: readonly string[], next: HypothesisDoc) => {
+    // 真实实现：status 谓词 + **version 谓词**（M11-P5/D2-02）；mock 同语义（含版本锚定）
+    cas: vi.fn(async (_id: string, from: readonly string[], next: HypothesisDoc, expectedVersion: number) => {
       if (!current || !from.includes(current.doc.status)) return 0;
+      if (current.version !== expectedVersion) return 0;
       if (over.casCount === 0) return 0;
       current = { ...current, doc: next, version: current.version + 1 };
       return 1;
@@ -162,7 +164,14 @@ function makeHarness(over: {
     prisma as never, store as never, insights as never, hypotheses as never,
     workflows as never, runs as never, evaluationRuns as never, experiments as never,
   );
-  return { service, store, hypotheses, prisma, workflows, runs, evaluationRuns, experiments, getCurrent: () => current };
+  return {
+    service, store, hypotheses, prisma, workflows, runs, evaluationRuns, experiments,
+    getCurrent: () => current,
+    /** 模拟"另一路并发写入"：行版本前移（非状态字段被编辑 / 执行引用被挂接） */
+    advanceVersion: () => {
+      if (current) current = { ...current, version: current.version + 1 };
+    },
+  };
 }
 
 function thisToView(s: StoredDoc<HypothesisDoc>) {
@@ -294,7 +303,8 @@ describe('CreativeLoopOrchestrator（loop 启动 + 收敛）', () => {
       perfRows: [{ impressions: 1000, clicks: 50, spend: 100, conversions: 5, revenue: 300, orders: 5 }],
     });
     const result = await h.service.status('u1', 'hyp-1');
-    expect(h.store.cas).toHaveBeenCalledWith('hyp-1', ['running'], expect.objectContaining({ status: 'validated' }));
+    // 条件更新锚定 status **与读取时版本**（D2-02：期间的用户编辑/挂接一律使本次收敛让位）
+    expect(h.store.cas).toHaveBeenCalledWith('hyp-1', ['running'], expect.objectContaining({ status: 'validated' }), 1);
     expect(result.hypothesis.status).toBe('validated');
     expect(result.hypothesis.verdict).toMatchObject({
       decision: 'validated', decidedBy: 'criteria', reason: expect.stringContaining('roas=3'),
@@ -457,6 +467,27 @@ describe('CreativeLoopOrchestrator（loop 启动 + 收敛）', () => {
     const h = makeHarness({ doc, run: makeRun({ status: 'failed' }), casCount: 0 });
     const result = await h.service.status('u1', 'hyp-1');
     expect(result.hypothesis.status).toBe('running');
+  });
+
+  it('收敛：事实聚合期间发生并发编辑（版本前移，D2-02）→ 系统收敛让位，绝不覆盖并发写入', async () => {
+    const doc = makeDoc({
+      status: 'running',
+      successCriteria: { metric: 'roas', op: 'gte', value: 2 },
+      loop: { workflowId: 'wf-1', runId: 'run-1', attempts: 1, startedAt: NOW.toISOString() },
+    });
+    const perfRows = [{ impressions: 1000, clicks: 50, spend: 100, conversions: 5, revenue: 300, orders: 5 }];
+    const h = makeHarness({ doc, run: makeRun({ status: 'completed' }), perfRows });
+    // 读取（v1）之后、条件更新之前的窗口里，另一路请求写入非状态字段 → 行版本前移
+    h.prisma.creativePerformance.findMany.mockImplementation(async () => {
+      h.advanceVersion();
+      return perfRows;
+    });
+
+    const result = await h.service.status('u1', 'hyp-1');
+    // 锚点 = **读取时**版本（v1，而非"最新"）：版本已前移 → 输家让位（旧实现会静默覆盖对方写入）
+    expect(h.store.cas).toHaveBeenCalledWith('hyp-1', ['running'], expect.anything(), 1);
+    expect(h.getCurrent()?.version).toBe(2); // 并发写入未被系统收敛推进/覆盖
+    expect(result.hypothesis.status).toBe('running'); // 收敛留待下一次读路径按最新快照重算
   });
 
   it('收敛：等待审批中 → pending=awaiting-approval（返回 approvalId 供审批端点使用）', async () => {

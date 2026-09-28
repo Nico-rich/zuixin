@@ -17,7 +17,9 @@ import { stepExternalActionKey } from '../src/modules/workflows/workflow-executo
 import { hashPayload } from '../src/modules/approvals/approval-binding';
 import { validateDefinition } from '../src/modules/workflows/workflow-types';
 import { LOOP_STEP_IDS, buildLoopDefinition } from '../src/modules/creative-loop/loop-template';
-import { HYPOTHESIS_KIND, INSIGHT_KIND } from '../src/modules/creative-loop/creative-loop-store';
+import {
+  BACKFILL_BATCH_SIZE, HYPOTHESIS_KIND, INSIGHT_KIND, HypothesisStore, InsightStore,
+} from '../src/modules/creative-loop/creative-loop-store';
 import { factsHashOf } from '../src/modules/creative-loop/insight-rules';
 
 /**
@@ -38,9 +40,12 @@ import { factsHashOf } from '../src/modules/creative-loop/insight-rules';
  *      外部动作）→ 审批绑定校验**闭锁拒绝**（绝不落第二条外部动作）→ run.output.compensation 留痕
  *      → 模块把"已发布未回滚"作为事实回报（verdict.facts.rollback + status.rollback）。
  *   ⑦ 条件更新：并发状态推进恰好一个成功；并发启动绝不产生第二个 run；取消 run 不自动终态化 + 人工判定。
+ *   ⑦b M11-P5/D2-02：状态 CAS 带 **version 谓词**——并发"编辑 + 状态推进"绝不互相静默覆盖
+ *      （成功次数与版本前移逐一对应；赢家的写入完整保留，输家 400 不落库）。
  *   ⑧ 租户隔离：非成员一律 404（防枚举），绝不因知道 id 而放行。
  *   ⑨ 存储隔离：假设/洞察落在**专表**（CreativeHypothesis/CreativeInsight），绝不进入 `Artifact` 容器
  *      （既无"制品列表污染"风险，也无需 conversationId/storageKey 空值兜底）。
+ *   ⑩ M11-P5/D2-01：旧容器行存量回填在**真实 PG** 上按主键游标**分批**（跨批不丢行）、幂等、只读不删。
  *
  * 说明：M10-P4 起假设/洞察写入 creative-loop 专表（organizationId 直列，查询一律 server-side scope）；
  * 历史 `Artifact(type='other')` 行由 store 层**首次访问幂等回填**（本 spec 不再产生这类行）。
@@ -74,6 +79,7 @@ describe('M9-P5 Creative Performance Loop (e2e, 真实 Queue + Worker)', () => {
 
   const hypothesisIds: string[] = [];
   const insightIds: string[] = [];
+  const legacyArtifactIds: string[] = [];
   const workflowIds: string[] = [];
   const runIds: string[] = [];
   const childRunIds: string[] = [];
@@ -176,9 +182,14 @@ describe('M9-P5 Creative Performance Loop (e2e, 真实 Queue + Worker)', () => {
     for (const id of workflowIds) {
       await prisma.workflow.delete({ where: { id } }).catch(() => undefined); // 级联 versions/runs/steps
     }
-    // 闭环专表（按 id 精确删除；已删除的行 count=0 无副作用）
-    await prisma.creativeInsight.deleteMany({ where: { id: { in: insightIds } } }).catch(() => undefined);
-    await prisma.creativeHypothesis.deleteMany({ where: { id: { in: hypothesisIds } } }).catch(() => undefined);
+    // 闭环专表（按 id 精确删除；已删除的行 count=0 无副作用；含回填用例搬入的旧容器行）
+    await prisma.creativeInsight.deleteMany({
+      where: { id: { in: [...insightIds, ...legacyArtifactIds] } },
+    }).catch(() => undefined);
+    await prisma.creativeHypothesis.deleteMany({
+      where: { id: { in: [...hypothesisIds, ...legacyArtifactIds] } },
+    }).catch(() => undefined);
+    await prisma.artifact.deleteMany({ where: { id: { in: legacyArtifactIds } } }).catch(() => undefined);
     await prisma.creativePerformance.deleteMany({ where: { userId, projectId } }).catch(() => undefined);
     await prisma.feedback.deleteMany({ where: { userId, projectId } }).catch(() => undefined);
     await prisma.project.delete({ where: { id: projectId } }).catch(() => undefined);
@@ -372,9 +383,13 @@ describe('M9-P5 Creative Performance Loop (e2e, 真实 Queue + Worker)', () => {
       where: { userId, idempotencyKey: stepExternalActionKey(loopRunId, 3) },
     })).toBe(0);
 
-    // run 让出 lease 等人工（绝不自旋）
-    const waiting = await prisma.workflowRun.findUniqueOrThrow({ where: { id: loopRunId } });
-    expect(waiting.status).toBe('waiting');
+    // run 让出 lease 等人工（绝不自旋）——approval 行先落库、run 状态随后转 waiting：
+    // 断言最终一致的事实（瞬态读会随机看到 running，M11-P5 顺手消除该 flake）
+    const waiting = await waitFor(
+      'loop run 让出 lease',
+      () => prisma.workflowRun.findUniqueOrThrow({ where: { id: loopRunId } }),
+      (r) => r.status === 'waiting',
+    );
     expect(waiting.waitingOnApprovalId).toBe(approval.id);
     expect(waiting.workerId).toBeNull();
 
@@ -742,6 +757,34 @@ describe('M9-P5 Creative Performance Loop (e2e, 真实 Queue + Worker)', () => {
     hypothesisIds.splice(hypothesisIds.indexOf(h3), 1);
   });
 
+  it('⑦b 状态 CAS 带 version 谓词：并发编辑 + 状态推进绝不互相静默覆盖（D2-02 lost update）', async () => {
+    // 并发"编辑陈述"（version CAS）与"提交 draft→ready"（status CAS）。旧实现只锚定 status：
+    // 状态推进会把**读取时的旧快照**（旧陈述）一并写回，两名选手都返回 201 → 编辑被静默吞掉。
+    for (let round = 0; round < 3; round++) {
+      const h = await createHypothesis({ statement: `并发对照假设 ${round}` });
+      const newStatement = `并发编辑后的陈述 ${round}`;
+      const [patched, advanced] = await Promise.all([
+        api().patch(`/api/v1/creative-loop/hypotheses/${h}`).set(XRW).set('Cookie', cookie).send({ statement: newStatement }),
+        api().post(`/api/v1/creative-loop/hypotheses/${h}/status`).set(XRW).set('Cookie', cookie).send({ status: 'ready' }),
+      ]);
+      expect([200, 400]).toContain(patched.status); // PATCH 成功 200 / 冲突 400
+      expect([201, 400]).toContain(advanced.status); // 状态推进成功 201 / 冲突 400
+      const winners = (patched.status === 200 ? 1 : 0) + (advanced.status === 201 ? 1 : 0);
+      const row = await prisma.creativeHypothesis.findUniqueOrThrow({ where: { id: h } });
+      expect(row.version).toBe(1 + winners); // 每次成功写入恰好前移一版（绝不"报成功却没写"）
+      expect((row.history as unknown as unknown[]).length).toBe(row.status === 'ready' ? 1 : 0);
+      if (winners === 2) {
+        // 两个写入完全串行：后写者读到的是**最新快照** → 编辑内容必须保留在最终行里
+        expect(row.status).toBe('ready');
+        expect(row.statement).toBe(newStatement);
+      } else if (row.status === 'ready') {
+        expect(row.statement).toBe(`并发对照假设 ${round}`); // 状态推进赢 → 编辑 400 且未落库
+      } else {
+        expect(row.statement).toBe(newStatement); // 编辑赢 → 状态推进 400 且未落库
+      }
+    }
+  });
+
   it('⑧ 租户隔离：非成员一律 404（防枚举），绝不因知道 id 而放行', async () => {
     await api().get(`/api/v1/creative-loop/hypotheses/${hypothesisId}`).set('Cookie', outsiderCookie).expect(404);
     await api().patch(`/api/v1/creative-loop/hypotheses/${hypothesisId}`).set(XRW).set('Cookie', outsiderCookie)
@@ -781,5 +824,56 @@ describe('M9-P5 Creative Performance Loop (e2e, 真实 Queue + Worker)', () => {
       const stored = hypotheses.find((h) => h.id === row.id);
       if (stored) expect(row.organizationId).toBe(stored.organizationId);
     }
+  });
+
+  it('⑩ 存量回填（真实 PG）：旧 Artifact 行按主键游标**分批**搬入专表（跨批不丢行），幂等且只读不删', async () => {
+    const orgId = (await prisma.creativeHypothesis.findUniqueOrThrow({ where: { id: hypothesisId } })).organizationId;
+    const total = BACKFILL_BATCH_SIZE + 1; // **跨两批**：末批 1 行（游标分页边界）
+    const ids = Array.from({ length: total }, (_, i) =>
+      `e2e-m9p5-legacy-${randomUUID().slice(0, 8)}-${String(i).padStart(4, '0')}`);
+    await prisma.artifact.createMany({
+      data: ids.map((id, i) => ({
+        id,
+        userId,
+        projectId,
+        type: 'other' as never,
+        title: 'legacy creative loop container',
+        createdAt: new Date('2025-01-01T00:00:00Z'),
+        content: i === total - 1
+          ? { kind: INSIGHT_KIND, organizationId: orgId, projectId, factsHash: 'legacy-hash' } // 末行：洞察 kind
+          : { kind: HYPOTHESIS_KIND, organizationId: orgId, projectId, status: 'draft', statement: `历史假设 ${i}` },
+      })),
+    });
+    legacyArtifactIds.push(...ids);
+
+    // 独立 store key = 等价于"新进程首次访问"（绕开 e2e 应用实例的进程内记忆化，触发真实回填）
+    const deps = {
+      artifact: prisma.artifact,
+      creativeHypothesis: prisma.creativeHypothesis,
+      creativeInsight: prisma.creativeInsight,
+    };
+    const freshStore = () => new HypothesisStore(deps as never);
+    const freshInsightStore = () => new InsightStore(deps as never);
+    const store = freshStore();
+    await store.list({ organizationId: orgId }); // 首次访问 → 触发分批回填
+
+    expect(await prisma.creativeHypothesis.count({ where: { id: { in: ids } } })).toBe(total - 1);
+    expect(await prisma.creativeInsight.count({ where: { id: { in: ids } } })).toBe(1);
+    // 跨批边界抽样（末行在第二批）：分批不丢行、原 id/归属/时间线保留
+    expect((await store.get(ids[0]))?.doc).toMatchObject({ organizationId: orgId, status: 'draft', statement: '历史假设 0' });
+    expect((await store.get(ids[BACKFILL_BATCH_SIZE - 1]))?.doc.statement).toBe(`历史假设 ${BACKFILL_BATCH_SIZE - 1}`);
+    // 末行按 kind 分流进洞察专表 → 由 InsightStore 读取（假设 store 只认假设表）
+    const last = await freshInsightStore().get(ids[total - 1]);
+    expect(last?.doc.kind).toBe(INSIGHT_KIND);
+    expect(last?.doc.organizationId).toBe(orgId);
+    expect(last?.doc.factsHash).toBe('legacy-hash');
+    expect(last?.createdAt).toEqual(new Date('2025-01-01T00:00:00Z'));
+
+    // 幂等：再次回填（新 key）→ 既有专表行绝不被旧容器内容覆盖
+    await prisma.creativeHypothesis.updateMany({ where: { id: ids[0] }, data: { statement: '专表内的最新陈述' } });
+    await freshStore().list({ organizationId: orgId });
+    expect((await store.get(ids[0]))?.doc.statement).toBe('专表内的最新陈述');
+    // 只读迁移：旧容器行全部保留（审计痕迹）
+    expect(await prisma.artifact.count({ where: { id: { in: ids } } })).toBe(total);
   });
 });

@@ -25,9 +25,17 @@ function makeDoc(over: Partial<HypothesisDoc> = {}): HypothesisDoc {
   };
 }
 
-function makeHarness(over: { doc?: HypothesisDoc | null; cas?: number; casFields?: number; remove?: number; insight?: { organizationId: string } | null } = {}) {
+function makeHarness(over: {
+  doc?: HypothesisDoc | null;
+  cas?: number;
+  casFields?: number;
+  remove?: number;
+  insight?: { organizationId: string } | null;
+  /** 读取返回后、写入前的并发窗口钩子（模拟"另一路请求已写入" → 本次快照过期） */
+  afterRead?: () => void;
+} = {}) {
   const doc = over.doc === undefined ? makeDoc() : over.doc;
-  const stored: StoredDoc<HypothesisDoc> | null = doc
+  let stored: StoredDoc<HypothesisDoc> | null = doc
     ? {
       id: 'hyp-1', userId: 'u1', doc, version: 1,
       createdAt: new Date('2026-01-01T00:00:00Z'), updatedAt: new Date('2026-01-01T00:00:00Z'),
@@ -35,9 +43,15 @@ function makeHarness(over: { doc?: HypothesisDoc | null; cas?: number; casFields
     : null;
   const store = {
     create: vi.fn(async (userId: string, d: HypothesisDoc) => ({ id: 'hyp-new', userId, doc: d, createdAt: new Date(), updatedAt: new Date(), version: 1 })),
-    get: vi.fn(async () => stored),
+    get: vi.fn(async () => {
+      const snapshot = stored;
+      over.afterRead?.(); // 读取与写入之间的并发窗口
+      return snapshot;
+    }),
     list: vi.fn(async () => (stored ? [stored] : [])),
-    cas: vi.fn(async () => over.cas ?? 1),
+    // 真实实现：status 谓词 + version 谓词（M11-P5/D2-02）；mock 同语义（只记录，断言形状用）
+    cas: vi.fn(async (_id: string, _from: readonly string[], _next: HypothesisDoc, expectedVersion: number) =>
+      (stored && stored.version !== expectedVersion ? 0 : over.cas ?? 1)),
     // 真实实现：非状态字段更新走 version CAS（锚定读取时版本；输家 count=0）；mock 同语义
     casFields: vi.fn(async (_id: string, expectedVersion: number) => (stored && stored.version === expectedVersion ? over.casFields ?? 1 : 0)),
     // 真实实现按 allowed 状态做 SQL 过滤（未命中 → count 0）；mock 同语义
@@ -54,7 +68,14 @@ function makeHarness(over: { doc?: HypothesisDoc | null; cas?: number; casFields
     requireWrite: vi.fn(async () => undefined),
     authorizeResource: vi.fn(async () => undefined),
   };
-  return { service: new HypothesesService(store as never, insights as never, access as never), store, insights, access, stored };
+  return {
+    service: new HypothesesService(store as never, insights as never, access as never), store, insights, access,
+    get stored() { return stored; },
+    /** 模拟"另一路并发写入"：行版本前移（编辑 / 执行引用挂接 / 状态推进） */
+    advanceVersion: () => {
+      if (stored) stored = { ...stored, version: stored.version + 1 };
+    },
+  };
 }
 
 /**
@@ -121,7 +142,7 @@ describe('HypothesesService（CRUD + 状态机 + 归属）', () => {
       .rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
   });
 
-  it('transition：合法边推进 + 追加历史（条件更新锚定 from）', async () => {
+  it('transition：合法边推进 + 追加历史（条件更新锚定 from **与读取时版本**）', async () => {
     const h = makeHarness({ doc: makeDoc({ status: 'ready' }) });
     const view = await h.service.transition('u1', 'hyp-1', 'running', { by: 'manual', patch: { loop: { workflowId: 'wf1', runId: 'run1', attempts: 1, startedAt: 'now' } } });
     expect(view.status).toBe('running');
@@ -129,7 +150,19 @@ describe('HypothesesService（CRUD + 状态机 + 归属）', () => {
     expect(h.store.cas).toHaveBeenCalledWith('hyp-1', ['ready'], expect.objectContaining({
       status: 'running',
       loop: { workflowId: 'wf1', runId: 'run1', attempts: 1, startedAt: 'now' },
-    }));
+    }), 1); // K=读取时版本（D2-02：并发编辑与状态推进绝不互相静默覆盖）
+  });
+
+  it('transition：读取后版本已被并发写入前移 → 400 且绝不落库（lost update 防护，D2-02）', async () => {
+    // 模拟另一路请求在"本请求读取之后、条件更新之前"写入了非状态字段（版本前移 → 本次快照过期）
+    let h: ReturnType<typeof makeHarness>;
+    h = makeHarness({ doc: makeDoc({ status: 'ready' }), afterRead: () => h.advanceVersion() });
+    await expect(h.service.transition('u1', 'hyp-1', 'running', { by: 'manual' }))
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    // 锚点 = 读取时版本（v1），而非最新版本——所以版本前移必然使本次写入 count=0
+    expect(h.store.cas).toHaveBeenCalledWith('hyp-1', ['ready'], expect.anything(), 1);
+    expect(h.stored?.doc.status).toBe('ready'); // 状态未被本次转移改写
+    expect(h.stored?.version).toBe(2); // 只有并发写入那一次（本次未落库）
   });
 
   it('transition：非法边 → 400 且绝不落库（draft→running / 终态复活）', async () => {
@@ -148,7 +181,7 @@ describe('HypothesesService（CRUD + 状态机 + 归属）', () => {
     const h = makeHarness({ doc: makeDoc({ status: 'draft' }) });
     const view = await h.service.setStatus('u1', 'hyp-1', { status: 'ready' });
     expect(view.status).toBe('ready');
-    expect(h.store.cas).toHaveBeenCalledWith('hyp-1', ['draft'], expect.objectContaining({ status: 'ready' }));
+    expect(h.store.cas).toHaveBeenCalledWith('hyp-1', ['draft'], expect.objectContaining({ status: 'ready' }), 1);
 
     const ready = makeHarness({ doc: makeDoc({ status: 'ready', successCriteria: { metric: 'roas', op: 'gte', value: 2 } }) });
     const rejected = await ready.service.setStatus('u1', 'hyp-1', { status: 'rejected', reason: '成本模型不成立' });

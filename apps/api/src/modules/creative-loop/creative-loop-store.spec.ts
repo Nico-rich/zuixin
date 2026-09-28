@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { Prisma } from '@prisma/client';
 import {
-  HYPOTHESIS_KIND, HypothesisDoc, HypothesisStore, INSIGHT_KIND, InsightDoc, InsightStore,
+  BACKFILL_BATCH_SIZE, BACKFILL_RETRY_BACKOFF_MS, HYPOTHESIS_KIND, HypothesisDoc, HypothesisStore,
+  INSIGHT_KIND, InsightDoc, InsightStore,
 } from './creative-loop-store';
 import { factsHashOf } from './insight-rules';
 
@@ -11,10 +12,13 @@ import { factsHashOf } from './insight-rules';
  * 与 e2e 互补：这里用内存版 Prisma 假实现（不连云 DB），把"绝不误写/绝不误删"的
  * 边界逐条钉死——
  * - 文档 ↔ 专表列**逐字段映射**（kind 由表决定并重建，容器判别彻底消失）；
- * - 状态推进 = status CAS；非状态字段更新 = version CAS（count=0 绝不覆盖）；
- * - 解读写入 = factsHash CAS（事实层变化 → 拒写；facts/derived 绝不进入该构造路径）；
+ * - 状态推进 = status CAS **+ version CAS**（M11-P5/D2-02：并发编辑与状态推进绝不互相静默覆盖）；
+ * - 非状态字段更新 = version CAS（count=0 绝不覆盖）；
+ * - 解读写入 = factsHash **+ version** 双锚点 CAS（事实层变化 → 拒写；并发解读 → 拒写；
+ *   facts/derived 绝不进入该构造路径）；
  * - 删除仅 allowed 状态（已启动 loop 的假设行是历史事实，绝不删除）；
- * - 存量回填：只读旧容器行 → 专表、按 id 幂等、脏行跳过不阻塞、扫描失败不缓存（下次重试）。
+ * - 存量回填：只读旧容器行 → 专表、**主键游标分批（每批一次 createMany，绝无逐行 N+1）**、
+ *   按 id 幂等、批内毒行逐行隔离跳过、扫描失败退避窗口内不重扫（窗口后重试）。
  */
 
 /** Prisma 的 SQL NULL 哨兵（写库后读回为 null；假实现须模拟数据库而非透传哨兵） */
@@ -36,6 +40,34 @@ function makeFakePrisma(seed: {
   for (const row of (seed.insights ?? [])) insights.set(row.id as string, row);
   const legacyRows = [...(seed.legacy ?? [])];
   let inserts = 0;
+
+  /**
+   * 旧容器表（Artifact 子集）：实现**主键游标分页**（orderBy id asc + cursor/skip/take）——
+   * 与 store 的有界分批语义一致；判别谓词（type + content.kind）按 JSONB path 语义求值。
+   */
+  const artifactDelegate = {
+    findMany: vi.fn(async (args: {
+      where?: Record<string, unknown>;
+      orderBy?: { id: 'asc' | 'desc' };
+      take?: number;
+      cursor?: { id: string };
+      skip?: number;
+    } = {}) => {
+      const wanted = (args.where?.OR ?? []) as Array<{ content: { path: string[]; equals: string } }>;
+      const kinds = wanted.map((w) => w.content.equals);
+      let matched = legacyRows
+        .filter((row) => args.where === undefined || row.type === undefined
+          || row.type === (args.where.type as string))
+        .filter((row) => kinds.length === 0
+          || kinds.includes((row.content as Record<string, unknown> | null)?.kind as string))
+        .sort((a, b) => ((a.id as string) < (b.id as string) ? -1 : 1));
+      if (args.cursor) {
+        const idx = matched.findIndex((row) => row.id === args.cursor!.id);
+        matched = idx < 0 ? [] : matched.slice(idx + (args.skip ?? 0));
+      }
+      return typeof args.take === 'number' ? matched.slice(0, args.take) : matched;
+    }),
+  };
 
   const matches = (row: Record<string, unknown> | undefined, where: Record<string, unknown>): boolean => {
     if (!row) return false;
@@ -111,9 +143,12 @@ function makeFakePrisma(seed: {
   const prisma = {
     creativeHypothesis: delegate(hypotheses),
     creativeInsight: delegate(insights),
-    artifact: { findMany: vi.fn(async () => legacyRows) },
+    artifact: artifactDelegate,
   };
-  return { prisma, hypotheses, insights, legacyRows, get inserts() { return inserts; } };
+  return {
+    prisma, hypotheses, insights, legacyRows, artifact: artifactDelegate,
+    get inserts() { return inserts; },
+  };
 }
 
 function makeHypothesisDoc(over: Partial<HypothesisDoc> = {}): HypothesisDoc {
@@ -224,15 +259,42 @@ describe('HypothesisStore（专表：映射 + status/version CAS + 删除语义�
       history: [{ from: 'draft', to: 'ready', at: 'now', by: 'manual' }],
     });
 
-    expect(await store.cas(created.id, ['ready'], next)).toBe(0); // 当前 draft ∉ from → 未命中
-    expect(await store.cas(created.id, ['draft'], next)).toBe(1);
+    expect(await store.cas(created.id, ['ready'], next, created.version)).toBe(0); // 当前 draft ∉ from → 未命中
+    expect(await store.cas(created.id, ['draft'], next, created.version)).toBe(1);
     const after = await store.get(created.id);
     expect(after?.doc.status).toBe('ready');
     expect(after?.doc.statement).toBe('被提交的陈述');
     expect(after?.version).toBe(2); // 每次写入 +1
 
     // 组织 scope：文档归属与行不一致 → 绝不落到该行上
-    expect(await store.cas(created.id, ['ready'], makeHypothesisDoc({ status: 'draft', organizationId: 'org-other' }))).toBe(0);
+    expect(await store.cas(created.id, ['ready'], makeHypothesisDoc({ status: 'draft', organizationId: 'org-other' }), 2)).toBe(0);
+    expect((await store.get(created.id))?.doc.status).toBe('ready');
+  });
+
+  it('cas（version 谓词，D2-02 lost update）：并发 casFields 写入后，旧版本的 cas 必须 count=0 且不覆盖', async () => {
+    const { prisma } = makeFakePrisma();
+    const store = new HypothesisStore(prisma as never);
+    const created = await store.create('u1', makeHypothesisDoc()); // v1 draft
+    const reader = await store.get(created.id); // 调用方 A：读到 v1（draft）
+    expect(reader?.version).toBe(1);
+
+    // 调用方 B：另一路并发写入**非状态字段**（编辑陈述）→ v2；status 仍是 draft（status 谓词对该写入无感）
+    expect(await store.casFields(created.id, reader!.version, makeHypothesisDoc({ status: 'draft', statement: 'B 的并发编辑' }))).toBe(1);
+
+    // 调用方 A：拿着 v1 快照做状态推进（draft → ready）——status 谓词成立，但 version 已前移
+    const staleTransition = makeHypothesisDoc({
+      status: 'ready', statement: 'A 的旧快照陈述',
+      history: [{ from: 'draft', to: 'ready', at: 'now', by: 'manual' }],
+    });
+    expect(await store.cas(created.id, ['draft'], staleTransition, reader!.version)).toBe(0); // **绝不静默覆盖 B 的写入**
+    const after = await store.get(created.id);
+    expect(after?.version).toBe(2); // 未被 A 再写一次（旧实现会写成功并前移到 3）
+    expect(after?.doc.status).toBe('draft');
+    expect(after?.doc.statement).toBe('B 的并发编辑');
+
+    // 每次写入 +1；version 前移后重读 → 转移成功（失败方刷新后按新快照重试）
+    const reRead = await store.get(created.id);
+    expect(await store.cas(created.id, ['draft'], { ...staleTransition, statement: reRead!.doc.statement }, reRead!.version)).toBe(1);
     expect((await store.get(created.id))?.doc.status).toBe('ready');
   });
 
@@ -294,7 +356,7 @@ describe('InsightStore（专表：三层字段 + factsHash CAS）', () => {
       interpretation: { source: 'llm-interpretation', items: ['解读文本'], model: 'mock', attachedAt: 'now' },
     };
 
-    expect(await store.saveInterpretation(created.id, doc.factsHash, next)).toBe(1);
+    expect(await store.saveInterpretation(created.id, doc.factsHash, next, created.version)).toBe(1);
     const after = await store.get(created.id);
     expect(after?.doc.interpretation?.items).toEqual(['解读文本']);
     expect(after?.doc.facts).toEqual(doc.facts);
@@ -303,8 +365,33 @@ describe('InsightStore（专表：三层字段 + factsHash CAS）', () => {
     expect(after?.version).toBe(2);
 
     // 事实层已变化（旧指纹不再命中）→ 拒写：解读必须基于最新事实重新生成
-    expect(await store.saveInterpretation(created.id, 'stale-hash', next)).toBe(0);
+    expect(await store.saveInterpretation(created.id, 'stale-hash', next, 2)).toBe(0);
     expect((await store.get(created.id))?.doc.interpretation?.items).toEqual(['解读文本']);
+  });
+
+  it('saveInterpretation（version 第二锚点，D2-02）：指纹相同但版本已前移 → count=0，并发解读绝不互相覆盖', async () => {
+    const { prisma } = makeFakePrisma();
+    const store = new InsightStore(prisma as never);
+    const doc = makeInsightDoc();
+    const created = await store.create('u1', doc); // v1
+    const interpretation = (items: string[]): InsightDoc => ({
+      ...doc,
+      interpretation: { source: 'llm-interpretation', items, model: 'mock', attachedAt: 'now' },
+    });
+
+    // 两个并发写入者都基于 v1 读取、指纹一致：先到者落库
+    expect(await store.saveInterpretation(created.id, doc.factsHash, interpretation(['先到者']), 1)).toBe(1);
+    // 后到者（仍拿 v1）→ 版本已前移 → 拒写（否则会静默覆盖"先到者"的解读）
+    expect(await store.saveInterpretation(created.id, doc.factsHash, interpretation(['后到者']), 1)).toBe(0);
+    expect((await store.get(created.id))?.doc.interpretation?.items).toEqual(['先到者']);
+    expect((await store.get(created.id))?.version).toBe(2);
+
+    // 重读拿到 v2 → 显式覆盖成功；事实层逐字节不变
+    expect(await store.saveInterpretation(created.id, doc.factsHash, interpretation(['重读后覆盖']), 2)).toBe(1);
+    const after = await store.get(created.id);
+    expect(after?.doc.interpretation?.items).toEqual(['重读后覆盖']);
+    expect(after?.doc.facts).toEqual(doc.facts);
+    expect(after?.doc.derived).toEqual(doc.derived);
   });
 });
 
@@ -404,28 +491,94 @@ describe('存量回填（旧 Artifact 容器 → 专表；只读 + 幂等 + 不�
     expect(fake.legacyRows).toHaveLength(2);
   });
 
-  it('单行失败不阻塞其余行（外键/数据错误 → 跳过该行，后续行照常回填）', async () => {
-    const fake = makeFakePrisma({ legacy: [legacyHypothesis, legacyInsight] });
-    (fake.prisma.creativeHypothesis.createMany as unknown as { mockImplementationOnce: (fn: () => never) => void })
-      .mockImplementationOnce(() => {
-        throw new Error('FK violation');
-      });
+  it('批内毒行隔离：整批 createMany 失败 → 退化为逐行，毒行跳过、其余行照常回填', async () => {
+    const legacyHypothesis2 = {
+      ...legacyHypothesis,
+      id: 'legacy-h2',
+      content: { ...legacyHypothesis.content, statement: '第二个历史假设' },
+    };
+    const fake = makeFakePrisma({ legacy: [legacyHypothesis, legacyHypothesis2, legacyInsight] });
+    // 毒行 legacy-h1（如组织/用户已被删除 → 外键不成立）：凡是包含它的批量插入都失败
+    const original = fake.prisma.creativeHypothesis.createMany.getMockImplementation() as unknown as
+      (args: { data: Array<Record<string, unknown>>; skipDuplicates?: boolean }) => Promise<{ count: number }>;
+    (fake.prisma.creativeHypothesis.createMany as unknown as {
+      mockImplementation: (fn: (args: unknown) => Promise<{ count: number }>) => void;
+    }).mockImplementation(async (args: unknown) => {
+      const { data } = args as { data: Array<{ id: string }> };
+      if (data.some((row) => row.id === 'legacy-h1')) throw new Error('FK violation');
+      return original(args as { data: Array<Record<string, unknown>> });
+    });
+
     const store = new HypothesisStore(fake.prisma as never);
-    expect(await store.list({ organizationId: 'org1' })).toEqual([]); // 绝不抛出
-    expect(await store.get('legacy-h1')).toBeNull(); // 该行被跳过（保留旧行待人工处理）
-    expect(await new InsightStore(fake.prisma as never).get('legacy-i1')).toMatchObject({ id: 'legacy-i1' }); // 其余行照常
+    // 绝不抛出（回填失败不阻塞读路径）；同批其余行照常落库
+    expect((await store.list({ organizationId: 'org1' })).map((r) => r.id)).toEqual(['legacy-h2']);
+    expect(await store.get('legacy-h1')).toBeNull(); // 毒行被跳过（保留旧行待人工处理）
+    expect((await store.get('legacy-h2'))?.doc.statement).toBe('第二个历史假设'); // 同批其余行照常回填
+    expect(await new InsightStore(fake.prisma as never).get('legacy-i1')).toMatchObject({ id: 'legacy-i1' });
+    expect(fake.legacyRows).toHaveLength(3); // 旧行一律保留（只读迁移）
   });
 
-  it('扫描级失败不缓存：读路径不报错，下次访问重试成功', async () => {
+  it('扫描级失败退避：窗口内绝不重扫（不放大失败），窗口后自动重试成功', async () => {
     const fake = makeFakePrisma({ legacy: [legacyHypothesis] });
-    (fake.prisma.artifact.findMany as unknown as { mockImplementationOnce: (fn: () => never) => void })
-      .mockImplementationOnce(() => {
-        throw new Error('db down');
-      });
-    const store = new HypothesisStore(fake.prisma as never);
-    expect(await store.list({ organizationId: 'org1' })).toEqual([]); // 不因回填失败而 500
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+    try {
+      (fake.prisma.artifact.findMany as unknown as { mockImplementationOnce: (fn: () => never) => void })
+        .mockImplementationOnce(() => {
+          throw new Error('db down');
+        });
+      const store = new HypothesisStore(fake.prisma as never);
+      expect(await store.list({ organizationId: 'org1' })).toEqual([]); // 不因回填失败而 500
+      expect(fake.artifact.findMany).toHaveBeenCalledTimes(1);
 
-    expect((await store.get('legacy-h1'))?.doc.statement).toBe('历史假设'); // 重试 → 回填成功
+      // 退避窗口内：多次访问都不重扫（失败绝不被每个请求放大成一次全表扫描）
+      for (let i = 0; i < 3; i++) expect(await store.get('legacy-h1')).toBeNull();
+      expect(fake.artifact.findMany).toHaveBeenCalledTimes(1);
+
+      // 窗口流逝 → 下一次访问重试（回填幂等：重试安全）
+      nowSpy.mockReturnValue(1_700_000_000_000 + BACKFILL_RETRY_BACKOFF_MS);
+      expect((await store.get('legacy-h1'))?.doc.statement).toBe('历史假设');
+      expect(fake.artifact.findMany).toHaveBeenCalledTimes(2);
+
+      // 成功即永久记忆：此后不再扫
+      nowSpy.mockReturnValue(1_700_000_000_000 + 10 * BACKFILL_RETRY_BACKOFF_MS);
+      await store.list({ organizationId: 'org1' });
+      expect(fake.artifact.findMany).toHaveBeenCalledTimes(2);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('有界分批：主键游标 + take=BACKFILL_BATCH_SIZE，每批单次 createMany（绝无无界载入/逐行 N+1）', async () => {
+    const total = BACKFILL_BATCH_SIZE * 2 + 7; // 三批：500 / 500 / 7
+    const legacy = Array.from({ length: total }, (_, i) => ({
+      id: `legacy-${String(i).padStart(5, '0')}`,
+      userId: 'u1',
+      createdAt: new Date('2025-12-01T00:00:00Z'),
+      content: { kind: 'creative_hypothesis', organizationId: 'org1', status: 'draft', statement: `历史假设 ${i}` },
+    }));
+    const fake = makeFakePrisma({ legacy });
+    await new HypothesisStore(fake.prisma as never).list({ organizationId: 'org1' });
+
+    expect(fake.inserts).toBe(total); // 全量回填（幂等 skipDuplicates）
+    const calls = (fake.prisma.artifact.findMany as unknown as {
+      mock: { calls: Array<[Record<string, unknown>]> };
+    }).mock.calls.map(([args]) => args);
+    expect(calls).toHaveLength(3); // 三批（末批不满 → 收尾）：绝不一次全表读入
+    expect(calls.map((c) => c.take)).toEqual([BACKFILL_BATCH_SIZE, BACKFILL_BATCH_SIZE, BACKFILL_BATCH_SIZE]);
+    expect(calls[0].cursor).toBeUndefined();
+    expect(calls[1]).toMatchObject({ cursor: { id: 'legacy-00499' }, skip: 1, orderBy: { id: 'asc' } });
+    expect(calls[2]).toMatchObject({ cursor: { id: 'legacy-00999' } });
+    // 每批**一次** createMany（非逐行）：3 批 = 3 次（本批只有假设行）
+    expect(fake.prisma.creativeHypothesis.createMany).toHaveBeenCalledTimes(3);
+    expect((fake.prisma.creativeHypothesis.createMany as unknown as {
+      mock: { calls: Array<[{ data: unknown[]; skipDuplicates: boolean }]> };
+    }).mock.calls.map(([a]) => [a.data.length, a.skipDuplicates]))
+      .toEqual([[BACKFILL_BATCH_SIZE, true], [BACKFILL_BATCH_SIZE, true], [7, true]]);
+
+    // 幂等：第二次访问不再扫（专表行数不变）
+    await fake.artifact.findMany.mockClear();
+    await new HypothesisStore(fake.prisma as never).list({ organizationId: 'org1' });
+    expect(fake.inserts).toBe(total);
   });
 
   it('回填只扫旧容器判别谓词（type=other + content.kind ∈ 两种 kind）', async () => {
