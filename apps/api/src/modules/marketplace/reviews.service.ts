@@ -5,8 +5,8 @@
  * - 评分 1~5 整数：zod 初筛 + `isValidRating` 服务层复核（同一口径两处断言，见单测）；
  * - 一用户一条目**一条**评审：`@@unique([publicationId, userId])` 上的 upsert（重复提交 = 覆盖，绝不重复计数）；
  * - 任何写入（含首次打分与后续改分/改评语）一律回到 `pending`——**审核是计入公开聚合的前置门禁**；
- * - moderation 仅发布者组织 **owner/admin** 或平台管理员——**M10-P6 起为显式判定**
- *   （`marketplace-moderation.ts` 的 `MODERATION_ROLES`，不再借用 `member.write` 的隐式推论）；
+ * - moderation 仅发布者组织持有 **`marketplace.moderate`**（M11-P12 专用治理位；矩阵口径 owner/admin）
+ *   或平台管理员——判定唯一入口 `marketplace-moderation.ts`（不再借用 `member.write` 的隐式推论）；
  *   `moderate` 与 `list`（pending/rejected 过滤）一律经 `access.assertModerationRights` 裁决；
  *   非成员 → 404 防枚举，成员但权限不足（member/viewer）→ 403；
  * - 状态机 pending→approved|rejected、approved↔rejected（同状态重复提交幂等），**pending 永不可被设**；

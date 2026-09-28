@@ -1,66 +1,63 @@
 /**
- * M10-P6 Marketplace 治理（moderation）**显式权限判定**——本模块唯一事实源（闭环审计 D7 / M9-02）。
+ * M11-P12 Marketplace 治理（moderation）**专用权限位** `marketplace.moderate`——本模块唯一事实源。
  *
- * ### 被闭环的问题
- * M9-P6 的审核裁决**借用**了组织 RBAC 的 `member.write` 位，依据是"当前矩阵中**恰好**只有
- * owner/admin 命中"（M9 Final Baseline §5 已知降级："marketplace moderation 复用 member.write
- * 是语义借用"）。这是对权限矩阵的**隐式推论**：矩阵一旦调整（例如 member 获得 member.write，
- * 或某新角色被授予该位），治理权会**静默放宽**，且没有任何测试会变红。
+ * ### 演进（M9-P6 借用 → M10-P6 显式枚举 → M11-P12 专用位落地）
+ * - **M9-P6**：审核裁决**借用**组织 RBAC 的 `member.write` 位，依据是"当前矩阵中**恰好**只有
+ *   owner/admin 命中"（M9 Final Baseline §5 已知降级："marketplace moderation 复用 member.write
+ *   是语义借用"）。这是对权限矩阵的**隐式推论**：矩阵一旦调整即静默改变治理面，且无测试变红；
+ * - **M10-P6**：改为**显式角色枚举**（`MODERATION_ROLES` = owner/admin ∨ 平台管理员），判定与矩阵
+ *   完全解耦（矩阵漂移绝不放宽治理权），并在本文件顶部登记 Deferred：更干净的终态是**专用治理位**
+ *   （`marketplace.moderate`），文档明写"若 M11 引入该位，**唯一改动点是本文件**，全部调用方零改动"；
+ * - **M11-P12（本 Phase）**：**Deferred 已落地**——新增 `marketplace.moderate` 权限位
+ *   （`organizations/authorization.service.ts`：owner/admin = 有，member/viewer = 无），
+ *   判定**consume 该位**：治理权 = 调用者角色持有 `marketplace.moderate` ∨ 平台管理员。
  *
- * ### 本文件的处置：显式枚举 + 双向锁定（不新增权限位）
- * 1. **判定显式化**：治理权 = 组织 role ∈ `MODERATION_ROLES`（owner/admin，此处显式枚举）
- *    ∨ 平台管理员（市场治理面的窄口径逃生门）。判定函数**不读取权限矩阵**——
- *    `canModerateMarketplace` / `decideModeration` 的入参只有 `{ role, platformAdmin }`，
- *    类型上就没有权限位调查器（contract-level：没有 lookup 参数可传）。
- * 2. **矩阵耦合点唯一化**：`MODERATION_MATRIX_PERMISSION`（历史上被借用的那个位）只保留为
- *    **一致性锚**，由 `auditModerationMatrix` 复核：
- *    - `leakedRoles`：**非治理角色**却持有该位 → 治理语义已漂移（矩阵改动使"借用"的旧口径
- *      会放宽治理权）；
- *    - `missingRoles`：治理角色却不再持有该位 → 旧耦合口径已断裂。
- *    两者都**不改变裁决结果**（判定与矩阵解耦 → 永不因矩阵变动放宽），只作为告警/审计暴露给运维；
- *    单测以**真实矩阵**运行 `auditModerationMatrix` 并断言一致 —— 矩阵一改即红，强制人工复核治理语义。
- * 3. **fail-closed**：未知角色字面量（Prisma 枚举未来新增）一律 `false`——新角色必须显式归类
- *    才会获得治理权（`ALL_ORGANIZATION_ROLES` 与 Prisma 枚举的一致性由单测锁定）。
+ * ### 判定口径（唯一入口；不再有"借用"与"显式枚举"的分叉）
+ * - 授权输入 = `{ role, platformAdmin }`（评分/审核状态/安装量在类型上不可达）+ 权限位查询器
+ *   （默认 = 真实矩阵的**纯查询** `roleHasPermission`，无 IO、无实例；调用方可传自己的同源查询器）；
+ * - `MODERATION_ROLES`（owner/admin）**不再直接决定放行**，退居为**矩阵审计对照**：
+ *   `auditModerationMatrix` 比对"矩阵实际授予 `marketplace.moderate` 的角色集合"与声明治理角色集合——
+ *   - `leakedRoles`：非声明治理角色却持有该位 → 治理面被**显式放大**（须人工复核该授权是否本意）；
+ *   - `missingRoles`：声明治理角色失去该位 → 治理面被**收紧**（fail-closed：判定随之拒绝）；
+ * - 单测以**真实矩阵**跑该审计并断言一致 ⇒ **矩阵一改即红**，强制人工复核。这取代了 M10-P6
+ *   "角色硬编码 + 矩阵漂移告警"的临时锁：治理权现在来自一个**可审计、可 grep、可单测锁定**的授权位；
+ * - 与 `member.write`（组织成员管理）**彻底解耦**：该位不在治理判定路径上——member 日后获得
+ *   `member.write` 绝不改变治理权（单测 ⑥ 锁定，tripwire 已迁移到 `marketplace.moderate`）。
+ *
+ * ### fail-closed
+ * 未知角色字面量（Prisma 枚举未来新增）/ 矩阵无该行 → `false`（矩阵查询器 `?? []` 兜底，不抛出、
+ * 不放行）。新角色必须**显式**决定是否授予治理位（deny-by-default 不因"查不到"被绕过）。
  *
  * ### 不变量（M9-P6 语义原样保留）
- * - **评分/审核状态/安装量绝不参与授权**：本文件只吃 `role` + `platformAdmin` 两个入参，
+ * - **评分/审核状态/安装量绝不参与授权**：本文件只吃 `role` + `platformAdmin` + 治理位；
  *   评分在类型上不可达（单测用"伪造额外字段"的对象复核：rating=1/5 都不改变判定）；
  * - 治理动作**只**覆盖评审审核与条目驳回；内容编辑/发布/撤回恒为 `agent.write`（发布者写权），
  *   平台管理员**不**因治理权获得内容编辑能力；
  * - 非成员一律由调用方按 404 防枚举处理（本文件只在成员身份已确定后使用；role=null 仅表示
  *   "无组织角色"，判定返回 false）。
- *
- * ### 权限位缺口（Deferred → M11+；本轮 schema / M9 冻结矩阵不动，如实记录不伪装）
- * 更干净的终态是新增**专用治理位**（如 `marketplace.moderate`）：
- * - 设计：`OrgPermission` 增 `marketplace.moderate`；矩阵 owner/admin = 有，member/viewer = 无；
- *   与 `member.write`（组织成员管理）彻底解耦——member 日后若获得 member.write，不会连带获得治理权
- *   （该路径本文件已用显式枚举先行阻断，故此项是"语义整洁"而非安全缺口）；
- * - 风险/成本：改 `apps/api/src/modules/organizations/authorization.service.ts`（**非本模块所有权**）
- *   + 冻结矩阵新增位（M9 基线声明"不新增权限位"）+ 需评估既有角色语义漂移；
- * - 结论：**本 Phase 不实施**（M10 §9 安全边界：不为修问题大规模重构、不新增 RBAC 位）。
- *   若 M11 引入该位，**唯一改动点是本文件**（`MODERATION_ROLES` 与判定函数），全部调用方零改动。
  */
 
 import { OrganizationRole } from '@prisma/client';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
-import type { OrgPermission } from '../organizations/authorization.service';
+import { OrgPermission, roleHasPermission } from '../organizations/authorization.service';
 
 /**
- * 治理角色白名单（**显式枚举**：治理语义的唯一口径，绝不从权限矩阵反推）。
- * 增删必须是显式代码改动 + 测试复核（见 marketplace-moderation.spec.ts）。
+ * 治理角色白名单（**声明式口径**：矩阵审计的对照集合，见 `auditModerationMatrix`）。
+ * 增删必须是显式代码改动 + 测试复核（见 marketplace-moderation.spec.ts）；
+ * 该集合**不再**单独决定放行——放行 = 矩阵对 `MODERATION_PERMISSION` 的授予。
  */
 export type ModerationRole = 'owner' | 'admin';
 export const MODERATION_ROLES: readonly ModerationRole[] = ['owner', 'admin'];
 
 /**
- * 权限矩阵耦合锚：M9-P6 曾借用、本 Phase 起**不再用于裁决**的权限位。
- * 仅用于 `auditModerationMatrix` 检测矩阵漂移（告警不降级）。
+ * 治理权**唯一权限位**（M11-P12 专用位；矩阵口径：owner/admin = 有，member/viewer = 无）。
+ * 语义改变（改名/改矩阵授予面）必须显式复核本文件与 authorization.service.ts 的矩阵。
  */
-export const MODERATION_MATRIX_PERMISSION: OrgPermission = 'member.write';
+export const MODERATION_PERMISSION: OrgPermission = 'marketplace.moderate';
 
 /**
  * 全部组织角色（必须与 Prisma `OrganizationRole` 枚举一一对应——单测逐字比对，新增角色即红）。
- * 新角色被加入时，必须显式决定其是否属于 `MODERATION_ROLES`（deny-by-default：不列入即无治理权）。
+ * 新角色被加入时，必须显式决定其是否在矩阵中获得 `marketplace.moderate`（deny-by-default：不授予即无治理权）。
  */
 export const ALL_ORGANIZATION_ROLES: readonly OrganizationRole[] = ['owner', 'admin', 'member', 'viewer'];
 
@@ -72,6 +69,9 @@ export interface ModerationSubject {
   platformAdmin: boolean;
 }
 
+/** 权限矩阵查询器（`AuthorizationService.can` 的形状；纯函数，无 IO）——判定与审计同源 */
+export type RolePermissionLookup = (role: OrganizationRole, action: OrgPermission) => boolean;
+
 /** 判定来源（审计/日志友好；**绝不**作为授权输入回流） */
 export type ModerationVia = 'platform-admin' | 'organization-governance' | 'none';
 
@@ -82,73 +82,87 @@ export interface ModerationDecision {
   reason: string;
 }
 
-/** 角色是否为治理角色（显式枚举；未知/新增角色字面量一律 false——deny-by-default） */
+/**
+ * 角色是否被**声明**为治理角色（矩阵审计对照；未知/新增角色字面量一律 false）。
+ * 注意：这不是授权判定（授权看 `MODERATION_PERMISSION` 位），仅用于审计报告与 deny-by-default 测试。
+ */
 export function isModerationRole(role: OrganizationRole | null | undefined): role is ModerationRole {
   return role != null && (MODERATION_ROLES as readonly string[]).includes(role);
 }
 
 /**
- * 治理判定（显式布尔 + 来源）：**不读取权限矩阵**（入参无语义外字段即为契约）。
- * 平台管理员优先（逃生门）；否则仅组织 owner/admin。
+ * 治理判定（**consume `marketplace.moderate` 位**，显式布尔 + 来源）。
+ *
+ * - `lookup` 省略时 = 真实权限矩阵纯查询（`roleHasPermission`，无 IO）——调用方零改动；
+ *   传入自定义查询器即"模拟矩阵改动"（单测用；生产调用方传自己的 `auth.can` 以保持单一事实源）。
+ * - 平台管理员优先（逃生门，矩阵无关）；否则**仅**看治理位：持有 → 放行，未持有 → 拒绝。
+ *   role=null（无组织角色）恒拒绝。
  */
-export function decideModeration(subject: ModerationSubject): ModerationDecision {
+export function decideModeration(
+  subject: ModerationSubject,
+  lookup: RolePermissionLookup = roleHasPermission,
+): ModerationDecision {
   if (subject.platformAdmin) {
     return { allowed: true, via: 'platform-admin', reason: '平台管理员（市场治理面窄口径）' };
   }
-  if (isModerationRole(subject.role)) {
+  if (subject.role != null && lookup(subject.role, MODERATION_PERMISSION)) {
     return {
       allowed: true,
       via: 'organization-governance',
-      reason: `发布者组织治理角色（${MODERATION_ROLES.join('/')}）`,
+      reason: `持有 ${MODERATION_PERMISSION} 治理位（当前矩阵：${MODERATION_ROLES.join('/')}）`,
     };
   }
   return {
     allowed: false,
     via: 'none',
-    reason: `仅发布者组织 ${MODERATION_ROLES.join('/')}（治理角色）或平台管理员可执行治理动作`,
+    reason: `仅持有 ${MODERATION_PERMISSION} 的组织角色（${MODERATION_ROLES.join('/')}）或平台管理员可执行治理动作`,
   };
 }
 
 /** 显式布尔（审核端点一律走本函数；调用方不得自行推导治理权） */
-export function canModerateMarketplace(subject: ModerationSubject): boolean {
-  return decideModeration(subject).allowed;
+export function canModerateMarketplace(
+  subject: ModerationSubject,
+  lookup: RolePermissionLookup = roleHasPermission,
+): boolean {
+  return decideModeration(subject, lookup).allowed;
 }
 
 /** 判定 + 拒绝即抛 403（判定唯一入口的"断言"形态；绝不抛出后仍继续执行） */
-export function assertModerationDecision(subject: ModerationSubject): ModerationDecision {
-  const decision = decideModeration(subject);
+export function assertModerationDecision(
+  subject: ModerationSubject,
+  lookup: RolePermissionLookup = roleHasPermission,
+): ModerationDecision {
+  const decision = decideModeration(subject, lookup);
   if (!decision.allowed) throw new AppError(ErrorCode.FORBIDDEN, decision.reason);
   return decision;
 }
 
-// ===== 矩阵漂移检测（告警不降级：判定已与矩阵解耦，漂移绝不放宽/收紧裁决） =====
-
-/** 权限矩阵查询器（`AuthorizationService.can` 的形状；纯函数，无 IO） */
-export type RolePermissionLookup = (role: OrganizationRole, action: OrgPermission) => boolean;
+// ===== 矩阵漂移检测（治理位 ↔ 声明治理角色的一致性；观测面，不参与裁决） =====
 
 export interface ModerationMatrixAudit {
   permission: OrgPermission;
-  /** 一致 = 无泄露且无缺失 */
+  /** 一致 = 无泄露且无缺失（矩阵授予面恰为声明治理角色） */
   consistent: boolean;
-  /** 非治理角色却持有该位 → 矩阵改动会（在旧的"借用"口径下）静默放宽治理权 */
+  /** 非声明治理角色却持有该位 → 治理面被显式放大（须人工复核；单测以真实矩阵断言为空 ⇒ 矩阵一改即红） */
   leakedRoles: OrganizationRole[];
-  /** 治理角色却不再持有该位 → 旧耦合口径已断裂（治理权不受影响，仅记录语义漂移） */
+  /** 声明治理角色却未持有该位 → 治理面被收紧（判定 fail-closed 拒绝；须人工复核） */
   missingRoles: OrganizationRole[];
 }
 
 /**
- * 复核 `MODERATION_MATRIX_PERMISSION` 与治理角色的语义一致性（纯函数，传入矩阵查询器即可离线跑）。
+ * 复核 `MODERATION_PERMISSION` 的矩阵授予面与声明治理角色是否一致（纯函数，传入矩阵查询器即可离线跑）。
  * 真实矩阵的调用点：MarketplaceAccessService（每次治理裁决时告警）+ 单测（矩阵变更即红）。
+ * **本函数不改变任何裁决结果**——裁决恒取治理位本身，审计只把漂移暴露给运维/测试。
  */
 export function auditModerationMatrix(lookup: RolePermissionLookup): ModerationMatrixAudit {
   const leakedRoles = ALL_ORGANIZATION_ROLES.filter(
-    (role) => !isModerationRole(role) && lookup(role, MODERATION_MATRIX_PERMISSION),
+    (role) => !isModerationRole(role) && lookup(role, MODERATION_PERMISSION),
   );
   const missingRoles = ALL_ORGANIZATION_ROLES.filter(
-    (role) => isModerationRole(role) && !lookup(role, MODERATION_MATRIX_PERMISSION),
+    (role) => isModerationRole(role) && !lookup(role, MODERATION_PERMISSION),
   );
   return {
-    permission: MODERATION_MATRIX_PERMISSION,
+    permission: MODERATION_PERMISSION,
     consistent: leakedRoles.length === 0 && missingRoles.length === 0,
     leakedRoles,
     missingRoles,
