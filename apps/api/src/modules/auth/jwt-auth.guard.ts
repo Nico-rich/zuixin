@@ -7,8 +7,11 @@ import { AccessGuardService } from '../security/access-guard.service';
 
 export interface AuthedUser { userId: string; role: string; sessionId?: string; }
 
-/** JWT 载荷：sid = 签发该 access token 的会话 id（M8-P8 起签发；历史/内部签发的 token 无此声明） */
-interface AccessPayload { sub: string; role: string; sid?: string; iat?: number; exp?: number; }
+/**
+ * JWT 载荷：sid = 签发该 access token 的会话 id（M8-P8 起签发）；jti = token 唯一 id（M10-P1 起签发）。
+ * 历史/内部签发的 token 两个声明都可能缺失——缺失时跳过对应校验（向后兼容），不退化为"无校验放行"。
+ */
+interface AccessPayload { sub: string; role: string; sid?: string; jti?: string; iat?: number; exp?: number; }
 
 @Injectable()
 export class JwtAuthGuard implements CanActivate {
@@ -32,6 +35,10 @@ export class JwtAuthGuard implements CanActivate {
     if (!payload?.sub) throw new AppError(ErrorCode.UNAUTHORIZED, '登录已过期');
 
     if (this.access) {
+      // 0) M10-P1 SA-4/X-20：jti 黑名单（登出全部/主动轮换）——token 粒度最先判定
+      if (payload.jti && (await this.access.isJtiBlocked(payload.jti))) {
+        throw new AppError(ErrorCode.UNAUTHORIZED, '登录已失效，请重新登录');
+      }
       // 1) 会话撤销：token 携带 sid 时校验会话仍然有效（登出/轮换后 access token 立即失效）
       if (payload.sid && !(await this.access.isSessionLive(payload.sid))) {
         throw new AppError(ErrorCode.UNAUTHORIZED, '登录已失效，请重新登录');

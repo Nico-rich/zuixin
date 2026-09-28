@@ -6,6 +6,7 @@ loadEnv({ path: resolve(process.cwd(), '.env'), override: true });
 
 import { PrismaClient, ProviderType, ModelType, HealthStatus } from '@prisma/client';
 import * as argon2 from 'argon2';
+import { assertSeedPasswordSafe } from '../src/modules/security/production-guards';
 
 const prisma = new PrismaClient();
 
@@ -20,8 +21,12 @@ const LLM_PROVIDERS = [
 ];
 
 async function main() {
+  // M10-P1 生产守卫（D23）：生产环境拒绝用默认/占位口令初始化管理员
+  // （默认口令 admin123456 一旦进入生产 = 一个公开已知口令的 admin 账号）。
+  // 注意：本调用必须在 loadEnv 之后（文件顶部已加载 .env）。
   const email = process.env.SEED_ADMIN_EMAIL ?? 'admin@example.com';
   const password = process.env.SEED_ADMIN_PASSWORD ?? 'admin123456';
+  assertSeedPasswordSafe({ ...process.env, SEED_ADMIN_PASSWORD: password });
 
   const admin = await prisma.user.upsert({
     where: { email },

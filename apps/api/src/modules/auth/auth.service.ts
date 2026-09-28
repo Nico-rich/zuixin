@@ -8,7 +8,11 @@ import { OrganizationsService } from '../organizations/organizations.service';
 import { AuditService, maskEmail } from '../audit/audit.service';
 import { RedisKVService } from '../../core/circuit-breaker/redis-kv.service';
 import { AccessGuardService } from '../security/access-guard.service';
-import { LOGIN_FAIL_WINDOW_SEC, LOGIN_MAX_FAILS, REFRESH_TTL_SEC } from './auth.constants';
+import { SessionEventsService } from '../security/session-events.service';
+import {
+  ACCESS_TTL_SEC, LOGIN_FAIL_WINDOW_SEC, LOGIN_MAX_FAILS, REFRESH_TTL_SEC,
+  sessionConcurrencyPolicy, sessionMaxConcurrent,
+} from './auth.constants';
 
 export interface RequestMeta { ip: string; userAgent?: string; }
 
@@ -16,6 +20,9 @@ export interface AuthResult {
   accessToken: string; refreshToken: string;
   user: { id: string; email: string; displayName: string | null; role: string };
 }
+
+/** access token 里与本服务治理相关的声明（M10-P1：sid 定位会话、jti 支持主动轮换黑名单） */
+export interface AccessClaims { sessionId?: string; jti?: string; exp?: number; }
 
 @Injectable()
 export class AuthService {
@@ -30,6 +37,8 @@ export class AuthService {
     @Optional() @Inject(AuditService) private readonly audit?: AuditService,
     // M8-P8 会话缓存（登出后立即失效；@Optional 仅为保持最小可构造性，AppModule 场景由 @Global SecurityModule 提供）
     @Optional() @Inject(AccessGuardService) private readonly access?: AccessGuardService,
+    // M10-P1 SA-1/SA-4：跨实例撤销传播（pub/sub `session-events`）+ jti 黑名单记账
+    @Optional() @Inject(SessionEventsService) private readonly events?: SessionEventsService,
   ) {}
 
   async login(email: string, password: string, meta: RequestMeta): Promise<AuthResult> {
@@ -63,6 +72,20 @@ export class AuthService {
         metadata: { email: maskEmail(email), ip: meta.ip },
       });
       throw new AppError(ErrorCode.FORBIDDEN, '账号已被禁用');
+    }
+    // M10-P1 X-21 / D16（**仅登录入口**）：组织禁用态 → 拒绝签发会话。
+    // 判定对象：用户**个人组织**——登录时尚无"当前组织"上下文，个人组织是登录建立的默认租户上下文。
+    // 非个人组织的禁用由资源守卫裁决（A14 OrgStatusGuard，M10-P14）；本处不越权覆盖资源面。
+    const personalOrgRow = await this.prisma.organization.findFirst({
+      where: { ownerUserId: user.id, isPersonal: true, deletedAt: null },
+      select: { status: true },
+    });
+    if (personalOrgRow?.status === 'disabled') {
+      await this.audit?.write({
+        userId: user.id, action: 'auth.login_failed', result: 'denied', reason: '所属组织已被禁用',
+        metadata: { email: maskEmail(email), ip: meta.ip },
+      });
+      throw new AppError(ErrorCode.ORG_DISABLED, '所属组织已被禁用，无法登录');
     }
     await this.clearLoginFails(failKey);
     await this.prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
@@ -125,28 +148,111 @@ export class AuthService {
    * 只靠 refresh cookie 时，若 refresh cookie 缺失/过期则会话不会被撤销、access token 仍可用约 15 分钟；
    * 传入 access token 的 sid（已验签）后，两种 cookie 任一存在即可完成会话撤销。
    */
-  async logout(rawRefresh: string | undefined, accessSessionId?: string): Promise<void> {
+  async logout(rawRefresh: string | undefined, accessSessionId?: string, claims?: AccessClaims | null): Promise<void> {
     const conditions: Array<{ tokenHash: string } | { id: string }> = [];
     if (rawRefresh) conditions.push({ tokenHash: this.hash(rawRefresh) });
     if (accessSessionId) conditions.push({ id: accessSessionId });
     if (!conditions.length) return;
+    // 先取将被撤销的会话（用于跨实例事件携带 userId/sessionId；updateMany 不回传受影响行）
+    const targets = await this.prisma.session.findMany({
+      where: { OR: conditions, revokedAt: null }, select: { id: true, userId: true },
+    });
     await this.prisma.session.updateMany({
       where: { OR: conditions, revokedAt: null },
       data: { revokedAt: new Date() },
     });
-    // 进程内会话缓存立即失效（无需等待 TTL；跨进程仍有 ≤ TTL 窗口，见 AccessGuardService 注释）
+    for (const t of targets) this.access?.invalidateSession(t.id); // 本进程立即失效
     if (accessSessionId) this.access?.invalidateSession(accessSessionId);
+    // M10-P1 SA-4/X-20：当前 access token 的 jti 一并拉黑（TTL = 剩余寿命）——
+    // 纵深：即使会话行被其他路径"复活"，这个已登出的 token 也不再可用。
+    await this.blacklistAccessToken(claims);
+    // M10-P1 SA-1/X-10：跨实例撤销传播（其他实例立即清肯定缓存，不再等 TTL）
+    await this.events?.publish({
+      type: 'session.revoked',
+      ...(accessSessionId ? { sessionId: accessSessionId } : targets[0] ? { sessionId: targets[0].id } : {}),
+      ...(targets[0] ? { userId: targets[0].userId } : {}),
+    });
+  }
+
+  /**
+   * M10-P1 SA-4/X-20：登出全部（撤销该用户**全部**活跃会话 + 拉黑其全部有效 jti + 跨实例传播）。
+   * 用途：用户主动"登出所有设备"、管理员踢出、检测到凭证泄漏后的应急撤销。
+   * 返回实际撤销的会话数与拉黑的 jti 数（可审计的事实，不做乐观上报）。
+   */
+  async logoutAll(userId: string, claims?: AccessClaims | null): Promise<{ revokedSessions: number; blacklistedJtis: number }> {
+    const targets = await this.prisma.session.findMany({
+      where: { userId, revokedAt: null }, select: { id: true },
+    });
+    const revoked = await this.prisma.session.updateMany({
+      where: { userId, revokedAt: null }, data: { revokedAt: new Date() },
+    });
+    for (const t of targets) this.access?.invalidateSession(t.id);
+    // 当前这次请求所用的 token 也拉黑（其 jti 可能因记账通道降级而不在集合里）
+    await this.blacklistAccessToken(claims);
+    const blacklistedJtis = (await this.events?.blacklistAllUserJtis(userId)) ?? 0;
+    await this.events?.publish({ type: 'user.sessions_revoked', userId });
+    return { revokedSessions: revoked.count, blacklistedJtis };
+  }
+
+  /** 从 access token 提取治理相关声明（仅本地验签，不查库；验签失败 → null） */
+  async accessTokenClaims(accessToken: string | undefined): Promise<AccessClaims | null> {
+    if (!accessToken) return null;
+    try {
+      const payload = await this.jwt.verifyAsync<{ sid?: string; jti?: string; exp?: number }>(accessToken);
+      return {
+        ...(payload?.sid ? { sessionId: payload.sid } : {}),
+        ...(payload?.jti ? { jti: payload.jti } : {}),
+        ...(typeof payload?.exp === 'number' ? { exp: payload.exp } : {}),
+      };
+    } catch {
+      return null;
+    }
   }
 
   /** 从 access token 提取会话 id（仅本地验签，不查库；验签失败/无 sid → null） */
   async sessionIdFromAccessToken(accessToken: string | undefined): Promise<string | null> {
-    if (!accessToken) return null;
-    try {
-      const payload = await this.jwt.verifyAsync<{ sid?: string }>(accessToken);
-      return payload?.sid ?? null;
-    } catch {
-      return null;
+    return (await this.accessTokenClaims(accessToken))?.sessionId ?? null;
+  }
+
+  /** 把 access token 的 jti 写入黑名单；TTL = token 剩余寿命（绝不留比 token 更久的墓碑） */
+  private async blacklistAccessToken(claims?: AccessClaims | null): Promise<void> {
+    if (!claims?.jti || !this.events) return;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const exp = claims.exp ?? nowSec + ACCESS_TTL_SEC;
+    await this.events.blacklistJti(claims.jti, exp - nowSec);
+  }
+
+  /**
+   * M10-P1 SA-1：每用户活跃会话上限（并发会话治理）。
+   * 策略见 auth.constants.sessionConcurrencyPolicy（默认 evict-oldest = 挤掉最旧，保证用户始终可登录）。
+   * 竞态口径：挤占用 `updateMany({ id, revokedAt: null })` 做 CAS；CAS 未命中（并发登录已挤掉）时
+   * **保守拒绝**（SESSION_CONCURRENCY_EXCEEDED），绝不放任会话数突破上限。
+   */
+  private async enforceSessionLimit(userId: string): Promise<void> {
+    const limit = sessionMaxConcurrent();
+    if (limit <= 0) return; // ≤0 = 不限制（显式关闭）
+    const active = await this.prisma.session.count({
+      where: { userId, revokedAt: null, expiresAt: { gt: new Date() } },
+    });
+    if (active < limit) return;
+    if (sessionConcurrencyPolicy() === 'reject') {
+      throw new AppError(ErrorCode.SESSION_CONCURRENCY_EXCEEDED, `活跃会话数已达上限（${limit}），请先登出其他设备`);
     }
+    const oldest = await this.prisma.session.findFirst({
+      where: { userId, revokedAt: null, expiresAt: { gt: new Date() } },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true },
+    });
+    if (!oldest) return;
+    const evicted = await this.prisma.session.updateMany({
+      where: { id: oldest.id, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+    if (evicted.count === 0) {
+      throw new AppError(ErrorCode.SESSION_CONCURRENCY_EXCEEDED, `活跃会话数已达上限（${limit}），请稍后重试`);
+    }
+    await this.events?.publish({ type: 'session.revoked', sessionId: oldest.id, userId });
+    this.access?.invalidateSession(oldest.id);
   }
 
   async me(userId: string) {
@@ -156,6 +262,8 @@ export class AuthService {
   }
 
   private async issueTokens(user: { id: string; email: string; displayName: string | null; role: string }, meta: RequestMeta): Promise<AuthResult> {
+    // M10-P1 SA-1：签发前做会话并发上限准入（两条签发路径——登录与 refresh——共用本方法）
+    await this.enforceSessionLimit(user.id);
     // M8-P8：会话 id 由服务端预生成 → access token 携带 sid（登出/撤销后 access token 立即失效）。
     // 预生成而非依赖 create 返回值：签发与落库的 id 一致且无竞态。
     const sessionId = randomUUID();
@@ -168,7 +276,10 @@ export class AuthService {
         userAgent: meta.userAgent, ip: meta.ip,
       },
     });
-    const accessToken = await this.jwt.signAsync({ sub: user.id, role: user.role, sid: sessionId });
+    // M10-P1 SA-4：jti 由本服务生成（而非依赖库随机）——签发即可记账，供"登出全部/主动轮换"精确拉黑
+    const jti = randomUUID();
+    const accessToken = await this.jwt.signAsync({ sub: user.id, role: user.role, sid: sessionId, jti });
+    await this.events?.trackJti(user.id, jti, Math.floor(Date.now() / 1000) + ACCESS_TTL_SEC);
     return {
       accessToken, refreshToken,
       user: { id: user.id, email: user.email, displayName: user.displayName, role: user.role },

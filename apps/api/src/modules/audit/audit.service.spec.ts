@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Logger } from '@nestjs/common';
 import { AuditService, maskEmail, maskSensitive } from './audit.service';
 import { TraceContext } from '../../core/tracing/trace-context';
 
@@ -110,5 +111,47 @@ describe('AuditService（M8-P3 增强：trace 自动注入 + 强制脱敏）', (
 
     prisma.auditLog.create.mockRejectedValueOnce(new Error('db down'));
     await expect(svc.write({ userId: 'u3', action: 'auth.login' })).resolves.toBeUndefined();
+  });
+
+  describe('M10-P1 D13：审计写失败必须可见（best-effort ≠ 静默）', () => {
+    it('写失败 → warn 带 action + 错误消息（此前是 .catch(() => undefined) 完全吞掉）', async () => {
+      const { svc, prisma } = makeService();
+      const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      try {
+        prisma.auditLog.create.mockRejectedValueOnce(new Error('db down'));
+        await svc.write({ userId: 'u3', action: 'connection.established' });
+
+        expect(warn).toHaveBeenCalledTimes(1);
+        const msg = String(warn.mock.calls[0][0]);
+        expect(msg).toContain('connection.established'); // 知道是哪条审计丢了
+        expect(msg).toContain('db down'); // 知道为什么丢
+        expect(msg).toContain('降级'); // 明确这是降级而非正常路径
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('告警**绝不复述 metadata**（可能含尚未脱敏的输入——脱敏只发生在落库前）', async () => {
+      const { svc, prisma } = makeService();
+      const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      try {
+        prisma.auditLog.create.mockRejectedValueOnce(new Error('db down'));
+        await svc.write({ userId: 'u3', action: 'auth.login', metadata: { accessToken: 'raw-token-in-metadata' } });
+        expect(String(warn.mock.calls[0][0])).not.toContain('raw-token-in-metadata');
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('写成功 → 不产生告警（告警只表示真降级，不被正常路径淹没）', async () => {
+      const { svc } = makeService();
+      const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      try {
+        await svc.write({ userId: 'u3', action: 'auth.login' });
+        expect(warn).not.toHaveBeenCalled();
+      } finally {
+        warn.mockRestore();
+      }
+    });
   });
 });

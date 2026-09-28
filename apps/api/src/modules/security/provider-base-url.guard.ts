@@ -27,11 +27,28 @@ export interface ProviderBaseUrlInput {
   allowHttp?: boolean;
 }
 
-/** mock 类 adapter 不出网（种子 provider baseUrl 为空是正常配置） */
-const MOCK_ADAPTER = /^mock(-|$)/;
+/**
+ * M10-P1 D24：mock 类 adapter 判定从正则 `/^mock(-|$)/` **收紧为精确枚举**。
+ *
+ * 原正则的问题：它是一个**前缀/分段**匹配，任何形如 `mock-anything`、`mock_anything`（`-` 分段）、
+ * 甚至未来新增的 `mock-<恶意或第三方>` adapter 名都会**自动**被当作"不出网"而**跳过 baseUrl 的 SSRF 校验**
+ * ——等于给了一个"取个 mock- 开头的名字就能让平台带自己的出口身份去访问任意内网地址"的旁路。
+ * 既然适配器集合是**平台代码里固定的枚举**（见 seed.ts 与各 manager 的 switch），判定就应当写成枚举：
+ * 只有平台**真实实现**的替身 adapter 才享受跳过校验的待遇；未知名字一律按"会出网"处理（fail-closed）。
+ *
+ * 新增替身 adapter 时必须**同时**在此登记 + 在对应 manager 的 switch 中实现——
+ * 这是一次有意识的改动，而不是靠命名巧合获得豁免。
+ */
+export const MOCK_ADAPTERS: ReadonlySet<string> = new Set([
+  'mock',           // LLM echo 替身（providers/llm/adapters/mock.adapter.ts）
+  'mock-router',    // 意图路由替身（llm-manager 的 mock-router）
+  'mock-image',     // 生图替身（providers/image/adapters/mock-image.adapter.ts）
+  'mock-video',     // 生视频替身（providers/video/adapters/mock-video.adapter.ts）
+  'mock-embedding', // embedding 确定性向量替身（providers/embedding）
+]);
 
 export function isMockAdapter(adapter: string | null | undefined): boolean {
-  return typeof adapter === 'string' && MOCK_ADAPTER.test(adapter);
+  return typeof adapter === 'string' && MOCK_ADAPTERS.has(adapter.trim());
 }
 
 /**
