@@ -1,5 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, Optional } from '@nestjs/common';
 import Redis from 'ioredis';
+import { boundedRedisOptions, redisCallDeadlineMs, withDeadline } from '../redis/redis-resilience';
 
 const CHANNEL_PREFIX = 'agent:events:';
 
@@ -9,6 +10,16 @@ export const EVENT_BATCH_WINDOW_MS = 10;
 export const EVENT_BATCH_MAX = 128;
 /** 关停时冲刷的最长等待（Redis 不可达绝不阻塞进程退出） */
 const DESTROY_FLUSH_TIMEOUT_MS = 200;
+
+/**
+ * Pre-M9 G4：单次发布/订阅的调用面兜底上界（默认 = 命令超时 + 500ms 宽限，env 可覆盖）。
+ * 理由：事件总线位于 AgentRun 主循环（driver 在 finally 中必须 flush），
+ * 若 Redis 半开则 await publish 会永久挂住 → 回合无法收尾、lease 无法释放。
+ */
+export const EVENT_OP_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.EVENT_OP_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : redisCallDeadlineMs();
+})();
 
 /** run 观察通道（M6-P6 SSE 订阅；driver/trigger/API 共用——core 层定义避免 worker↔module 依赖） */
 export const agentRunChannel = (runId: string) => `agent-run:${runId}`;
@@ -74,8 +85,10 @@ export class EventBusService implements OnModuleDestroy {
       return;
     }
     const url = process.env.REDIS_URL ?? 'redis://localhost:6379';
-    this.pub = wrapRedis(new Redis(url, { maxRetriesPerRequest: null }));
-    this.sub = wrapRedis(new Redis(url, { maxRetriesPerRequest: null }));
+    // Pre-M9 G4：原为 maxRetriesPerRequest: null（命令无限重试 → 半开连接下 await publish 永不返回）。
+    // 发布/订阅均为**非阻塞命令**（无 BLPOP 类），可安全启用命令超时 + 有界重试。
+    this.pub = wrapRedis(new Redis(url, boundedRedisOptions()));
+    this.sub = wrapRedis(new Redis(url, boundedRedisOptions()));
     this.attachDispatcher();
   }
 
@@ -102,14 +115,14 @@ export class EventBusService implements OnModuleDestroy {
     this.scheduleFlush();
   }
 
-  /** 强制冲刷（流结束/异常路径/关停）：清窗口定时器并立即发布全部缓冲事件 */
+  /** 强制冲刷（流结束/异常路径/关停）：清窗口定时器并立即发布全部缓冲事件（有界，失败不冒泡） */
   async flush(): Promise<void> {
     this.clearTimer();
     if (!this.buffer.length) { await this.chain; return; }
     const batch = this.buffer;
     this.buffer = [];
     // 串行化：绝不与在途批量并发（同一 channel 的事件顺序恒定）
-    this.chain = this.chain.then(() => this.send(batch)).catch((err) => {
+    this.chain = this.chain.then(() => this.sendBounded(batch)).catch((err) => {
       this.logger.error(`事件发布失败（${batch.length} 条）: ${(err as Error).message}`);
     });
     await this.chain;
@@ -135,11 +148,36 @@ export class EventBusService implements OnModuleDestroy {
     for (const entry of batch) await this.pub.publish(entry.channel, entry.message);
   }
 
+  /**
+   * Pre-M9 G4：带调用面上界的发布。
+   * 降级（**fail-open**）：超时/失败仅记录日志并丢弃本批——事件推送是"尽力而为"的实时观察面，
+   * **事实源是 DB**（AgentRun timeline 投影 + 事件表）；绝不让 Redis 故障阻塞 AgentRun 收尾、
+   * lease 释放或 SSE 线程（原 `maxRetriesPerRequest: null` 下 await publish 可能永不返回）。
+   */
+  private async sendBounded(batch: Array<{ channel: string; message: string }>): Promise<void> {
+    try {
+      await withDeadline(this.send(batch), EVENT_OP_TIMEOUT_MS, `event-bus:publish:${batch.length}`);
+    } catch (err) {
+      this.logger.error(`事件发布失败/超时（${batch.length} 条，降级：丢弃本批，事实源为 DB）: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * 订阅（底层 Redis 订阅一次；handler 分发出内存 Map 承担）。
+   * Pre-M9 G4：**有界等待 + 显式失败**——订阅建立不上时清掉刚写入的 handler 集合后抛错，
+   * 绝不留下"看起来有订阅、实际收不到事件"的半成品状态；调用点据此选择降级（如 SSE 仅推快照）。
+   */
   async subscribe(channel: string, handler: (event: Record<string, unknown>) => void): Promise<void> {
     const key = CHANNEL_PREFIX + channel;
     if (!this.handlers.has(key)) {
       this.handlers.set(key, new Set());
-      await this.sub.subscribe(key, () => undefined); // 底层订阅一次；handler 分发出内存 Map 承担
+      try {
+        await withDeadline(this.sub.subscribe(key, () => undefined), EVENT_OP_TIMEOUT_MS, `event-bus:subscribe:${key}`);
+      } catch (err) {
+        this.handlers.delete(key); // 订阅未建立 → 不留半成品
+        this.logger.error(`事件订阅失败/超时（${key}）: ${(err as Error).message}`);
+        throw err;
+      }
     }
     this.handlers.get(key)!.add(handler);
   }

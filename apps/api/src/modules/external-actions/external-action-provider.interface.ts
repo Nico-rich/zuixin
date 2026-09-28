@@ -18,7 +18,23 @@ export interface ExternalActionRequest {
   signal: AbortSignal;
 }
 
+/**
+ * Pre-M9 G7：远端动作**真实状态**（崩溃恢复时按 externalRequestId 反查，provider 权威）。
+ * `published` 之外的两种终态都可落库；`processing` 表示远端仍在执行 → 保持本地 executing，绝不伪造终态。
+ */
+export interface ExternalActionRemoteStatus {
+  status: 'processing' | 'completed' | 'failed';
+  result?: unknown;
+  errorCode?: string;
+  error?: string;
+}
+
 export interface ExternalActionProvider {
   name: string;
   execute(req: ExternalActionRequest): Promise<unknown>;
+  /**
+   * Pre-M9 G7：按**远端幂等键**查询动作真实状态（可选——平台不支持状态查询则不实现，
+   * 此时残留 executing 行由业务重试接管：同一 externalRequestId 交给 provider 去重，副作用依然 exactly-once）。
+   */
+  remoteStatus?(req: ExternalActionRequest): Promise<ExternalActionRemoteStatus>;
 }

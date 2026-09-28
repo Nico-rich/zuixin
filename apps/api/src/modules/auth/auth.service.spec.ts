@@ -56,6 +56,29 @@ describe('AuthService.login', () => {
     expect(prisma.user.findUnique).not.toHaveBeenCalled();
   });
 
+  it('Pre-M9 G4：登录计数 Redis 读取失败 → 降级放行（fail-open，不因基础设施故障打死登录）', async () => {
+    const { svc, prisma, kv } = makeAuth();
+    kv.get.mockRejectedValue(new Error('Redis 操作超时（kv:get，>1500ms）'));
+    prisma.user.findUnique.mockResolvedValue({ ...activeUser, passwordHash: await argon2.hash('secret123') });
+    const r = await svc.login('a@b.com', 'secret123', { ip: '1.2.3.4' });
+    expect(r.accessToken).toBe('jwt-token'); // 放行
+  });
+
+  it('Pre-M9 G4：计数写入失败仍返回 UNAUTHORIZED（业务裁决不被基础设施故障改写）', async () => {
+    const { svc, prisma, kv } = makeAuth();
+    kv.incr.mockRejectedValue(new Error('Redis 操作超时（kv:incr，>1500ms）'));
+    prisma.user.findUnique.mockResolvedValue({ ...activeUser, passwordHash: await argon2.hash('right') });
+    await expect(svc.login('a@b.com', 'wrong', { ip: '1.2.3.4' })).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+  });
+
+  it('Pre-M9 G4：成功登录后计数清零失败 → 登录仍成功（正确密码绝不被 Redis 抖动拦下）', async () => {
+    const { svc, prisma, kv } = makeAuth();
+    kv.set.mockRejectedValue(new Error('Redis 操作超时（kv:set，>1500ms）'));
+    prisma.user.findUnique.mockResolvedValue({ ...activeUser, passwordHash: await argon2.hash('secret123') });
+    const r = await svc.login('a@b.com', 'secret123', { ip: '1.2.3.4' });
+    expect(r.accessToken).toBe('jwt-token');
+  });
+
   it('用户不存在 → 同样返回 UNAUTHORIZED（防枚举）', async () => {
     const { svc, prisma } = makeAuth();
     prisma.user.findUnique.mockResolvedValue(null);

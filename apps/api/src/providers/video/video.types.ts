@@ -22,6 +22,10 @@ export interface VideoRemoteStatus {
 export interface VideoProvider {
   readonly kind: 'video';
   submit(params: VideoGenerationParams): Promise<{ remoteTaskId: string }>;
-  getStatus(remoteTaskId: string): Promise<VideoRemoteStatus>;
+  /**
+   * 查询远端任务状态。Pre-M9 G5：`opts.signal` 传整体 deadline 信号（适配器将其与单请求超时
+   * 组合后交给 fetch，任一触发即中止）；不传则仅受适配器单请求超时约束。
+   */
+  getStatus(remoteTaskId: string, opts?: { signal?: AbortSignal }): Promise<VideoRemoteStatus>;
   cancel?(remoteTaskId: string): Promise<void>;
 }

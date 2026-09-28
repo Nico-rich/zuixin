@@ -166,13 +166,37 @@ describe('SchedulerService（M8-P5 调度：幂等/状态机/队列投递）', (
 
     await svc.resume('u1', 'job-1');
     expect(prisma.scheduledJob.updateMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: 'job-1', status: 'paused' }, data: expect.objectContaining({ status: 'scheduled', attempts: 0 }),
+      where: { id: 'job-1', status: { in: ['paused', 'dead'] } }, // Pre-M9 G9：可恢复 = paused/dead
+      data: expect.objectContaining({ status: 'scheduled', attempts: 0 }),
     }));
     expect((queue.add.mock.calls.at(-1)![2] as { jobId: string }).jobId).toBe('sched-rec-job-1');
     expect(state.row!.status).toBe('scheduled');
 
     state.row = makeRow({ status: 'completed' });
     await expect(svc.resume('u1', 'job-1')).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+
+  it('G9：dead（重试超限/stalled 判死）可显式 resume——attempts 归零、lastError/completedAt 清空、重新投递', async () => {
+    const { svc, prisma, queue, state } = makeService({
+      type: 'delayed', runAt: new Date(Date.now() - 1000),
+      status: 'dead', attempts: 3, lastError: 'stalled：心跳中断', completedAt: new Date(),
+    });
+    const res = await svc.resume('u1', 'job-1');
+    expect(res).toEqual({ resumed: true, status: 'scheduled' });
+    expect(prisma.scheduledJob.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'job-1', status: { in: ['paused', 'dead'] } },
+      data: { status: 'scheduled', attempts: 0, lastError: null, completedAt: null }, // 重试预算与失败留痕一并重置
+    }));
+    expect((queue.add.mock.calls.at(-1)![2] as { jobId: string }).jobId).toBe('sched-job-1');
+    expect(state.row!.status).toBe('scheduled');
+  });
+
+  it('G9：终态/进行中状态一律不可 resume（completed/cancelled/running/pending/scheduled）', async () => {
+    for (const status of ['completed', 'cancelled', 'running', 'pending', 'scheduled']) {
+      const { svc, state } = makeService({ status });
+      state.row = makeRow({ status }); // 条件更新失配（count=0）
+      await expect(svc.resume('u1', 'job-1')).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    }
   });
 
   it('pause/resume：one-shot 移除延迟 job；resume 按剩余时间重建（已过期 → 立即）', async () => {

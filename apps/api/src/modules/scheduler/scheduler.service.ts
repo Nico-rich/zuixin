@@ -6,11 +6,23 @@ import type { ScheduledJob } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthorizationService } from '../organizations/authorization.service';
 import { SCHEDULER_QUEUE } from '../../core/queue/scheduler-queue.module';
+import { addJobBounded } from '../../core/queue/bounded-add';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 
 export type ScheduledJobType = 'one-shot' | 'delayed' | 'recurring';
 /** 可执行状态（处理器只从这两个状态认领——终态/暂停/取消的行绝不被 BullMQ 残留 job 意外执行） */
 export const SCHEDULED_ACTIVE_STATUSES = ['pending', 'scheduled'] as const;
+
+/**
+ * Pre-M9 G9：`ScheduledJob.status` 语义（**沿用既有取值，不新增**；schema 列注释为准）：
+ * - `pending` / `scheduled`：可执行（待投递 / 已投递且等 BullMQ 触发）；
+ * - `running`：处理器已认领并执行中（心跳经 updatedAt 观测）；
+ * - `paused`：用户暂停（行保留、队列投递已移除）→ resume 重建投递；
+ * - `dead`：**终态失败**（重试超 maxAttempts，或 stalled 心跳中断被判死）→ 人工显式 resume 可复活；
+ * - `completed` / `cancelled`：终态，任何路径都不复活（resume/cancel 都拒绝对它们操作）。
+ * `failed` 为 schema 注释中的历史取值，当前实现不写入（终态失败统一为 `dead`）。
+ */
+export const SCHEDULED_RESUMABLE_STATUSES = ['paused', 'dead'] as const;
 
 export interface ScheduleJobInput {
   ownerUserId: string;
@@ -184,19 +196,19 @@ export class SchedulerService {
       if (!row.cron) throw new AppError(ErrorCode.VALIDATION_ERROR, 'recurring 作业缺少 cron');
       // 作业名 = 行身份（BullMQ 的 repeatable 元数据不保留自定义 jobId，只有 name 可用于精确注销）；
       // 同名同 pattern 重复注册由 BullMQ 去重（pause→resume 重建不会产生第二条）
-      await this.queue.add(
+      await addJobBounded(this.queue,
         repeatJobId(row.id),
         { jobId: row.id },
         { jobId: repeatJobId(row.id), repeat: { pattern: row.cron }, removeOnComplete: true, removeOnFail: true, priority: row.priority },
-      );
+        `recurring:${row.id}`);
       return;
     }
     const delay = delayOverrideMs ?? Math.max(0, (row.runAt?.getTime() ?? Date.now()) - Date.now());
-    await this.queue.add(
+    await addJobBounded(this.queue,
       'scheduled-job',
       { jobId: row.id },
       { jobId: oneShotJobId(row.id, row.attempts), delay, removeOnComplete: true, removeOnFail: true, priority: row.priority },
-    );
+      `one-shot:${row.id}`);
   }
 
   /**
@@ -204,11 +216,12 @@ export class SchedulerService {
    * 同 id add 会被 BullMQ 判重丢弃（作业就永远卡住）。
    */
   async enqueueRetry(id: string, delayMs: number, attempt: number): Promise<void> {
-    await this.queue.add(
+    // Pre-M9 G4：投递有界（2s）——调用方（worker 失败重投路径）已有 catch 告警，行仍为 scheduled 可人工触发
+    await addJobBounded(this.queue,
       'scheduled-job',
       { jobId: id },
       { jobId: oneShotJobId(id, attempt), delay: Math.max(0, Math.trunc(delayMs)), removeOnComplete: true, removeOnFail: true },
-    );
+      `retry:${id}#${attempt}`);
   }
 
   /** 取消（pending/scheduled/running/paused → cancelled + 移除 BullMQ job）；已 cancelled 幂等返回，其余终态 → 400 */
@@ -246,14 +259,23 @@ export class SchedulerService {
     return { paused: true, status: 'paused' };
   }
 
-  /** 恢复（paused → scheduled + 重建 BullMQ job）；非 paused → 400 */
+  /**
+   * 恢复（paused/dead → scheduled + 重建 BullMQ job；attempts 归零、lastError/completedAt 清空）。
+   *
+   * Pre-M9 G9：**dead 也可 resume**——死信作业此前无任何显式复活路径（stalled 巡检与重试超限都判 dead，
+   * 而 resume 只认 paused），运维只能改库。dead 是"需要人工裁决"而非"永久不可用"：
+   * 人工修好下游后 resume 即可重新投递（attempts 归零 → 重试预算重置）。
+   * 其余状态（completed/cancelled/running/pending/scheduled）→ 400：终态不复活。
+   */
   async resume(userId: string, id: string): Promise<{ resumed: boolean; status: string }> {
     const row = await this.get(userId, id);
     const done = await this.prisma.scheduledJob.updateMany({
-      where: { id, status: 'paused' },
-      data: { status: 'scheduled', attempts: 0, lastError: null },
+      where: { id, status: { in: [...SCHEDULED_RESUMABLE_STATUSES] } },
+      data: { status: 'scheduled', attempts: 0, lastError: null, completedAt: null },
     });
-    if (done.count === 0) throw new AppError(ErrorCode.VALIDATION_ERROR, `作业不在暂停态（当前 ${row.status}）`);
+    if (done.count === 0) {
+      throw new AppError(ErrorCode.VALIDATION_ERROR, `作业不在可恢复状态（当前 ${row.status}；可恢复：paused/dead）`);
+    }
     const fresh = { ...row, status: 'scheduled', attempts: 0 };
     if (row.type === 'recurring') {
       await this.enqueue(fresh);

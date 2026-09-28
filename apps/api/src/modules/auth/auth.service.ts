@@ -34,14 +34,17 @@ export class AuthService {
 
   async login(email: string, password: string, meta: RequestMeta): Promise<AuthResult> {
     const failKey = `auth:loginfail:${meta.ip}`;
-    const fails = Number(await this.kv.get(failKey) ?? '0');
+    // Pre-M9 G4 降级（**fail-open**）：登录失败计数是**保护面**（防暴力破解），不是登录正确性面。
+    // Redis 不可用/超时时放行本次尝试并告警，绝不因基础设施故障把全站登录打死。
+    // 已知取舍：Redis 故障窗口内该计数失效（argon2 校验成本 + 上游限流仍在）。
+    const fails = await this.readLoginFails(failKey);
     if (fails >= LOGIN_MAX_FAILS) {
       throw new AppError(ErrorCode.RATE_LIMITED, '登录尝试过于频繁，请 5 分钟后再试');
     }
     const user = await this.prisma.user.findUnique({ where: { email } });
     const ok = user != null && await argon2.verify(user.passwordHash, password);
     if (!ok) {
-      await this.kv.incr(failKey, LOGIN_FAIL_WINDOW_SEC);
+      await this.bumpLoginFails(failKey);
       // M8-P3 login 审计：失败也留痕（metadata 仅邮箱掩码+IP；绝不落密码）。
       // AuditLog.userId 是非空外键：未知邮箱无 userId 可归属 → 仅结构化 warn（不伪造归属）。
       if (user) {
@@ -61,7 +64,7 @@ export class AuthService {
       });
       throw new AppError(ErrorCode.FORBIDDEN, '账号已被禁用');
     }
-    await this.kv.set(failKey, '0', LOGIN_FAIL_WINDOW_SEC);
+    await this.clearLoginFails(failKey);
     await this.prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
     // M8-P1：懒创建 Personal Organization（幂等；多租户基线）
     const personalOrg = await this.orgs.ensurePersonalOrganization(user.id).catch(() => null);
@@ -71,6 +74,38 @@ export class AuthService {
       metadata: { email: maskEmail(user.email), ip: meta.ip },
     });
     return this.issueTokens(user, meta);
+  }
+
+  /**
+   * Pre-M9 G4：登录失败计数的三条 Redis 通道全部**显式降级**（fail-open，理由见 login 注释）：
+   * 读失败 → 视为 0 次（放行）；写失败 → 告警（本次失败未计数）；清零失败 → 告警（成功登录仍继续）。
+   * 关键点：**成功登录绝不被计数器写失败拖垮**（否则 Redis 抖动会让所有正确密码都登不进来）。
+   */
+  private async readLoginFails(failKey: string): Promise<number> {
+    try {
+      const raw = await this.kv.get(failKey);
+      const n = Number(raw ?? '0');
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    } catch (err) {
+      this.logger.warn(`登录失败计数读取失败（降级：放行本次尝试，登录锁在该窗口失效）: ${(err as Error).message}`);
+      return 0;
+    }
+  }
+
+  private async bumpLoginFails(failKey: string): Promise<void> {
+    try {
+      await this.kv.incr(failKey, LOGIN_FAIL_WINDOW_SEC);
+    } catch (err) {
+      this.logger.warn(`登录失败计数写入失败（降级：本次失败未计数）: ${(err as Error).message}`);
+    }
+  }
+
+  private async clearLoginFails(failKey: string): Promise<void> {
+    try {
+      await this.kv.set(failKey, '0', LOGIN_FAIL_WINDOW_SEC);
+    } catch (err) {
+      this.logger.warn(`登录失败计数清零失败（降级：登录继续，计数留待 TTL 自然过期）: ${(err as Error).message}`);
+    }
   }
 
   async refresh(rawRefresh: string | undefined, meta: RequestMeta): Promise<AuthResult> {

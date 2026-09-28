@@ -67,7 +67,9 @@ export class ImageManagerService implements OnModuleInit {
       case 'zhipu-image':
         return new OpenAIImageAdapter(cfg);
       case 'dashscope-image':
-        return new DashScopeImageAdapter({ baseUrl: cfg.baseUrl, apiKey: cfg.apiKey });
+        // Pre-M9 G5：透传 provider.timeoutMs 作为**单请求超时**（原实现丢弃该配置 →
+        // 卡死连接只能等任务被清扫；默认 60s 与 schema provider.timeoutMs 默认一致）
+        return new DashScopeImageAdapter({ baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, timeoutMs: cfg.timeoutMs });
       case 'mock-image':
         return new MockImageAdapter();
       default:

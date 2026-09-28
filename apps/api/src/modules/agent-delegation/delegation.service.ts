@@ -3,6 +3,7 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { PrismaService } from '../prisma/prisma.service';
 import { AGENT_RUN_QUEUE } from '../../core/queue/queue.module';
+import { addJobBounded, addJobBestEffort } from '../../core/queue/bounded-add';
 import { EventBusService, agentRunChannel } from '../../core/events/event-bus.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { AuditService } from '../audit/audit.service';
@@ -120,10 +121,9 @@ export class DelegationService {
     await this.prisma.agentRunMessage.create({
       data: { runId: child.id, sequence: 0, role: 'user', content: input.task },
     });
-    await this.agentRunQueue.add(
-      'execute', { runId: child.id },
+    await addJobBounded(this.agentRunQueue, 'execute', { runId: child.id },
       { jobId: `run-${child.id}`, attempts: 2, backoff: { type: 'exponential', delay: 2000 }, removeOnComplete: true, removeOnFail: { count: 500 } },
-    );
+      'delegation-child');
     // 6. 子 run 终态 → 唤醒父 run（本进程订阅；recoverStale 兜底事件丢失）
     await this.events.subscribe(agentRunChannel(child.id), (event) => {
       const type = event.type as string | undefined;
@@ -167,10 +167,11 @@ export class DelegationService {
       data: { status: 'queued', waitingOnDelegationId: null, workerId: null, leaseUntil: null, heartbeatAt: null },
     });
     if (woken.count === 0) return;
-    await this.agentRunQueue.add(
-      'execute', { runId: parent.id },
+    // Pre-M9 G4：唤醒投递为 best-effort——行已回到 queued，recoverStale 巡检会兜底重投；
+    // 故此处有界（2s）且失败只告警，绝不把"唤醒失败"升级为业务错误。
+    await addJobBestEffort(this.agentRunQueue, 'execute', { runId: parent.id },
       { jobId: `run-${parent.id}-wake-${Date.now()}`, attempts: 2, backoff: { type: 'exponential', delay: 2000 }, removeOnComplete: true, removeOnFail: { count: 500 } },
-    );
+      'delegation-wake');
     this.logger.log({ childRunId, parentRunId: parent.id }, '子 run 终态 → 唤醒父 run');
   }
 

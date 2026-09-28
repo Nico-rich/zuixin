@@ -17,7 +17,8 @@ export function createFeedbackTools(feedback: FeedbackService): Tool[] {
       }),
       execute: async (raw, ctx) => {
         const input = raw as Parameters<FeedbackService['submit']>[1];
-        return feedback.submit(ctx.userId, { ...input, projectId: ctx.projectId });
+        // G11：ToolCall 账本幂等（崩溃后 resume 重放绝不产生第二条反馈事实）
+        return feedback.submit(ctx.userId, { ...input, projectId: ctx.projectId }, { toolCallId: ctx.toolCallId });
       },
     },
     {
@@ -36,7 +37,8 @@ export function createFeedbackTools(feedback: FeedbackService): Tool[] {
       }),
       execute: async (raw, ctx) => {
         const input = raw as Parameters<FeedbackService['capturePerformance']>[1];
-        return feedback.capturePerformance(ctx.userId, { ...input, projectId: ctx.projectId });
+        // G11：ToolCall 账本幂等（事实 + 快照 + 账本同事务）
+        return feedback.capturePerformance(ctx.userId, { ...input, projectId: ctx.projectId }, { toolCallId: ctx.toolCallId });
       },
     },
     {

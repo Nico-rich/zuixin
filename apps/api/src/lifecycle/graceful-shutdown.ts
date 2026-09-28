@@ -1,4 +1,5 @@
 import { INestApplicationContext, Logger, LoggerService } from '@nestjs/common';
+import { LifecycleRegistry, LifecycleStepResult, SHUTDOWN_STEPS, ShutdownStep } from './lifecycle-registry';
 
 /**
  * M8-P9 优雅停机（单文件模块，API 进程与 Worker 进程共用同一实现）。
@@ -48,6 +49,13 @@ export interface GracefulShutdownOptions {
   logger?: Pick<LoggerService, 'log' | 'warn' | 'error'>;
   /** 每个阶段回调（测试断言顺序用；生产不传） */
   onPhase?: (event: ShutdownEvent) => void;
+  /**
+   * Pre-M9 G3：有序停机阶段执行器。缺省时自动从 Nest 容器解析（`app.get(LifecycleRegistry)`）；
+   * 容器内没有该 provider（例如仅装了 BullMQ 的合成测试模块）→ 回退到 M8-P9 的单次 `app.close()` 语义。
+   */
+  lifecycle?: LifecycleRegistry;
+  /** Pre-M9 G3：每个步骤完成回调（观测/测试断言顺序用） */
+  onStep?: (result: LifecycleStepResult) => void;
 }
 
 export interface GracefulShutdownHandle {
@@ -60,10 +68,61 @@ export interface GracefulShutdownHandle {
 
 export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 30_000;
 
+/** Pre-M9 G3：各阶段预算上限（ms）；实际取 min(上限, 全局剩余预算)——全局兜底计时器仍是最终边界 */
+const STEP_BUDGET_CAP_MS: Record<ShutdownStep, number> = {
+  stopAcceptingHttp: 2_000,
+  stopClaim: 5_000,
+  stopSseSubscriptions: 1_000,
+  drainSse: 5_000,
+  drainHttp: 10_000,
+  finalizeLeases: 12_000,
+  closeBullmq: 20_000,
+  closeRedis: 1_000,
+  closeDatabase: 1_000,
+};
+
 function resolveTimeoutMs(explicit?: number): number {
   if (typeof explicit === 'number' && Number.isFinite(explicit) && explicit > 0) return explicit;
   const env = Number(process.env.GRACEFUL_SHUTDOWN_TIMEOUT_MS);
   return Number.isFinite(env) && env > 0 ? env : DEFAULT_SHUTDOWN_TIMEOUT_MS;
+}
+
+/** 从 Nest 容器解析停机阶段注册表（没有该 provider 的容器 → undefined，回退单次 app.close() 语义） */
+function resolveLifecycleRegistry(app: unknown): LifecycleRegistry | undefined {
+  const get = (app as { get?: (token: unknown, opts?: unknown) => unknown })?.get;
+  if (typeof get !== 'function') return undefined;
+  try {
+    const registry = get.call(app, LifecycleRegistry, { strict: false }) as LifecycleRegistry | undefined;
+    return registry && typeof registry.runStep === 'function' ? registry : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+interface HttpServerLike {
+  listening?: boolean;
+  close(cb?: (err?: Error) => void): unknown;
+  getConnections(cb: (err: Error | null, count: number) => void): void;
+}
+
+function httpServerOf(app: unknown): HttpServerLike | undefined {
+  const getServer = (app as { getHttpServer?: () => unknown })?.getHttpServer;
+  if (typeof getServer !== 'function') return undefined;
+  try {
+    const server = getServer.call(app) as HttpServerLike | undefined;
+    return server && typeof server.close === 'function' ? server : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => { setTimeout(r, ms).unref?.(); });
+
+function openConnections(server: HttpServerLike): Promise<number> {
+  if (typeof server.getConnections !== 'function') return Promise.resolve(0);
+  return new Promise<number>((resolve) => {
+    try { server.getConnections((err, count) => resolve(err ? 0 : count)); } catch { resolve(0); }
+  });
 }
 
 /**
@@ -116,8 +175,35 @@ export function registerGracefulShutdown(
 
     try {
       emit({ phase: 'closing', elapsedMs: Date.now() - startedAt });
-      // 一条 await 覆盖全部阶段：关 HTTP server → 处理器 onApplicationShutdown → BullMQ worker.close()
-      // （BullMQ 非 force close 会等当前 active job 结束）→ onModuleDestroy（连接释放）
+      // Pre-M9 G3：先跑显式停机阶段序列（停 HTTP → 停认领 → 停 SSE → drain → 释放 lease → 关 BullMQ），
+      // 再交给 app.close() 收尾（Redis/DB 等 Nest teardown 自然落在最后）。
+      const registry = options.lifecycle ?? resolveLifecycleRegistry(app);
+      if (registry) {
+        const server = httpServerOf(app);
+        if (server) {
+          // 步骤 1：关闭 listen socket（不再接受新连接；已在途请求继续跑完，SSE 由注册表显式关闭）
+          registry.register('stopAcceptingHttp', 'http:stopListening', () => {
+            if (!server.listening) return;
+            try { server.close(); } catch { /* 已关闭 */ }
+          });
+          // 步骤 4b：有界等待在途 HTTP 连接归零（drain 超时只告警，不阻塞后续阶段）
+          registry.register('drainHttp', 'http:awaitConnections', async () => {
+            const deadline = Date.now() + STEP_BUDGET_CAP_MS.drainHttp;
+            let open = await openConnections(server);
+            while (open > 0 && Date.now() < deadline) { await sleep(50); open = await openConnections(server); }
+            if (open > 0) throw new Error(`仍有 ${open} 条 HTTP 连接未归零（交由 app.close() 强收）`);
+          });
+        }
+        for (const step of SHUTDOWN_STEPS) {
+          const remaining = timeoutMs - (Date.now() - startedAt);
+          if (remaining <= 0) { logger.warn(`停机预算耗尽，跳过后续阶段（自 ${step} 起）`); break; }
+          const budget = Math.max(250, Math.min(remaining, STEP_BUDGET_CAP_MS[step]));
+          const result = await registry.runStep(step, budget);
+          if (result.ran.length || result.failures.length) options.onStep?.(result);
+        }
+      }
+      // 尾部：Nest teardown（onModuleDestroy → Redis/DB 释放 → dispose → onApplicationShutdown；
+      // 处理器钩子与 BullMQ worker.close() 均已在前面的阶段完成，此处为幂等复查）
       await app.close();
       if (finished) return events; // 超时已强退（测试替身不会真退，这里显式短路）
       finished = true;

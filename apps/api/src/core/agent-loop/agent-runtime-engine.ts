@@ -11,6 +11,7 @@ import { ToolRegistry } from '../tools/tool-registry.service';
 import { Tool, ToolContext } from '../tools/tool.types';
 import { mapProviderError, ProviderLikeError } from '../../common/errors/provider-error';
 import { AGENT_RUNTIME_PERSISTENCE, AgentRuntimePersistence } from './runtime-persistence';
+import { CircuitBreakerService } from '../circuit-breaker/circuit-breaker.service';
 import { ResumePlan } from './resume-planner';
 import { assertApprovalBinding, bindPayload, requiresHumanApproval } from '../../modules/approvals/approval-binding';
 
@@ -115,6 +116,8 @@ export class AgentRuntimeEngine {
     @Inject(ToolRegistry) private readonly registry: ToolRegistry,
     @Inject(ModelResolverService) private readonly modelResolver: ModelResolverService,
     @Inject(LLMManagerService) private readonly llmManager: LLMManagerService,
+    // Pre-M9 G1/G2：LLM 回合失败进熔断计数；open provider 的钉死模型快速失败（模型选择跳过见 ModelResolver）
+    @Inject(CircuitBreakerService) private readonly breaker: CircuitBreakerService,
   ) {}
 
   async *run(ctx: AgentRuntimeContext): AsyncGenerator<AgentEvent, AgentRunOutcome, void> {
@@ -282,8 +285,12 @@ export class AgentRuntimeEngine {
             status: 'failed', errorCode: appErr.code,
             organizationId: ctx.organizationId,
           });
+          // Pre-M9 G1/G2：回合失败（含重试耗尽）→ 熔断计数（best-effort，绝不影响失败语义）
+          await this.recordBreakerFailure(resolved.providerId);
           throw turnError;
         }
+        // Pre-M9 G1/G2：回合成功 → 复位熔断（半开探测成功即自愈；失败计数清零）
+        await this.recordBreakerSuccess(resolved.providerId);
         await this.persistence.recordChatUsage({
           userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.messageId ?? '',
           providerId: resolved.providerId, modelId: resolved.modelId, runId,
@@ -822,8 +829,39 @@ export class AgentRuntimeEngine {
   }
 
   private async resolveLLM(agent: AgentLoopAgentConfig): Promise<ResolvedLLM> {
-    if (agent.modelId) return this.llmManager.resolve(agent.modelId);
+    if (agent.modelId) {
+      const resolved = await this.llmManager.resolve(agent.modelId);
+      // Pre-M9 G2：钉死模型的 provider 已熔断（open/探测槽被占）→ 快速失败
+      // （绝不静默改用其它模型：Agent 钉死模型是显式选择）；冷却到期后自动半开，可由下次运行探通复位。
+      if (!(await this.canCallProvider(resolved.providerId))) {
+        throw new AppError(ErrorCode.PROVIDER_UNAVAILABLE, `模型 provider 处于熔断状态，请稍后重试：${resolved.providerName}`);
+      }
+      return resolved;
+    }
     return this.modelResolver.resolveDefaultLLM();
+  }
+
+  /** 熔断判定（best-effort：KV 不可用时放行——熔断是优化/保护，不是准入事实来源） */
+  private async canCallProvider(providerId: string): Promise<boolean> {
+    try {
+      return await this.breaker.canProbe(providerId);
+    } catch (err) {
+      this.logger.warn(`熔断状态读取失败（放行）: ${(err as Error).message}`);
+      return true;
+    }
+  }
+
+  /** 熔断计数：成功复位 / 失败累计（KV 故障只记日志——绝不因观测面问题改变 run 语义） */
+  private async recordBreakerSuccess(providerId: string): Promise<void> {
+    try { await this.breaker.recordSuccess(providerId); }
+    catch (err) { this.logger.warn(`熔断成功计数写入失败: ${(err as Error).message}`); }
+  }
+
+  private async recordBreakerFailure(providerId: string): Promise<void> {
+    try {
+      const opened = await this.breaker.recordFailure(providerId);
+      if (opened) this.logger.warn({ providerId }, 'provider 触发熔断（后续回合将跳过该 provider，冷却后自动半开探测）');
+    } catch (err) { this.logger.warn(`熔断失败计数写入失败: ${(err as Error).message}`); }
   }
 
   /**

@@ -1,7 +1,9 @@
 import OpenAI from 'openai';
+import { AppError, ErrorCode } from '@ai-agent/shared';
 import { ChatMessage, ChatParams, ChatResponse, LLMChunk, LLMProvider } from '../llm.types';
 import { mapProviderError, ProviderLikeError } from '../../../common/errors/provider-error';
 import { manualRedirectFetch } from '../../../modules/security/provider-base-url.guard';
+import { StreamGuard, StreamTimeoutError, streamTimeoutsFrom } from '../../../core/http/stream-guard';
 
 export interface OpenAICompatibleConfig { baseUrl: string; apiKey: string; timeoutMs: number; }
 
@@ -14,8 +16,11 @@ export class OpenAICompatibleAdapter implements LLMProvider {
   readonly kind = 'llm' as const;
   private readonly chatFn: ChatFn;
   private readonly streamFn: StreamFn;
+  /** Pre-M9 G6：四层流式超时（构造期解析一次：provider.timeoutMs + env 覆盖） */
+  private readonly cfg: OpenAICompatibleConfig;
 
   constructor(cfg: OpenAICompatibleConfig, injected?: { chat?: ChatFn; stream?: StreamFn }) {
+    this.cfg = cfg;
     // Pre-M9 F3-B：禁止自动跟随重定向（3xx 会绕过 baseUrl 校验）；出网策略与 baseUrl 校验同源
     const client = new OpenAI({ baseURL: cfg.baseUrl, apiKey: cfg.apiKey, timeout: cfg.timeoutMs, maxRetries: 0, fetch: manualRedirectFetch });
     this.chatFn = injected?.chat ?? (async (body, options) => (await client.chat.completions.create(body as never, options)) as unknown as Record<string, unknown>);
@@ -32,17 +37,24 @@ export class OpenAICompatibleAdapter implements LLMProvider {
         toolCalls: this.mapToolCalls(choice?.message?.tool_calls),
         usage: usage ? { inputTokens: usage.prompt_tokens ?? 0, outputTokens: usage.completion_tokens ?? 0 } : undefined,
       };
-    } catch (err) { throw mapProviderError(err as ProviderLikeError); }
+    } catch (err) { throw err instanceof AppError ? err : mapProviderError(err as ProviderLikeError); }
   }
 
   async *stream(params: ChatParams): AsyncIterable<LLMChunk> {
+    // Pre-M9 G6：四层超时（连接/首包/空闲/总时长）+ 主动中断。
+    // 外部 deadline 信号（AgentRun/回合）与内部控制器、总时长上限共同组合交给 SDK → fetch abort。
+    const guard = new StreamGuard(streamTimeoutsFrom(this.cfg), params.signal);
     try {
       // M6-A8：signal 经 SDK options 传入（body.signal 会被 JSON 序列化丢弃且不接入 fetch abort）
-      const s = await this.streamFn(this.buildBody(params, true), { signal: params.signal });
+      const s = await guard.connect(() => this.streamFn(this.buildBody(params, true), { signal: guard.signal }));
       // OpenAI 流式 tool_calls 以 delta 分片到达，按 index 聚合，流结束时一次产出内部协议块
       const acc = new Map<number, { id?: string; name?: string; args: string }>();
       let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
-      for await (const chunk of s) {
+      const iterator = s[Symbol.asyncIterator]();
+      for (;;) {
+        const step = await guard.next(iterator);
+        if (step.done) break;
+        const chunk = step.value;
         const delta = (chunk.choices as Array<{ delta?: { content?: string | null; tool_calls?: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }> } }>)?.[0]?.delta;
         if (delta?.content) yield { type: 'text', text: delta.content };
         for (const tc of delta?.tool_calls ?? []) {
@@ -62,7 +74,14 @@ export class OpenAICompatibleAdapter implements LLMProvider {
       if (usage) {
         yield { type: 'usage', usage: { inputTokens: usage.prompt_tokens ?? 0, outputTokens: usage.completion_tokens ?? 0 } };
       }
-    } catch (err) { throw mapProviderError(err as ProviderLikeError); }
+    } catch (err) {
+      // 超时层 → PROVIDER_TIMEOUT（可重试/可回退）；AppError 原样透传（绝不被 mapProviderError 降级）
+      if (err instanceof StreamTimeoutError) throw new AppError(ErrorCode.PROVIDER_TIMEOUT, err.message);
+      throw err instanceof AppError ? err : mapProviderError(err as ProviderLikeError);
+    } finally {
+      // 收尾（正常结束/异常/消费者提前 return）都中断在途请求：绝不把连接挂在服务端
+      guard.abort();
+    }
   }
 
   /** Provider tool_calls → 内部 ToolCallRequest[] */

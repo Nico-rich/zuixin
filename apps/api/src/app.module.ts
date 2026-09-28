@@ -43,6 +43,8 @@ import { UsageApiModule } from './modules/usage/usage-api.module';
 import { ProviderRoutingApiModule } from './modules/provider-routing/provider-routing-api.module';
 import { GlobalExceptionFilter } from './common/filters/global-exception.filter';
 import { createHttpLoggerParams } from './common/logging/pino-logging';
+import { LifecycleModule } from './lifecycle/lifecycle.module';
+import { SseModule } from './core/sse/sse.module';
 
 @Module({
   imports: [
@@ -95,6 +97,9 @@ import { createHttpLoggerParams } from './common/logging/pino-logging';
     UsageApiModule,
     ProviderRoutingApiModule,
     HealthModule,
+    // Pre-M9 G3：有序优雅停机（阶段注册表）+ SSE 连接纳管（API 进程）
+    LifecycleModule,
+    SseModule,
   ],
   providers: [GlobalExceptionFilter],
 })

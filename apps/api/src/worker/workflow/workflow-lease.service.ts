@@ -3,6 +3,7 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { PrismaService } from '../../modules/prisma/prisma.service';
 import { WORKFLOW_QUEUE } from '../../core/queue/queue.module';
+import { addJobBestEffort } from '../../core/queue/bounded-add';
 import { DEFAULT_LEASE_TTL_MS } from '../../core/agent-run-lease/agent-run-lease.service';
 import { QuotaService } from '../../modules/billing/quota.service';
 
@@ -71,7 +72,8 @@ export class WorkflowLeaseService {
 
   /** 唤醒唯一键（M6 教训：绝不复用创建时的 jobId——BullMQ 同键去重吞 job） */
   private enqueueRecover(runId: string, now: number): Promise<void> {
-    return this.workflowQueue.add(
+    // Pre-M9 G4：恢复重投是 best-effort（下一轮 recoverStale 巡检会再试）；有界 2s，失败告警不冒泡
+    return addJobBestEffort(this.workflowQueue,
       'execute',
       { runId },
       {
@@ -79,7 +81,7 @@ export class WorkflowLeaseService {
         attempts: 2, backoff: { type: 'exponential', delay: 2000 },
         removeOnComplete: true, removeOnFail: { count: 500 },
       },
-    ).then(() => undefined);
+      `recover:${runId}`).then(() => undefined);
   }
 
   async recoverStale(): Promise<{ reEnqueued: number; timedOut: number }> {

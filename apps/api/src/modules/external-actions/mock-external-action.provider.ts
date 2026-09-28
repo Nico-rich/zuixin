@@ -1,5 +1,7 @@
 import { Injectable } from '@nestjs/common';
-import { ExternalActionProvider, ExternalActionRequest } from './external-action-provider.interface';
+import {
+  ExternalActionProvider, ExternalActionRemoteStatus, ExternalActionRequest,
+} from './external-action-provider.interface';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 
 /**
@@ -40,6 +42,27 @@ export class MockExternalActionProvider implements ExternalActionProvider {
         throw new AppError(ErrorCode.FORBIDDEN, 'mock: 远端拒绝');
       default:
         return { ok: true, externalId: `${req.externalRequestId}-default`, payload: req.payload };
+    }
+  }
+
+  /**
+   * Pre-M9 G7：远端状态查询（确定性向量，与 execute 的 actionType 语义对齐）：
+   * - success/duplicate：远端已执行 → completed（结果与 execute 一致：externalId 由同一 externalRequestId 派生，
+   *   证明"同键绝不重复执行"，仅额外带 `recovered: true` 标注供恢复路径断言）；
+   * - failure：远端已判定失败 → failed（错误码/文案与 execute 一致）；
+   * - 其余（timeout/retry/unknown）：**无权威结论** → processing（恢复路径必须保持 executing，
+   *   绝不把"查不到"当成失败，更不重复执行副作用）。
+   */
+  async remoteStatus(req: ExternalActionRequest): Promise<ExternalActionRemoteStatus> {
+    if (req.signal.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+    switch (req.actionType) {
+      case 'success':
+      case 'duplicate':
+        return { status: 'completed', result: { ok: true, recovered: true, externalId: `${req.externalRequestId}-done`, payload: req.payload } };
+      case 'failure':
+        return { status: 'failed', errorCode: ErrorCode.PROVIDER_UNKNOWN, error: 'mock: 外部执行失败' };
+      default:
+        return { status: 'processing' };
     }
   }
 }

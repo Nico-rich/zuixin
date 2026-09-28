@@ -12,6 +12,12 @@ import { assertApprovalBinding, hashPayload } from '../approvals/approval-bindin
 /** Pre-M9 C2：claim 失败轮询赢家终态的时长上限 */
 const EXECUTING_POLL_MS = 20_000;
 
+/** Pre-M9 G7：executing 残留行视为"执行者已死"的静默阈值（健康执行远短于此：单次 provider 调用） */
+const EXECUTING_STALE_MS = Number(process.env.EXTERNAL_ACTION_STALE_MS) || 10 * 60_000;
+
+/** Pre-M9 G7：远端状态查询单次上限（恢复绝不无限期挂住清扫周期） */
+const RECOVER_QUERY_TIMEOUT_MS = 15_000;
+
 /** M7-P3 风险分级（快照入库；financial/destructive → high，external_action → medium，其余 low） */
 export function classifyRisk(permission: string): 'low' | 'medium' | 'high' {
   if (permission === 'financial' || permission === 'destructive') return 'high';
@@ -42,7 +48,9 @@ export interface ExecuteExternalActionInput {
  * → 连接校验（凭证服务端解密注入 Adapter，绝不进行内 input）→ Provider Adapter → 行终态。
  * - 幂等：UNIQUE(userId, provider, idempotencyKey) + executing 残留行复用同一 externalRequestId；
  * - 审批复核（P9-5 防线）：toolCallId 关联 Approval 必须 approved（或直接给定 approvalId）；
- * - 取消：signal aborted → 行 cancelled(AGENT_CANCELLED)，错误上抛（Engine 识别取消）。
+ * - 取消：signal aborted → 行 cancelled(AGENT_CANCELLED)，错误上抛（Engine 识别取消）；
+ * - Pre-M9 G7：executing 残留行（执行者崩溃）由 recoverExecutingAction 按**远端真实状态**收口，
+ *   绝不重复执行 provider 副作用（远端幂等键只用于去重，不用于重放）。
  */
 @Injectable()
 export class ExternalActionsService {
@@ -204,6 +212,99 @@ export class ExternalActionsService {
       if (aborted) throw err; // AbortError 上抛：Engine 识别为取消
       throw appErr;
     }
+  }
+
+  /**
+   * Pre-M9 G7：**executing 残留行恢复**——执行者进程崩溃/重启后本地无人推进，但**远端可能早已执行成功**。
+   * 只有 provider 是权威：对声明 `remoteStatus` 的 provider 反查真实状态并落终态，
+   * **绝不重复执行副作用**（远端是既成事实，重放会二次下单/二次扣款）。
+   * - completed → 条件更新（status='executing'）落 completed + 审计 + 计量 + 配额释放；
+   * - failed    → 条件更新落 failed（错误来自 provider）+ 审计 + 配额释放；
+   * - processing/unknown（无适配器、查询失败、连接不可用、竞态已终态）→ 保持 executing，绝不伪造终态。
+   */
+  async recoverExecutingAction(actionId: string): Promise<'completed' | 'failed' | 'processing' | 'unknown'> {
+    const row = await this.prisma.externalAction.findUnique({ where: { id: actionId } });
+    if (!row || row.status !== 'executing' || !row.externalRequestId) return 'unknown';
+    const provider = this.providers.get(row.provider);
+    if (!provider?.remoteStatus) return 'unknown'; // 平台不支持状态查询 → 由业务重试（同键去重）接管
+    const connection = row.connectionId
+      ? await this.prisma.connection.findFirst({ where: { id: row.connectionId, userId: row.userId } }).catch(() => null)
+      : null;
+    if (!connection || connection.status !== 'active') return 'unknown';
+    const accessToken = await this.credentials.getAccessToken(connection.id).catch(() => null);
+    if (!accessToken) return 'unknown';
+    let status;
+    try {
+      status = await provider.remoteStatus({
+        provider: row.provider, actionType: row.actionType, payload: (row.input ?? {}) as Record<string, unknown>,
+        externalRequestId: row.externalRequestId, connectionId: connection.id, accessToken: accessToken.token,
+        signal: AbortSignal.timeout(RECOVER_QUERY_TIMEOUT_MS),
+      });
+    } catch (err) {
+      // 查询失败 ≠ 动作失败：保持 executing（远端状态未知，任何终态都是伪造）
+      this.logger.warn({ actionId, err: (err as Error).message }, '外部动作远端状态查询失败，保持 executing');
+      return 'unknown';
+    }
+    if (!status || status.status === 'processing') return 'processing';
+    if (status.status === 'failed') {
+      const failed = await this.prisma.externalAction.updateMany({
+        where: { id: actionId, status: 'executing' },
+        data: {
+          status: 'failed', completedAt: new Date(),
+          errorCode: status.errorCode ?? ErrorCode.PROVIDER_UNKNOWN, error: status.error ?? '远端动作失败',
+        },
+      });
+      if (failed.count === 0) return 'unknown'; // 竞态：已被正常路径终态
+      await this.audit.write({
+        userId: row.userId, action: 'external_action.executed', projectId: row.projectId,
+        targetType: 'external_action', targetId: actionId, externalActionId: actionId,
+        agentRunId: row.agentRunId ?? undefined, toolCallId: row.toolCallId ?? undefined,
+        approvalId: row.approvalId ?? undefined, connectionId: connection.id,
+        metadata: { provider: row.provider, actionType: row.actionType, status: 'failed', recovered: true, errorCode: status.errorCode ?? ErrorCode.PROVIDER_UNKNOWN },
+      });
+      await this.quota.release(row.idempotencyKey, 'external_api_call').catch(() => undefined);
+      this.logger.warn({ actionId, provider: row.provider }, '外部动作按远端真实状态恢复为 failed');
+      return 'failed';
+    }
+    const done = await this.prisma.externalAction.updateMany({
+      where: { id: actionId, status: 'executing' },
+      data: { status: 'completed', completedAt: new Date(), result: (status.result ?? null) as never },
+    });
+    if (done.count === 0) return 'unknown';
+    await this.audit.write({
+      userId: row.userId, action: 'external_action.executed', projectId: row.projectId,
+      targetType: 'external_action', targetId: actionId, externalActionId: actionId,
+      agentRunId: row.agentRunId ?? undefined, toolCallId: row.toolCallId ?? undefined,
+      approvalId: row.approvalId ?? undefined, connectionId: connection.id,
+      metadata: { provider: row.provider, actionType: row.actionType, status: 'completed', recovered: true },
+    });
+    // 计量幂等键 = 动作 id：与正常完成路径同一把键 → 恢复绝不重复计量
+    await this.billing.recordUsage({
+      userId: row.userId, projectId: row.projectId ?? undefined, kind: 'external_api_call', quantity: 1,
+      runId: row.agentRunId ?? undefined, toolCallId: row.toolCallId ?? undefined, idempotencyKey: `ea:${actionId}`,
+    }).catch(() => undefined);
+    await this.quota.release(row.idempotencyKey, 'external_api_call').catch(() => undefined);
+    this.logger.log({ actionId, provider: row.provider }, '外部动作按远端真实状态恢复为 completed（未重复执行）');
+    return 'completed';
+  }
+
+  /**
+   * Pre-M9 G7：批量恢复**静默过久**的 executing 行（周期清扫调用，幂等、多实例安全）。
+   * 只处理 startedAt 超过阈值的行（正常执行中的行绝不被触碰）；单个失败不影响其余。
+   */
+  async recoverStaleExecutingActions(olderThanMs: number = EXECUTING_STALE_MS): Promise<{ scanned: number; recovered: number }> {
+    const rows = await this.prisma.externalAction.findMany({
+      where: { status: 'executing', startedAt: { lt: new Date(Date.now() - olderThanMs) } },
+      select: { id: true }, orderBy: { startedAt: 'asc' }, take: 50,
+    });
+    let recovered = 0;
+    for (const row of rows) {
+      const outcome = await this.recoverExecutingAction(row.id)
+        .catch((err) => { this.logger.warn({ actionId: row.id, err: (err as Error).message }, '外部动作恢复失败（跳过，等待下次清扫）'); return 'unknown' as const; });
+      if (outcome === 'completed' || outcome === 'failed') recovered++;
+    }
+    if (rows.length > 0) this.logger.log({ scanned: rows.length, recovered }, '外部动作残留 executing 行恢复完成');
+    return { scanned: rows.length, recovered };
   }
 
   /**

@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Prisma } from '@prisma/client';
 import type { EventEnvelope } from '@prisma/client';
@@ -55,7 +55,24 @@ export const DEFAULT_BACKOFF_MS = 200;
 export const eventChannel = (eventType: string): string => `m8:event:${eventType}`;
 
 /**
- * M8-P5 Event Platform（领域事件层）：
+ * Pre-M9 G10：**事件平台已冻结（FREEZE，方案 B）**。
+ *
+ * 冻结依据：当前产品**没有任何真实领域事件消费者**（生产者仅 SchedulerProcessor 的作业生命周期事件），
+ * 平台的消费/重试/死信/重投机制只有测试使用；继续演进的收益为 0，而"看起来有投递管道"的误导成本很高。
+ *
+ * 冻结范围（做与不做）：
+ * - ✅ **保留**：EventEnvelope 表结构（不动 schema）、幂等写入 API（`publish`，eventId 唯一 + P2002 复用行）、
+ *   读面（`list`/`deadLetterList`）与死信重投（`redeliver`，仅 dead → published）；
+ * - 🚫 **禁止**：新增订阅者（生产代码不得再 `subscribe`）、新增 relay/outbox 中继、跨进程消费、
+ *   为"投递"新增队列/定时任务/job。若审计后发现真实消费者需求 → **先报 Coordinator（M9 决策）**，
+ *   不得在本包内自行接线；
+ * - ⚠️ **预期现象（非缺陷）**：无消费者的事件类型，其行将永久停留在 `published`（冻结期不做清理/中继）；
+ *   `dead` 只可能来自测试或显式重投失败——生产无消费者的类型不会产生 dead。若需要留存策略
+ *   （published 保留窗口/归档），属 M9 决策项，本包不引入破坏事实源的删除任务。
+ *
+ * 消费路径的既有能力（`subscribe`/`deliver`/`redeliver`）**保持可用**（M8-P5 契约与 e2e 依赖），
+ * 但仅作为"同进程消费者的测试/调试面"：EventBus 通知是跨进程的（Redis pub/sub），
+ * 而消费者注册表是**进程内**的——跨进程消费不在冻结期的支持范围内。
  *
  * 三层职责分离（绝不重叠）：
  * - **EventEnvelope（本服务）= 领域事件事实**：幂等落库（eventId unique）、投递状态机
@@ -71,19 +88,35 @@ export const eventChannel = (eventType: string): string => `m8:event:${eventType
  * 边界（P5 明确不做）：多消费者扇出（一个事件被多个消费者各消费一次）需要 per-consumer 投递表，
  * 本阶段 EventEnvelope.status 表达的是"平台级投递"的单消费者语义——同一 eventType 只应有一个消费者。
  */
+export const EVENT_PLATFORM_FROZEN = true as const;
+
+/** G10 冻结：生产进程内**禁止新增消费者**；唯一的豁免是 Coordinator 批准后的显式开关（真实消费者需求）。 */
+const subscribeAllowed = (): boolean =>
+  process.env.NODE_ENV !== 'production' || process.env.EVENT_PLATFORM_ALLOW_SUBSCRIBE === '1';
+
 @Injectable()
-export class EventPlatformService {
+export class EventPlatformService implements OnModuleInit {
   private readonly logger = new Logger('EventPlatform');
   /** channel → 消费者集合（进程内登记；重复 subscribe 同名忽略） */
   private readonly consumers = new Map<string, Map<string, EventConsumer>>();
   /** channel → EventBus handler（unsubscribe 需要同一函数引用） */
   private readonly busHandlers = new Map<string, (event: Record<string, unknown>) => void>();
+  /** G10：已提示过"无消费者"的事件类型（同类型每进程只提示一次，绝不刷日志） */
+  private readonly undeliveredWarned = new Set<string>();
 
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(AuthorizationService) private readonly auth: AuthorizationService,
     @Inject(EventBusService) private readonly bus: EventBusService,
   ) {}
+
+  /** G10：冻结状态在每个进程启动时显式可见（绝不静默"看起来有投递管道"） */
+  onModuleInit(): void {
+    this.logger.log(
+      { frozen: EVENT_PLATFORM_FROZEN, allowSubscribe: process.env.EVENT_PLATFORM_ALLOW_SUBSCRIBE === '1' },
+      '事件平台已冻结（G10）：仅保留表结构与幂等写入 API；无消费者的事件仅落库，不做中继/清理',
+    );
+  }
 
   // ===== 发布 =====
 
@@ -128,7 +161,15 @@ export class EventPlatformService {
       payload: event.payload, occurredAt: event.occurredAt.toISOString(), traceId: event.traceId,
     });
     const consumers = this.consumers.get(eventChannel(event.eventType))?.size ?? 0;
-    this.logger.log({ eventId: event.eventId, eventType: event.eventType, consumers }, '领域事件已发布');
+    if (consumers === 0) {
+      // G10 冻结：无消费者 = 该行只会停留在 published（预期现象，非缺陷）——提示一次，绝不刷日志
+      if (!this.undeliveredWarned.has(event.eventType)) {
+        this.undeliveredWarned.add(event.eventType);
+        this.logger.warn({ eventType: event.eventType }, '事件平台已冻结（G10）：该类型无消费者，事件仅落库（published 长期保留，不做中继/清理）');
+      }
+    } else {
+      this.logger.log({ eventId: event.eventId, eventType: event.eventType, consumers }, '领域事件已发布');
+    }
     return { event, created: true, consumers };
   }
 
@@ -137,8 +178,16 @@ export class EventPlatformService {
   /**
    * 订阅（进程内登记；通知 → 按 eventType 分发 → 事实行状态机）。
    * 同一 consumer.name 重复订阅同一类型 → 忽略（绝不重复消费）。
+   *
+   * G10 冻结：**生产进程禁止新增消费者**（当前产品无真实消费者）。测试/开发环境（NODE_ENV !== 'production'）
+   * 仍可用，以保持 M8-P5 契约与 e2e 可验证；生产若确需消费者 → 先报 Coordinator，再以
+   * `EVENT_PLATFORM_ALLOW_SUBSCRIBE=1` 显式放开（绝不默认开启，也绝不新增 relay）。
    */
   async subscribe(consumer: EventConsumer): Promise<void> {
+    if (!subscribeAllowed()) {
+      this.logger.error({ name: consumer.name }, '事件平台已冻结（G10）：生产进程禁止注册消费者');
+      throw new AppError(ErrorCode.FORBIDDEN, '事件平台已冻结：生产进程禁止新增消费者（需先报 Coordinator）');
+    }
     if (!consumer.name) throw new Error('消费者必须有 name');
     if (!consumer.eventTypes?.length) throw new Error('消费者必须声明 eventTypes');
     for (const eventType of consumer.eventTypes) {

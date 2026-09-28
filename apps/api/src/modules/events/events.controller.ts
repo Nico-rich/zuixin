@@ -8,6 +8,9 @@ import { AuthedUser, JwtAuthGuard } from '../auth/jwt-auth.guard';
  * M8-P5 事件平台 API（JWT + 组织 RBAC；P5 不新增权限位 → 复用 workflow.read/write 语义）。
  * 只暴露"读 + 死信重投"：事件由领域代码经 EventPlatformService.publish 产生（HTTP 不发事件，
  * 避免把事件总线变成任意外部写入面）。
+ *
+ * Pre-M9 G10：**FROZEN（冻结，方案 B）**。本控制器**只读 + 死信重投**，不新增任何写入/订阅/relay 端点；
+ * 冻结期无消费者的事件会长期停留在 published（预期现象），dead 仅由显式消费失败产生。
  */
 @Controller('events')
 @UseGuards(JwtAuthGuard)

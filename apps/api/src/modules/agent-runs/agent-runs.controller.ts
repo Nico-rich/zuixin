@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Headers, Inject, Param, Post, Query, Req, Res, UseGuards, UsePipes } from '@nestjs/common';
+import { Body, Controller, Get, Headers, Inject, Logger, Param, Post, Query, Req, Res, UseGuards, UsePipes } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { AgentRunsService } from './agent-runs.service';
 import { AgentRunTimelineService } from './agent-run-timeline.service';
@@ -9,6 +9,7 @@ import { RateLimit, RateLimitGuard } from '../../core/rate-limit/rate-limit.guar
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { EventBusService, agentRunChannel } from '../../core/events/event-bus.service';
 import { SSEWriter, SSESink } from '../chat/sse-writer';
+import { SseRegistryService } from '../../core/sse/sse-registry.service';
 import { TimelineItem } from './timeline.types';
 
 const TERMINAL = ['completed', 'failed', 'cancelled', 'timeout'];
@@ -16,10 +17,14 @@ const TERMINAL = ['completed', 'failed', 'cancelled', 'timeout'];
 @Controller('agent-runs')
 @UseGuards(JwtAuthGuard)
 export class AgentRunsController {
+  private readonly logger = new Logger('AgentRunsEvents');
+
   constructor(
     @Inject(AgentRunsService) private readonly runs: AgentRunsService,
     @Inject(AgentRunTimelineService) private readonly timeline: AgentRunTimelineService,
     @Inject(EventBusService) private readonly eventBus: EventBusService,
+    // Pre-M9 G3：SSE 连接纳管（停机时拒绝新订阅 + 主动关闭已建立连接）
+    @Inject(SseRegistryService) private readonly sse: SseRegistryService,
   ) {}
 
   @Get()
@@ -75,12 +80,19 @@ export class AgentRunsController {
     @Param('id') id: string,
     @Headers('last-event-id') lastEventId?: string,
   ) {
+    // Pre-M9 G3：停机排空期拒绝新订阅（503：服务端状态裁决，与"越权/不存在 404"分离）
+    if (this.sse.isDraining()) {
+      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: { code: 'INTERNAL', message: '服务正在优雅停机，暂不接受新的 SSE 订阅' } }));
+      return;
+    }
     const run = await this.runs.getStatus(req.user.userId, id); // 归属校验（404 防枚举）
     const snapshot = await this.timeline.build(req.user.userId, id);
     const terminal = TERMINAL.includes(run.status);
 
     const writer = new SSEWriter(res as unknown as SSESink);
     writer.init();
+    const unregister = this.sse.add('agent-run-events', res as unknown as { end(): void; writableEnded?: boolean });
     const heartbeat = setInterval(() => writer.ping(), 15000);
     try {
       // 断点过滤：按投影确定性排序（timestamp → TYPE_ORDER → id）只补缺失段；未知 id → 全量（客户端自行去重）
@@ -103,7 +115,15 @@ export class AgentRunsController {
           resolveClose();
         }
       };
-      await this.eventBus.subscribe(agentRunChannel(id), handler);
+      try {
+        await this.eventBus.subscribe(agentRunChannel(id), handler);
+      } catch (err) {
+        // Pre-M9 G4 降级（fail-open）：实时订阅建立失败/超时（Redis 不可用）→ 本连接退化为"仅快照"。
+        // 理由：run 的**事实源是 DB timeline 投影**（快照已在上面发出），实时转发只是观察面加速；
+        // 已建立的 SSE 绝不因总线故障变 5xx，也绝不无限等待订阅结果（subscribe 自带调用面上界）。
+        this.logger.warn(`实时事件订阅失败，降级为仅快照（run=${id}）: ${(err as Error).message}`);
+        return;
+      }
       await new Promise<void>((resolve) => {
         resolveClose = resolve;
         res.on('close', () => resolve()); // 客户端断开即返回（SSE 断线不影响 Runtime）
@@ -112,6 +132,7 @@ export class AgentRunsController {
       this.eventBus.unsubscribe(agentRunChannel(id), handler);
     } finally {
       clearInterval(heartbeat);
+      unregister(); // 连接结束 → 从纳管集合移除（停机时不再尝试关闭）
       writer.end();
     }
   }

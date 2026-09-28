@@ -10,7 +10,8 @@ import { StorageAdapter } from '../../core/storage/storage.types';
 import { EventBusService } from '../../core/events/event-bus.service';
 import { UsageService } from '../usage/usage.service';
 import { IMAGE_QUEUE, VIDEO_QUEUE } from '../../core/queue/queue.module';
-import { MediaExecutor, MediaExecResult } from './media-types';
+import { addJobBounded } from '../../core/queue/bounded-add';
+import { MediaExecutor, MediaExecResult, MediaRemoteStatus } from './media-types';
 import { AgentRunResumeTrigger } from '../../core/agent-run-resume/agent-run-resume-trigger.service';
 import { QuotaService } from '../billing/quota.service';
 import { SafeRemoteFetcher } from '../security/safe-remote-fetcher.service';
@@ -101,7 +102,9 @@ export class MediaGenerationService {
         },
       });
       const queue = input.type === 'image' ? this.imageQueue : this.videoQueue;
-      await queue.add('generate', { taskId: task.id }, { attempts: 1, removeOnComplete: true, removeOnFail: true });
+      // Pre-M9 G4：投递有界（2s）+ 显式失败——任务行此刻已是 pending，投递失败会由
+      // media-cleanup 巡检（G7）按 remoteTaskId/超时兜底置失败，绝不无限挂住创建接口。
+      await addJobBounded(queue, 'generate', { taskId: task.id }, { attempts: 1, removeOnComplete: true, removeOnFail: true }, `media:${input.type}`);
       return task;
     } catch (err) {
       // 幂等键冲突（UNIQUE）：同一 ToolCall 重试 → 返回已有任务，绝不产生第二个任务
@@ -156,45 +159,105 @@ export class MediaGenerationService {
       const result = await executor.execute(ctx);
       await ctx.publishProgress(80, '正在保存结果…');
 
-      const files = await this.storeFiles(task, result);
-      // 条件完成：若已被清扫 job 标 failed（慢 Worker 竞态），放弃写入并回收附件
-      const done = await this.prisma.generationTask.updateMany({
-        where: { id: taskId, status: 'processing' },
-        data: {
-          status: 'completed', statusMessage: '完成', progress: 100, completedAt: new Date(),
-          providerId: result.providerId, modelId: result.modelId,
-          output: { attachments: files.map((a) => a.id) },
-        },
-      });
-      if (done.count === 0) {
-        await this.prisma.attachment.deleteMany({ where: { id: { in: files.map((a) => a.id) } } }).catch(() => undefined);
-        this.logger.warn({ taskId }, '任务已被清扫为失败，放弃完成写入并回收附件');
-        return;
-      }
-      await this.usage.recordMediaUsage({
-        userId: task.userId, conversationId: task.conversationId ?? undefined, messageId: task.messageId ?? undefined, taskId,
-        kind: task.type, providerId: result.providerId, modelId: result.modelId,
-        imageCount: result.imageCount, videoSeconds: result.videoSeconds,
-        latencyMs: Date.now() - startedAt, status: 'success', runId: task.runId ?? undefined,
-      });
-      await this.events.publish('task', { type: 'task.completed', taskId, progress: 100 });
-      // M6-P4：任务终态单点 hook → 唤醒 waiting 的 AgentRun（waiting→queued→resume）
-      await this.resume.onTaskTerminal(taskId).catch(() => undefined);
-      // Pre-M9 D1：媒体账本行由 UsageService.recordMediaUsage 派生镜像（ur:{recordId} 幂等键）——本处不再直写
-      // Pre-M9 C1：终态释放配额预留
-      await this.quota.release(taskId, task.type === 'image' ? 'image_generation' : 'video_seconds').catch(() => undefined);
-      this.logger.log({ taskId, userId: task.userId, type: task.type, provider: result.providerId, latencyMs: Date.now() - startedAt }, '媒体任务完成');
+      // 正常执行路径的完成写入只允许 processing → completed（慢 Worker 与清扫竞态时放弃写入）
+      await this.finishCompleted(task, result, startedAt, ['processing']);
     } catch (err) {
       const appErr = err instanceof AppError ? err : mapProviderError(err as ProviderLikeError);
       await this.failTask(taskId, appErr.code, appErr.message, startedAt);
     }
   }
 
+  /**
+   * Pre-M9 G7：**远端任务恢复**——进程崩溃/重启（或 lease 丢失）后本地已无执行者轮询，
+   * 但 provider 侧任务可能早已完成；此时只有问 provider 才是权威，绝不能一律判超时失败。
+   *
+   * 只处理**非终态且已提交过远端任务**的行（remoteTaskId 非空；终态绝不复活）：
+   * - completed → 与正常完成完全一致的落库路径（转存附件 / usage / task.completed / resume / 配额释放）；
+   * - failed    → 落失败终态（错误文案来自 provider）；
+   * - processing→ 保持非终态（远端仍在跑，提前判死会造成"用钱买了却被判失败"）；
+   * - unknown   → 无法断定（无适配器/查询失败/竞态已终态）→ 交调用方（清扫超时兜底）裁决。
+   */
+  async recoverRemoteGenerationTask(taskId: string): Promise<'completed' | 'failed' | 'processing' | 'unknown'> {
+    const task = await this.prisma.generationTask.findUnique({ where: { id: taskId } });
+    if (!task || !task.remoteTaskId) return 'unknown';
+    if (task.status !== 'pending' && task.status !== 'processing') return 'unknown';
+    const executor = this.executors.get(task.type);
+    if (!executor?.queryRemoteStatus) return 'unknown';
+    const timeoutMs = Number(process.env.MEDIA_RECOVERY_QUERY_TIMEOUT_MS) || 15_000;
+    const startedAt = task.startedAt?.getTime() ?? Date.now();
+    let remote: MediaRemoteStatus | null;
+    try {
+      remote = await executor.queryRemoteStatus({
+        taskId, remoteTaskId: task.remoteTaskId, modelId: task.modelId, providerId: task.providerId,
+        input: task.input, deadline: Date.now() + timeoutMs,
+      });
+    } catch (err) {
+      // 查询失败（provider 不可达 / 模型停用 / 超时）≠ 任务失败：保持现状，由超时兜底裁决
+      this.logger.warn({ taskId, remoteTaskId: task.remoteTaskId, err: (err as Error).message }, '远端状态查询失败，交由超时兜底');
+      return 'unknown';
+    }
+    if (!remote) return 'unknown';
+    if (remote.status === 'processing') {
+      this.logger.log({ taskId, remoteTaskId: task.remoteTaskId }, '远端任务仍在执行 → 保持非终态（不判超时）');
+      return 'processing';
+    }
+    if (remote.status === 'failed') {
+      await this.failTask(taskId, ErrorCode.PROVIDER_UNKNOWN, remote.error, startedAt, ['pending', 'processing']);
+      return 'failed';
+    }
+    this.logger.log({ taskId, remoteTaskId: task.remoteTaskId }, '远端任务已完成 → 按真实结果恢复落库');
+    return (await this.finishCompleted(task, remote.result, startedAt, ['pending', 'processing'])) ? 'completed' : 'unknown';
+  }
+
+  /**
+   * 完成落库（正常执行与 G7 远端恢复共用同一路径）：转存附件 → 条件完成 → usage/事件/resume/配额释放。
+   * `fromStatuses`：正常路径只允许 processing（清扫竞态保护）；恢复路径额外允许 pending。
+   */
+  private async finishCompleted(
+    task: { id: string; userId: string; conversationId: string | null; messageId: string | null; type: string; runId: string | null },
+    result: MediaExecResult,
+    startedAt: number,
+    fromStatuses: Array<'pending' | 'processing'>,
+  ): Promise<boolean> {
+    const files = await this.storeFiles(task, result);
+    // 条件完成：若已被清扫 job 标 failed（慢 Worker 竞态），放弃写入并回收附件
+    const done = await this.prisma.generationTask.updateMany({
+      where: { id: task.id, status: { in: fromStatuses } },
+      data: {
+        status: 'completed', statusMessage: '完成', progress: 100, completedAt: new Date(),
+        providerId: result.providerId, modelId: result.modelId,
+        output: { attachments: files.map((a) => a.id) },
+      },
+    });
+    if (done.count === 0) {
+      await this.prisma.attachment.deleteMany({ where: { id: { in: files.map((a) => a.id) } } }).catch(() => undefined);
+      this.logger.warn({ taskId: task.id }, '任务已被清扫为失败，放弃完成写入并回收附件');
+      return false;
+    }
+    await this.usage.recordMediaUsage({
+      userId: task.userId, conversationId: task.conversationId ?? undefined, messageId: task.messageId ?? undefined, taskId: task.id,
+      kind: task.type as 'image' | 'video', providerId: result.providerId, modelId: result.modelId,
+      imageCount: result.imageCount, videoSeconds: result.videoSeconds,
+      latencyMs: Date.now() - startedAt, status: 'success', runId: task.runId ?? undefined,
+    });
+    await this.events.publish('task', { type: 'task.completed', taskId: task.id, progress: 100 });
+    // M6-P4：任务终态单点 hook → 唤醒 waiting 的 AgentRun（waiting→queued→resume）
+    await this.resume.onTaskTerminal(task.id).catch(() => undefined);
+    // Pre-M9 D1：媒体账本行由 UsageService.recordMediaUsage 派生镜像（ur:{recordId} 幂等键）——本处不再直写
+    // Pre-M9 C1：终态释放配额预留
+    await this.quota.release(task.id, task.type === 'image' ? 'image_generation' : 'video_seconds').catch(() => undefined);
+    this.logger.log({ taskId: task.id, userId: task.userId, type: task.type, provider: result.providerId, latencyMs: Date.now() - startedAt }, '媒体任务完成');
+    return true;
+  }
+
   /** 失败终态（条件更新，不覆盖已终态的任务）；usage 失败归因取自 attempt 时写入的 provider/model */
-  private async failTask(taskId: string, code: string, message: string, startedAt: number) {
+  private async failTask(
+    taskId: string, code: string, message: string, startedAt: number,
+    fromStatuses: Array<'pending' | 'processing'> = ['processing'],
+  ) {
     const current = await this.prisma.generationTask.findUnique({ where: { id: taskId } });
     const failed = await this.prisma.generationTask.updateMany({
-      where: { id: taskId, status: 'processing' },
+      where: { id: taskId, status: { in: fromStatuses } },
       data: { status: 'failed', statusMessage: message, errorCode: code, errorMessage: message, completedAt: new Date() },
     });
     if (failed.count === 0) return; // 已被清扫/其他路径终态
