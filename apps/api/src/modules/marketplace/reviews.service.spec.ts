@@ -1,9 +1,16 @@
 import { describe, it, expect, vi } from 'vitest';
+import { OrganizationRole } from '@prisma/client';
 import { ReviewsService } from './reviews.service';
+import { AuthorizationService } from '../organizations/authorization.service';
+import { MarketplaceAccessService } from './marketplace-access.service';
 
 /**
- * M9-P6 评审服务单测：评分边界 / upsert 语义（一用户一条）/ 写入即回 pending / moderation 权限与 CAS。
- * 断言重点 = "非法评分绝不落库""非 owner/admin 绝不改审核状态""审核只动 ExtensionReview 表"。
+ * M9-P6 / M10-P6 评审服务单测：评分边界 / upsert 语义（一用户一条）/ 写入即回 pending / moderation 权限与 CAS。
+ * 断言重点 = "非法评分绝不落库""非治理角色绝不改审核状态""审核只动 ExtensionReview 表"。
+ *
+ * 第二段（M10-P6 补强）= **真实治理判定接线**：ReviewsService + 真实 MarketplaceAccessService
+ * + 真实 AuthorizationService 矩阵（prisma 只提供假行）——
+ * 审核端点"一律走显式治理判定函数"这一契约在此被锁死（member/viewer 即使矩阵未来放宽也 403）。
  */
 const ORG = 'org-1';
 
@@ -175,5 +182,114 @@ describe('ReviewsService（评分 + 审核状态机）', () => {
     expect(h.prisma.extensionReview.findUnique).toHaveBeenCalledWith({
       where: { publicationId_userId: { publicationId: 'pub-1', userId: 'u2' } },
     });
+  });
+});
+
+// ===== M10-P6：审核端点 × 真实治理判定（access / RBAC 矩阵全真实，prisma 为假行）=====
+// 哨兵表：审核路径**绝不**写扩展/版本/Agent 物化面（M9-P6 不变量"评分与审核状态不参与授权"的落库侧锁）
+
+function makeWiredHarness(opts: {
+  role?: OrganizationRole | null; userRole?: string;
+  review?: unknown; casCount?: number;
+} = {}) {
+  const role = opts.role === undefined ? ('owner' as OrganizationRole) : opts.role;
+  const review = opts.review === undefined ? reviewRow({ moderationStatus: 'pending' }) : opts.review;
+  const prisma = {
+    organization: { findFirst: vi.fn(async () => ({ id: ORG })) },
+    organizationMember: { findUnique: vi.fn(async () => (role === null ? null : { role })) },
+    user: {
+      findUnique: vi.fn(async () => ({ role: opts.userRole ?? 'user' })),
+      findMany: vi.fn(async () => [{ id: 'u2', displayName: '评审者甲' }]),
+    },
+    extensionPublication: { findUnique: vi.fn(async () => pubRow()) },
+    extensionReview: {
+      findUnique: vi.fn(async () => review),
+      findUniqueOrThrow: vi.fn(async () => review),
+      findMany: vi.fn(async () => [review]),
+      upsert: vi.fn(async () => review),
+      updateMany: vi.fn(async () => ({ count: opts.casCount ?? 1 })),
+    },
+    // 哨兵（审核绝不可写）：任何一次调用即用例失败，失败信息直接点出被污染的物化面
+    agent: { update: vi.fn(), updateMany: vi.fn() },
+    agentVersion: { update: vi.fn(), updateMany: vi.fn() },
+    extension: { update: vi.fn(), updateMany: vi.fn() },
+    extensionVersion: { update: vi.fn(), updateMany: vi.fn(), upsert: vi.fn() },
+  };
+  const auth = new AuthorizationService(prisma as never); // 真实矩阵（can/authorize 均为真实实现）
+  const access = new MarketplaceAccessService(prisma as never, auth as never); // 真实治理判定
+  const audit = { write: vi.fn(async () => undefined) };
+  const service = new ReviewsService(prisma as never, access as never, audit as never);
+  return { service, prisma, auth, access, audit };
+}
+
+/** 审核后：除 ExtensionReview.moderationStatus 外，绝不写任何物化面 */
+function expectModerationWriteSurfaceIsClosed(h: ReturnType<typeof makeWiredHarness>): void {
+  for (const [table, spies] of [
+    ['agent', h.prisma.agent], ['agentVersion', h.prisma.agentVersion],
+    ['extension', h.prisma.extension], ['extensionVersion', h.prisma.extensionVersion],
+  ] as const) {
+    for (const [method, spy] of Object.entries(spies)) {
+      expect(spy, `${table}.${method} 不得被治理动作写入`).not.toHaveBeenCalled();
+    }
+  }
+  expect(h.prisma.extensionReview.upsert).not.toHaveBeenCalled();
+}
+
+describe('ReviewsService × 真实治理判定（M10-P6）', () => {
+  it('moderate：owner/admin 可审核；member/viewer/非成员一律拒绝且零写入', async () => {
+    for (const role of ['owner', 'admin'] as const) {
+      const h = makeWiredHarness({ role });
+      await expect(h.service.moderate('u-mod', 'rv-1', { status: 'approved' })).resolves.toMatchObject({ id: 'rv-1' });
+      expect(h.prisma.extensionReview.updateMany).toHaveBeenCalledTimes(1);
+      expectModerationWriteSurfaceIsClosed(h);
+    }
+    for (const role of ['member', 'viewer'] as const) {
+      const h = makeWiredHarness({ role });
+      await expect(h.service.moderate('u-mod', 'rv-1', { status: 'approved' }))
+        .rejects.toMatchObject({ code: 'FORBIDDEN' });
+      expect(h.prisma.extensionReview.updateMany).not.toHaveBeenCalled();
+      expect(h.audit.write).not.toHaveBeenCalled();
+      expectModerationWriteSurfaceIsClosed(h);
+    }
+    // 非成员 → 404（防枚举：不得暴露评审/条目存在性）
+    const outsider = makeWiredHarness({ role: null });
+    await expect(outsider.service.moderate('u-out', 'rv-1', { status: 'approved' }))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(outsider.prisma.extensionReview.updateMany).not.toHaveBeenCalled();
+    // 平台管理员（非成员）→ 逃生门放行
+    const platform = makeWiredHarness({ role: null, userRole: 'admin' });
+    await expect(platform.service.moderate('u-admin', 'rv-1', { status: 'approved' })).resolves.toMatchObject({ id: 'rv-1' });
+  });
+
+  it('moderate：**只**改 moderationStatus 字段（评分/物化面逐项不变——M9-P6 不变量）', async () => {
+    for (const [rating, target] of [[5, 'approved'], [1, 'rejected']] as const) {
+      const h = makeWiredHarness({ role: 'owner', review: reviewRow({ rating, moderationStatus: 'pending' }) });
+      await h.service.moderate('u-mod', 'rv-1', { status: target });
+      // 落库 payload 精确等于"状态条件更新"：不含 rating/body，也不含任何其他表
+      expect(h.prisma.extensionReview.updateMany).toHaveBeenCalledWith({
+        where: { id: 'rv-1', moderationStatus: 'pending' },
+        data: { moderationStatus: target },
+      });
+      expectModerationWriteSurfaceIsClosed(h);
+    }
+  });
+
+  it('list：pending/rejected 过滤需治理权（真实判定）；approved 公开面任何成员可读', async () => {
+    for (const role of ['member', 'viewer'] as const) {
+      const h = makeWiredHarness({ role });
+      await expect(h.service.list('u-x', 'pub-1', { moderationStatus: 'pending' }))
+        .rejects.toMatchObject({ code: 'FORBIDDEN' });
+      expect(h.prisma.extensionReview.findMany).not.toHaveBeenCalled();
+    }
+    const owner = makeWiredHarness({ role: 'owner' });
+    await expect(owner.service.list('u-owner', 'pub-1', { moderationStatus: 'pending' })).resolves.toHaveLength(1);
+    expect(owner.prisma.extensionReview.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { publicationId: 'pub-1', moderationStatus: 'pending' },
+    }));
+    const member = makeWiredHarness({ role: 'member' });
+    await expect(member.service.list('u-member', 'pub-1', {})).resolves.toHaveLength(1);
+    expect(member.prisma.extensionReview.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { publicationId: 'pub-1', moderationStatus: 'approved' },
+    }));
   });
 });

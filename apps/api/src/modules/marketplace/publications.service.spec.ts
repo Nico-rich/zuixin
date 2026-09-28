@@ -1,5 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
+import { OrganizationRole } from '@prisma/client';
 import { PublicationsService } from './publications.service';
+import { AuthorizationService } from '../organizations/authorization.service';
+import { MarketplaceAccessService } from './marketplace-access.service';
 import { checksumOf, parseManifest, signChecksum } from '../extensions/manifest';
 
 /**
@@ -78,6 +81,30 @@ function makeHarness(opts: {
   const audit = { write: vi.fn(async () => undefined) };
   const service = new PublicationsService(prisma as never, orgs as never, access as never, audit as never);
   return { service, prisma, orgs, access, audit };
+}
+
+/**
+ * M10-P6：**真实**治理判定接线（prisma 只提供假行；AuthorizationService 矩阵与
+ * MarketplaceAccessService 判定均为真实实现）——驳回端点"走显式治理判定"的契约在此锁死。
+ */
+function makeWiredHarness(role: OrganizationRole | null) {
+  const prisma = {
+    organization: { findFirst: vi.fn(async () => ({ id: ORG })) },
+    organizationMember: { findUnique: vi.fn(async () => (role === null ? null : { role })) },
+    user: { findUnique: vi.fn(async () => ({ role: 'user' })) },
+    extensionPublication: {
+      findUnique: vi.fn(async () => pubRow({ status: 'published' })),
+      updateMany: vi.fn(async () => ({ count: 1 })),
+    },
+    extension: { findUnique: vi.fn(async () => extRow()) },
+    extensionVersion: { findFirst: vi.fn(async () => publishedVersion()) },
+  };
+  const orgs = { ensurePersonalOrganization: vi.fn(async () => ({ id: 'personal-u1' })) };
+  const auth = new AuthorizationService(prisma as never);
+  const access = new MarketplaceAccessService(prisma as never, auth as never);
+  const audit = { write: vi.fn(async () => undefined) };
+  const service = new PublicationsService(prisma as never, orgs as never, access as never, audit as never);
+  return { service, prisma, orgs, auth, access, audit };
 }
 
 describe('PublicationsService（上架门禁 + 状态机）', () => {
@@ -254,5 +281,26 @@ describe('PublicationsService（上架门禁 + 状态机）', () => {
   it('读路径：条目不存在 → 404（防枚举）', async () => {
     const h = makeHarness({ pub: null });
     await expect(h.service.getRowForAccess('pub-x')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('reject × 真实治理判定（M10-P6）：owner/admin 可驳回；member/viewer 403；非成员 404', async () => {
+    for (const role of ['owner', 'admin'] as const) {
+      const h = makeWiredHarness(role);
+      await expect(h.service.reject('u-mod', 'pub-1', { reason: '分类与内容不符' })).resolves.toMatchObject({ id: 'pub-1' });
+      expect(h.prisma.extensionPublication.updateMany).toHaveBeenCalledWith({
+        where: { id: 'pub-1', status: 'published' }, data: { status: 'rejected' },
+      });
+    }
+    for (const role of ['member', 'viewer'] as const) {
+      const h = makeWiredHarness(role);
+      await expect(h.service.reject('u-x', 'pub-1', { reason: '越权驳回' }))
+        .rejects.toMatchObject({ code: 'FORBIDDEN' });
+      expect(h.prisma.extensionPublication.updateMany).not.toHaveBeenCalled();
+      expect(h.audit.write).not.toHaveBeenCalled();
+    }
+    const outsider = makeWiredHarness(null);
+    await expect(outsider.service.reject('u-out', 'pub-1', { reason: '局外人驳回' }))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(outsider.prisma.extensionPublication.updateMany).not.toHaveBeenCalled();
   });
 });

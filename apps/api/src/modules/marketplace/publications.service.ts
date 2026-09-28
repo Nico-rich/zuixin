@@ -206,7 +206,11 @@ export class PublicationsService {
     return updated;
   }
 
-  /** 驳回（治理侧下架）：published → rejected，仅 owner/admin（`member.write`）或平台管理员 */
+  /**
+   * 驳回（治理侧下架）：published → rejected。
+   * 治理权经 `access.assertModerationRights`（M10-P6 显式判定：owner/admin 或平台管理员）——
+   * 与评审审核**同一判定入口**，绝不各自推导（审计 D7 / M9-02）。
+   */
   async reject(userId: string, id: string, dto: RejectPublicationDto): Promise<PublicationRow> {
     const pub = await this.require(id);
     await this.access.assertModerationRights(userId, pub);
