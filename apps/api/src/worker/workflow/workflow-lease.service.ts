@@ -8,6 +8,7 @@ import { DEFAULT_LEASE_TTL_MS } from '../../core/agent-run-lease/agent-run-lease
 import { QuotaService } from '../../modules/billing/quota.service';
 import { WORKFLOW_DEADLINE_DEFAULT_MS, workflowDeadlineMsFromSetting } from '../../modules/workflows/workflow-types';
 import { parseWaitingUntil } from '../../modules/workflows/workflow-wait.service';
+import { CHILD_TERMINAL_STATUSES, WorkflowWakeService } from './workflow-wake.service';
 
 export const WORKFLOW_DEADLINE_MS = WORKFLOW_DEADLINE_DEFAULT_MS; // workflow run 上限 1h（可被 limits.workflowDeadlineMs 覆盖）
 
@@ -25,6 +26,9 @@ export class WorkflowLeaseService {
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @InjectQueue(WORKFLOW_QUEUE) private readonly workflowQueue: Queue,
     @Inject(QuotaService) private readonly quota: QuotaService,
+    // D2-04：兜底巡检是"丢事件"场景下唯一的唤醒路径——唤醒的同时回收子 run 终态订阅
+    // （否则事件丢失 = 订阅永不触发、永不回收；D2-04 的泄漏只在正常事件路径被堵住是不够的）
+    @Inject(WorkflowWakeService) private readonly wake: WorkflowWakeService,
   ) {}
 
   async deadlineMs(): Promise<number> {
@@ -122,6 +126,8 @@ export class WorkflowLeaseService {
           this.logger.warn({ runId: row.id }, 'workflow run 超过 deadline → timeout');
           // Pre-M9 C1：timeout 终态释放配额预留
           await this.quota.release(row.id, 'workflow_run').catch(() => undefined);
+          // D2-04：run 已终态（绝不再被唤醒）→ 子 run 终态订阅必须回收
+          if (row.waitingOnAgentRunId) this.wake.clearChildSubscription(row.waitingOnAgentRunId);
         }
         continue;
       }
@@ -159,7 +165,11 @@ export class WorkflowLeaseService {
         const child = await this.prisma.agentRun.findUnique({
           where: { id: row.waitingOnAgentRunId }, select: { status: true },
         });
-        if (child && ['completed', 'failed', 'cancelled', 'timeout'].includes(child.status)) {
+        if (child && CHILD_TERMINAL_STATUSES.includes(child.status)) {
+          // D2-04：子 run 已终态 = 该子 run 观察订阅的终点（终态 run 不再产生终态事件；executor 也绝不
+          // 对终态子 run 重新进入等待）——无论本次唤醒是否由本进程完成，都在这里回收：
+          // 事件丢失（Pub/Sub at-most-once）时订阅永不会被触发，本巡检是唯一的净网。
+          this.wake.clearChildSubscription(row.waitingOnAgentRunId);
           const woken = await this.prisma.workflowRun.updateMany({
             where: { id: row.id, status: 'waiting', waitingOnAgentRunId: row.waitingOnAgentRunId },
             data: { status: 'queued', waitingOnAgentRunId: null, workerId: null, leaseUntil: null, heartbeatAt: null },

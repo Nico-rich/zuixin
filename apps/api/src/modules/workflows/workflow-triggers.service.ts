@@ -102,8 +102,18 @@ export function scheduleCronsOf(definition: WorkflowDefinition): string[] {
 @Injectable()
 export class WorkflowTriggersService implements OnModuleInit {
   private readonly logger = new Logger('WorkflowTriggers');
-  /** 进程内 event 订阅登记（重注册去重） */
+  /** 进程内 event 订阅登记（**重注册去重**；channel → 订阅该 channel 的 workflowId 集合） */
   private readonly eventSubscriptions = new Map<string, Set<string>>();
+  /**
+   * D2-03：channel → 本服务登记在 EventBusService 上的 handler（**精确解绑的唯一句柄**）。
+   *
+   * `EventBusService.unsubscribe(channel, handler)` 是按 handler **精确移除**的公开 API
+   * （底层 Redis 订阅保留——共享单例总线不释放 channel，见 event-bus.service.ts 注释），
+   * 因此本服务必须自己保存 handler 引用：只 `Set.delete(workflowId)` 而不同步解绑时，
+   * handler 常驻总线的 handler 表（闭包捕获 this，随归档/重发布次数线性增长），
+   * `eventSubscriptions` 的 Map 键也永不回收（空 Set 常驻 = 同一泄漏）。
+   */
+  private readonly eventHandlers = new Map<string, (event: Record<string, unknown>) => void>();
 
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
@@ -504,24 +514,61 @@ export class WorkflowTriggersService implements OnModuleInit {
     this.logger.log({ workflowId, bucket }, 'schedule 触发 → 创建 workflow run');
   }
 
-  /** event 触发订阅（幂等键 = event.id 或载荷摘要） */
+  /**
+   * event 触发订阅（幂等键 = event.id 或载荷摘要）。
+   * 单 channel 单 handler：handler 分发时**现查**成员集合（绝不闭包捕获某一次的快照），
+   * 因此后续的注册/注销立即生效。
+   */
   async registerEvent(workflowId: string, channel: string): Promise<void> {
     const key = channel;
     if (this.eventSubscriptions.get(key)?.has(workflowId)) return;
     if (!this.eventSubscriptions.has(key)) {
-      this.eventSubscriptions.set(key, new Set());
-      await this.events.subscribe(key, (event) => {
+      const members = new Set<string>();
+      this.eventSubscriptions.set(key, members);
+      const handler = (event: Record<string, unknown>) => {
         for (const wfId of this.eventSubscriptions.get(key) ?? []) {
           void this.handleEvent(wfId, event).catch(() => undefined);
         }
-      });
+      };
+      try {
+        await this.events.subscribe(key, handler);
+      } catch (err) {
+        // 与 EventBusService.subscribe 同一纪律（Pre-M9 G4）：订阅未建立 → **绝不留下半成品**。
+        // 原实现此处残留空 Set：后续 registerEvent 见键已存在 → 跳过订阅，成员加进一个
+        // 无人分发的集合（"看似已订阅、实际收不到"）且该键永不回收。
+        this.eventSubscriptions.delete(key);
+        throw err;
+      }
+      this.eventHandlers.set(key, handler);
     }
     this.eventSubscriptions.get(key)!.add(workflowId);
   }
 
+  /**
+   * D2-03：注销 event 订阅 = **真解绑**（不是只从 Set 里删 id）。
+   * - 该 channel 仍有其他 workflow 订阅 → 只移除本 id（handler 保留，channel 继续服务其余 workflow）；
+   * - 本 id 是最后一个 → `EventBusService.unsubscribe(channel, handler)` **精确移除本服务的 handler**
+   *   （绝不误删其他服务的同 channel 订阅）+ 删除 `eventSubscriptions` 的 Map 键
+   *   （空 Set 无意义：键随归档/重发布次数增长即泄漏）；
+   * - 底层 Redis 订阅保留（共享单例总线不释放 channel）；解绑后该 channel 的迟到事件
+   *   对本服务不再有任何投递（handleEvent 的 `status !== 'published'` 判定是第二道保险）。
+   * 幂等：从未登记（或已解绑）→ no-op，绝不误删他人 handler。
+   */
   async unregisterEvent(workflowId: string, channel: string): Promise<void> {
-    this.eventSubscriptions.get(channel)?.delete(workflowId);
+    const key = channel;
+    const members = this.eventSubscriptions.get(key);
+    if (!members) return;
+    members.delete(workflowId);
+    if (members.size > 0) return; // 其余 workflow 仍在订阅 → handler 必须继续有效
+    this.eventSubscriptions.delete(key);
+    const handler = this.eventHandlers.get(key);
+    if (!handler) return;
+    this.eventHandlers.delete(key);
+    this.events.unsubscribe(key, handler);
   }
+
+  /** D2-03 可观测：已登记订阅的 channel 数（归档后必须回落，绝不随发布/归档次数增长） */
+  pendingEventSubscriptions(): number { return this.eventSubscriptions.size; }
 
   async handleEvent(workflowId: string, event: Record<string, unknown>): Promise<void> {
     const wf = await this.prisma.workflow.findUnique({ where: { id: workflowId } });
