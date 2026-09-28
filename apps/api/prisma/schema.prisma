@@ -211,7 +211,7 @@ model Conversation {
   summaries ConversationSummary[]
   artifacts Artifact[]
   agentRuns AgentRun[]
-  @@index([userId, updatedAt])
+  @@index([userId, deletedAt, updatedAt(sort: Desc), id(sort: Desc)]) // M10-P16：会话列表游标分页（替换旧 [userId, updatedAt]）
   @@index([projectId])
 }
 
@@ -235,7 +235,7 @@ model Message {
   createdAt        DateTime        @default(now())
   attachments      Attachment[]
   tasks            GenerationTask[]
-  @@index([conversationId, createdAt])
+  @@index([conversationId, createdAt(sort: Desc), id(sort: Desc)]) // M10-P16：游标分页 keyset+Sort 消除（替换旧 2 列索引）
 }
 
 // ===== 附件（上传与生成产物统一管理）=====
@@ -365,6 +365,7 @@ model GenerationTask {
   @@index([status])
   @@index([runId])
   @@index([toolCallId])
+  @@index([conversationId, createdAt(sort: Desc)]) // M10-P16：任务列表端点（原全表扫）
 }
 
 // ===== 用量与成本 =====
@@ -396,6 +397,7 @@ model UsageRecord {
   @@index([userId, createdAt])
   @@index([runId])
   @@index([organizationId, createdAt])
+  @@index([providerId, createdAt]) // M10-P16：路由健康评分窗口聚合（原每次路由决策全表扫）
 }
 
 // ===== 系统配置 =====
@@ -1699,6 +1701,7 @@ model EvaluationResult {
   evidence    Json?    // judge 引用/规则命中——只读事实（LLM judge 输出只进这里，绝不决定权限）
   createdAt   DateTime @default(now())
   @@unique([caseRunId, evaluatorId])
+  @@index([evaluatorId]) // M10-P16：评测器结果计数（唯一索引前导列不可用）
 }
 
 model Experiment {
@@ -1749,6 +1752,7 @@ model MemoryCandidate {
   promotedAt      DateTime?
   @@index([userId, status])
   @@unique([userId, contentHash]) // M10-P11：同一用户同内容候选绝不重复
+  @@index([sourceSummaryId]) // M10-P16：会话删除/摘要重建清理路径
 }
 
 // ===== M9-P6 Marketplace 公开层（Coordinator 预整合；评分绝不提升权限——权限仍 = manifest ∩ 平台白名单 ∩ 组织策略）=====
@@ -1769,6 +1773,7 @@ model ExtensionPublication {
   reviews        ExtensionReview[]
   @@index([organizationId])
   @@index([status, category])
+  @@index([status, createdAt(sort: Desc), id(sort: Desc)]) // M10-P16：目录分页排序键
 }
 
 model ExtensionReview {
