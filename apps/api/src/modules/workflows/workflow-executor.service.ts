@@ -80,7 +80,7 @@ export interface WorkflowApprovalRequest {
  * ③ compensate：非瞬态失败 → 对已成功步骤按 stepIndex **逆序**执行补偿链（复用同一锚点行 + 同一幂等键）；
  *    补偿步骤在正常流程中绝不执行；补偿自身失败只记录（绝不无限重试）；
  * ④ approval：reason 模板 + formFields 展示字段 + **执行前重算绑定摘要**（审批绑定具体动作，三处校验语义不变）；
- * ⑤ 版本锁定：定义一律取 run 锁定的不可变版本（`lockedDefinition`），绝不读 workflow 最新版本。
+ * ⑤ 版本锁定：定义一律取 run 锁定的 `definitionSnapshot`（历史 run 回退锁定版本行），绝不读 workflow 最新版本。
  */
 @Injectable()
 export class WorkflowExecutor {
@@ -110,8 +110,9 @@ export class WorkflowExecutor {
       include: { version: true, steps: { orderBy: { stepIndex: 'asc' } } },
     });
     if (!run || run.status !== 'running') return { outcome: 'done' };
-    // M9-P4 ⑤：定义一律取 run 锁定的不可变版本（绝不读 workflow 最新版本）
-    const def = lockedDefinition(run.version);
+    // M9-P4 ⑤ / M10-P5 D4：定义一律取 run 锁定的快照（历史 run snapshot=null → 回退锁定版本行）；
+    // **绝不读 workflow 的最新版本**
+    const def = lockedDefinition(run.version, run.definitionSnapshot);
     const steps = def.steps;
 
     if (run.currentStep >= steps.length) {

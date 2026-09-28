@@ -31,6 +31,7 @@ function makeService(row: Record<string, unknown> | null = ROW) {
   const triggers = {
     registerTriggers: vi.fn(async () => ({ webhook: null })),
     unregisterTriggers: vi.fn(async () => undefined),
+    rotateWebhook: vi.fn(async () => ({ token: 'tok-1', secret: 'new-secret', previousSecretExpiresAt: '2026-01-01T00:00:00.000Z' })),
   };
   const orgs = {
     requirePermission: vi.fn(async () => 'owner'),
@@ -106,5 +107,54 @@ describe('WorkflowsService 写路径 RBAC（Pre-M9：viewer/member 可写修复�
     await expect(svc.create('viewer-1', { name: 'n', organizationId: 'org-1', definition: DEFINITION as never }))
       .rejects.toMatchObject({ code: 'FORBIDDEN' });
     expect(prisma.workflow.create).toHaveBeenCalledTimes(2); // viewer 那一次绝不落库
+  });
+});
+
+/**
+ * M10-P5 SA-18：webhook secret 轮换的 RBAC = **org owner/admin**（比 workflow.write 更严）。
+ * 关键：member 虽可写工作流，但**不可轮换密钥**（密钥是端点凭据，属管理员面）；
+ * 角色不足时绝不产生任何副作用（triggers.rotateWebhook 不被调用）。
+ */
+describe('WorkflowsService webhook 密钥轮换 RBAC（M10-P5 SA-18）', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('owner / admin → 允许；member（有 workflow.write）→ 403 且零副作用', async () => {
+    const owner = makeService();
+    await owner.svc.rotateWebhookSecret('owner-1', 'wf-1');
+    expect(owner.triggers.rotateWebhook).toHaveBeenCalledWith('wf-1', 'owner-1');
+
+    const admin = makeService();
+    admin.orgs.requireMembership.mockResolvedValueOnce('admin');
+    await admin.svc.rotateWebhookSecret('admin-1', 'wf-1');
+    expect(admin.triggers.rotateWebhook).toHaveBeenCalledTimes(1);
+
+    const member = makeService();
+    member.orgs.requireMembership.mockResolvedValueOnce('member');
+    await expect(member.svc.rotateWebhookSecret('member-1', 'wf-1')).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(member.triggers.rotateWebhook).not.toHaveBeenCalled(); // 先校验后操作
+
+    const viewer = makeService();
+    viewer.orgs.requirePermission.mockRejectedValueOnce(new AppError(ErrorCode.FORBIDDEN, '权限不足'));
+    viewer.orgs.requireMembership.mockResolvedValueOnce('viewer');
+    await expect(viewer.svc.rotateWebhookSecret('viewer-1', 'wf-1')).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(viewer.triggers.rotateWebhook).not.toHaveBeenCalled();
+  });
+
+  it('非成员/不存在 → 404 反枚举（角色查询都不发生）', async () => {
+    const { svc, triggers, orgs } = makeService(null);
+    await expect(svc.rotateWebhookSecret('outsider-1', 'wf-1')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(orgs.requireMembership).not.toHaveBeenCalled();
+    expect(triggers.rotateWebhook).not.toHaveBeenCalled();
+  });
+
+  it('个人流程（无 organizationId）→ 不查组织角色，仅创建者本人可轮换', async () => {
+    const personal = makeService({ ...ROW, organizationId: null });
+    await personal.svc.rotateWebhookSecret('owner-1', 'wf-1');
+    expect(personal.orgs.requireMembership).not.toHaveBeenCalled();
+    expect(personal.triggers.rotateWebhook).toHaveBeenCalled();
+
+    const legacy = makeService({ ...ROW, organizationId: null, userId: 'someone-else' });
+    await expect(legacy.svc.rotateWebhookSecret('owner-1', 'wf-1')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(legacy.triggers.rotateWebhook).not.toHaveBeenCalled();
   });
 });

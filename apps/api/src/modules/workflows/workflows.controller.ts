@@ -66,6 +66,15 @@ export class WorkflowsController {
     return this.workflows.remove(req.user.userId, id);
   }
 
+  /**
+   * M10-P5 SA-18：webhook secret 轮换（RBAC = org owner/admin）。
+   * 响应 `{ token, secret, previousSecretExpiresAt }`——secret 明文**仅此一次**，过渡窗内旧 secret 仍可验签。
+   */
+  @Post(':id/webhook/rotate')
+  rotateWebhook(@Req() req: Request & { user: AuthedUser }, @Param('id') id: string) {
+    return this.workflows.rotateWebhookSecret(req.user.userId, id);
+  }
+
   /** Run 创建（manual 触发；幂等键去重）；M7-P9 限流 60/min */
   @Post(':id/runs')
   @UseGuards(RateLimitGuard)

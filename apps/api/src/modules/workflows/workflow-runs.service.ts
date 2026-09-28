@@ -75,6 +75,9 @@ export class WorkflowRunsService {
         idempotencyKey, input: (input.payload ?? {}) as never,
         attempt: input.attempt ?? 1,
         status: 'queued',
+        // M10-P5 D4/M9-01：run 创建即锁定该版本的**定义快照**（执行期快照优先，见 lockedDefinition）。
+        // 四种触发（manual/webhook/schedule/event）与 retry 全部经本入口 → 一处写入即全覆盖。
+        definitionSnapshot: version.definition as never,
       },
     });
     let run: { id: string; status: string };
