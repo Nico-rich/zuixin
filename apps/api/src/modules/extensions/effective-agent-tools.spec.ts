@@ -101,6 +101,13 @@ describe('F4 resolveEffectiveAgentTools（交集语义 / 权限提升防线）',
     expect(expanded.tools).toEqual([]);
   });
 
+  it('组织策略空名单（[]）：M10-P14 组织白名单的 fail-closed 表达 → 全部工具剔除（含合法工具）', () => {
+    const r = resolve(['knowledge.search', 'artifact.create'], { orgAllowlist: [] });
+    expect(r.tools).toEqual([]);
+    expect(reasonsOf(r.dropped)).toEqual(['org_policy_denied', 'org_policy_denied']);
+    expect(r.dropped[0].detail).toContain('组织白名单');
+  });
+
   it('剔除审计回调：每条剔除恰好回调一次（含 extensionId 无关的 name/reason/detail）', () => {
     const onDropped = vi.fn();
     const r = resolve(['external_action.execute', 'nope.tool', 'knowledge.search'], { onDropped });
