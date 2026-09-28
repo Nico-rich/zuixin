@@ -109,12 +109,23 @@ export class BillingService implements OnModuleInit {
     }
     const free = await this.prisma.plan.findUnique({ where: { code: 'free' } });
     const now = new Date();
-    await this.prisma.subscription.create({
-      data: {
-        organizationId, planId: free!.id, status: 'active',
-        currentPeriodStart: now, currentPeriodEnd: new Date(now.getTime() + 30 * 86400_000),
-      },
-    });
+    try {
+      await this.prisma.subscription.create({
+        data: {
+          organizationId, planId: free!.id, status: 'active',
+          currentPeriodStart: now, currentPeriodEnd: new Date(now.getTime() + 30 * 86400_000),
+        },
+      });
+    } catch (err) {
+      // Pre-M9 测试补强（多实例 e2e 实抓）：并发懒创建竞态——唯一键 P2002 → 复用赢家行（同 ensurePersonalOrganization 模式）
+      if ((err as { code?: string }).code === 'P2002') {
+        const won = await this.prisma.subscription.findUnique({ where: { organizationId }, include: { plan: true } });
+        if (won) {
+          return { planId: won.planId, plan: won.plan.code, entitlements: won.plan.entitlements as Record<string, number>, status: won.status };
+        }
+      }
+      throw err;
+    }
     return { planId: free!.id, plan: 'free', entitlements: free!.entitlements as Record<string, number>, status: 'active' };
   }
 

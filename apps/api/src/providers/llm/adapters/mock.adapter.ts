@@ -1,11 +1,28 @@
 import { ChatParams, ChatResponse, LLMChunk, LLMProvider } from '../llm.types';
+import { AppError, ErrorCode } from '../../../common/errors/app-error';
+import { StreamGuard, StreamTimeoutError, streamTimeoutsFrom } from '../../../core/http/stream-guard';
 
-/** 开发/测试用 echo 适配器（无真实 API Key 时跑通全链路）；分块延迟模拟真实流式 */
+export type MockFaultMode = 'timeout' | 'unavailable' | 'stall' | 'server_error';
+
+/** 开发/测试用 echo 适配器（无真实 API Key 时跑通全链路）；分块延迟模拟真实流式。
+ *  Pre-M9 测试补强：故障注入（env 开关，MOCK_DELAY_MS 同模式；未设置时行为与历史完全一致）：
+ *  - timeout：抛 PROVIDER_TIMEOUT（可重试路径 → 引擎回合重试 → 熔断计数）；
+ *  - unavailable：抛 PROVIDER_UNAVAILABLE（不可重试）；
+ *  - stall：发完全部文本块后永久挂起（不发 EOF——经 StreamGuard idle 超时验证 G6）；
+ *  - server_error：抛 PROVIDER_OVERLOADED。
+ *  G6 对齐：stream 与 openai-compatible 同用 StreamGuard（四层超时）——dev 替身行为与生产形态一致。
+ */
 export class MockLLMAdapter implements LLMProvider {
   readonly kind = 'llm' as const;
-  constructor(private readonly chunkDelayMs = 20) {}
+  constructor(
+    private readonly timeoutCfg: { timeoutMs: number },
+    private readonly chunkDelayMs = Number(process.env.MOCK_DELAY_MS ?? 20),
+    private readonly fault: MockFaultMode | null = (process.env.MOCK_LLM_FAILURE as MockFaultMode | undefined) ?? null,
+    private readonly stallMs: number = Number(process.env.MOCK_LLM_STALL_MS ?? 60_000),
+  ) {}
 
   async chat(params: ChatParams): Promise<ChatResponse> {
+    this.injectFault();
     return { content: this.reply(params), usage: { inputTokens: 1, outputTokens: 1 } };
   }
 
@@ -13,18 +30,50 @@ export class MockLLMAdapter implements LLMProvider {
     // dev/e2e 替身：确定性 function calling（启发式仅存在于本替身；生产由真实模型驱动）
     const toolCall = this.maybeToolCall(params);
     if (toolCall) {
+      this.injectFault();
       yield { type: 'tool_calls', toolCalls: [toolCall] };
       // Pre-M9 R1：替身确定性用量（4 字符/token 近似——仅 dev/e2e 可见，绝不冒充生产事实）
       yield { type: 'usage', usage: { inputTokens: 4, outputTokens: Math.ceil(toolCall.arguments.length / 4) } };
       return;
     }
+    this.injectFault();
     const text = this.reply(params);
-    for (const ch of text) {
-      if (params.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
-      yield { type: 'text', text: ch };
-      if (this.chunkDelayMs > 0) await new Promise((r) => setTimeout(r, this.chunkDelayMs));
+    const guard = new StreamGuard(streamTimeoutsFrom(this.timeoutCfg), params.signal);
+    const self = this;
+    try {
+      const src = (async function* () {
+        for (const ch of text) {
+          if (params.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+          yield { type: 'text', text: ch } as LLMChunk;
+          if (self.chunkDelayMs > 0) await new Promise((r) => setTimeout(r, self.chunkDelayMs));
+        }
+        if (self.fault === 'stall') {
+          // 挂起（不发 EOF）：StreamGuard idle 超时应中断（绝不挂住调用方）
+          await new Promise((r) => setTimeout(r, self.stallMs));
+          if (params.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+        }
+      })();
+      const it = src[Symbol.asyncIterator]();
+      for (;;) {
+        const step = await guard.next(it);
+        if (step.done) break;
+        yield step.value;
+      }
+      yield { type: 'usage', usage: { inputTokens: 4, outputTokens: Math.ceil(text.length / 4) } };
+    } catch (err) {
+      if (err instanceof StreamTimeoutError) throw new AppError(ErrorCode.PROVIDER_TIMEOUT, err.message);
+      throw err;
+    } finally {
+      guard.abort();
     }
-    yield { type: 'usage', usage: { inputTokens: 4, outputTokens: Math.ceil(text.length / 4) } };
+  }
+
+  /** 故障注入（chat 与 stream 共用；抛 AppError 形态——错误映射链原样透传，绝不降级为 PROVIDER_UNKNOWN） */
+  private injectFault(): void {
+    if (!this.fault) return;
+    if (this.fault === 'timeout') throw new AppError(ErrorCode.PROVIDER_TIMEOUT, 'mock: provider timeout');
+    if (this.fault === 'unavailable') throw new AppError(ErrorCode.PROVIDER_UNAVAILABLE, 'mock: provider unavailable');
+    if (this.fault === 'server_error') throw new AppError(ErrorCode.PROVIDER_OVERLOADED, 'mock: provider 500');
   }
 
   private maybeToolCall(params: ChatParams) {

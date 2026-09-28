@@ -12,6 +12,10 @@ import { PrismaService } from '../src/modules/prisma/prisma.service';
 
 const XRW = { 'X-Requested-With': 'XMLHttpRequest' };
 
+function periodOfUtc(d = new Date()): string {
+  return d.toISOString().slice(0, 10);
+}
+
 async function waitForStatus(prisma: PrismaService, runId: string, targets: string[], timeoutMs = 30_000): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   let last = '';
@@ -126,7 +130,7 @@ describe('Pre-M9 Billing Correctness (e2e)', () => {
     expect(res.body.data).toMatchObject({ organizationId: orgId, consistent: true });
   });
 
-  it('D1 对账发现 missing：删除镜像行 → diagnose 检出（consistent=false + missing 列表）', async () => {
+  it('D1 对账发现 missing：删除镜像行 → diagnose 检出（consistent=false + missing 列表）→ 恢复镜像（绝不把脏状态留给后续用例）', async () => {
     const mirror = await prisma.usageLedgerEntry.findFirst({ where: { organizationId: orgId, kind: 'llm_cost', usageRecordId: { not: null } } });
     expect(mirror).toBeTruthy();
     await prisma.usageLedgerEntry.delete({ where: { id: mirror!.id } });
@@ -136,6 +140,16 @@ describe('Pre-M9 Billing Correctness (e2e)', () => {
     expect(res.body.data.consistent).toBe(false);
     expect(res.body.data.missing.length).toBeGreaterThan(0);
     expect(res.body.data.missing[0]).toMatchObject({ kind: 'llm_cost', usageRecordId: mirror!.usageRecordId });
+
+    // 恢复被删的镜像行（同值同幂等键）——组织状态回到 consistent，绝不影响后续三方对账用例
+    await prisma.usageLedgerEntry.create({
+      data: {
+        id: mirror!.id, organizationId: orgId, userId, kind: mirror!.kind,
+        quantity: mirror!.quantity, unit: mirror!.unit, runId: mirror!.runId, taskId: mirror!.taskId,
+        usageRecordId: mirror!.usageRecordId, idempotencyKey: mirror!.idempotencyKey,
+        period: mirror!.period, metadata: mirror!.metadata as never, createdAt: mirror!.createdAt,
+      },
+    });
   });
 
   it('C1：agent run 创建预留 → 完成释放（终态后无开放预留）', async () => {
@@ -154,6 +168,39 @@ describe('Pre-M9 Billing Correctness (e2e)', () => {
     expect(await waitForStatus(prisma, runId, ['completed', 'failed'], 30_000)).toBe('completed');
     const after = await prisma.quotaReservation.count({ where: { organizationId: orgId, refId: runId } });
     expect(after).toBe(0); // 终态释放
+  });
+
+  it('Pre-M9 三方对账：真实 run → UsageRecord(事实) ↔ UsageLedgerEntry(投影) ↔ Analytics(投影) 数字一致', async () => {
+    const created = await request(app.getHttpServer()).post('/api/v1/agent-runs').set(XRW).set('Cookie', cookie)
+      .send({ message: '你好', conversationId }).expect(201);
+    const runId = created.body.data.runId as string;
+    runIds.push(runId);
+    expect(await waitForStatus(prisma, runId, ['completed', 'failed'], 30_000)).toBe('completed');
+
+    // 事实层：usage_records（llm_chat 行 + 成本）
+    const records = await prisma.usageRecord.findMany({ where: { runId } });
+    expect(records.length).toBeGreaterThan(0);
+    const factTokens = records.reduce((s, r) => s + r.inputTokens + r.outputTokens, 0);
+    const factCost = records.reduce((s, r) => s + r.estimatedCost, 0);
+
+    // 投影层 1：账本镜像（llm_tokens/llm_cost 与事实求和一致）
+    const mirrors = await prisma.usageLedgerEntry.findMany({ where: { runId, kind: { in: ['llm_tokens', 'llm_cost'] } } });
+    const ledgerTokens = mirrors.filter((m) => m.kind === 'llm_tokens').reduce((s, m) => s + m.quantity, 0);
+    const ledgerCost = mirrors.filter((m) => m.kind === 'llm_cost').reduce((s, m) => s + m.quantity, 0);
+    expect(ledgerTokens).toBeCloseTo(factTokens, 6);
+    expect(ledgerCost).toBeCloseTo(factCost, 6);
+
+    // 对账端点：事实 ↔ 投影零漂移
+    const rec = await request(app.getHttpServer()).get(`/api/v1/billing/reconciliation?organizationId=${orgId}`)
+      .set(XRW).set('Cookie', cookie).expect(200);
+    expect(rec.body.data.consistent).toBe(true);
+
+    // 投影层 2：Analytics（显式刷新当日 → overview 成本 = 事实成本累计；U1 单源）
+    await request(app.getHttpServer()).post('/api/v1/analytics/refresh').set(XRW).set('Cookie', cookie)
+      .send({ organizationId: orgId, from: periodOfUtc(), to: periodOfUtc() }).expect(201);
+    const ov = await request(app.getHttpServer()).get(`/api/v1/analytics/overview?organizationId=${orgId}&range=day`)
+      .set(XRW).set('Cookie', cookie).expect(200);
+    expect(ov.body.data.derived.totalCost).toBeGreaterThanOrEqual(factCost - 1e-9);
   });
 
   it('U1：单条 usage 事实 → 单一成本（overview 绝不双计——provider 成本即总量）', async () => {
