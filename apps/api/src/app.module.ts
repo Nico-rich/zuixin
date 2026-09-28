@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { APP_GUARD } from '@nestjs/core';
 import { ConfigModule } from '@nestjs/config';
 import { LoggerModule } from 'nestjs-pino';
 import { randomUUID } from 'node:crypto';
@@ -33,6 +34,7 @@ import { SchedulerApiModule } from './modules/scheduler/scheduler-api.module';
 import { EventsApiModule } from './modules/events/events-api.module';
 import { AuditModule } from './modules/audit/audit.module';
 import { RateLimitModule } from './core/rate-limit/rate-limit.module';
+import { GlobalRateLimitGuard } from './core/rate-limit/global-rate-limit.guard';
 import { KnowledgeApiModule } from './modules/knowledge/knowledge.module';
 import { EvaluationApiModule } from './modules/evaluation/evaluation-api.module'; // M9-P1 Evaluation
 import { CreativeLoopApiModule } from './modules/creative-loop/creative-loop-api.module'; // M9-P5 Creative Performance Loop
@@ -107,6 +109,12 @@ import { SseModule } from './core/sse/sse.module';
     LifecycleModule,
     SseModule,
   ],
-  providers: [GlobalExceptionFilter],
+  providers: [
+    GlobalExceptionFilter,
+    // M10-P8（SA-25）全局 per-IP 限流：本文件唯一改动者 = P8/A8。
+    // 全局守卫先于控制器/路由守卫执行 → 鉴权失败（401）的请求同样计入桶（防"用无效凭证探路刷接口"）。
+    // 豁免与阈值见 core/rate-limit/global-rate-limit.policy.ts（健康探针/webhook/SSE/预检不计数）。
+    { provide: APP_GUARD, useClass: GlobalRateLimitGuard },
+  ],
 })
 export class AppModule {}
