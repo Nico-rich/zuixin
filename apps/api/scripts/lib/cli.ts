@@ -10,6 +10,7 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream, WriteStream } from 'node:fs';
+import type { Readable } from 'node:stream';
 
 export const EXIT_OK = 0;
 export const EXIT_FAIL = 1;
@@ -149,6 +150,54 @@ export function run(command: string, args: readonly string[], options: RunOption
   });
 }
 
+export interface StreamingChild {
+  /** 子进程 stdout（**作为流**交给下游：gpg 解密的明文直接进 psql，不经过内存） */
+  stdout: Readable;
+  /** 子进程结束/失败后的结论（默认不 reject；stderr 已收集并截断） */
+  done: Promise<Omit<RunResult, 'stdout' | 'stdoutBuffer'>>;
+}
+
+/**
+ * 与 `run()` 同源的启动方式，但 **stdout 作为流返回**（用于"解密 → psql"这类管道）：
+ * - 同样不经 shell、同样回显脱敏命令（口令只走 stdin，绝不进 argv）；
+ * - stderr 由本函数收集（管道下游只消费 stdout，留一份给失败诊断）；
+ * - `stdin` 支持一次性写入的 Buffer/string 或流：gpg 的口令就是一次性 Buffer。
+ */
+export function spawnStreaming(
+  command: string,
+  args: readonly string[],
+  options: { stdin?: NodeJS.ReadableStream | Buffer | string; env?: NodeJS.ProcessEnv; quiet?: boolean } = {},
+): StreamingChild {
+  const started = Date.now();
+  const display = [command, ...args.map(quoteForDisplay)].join(' ');
+  if (!options.quiet) process.stdout.write(`${new Date().toISOString()} [exec] ${redactSecrets(display)}\n`);
+  const child = spawn(command, [...args], {
+    env: options.env ?? process.env,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  const errChunks: Buffer[] = [];
+  child.stderr.on('data', (chunk: Buffer) => {
+    // 上限 64KB：失败诊断够用，且绝不因为下游不读 stderr 而积压内存
+    if (errChunks.length < 512) errChunks.push(chunk);
+  });
+  if (options.stdin !== undefined) {
+    if (typeof options.stdin === 'string' || Buffer.isBuffer(options.stdin)) child.stdin.end(options.stdin);
+    else options.stdin.pipe(child.stdin);
+  } else {
+    child.stdin.end(); // 关掉 stdin：gpg 在 --batch 下宁可失败也不去等一个永不到来的口令
+  }
+  const done = new Promise<Omit<RunResult, 'stdout' | 'stdoutBuffer'>>((resolve) => {
+    child.on('error', (err) =>
+      resolve({ code: -1, stderr: Buffer.concat(errChunks).toString('utf8'), durationMs: Date.now() - started, spawnError: err.message, command: display }),
+    );
+    child.on('close', (code) =>
+      resolve({ code: code ?? -1, stderr: Buffer.concat(errChunks).toString('utf8'), durationMs: Date.now() - started, command: display }),
+    );
+  });
+  return { stdout: child.stdout, done };
+}
+
 /** 命令是否可用（`--version` 探针）。 */
 export async function commandExists(command: string): Promise<boolean> {
   const res = await run(command, ['--version'], { quiet: true, timeoutMs: 15_000 });
@@ -200,6 +249,33 @@ export function stamp(d: Date = new Date()): string {
 export function sha256File(path: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const hash = createHash('sha256');
+    const stream = createReadStream(path);
+    stream.on('error', reject);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+  });
+}
+
+/**
+ * 对**流**求 sha256（加密自检用：把 gpg 解密后的字节直接哈希，不落临时明文文件）。
+ * 顺序：必须先读完流再取哈希；出错时 reject（调用方转为非 0 退出码）。
+ */
+export function sha256Stream(stream: Readable): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    stream.on('error', reject);
+    stream.on('data', (chunk: Buffer) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+  });
+}
+
+/**
+ * 文件的 MD5（**只用于与 S3/MinIO 单段对象的 ETag 比对**——ETag 对单段上传即对象内容的 MD5）。
+ * 不用于任何安全用途（MD5 已不抗碰撞；这里是"传输完整性"而非"防篡改"，防篡改由 sha256 + gpg 承担）。
+ */
+export function md5File(path: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('md5');
     const stream = createReadStream(path);
     stream.on('error', reject);
     stream.on('data', (chunk) => hash.update(chunk));

@@ -77,6 +77,56 @@ export function parseMcListJson(text: string): McMirrorSummary {
   return { count: objects.length, totalBytes: objects.reduce((s, o) => s + o.sizeBytes, 0), objects };
 }
 
+export interface McStatEntry {
+  key: string;
+  sizeBytes: number;
+  /** 服务端 ETag（**单段上传时为对象内容的 MD5**；多段上传带 `-N` 后缀，此时不可当 md5 用） */
+  etag: string;
+  /** ETag 是否可用作 md5 比对（32 位十六进制、无 `-N` 后缀） */
+  etagIsMd5: boolean;
+}
+
+/** 剥掉 ETag 的引号（S3 协议里 ETag 常带双引号；mc 一般已剥好，但两种都要能读）。 */
+export function normalizeEtag(raw: string): string {
+  return raw.trim().replace(/^"+|"+$/g, '').toLowerCase();
+}
+
+/** ETag 能否当 md5 用：单段上传 = 32 位十六进制；多段上传形如 `<md5>-<parts>`。 */
+export function etagAsMd5(raw: string): string | null {
+  const etag = normalizeEtag(raw);
+  return /^[0-9a-f]{32}$/.test(etag) ? etag : null;
+}
+
+/**
+ * 解析 `mc stat --json <target>` 的单行 JSON。
+ * 用途：**上传后零传输的内容级核对**——比体积更能发现"传了别的对象/被覆盖"，
+ * 又不必像 `mc cat` 那样把整个对象拉回来（GB 级备份不适合）。
+ * 解析不出 ⇒ null（调用方降级为"只比体积"，并如实标注，不假装核对过）。
+ *
+ * 字段形态（M11-P9 实测教训）：**对象名在 `stat` 里叫 `name`，在 `ls --json` 里才叫 `key`**。
+ * 早期版本只认 `key` ⇒ 解析恒为 null ⇒ ETag 明明在响应里却被丢掉，上传核对悄悄降级成
+ * "只比了体积"，而且日志会让人以为服务端没给 ETag（错误归因）。两种字段都认。
+ */
+export function parseMcStatJson(text: string): McStatEntry | null {
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line.startsWith('{')) continue;
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const key = typeof parsed.key === 'string' && parsed.key ? parsed.key : typeof parsed.name === 'string' ? parsed.name : '';
+    if (!key) continue;
+    const size = typeof parsed.size === 'number' && Number.isFinite(parsed.size) ? parsed.size : 0;
+    const etagRaw = typeof parsed.etag === 'string' ? parsed.etag : '';
+    const etag = normalizeEtag(etagRaw);
+    return { key, sizeBytes: size, etag, etagIsMd5: etagAsMd5(etag) !== null };
+  }
+  return null;
+}
+
 export interface MirrorDiff {
   ok: boolean;
   missingInTarget: string[];
@@ -226,6 +276,11 @@ export class McClient {
   /** 读对象的字节（内容级抽样校验用；`captureBinary` 打开后取 `stdoutBuffer`）。 */
   async cat(remote: string, options: McRunOptions = {}): Promise<RunResult> {
     return this.exec(['cat', remote], { captureBinary: true, ...options });
+  }
+
+  /** `mc stat --json`（零传输拿到 size + ETag：单段对象 ETag == 内容 md5）。 */
+  async stat(remote: string, options: McRunOptions = {}): Promise<RunResult> {
+    return this.exec(['stat', '--json', remote], { quiet: true, ...options });
   }
 
   async makeBucket(bucket: string, options: McRunOptions = {}): Promise<RunResult> {
