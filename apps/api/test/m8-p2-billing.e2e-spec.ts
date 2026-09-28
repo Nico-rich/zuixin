@@ -142,12 +142,21 @@ describe('M8-P2 Billing / Subscription / Quota (e2e)', () => {
     runIds.push(runId);
     expect(await waitForStatus(prisma, runId, ['completed', 'failed'], 30_000)).toBe('completed');
 
-    const entries = await prisma.usageLedgerEntry.findMany({ where: { runId } });
+    // Pre-M9 稳定性：agent_run 账本行在 run 终态翻转**之后**写入（driver 收尾阶段——按设计的最终一致，
+    // 由对账端点兜底）；全量负载下窗口拉宽，必须轮询等待而非即时断言
+    const deadline = Date.now() + 15_000;
+    let entries: Array<{ kind: string; idempotencyKey: string }> = [];
+    while (Date.now() < deadline) {
+      entries = await prisma.usageLedgerEntry.findMany({ where: { runId }, select: { kind: true, idempotencyKey: true } });
+      const kinds = entries.map((e) => e.kind);
+      if (kinds.includes('agent_run') && kinds.includes('llm_tokens') && kinds.includes('llm_cost')) break;
+      await new Promise((r) => setTimeout(r, 200));
+    }
     const kinds = entries.map((e) => e.kind);
     expect(kinds).toContain('agent_run');
     expect(kinds).toContain('llm_tokens');
     expect(kinds).toContain('llm_cost');
-    // 幂等键 = run id（绝不重复计量）
+    // 幂等键唯一（绝不重复计量）
     expect(new Set(entries.map((e) => e.idempotencyKey)).size).toBe(entries.length);
 
     const usage = await request(app.getHttpServer()).get(`/api/v1/billing/usage?organizationId=${orgId}`).set(XRW).set('Cookie', cookie).expect(200);
