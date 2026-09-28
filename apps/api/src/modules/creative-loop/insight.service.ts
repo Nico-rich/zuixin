@@ -171,7 +171,8 @@ export class InsightService {
   }
 
   /**
-   * 写入 LLM 解读（**隔离不变量**：facts/derived 逐字节不变 + factsHash 条件更新）。
+   * 写入 LLM 解读（**隔离不变量**：facts/derived 逐字节不变 + factsHash 条件更新；
+   * 并发不覆盖：条件更新同时锚定**读取时行版本**——期间任何写入都让本次写入 count=0，M11-P5/D2-02）。
    * 事实层在本方法内**只读**（复制自存储行，绝不接收调用方传入的 facts/derived）。
    */
   async attachInterpretation(
@@ -192,10 +193,11 @@ export class InsightService {
     };
     // 双保险①：事实层不变断言（违反 → INTERNAL，绝不落库）
     assertFactsUnchanged(stored.doc, next);
-    // 双保险②：factsHash 条件更新（事实已变 → 拒写，解读必须基于最新事实重生成）
-    const count = await this.store.saveInterpretation(id, stored.doc.factsHash, next);
+    // 双保险②：factsHash **+ 读取时版本** 条件更新（事实已变 → 拒写，解读必须基于最新事实重生成；
+    // 期间其它写入 → 拒写，并发解读绝不互相静默覆盖）
+    const count = await this.store.saveInterpretation(id, stored.doc.factsHash, next, stored.version);
     if (count === 0) {
-      throw new AppError(ErrorCode.VALIDATION_ERROR, '洞察事实层已更新，解读需基于最新事实重新生成');
+      throw new AppError(ErrorCode.VALIDATION_ERROR, '洞察已被并发修改（事实层更新或并发解读写入），请刷新后重试');
     }
     return this.toView({ ...stored, doc: next });
   }

@@ -3,7 +3,8 @@
  *
  * 不变量：
  * - 状态推进**唯一入口** = `transition`（内部走 `assertTransition` 纯规则 + `HypothesisStore.cas`
- *   **status CAS**，失败 → 400"已被并发修改"，绝不盲目覆盖）；
+ *   **status CAS + version CAS**——锚定读取时的 status 与行版本，失败 → 400"已被并发修改"，
+ *   绝不盲目覆盖；version 谓词防的是"编辑与状态推进互相静默覆盖"的 lost update，M11-P5/D2-02）；
  * - 非状态字段更新（编辑/挂接执行引用）= `HypothesisStore.casFields` **version CAS**（读时版本锚定）；
  * - 终态只读（`isTerminal` → 编辑/删除/再推进一律拒绝）；
  * - 归属：组织/项目 scope = 专表直列 `organizationId`/`projectId`（查询 server-side scope）；
@@ -190,8 +191,9 @@ export class HypothesesService {
   }
 
   /**
-   * 状态推进（**唯一入口**）：纯规则校验 → 条件更新。
-   * 返回推进后的文档；CAS 失败（并发或状态已变）→ 400（调用方无需重试语义，刷新后按新状态决策）。
+   * 状态推进（**唯一入口**）：纯规则校验 → 条件更新（status 谓词 + **读取时 version 谓词**）。
+   * 返回推进后的文档；CAS 失败（并发状态推进/并发编辑/状态已变）→ 400
+   * （调用方无需重试语义，刷新后按最新状态决策——绝不把旧快照写回去）。
    */
   async transition(
     userId: string,
@@ -209,7 +211,9 @@ export class HypothesesService {
       status: to,
       history: [...stored.doc.history, { from, to, at, by: opts.by }],
     };
-    const count = await this.store.cas(id, [from], next);
+    // M11-P5/D2-02：状态转移写整份文档 → 必须同时锚定 status 与**读取时版本**
+    // （否则并发 casFields 写入的非状态字段会被本次转移用旧快照静默覆盖）
+    const count = await this.store.cas(id, [from], next, stored.version);
     if (count === 0) throw new AppError(ErrorCode.VALIDATION_ERROR, '假设状态已被并发修改，请刷新后重试');
     return this.toView({ ...stored, doc: next });
   }

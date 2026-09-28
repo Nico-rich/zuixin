@@ -12,7 +12,8 @@
  * - 真实平台写操作 = M7-P3 `ExternalActionsService`（引擎内部调用：审批绑定 + 审计 + 幂等全链，绝不绕过）；
  * - 评测 / 实验 = M9-P1（本服务只做**引用挂接**与只读消费，绝不新建第二套）；
  * - 假设状态机 = HypothesesService：用户触发走带 RBAC 的 `transition`；系统收敛走 `systemTransition`，
- *   两者同样**条件更新**（CAS 锚定当前 status，失败绝不覆盖）。
+ *   两者同样**条件更新**（CAS 锚定当前 status **与读取时行版本**——并发编辑/并发状态推进一律不覆盖，
+ *   M11-P5/D2-02；失败绝不覆盖，见 systemTransition 注释）。
  *
  * 边界（M8 冻结边界延续）：loop 只在**单次人工审批**后提交一次平台写操作；绝不批量投放、绝不无审批写。
  */
@@ -433,9 +434,10 @@ export class CreativeLoopOrchestrator {
         },
       });
     } catch (err) {
-      // 并发读同时收敛 → 输家 CAS 失败：这不是错误（状态已由赢家推进，上层重读即为最新）
+      // 并发收敛（多请求同时读同一终态 run）/期间发生用户编辑 → 输家 CAS 未命中：这不是错误
+      // （状态或非状态字段已由赢家推进，上层重读即为最新；本次判定留待下一次读路径收敛重算）
       if (err instanceof AppError && err.code === ErrorCode.VALIDATION_ERROR) {
-        this.logger.debug({ hypothesisId: stored.id }, '并发收敛：CAS 未命中（另一请求已推进）');
+        this.logger.debug({ hypothesisId: stored.id }, '并发收敛：CAS 未命中（另一请求已推进或期间被编辑）');
         return;
       }
       throw err;
@@ -466,7 +468,11 @@ export class CreativeLoopOrchestrator {
     return target;
   }
 
-  /** 系统驱动推进（**条件更新**：锚定当前 status；失败由 reconcile 静默处理） */
+  /**
+   * 系统驱动推进（**条件更新**：锚定当前 status **与读取时版本**；失败由 reconcile 静默处理）。
+   * version 谓词（M11-P5/D2-02）保证"本方法的整份文档写入"绝不覆盖期间发生的非状态字段写入
+   * （用户编辑 / 评测实验挂接）——失败即让位，下一次读路径收敛会基于最新事实重算。
+   */
   private async systemTransition(
     stored: StoredDoc<HypothesisDoc>,
     to: HypothesisStatus,
@@ -480,7 +486,7 @@ export class CreativeLoopOrchestrator {
       verdict: opts.verdict,
       history: [...stored.doc.history, { from, to, at: new Date().toISOString(), by: opts.by }],
     };
-    const count = await this.store.cas(stored.id, [from], next);
+    const count = await this.store.cas(stored.id, [from], next, stored.version);
     if (count === 0) throw new AppError(ErrorCode.VALIDATION_ERROR, '假设状态已被并发修改，请刷新后重试');
   }
 

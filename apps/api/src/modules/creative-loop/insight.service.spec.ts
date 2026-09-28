@@ -137,19 +137,25 @@ describe('InsightService（事实聚合 + 解读分层隔离）', () => {
     expect(view.facts).toEqual(doc.facts);
     expect(view.derived).toEqual(doc.derived);
     expect(view.factsHash).toBe(doc.factsHash);
-    // 落库内容 = 原事实 + 新解读（解读分支绝不构造 facts/derived）
-    const [, hash, next] = h.store.saveInterpretation.mock.calls[0] as unknown as [string, string, InsightDoc];
+    // 落库内容 = 原事实 + 新解读（解读分支绝不构造 facts/derived）；条件更新锚定**读取时的版本**
+    const [, hash, next, expectedVersion] = h.store.saveInterpretation.mock.calls[0] as unknown as [string, string, InsightDoc, number];
     expect(hash).toBe(doc.factsHash);
+    expect(expectedVersion).toBe(1); // 读取时版本（D2-02 第二锚点：并发解读绝不互相覆盖）
     expect(next.facts).toEqual(doc.facts);
     expect(next.derived).toEqual(doc.derived);
     expect(next.interpretation?.source).toBe('llm-interpretation');
     expect(h.access.authorizeResource).toHaveBeenCalledWith('u1', { organizationId: DOMAIN, userId: 'u1' }, 'workflow.write', '洞察不存在');
   });
 
-  it('attachInterpretation：事实层已更新（factsHash CAS 未命中）→ 400，拒绝用旧事实承载新解读', async () => {
+  it('attachInterpretation：条件更新未命中（事实层已更新 / 期间被并发写入）→ 400，拒绝落库', async () => {
     const h = makeHarness({ doc: baseDoc(), saveCount: 0 });
     await expect(h.service.attachInterpretation('u1', 'ins-1', { items: ['解读'] }))
       .rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    // 双重锚点（factsHash + version）都由 store 侧谓词裁决，服务层绝不"先写后查"
+    const [id, hash, , expectedVersion] = h.store.saveInterpretation.mock.calls[0] as unknown as [string, string, InsightDoc, number];
+    expect(id).toBe('ins-1');
+    expect(hash).toBe(baseDoc().factsHash);
+    expect(expectedVersion).toBe(1);
   });
 
   it('attachInterpretation：洞察不存在 → 404（绝不隐式创建）', async () => {

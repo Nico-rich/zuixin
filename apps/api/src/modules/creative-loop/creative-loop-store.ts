@@ -6,19 +6,34 @@
  * - 组织归属 = `organizationId` 直列（**查询一律 server-side scope**，删除 JSON path 谓词）；
  * - 生命周期/判定事实（status/statement/successCriteria/loop/verdict/history）逐列落库，
  *   数据库级 CHECK（enum）与外键（组织/项目/用户）保证合法值与归属；
- * - 状态推进仍为 **status CAS**（`updateMany` + status 谓词，count=0 → 调用方转 400/409）；
+ * - 状态推进为 **status CAS + version CAS**（`updateMany` 谓词 = id + organizationId + status ∈ from
+ *   + **version = 读取时版本**，count=0 → 调用方转 400/409）。**两个谓词缺一不可**：状态转移会写整份
+ *   文档，若只锚定 status，则"读 → 并发 casFields 写非状态字段 → 本转移落库"会静默覆盖对方（双方都
+ *   返回成功）——即 lost update（M11-P5/D2-02）。version 谓词使**任何**并发写入（状态推进/编辑/解读
+ *   挂接）都让输家 count=0；
  * - 非状态字段更新为 **version CAS**（读时版本 → `where.version` 条件 + `version = version+1`），
  *   并发状态推进/并发编辑一律不被盲目覆盖；
- * - 洞察解读写入仍锚定 `factsHash`（事实层变化后旧解读拒绝落库——隔离不变量不变）。
+ * - 洞察解读写入锚定 `factsHash` **且** version（双锚点）：事实层变化 → 拒写（隔离不变量不变），
+ *   期间任何其它写入 → 拒写（并发解读绝不互相覆盖）。
  *
- * 存量回填（一次性、幂等）：dev 库中既有的旧容器行（`Artifact(type='other')` + `content.kind` ∈
+ * 存量回填（一次性、幂等、**有界**）：dev 库中既有的旧容器行（`Artifact(type='other')` + `content.kind` ∈
  * {creative_hypothesis, creative_insight}）在**首次访问本 store** 时按 id 原样搬入专表
  * （`createMany({ skipDuplicates: true })` → 重复执行安全）；旧行**只读不删**（保留审计痕迹，
- * 模块此后不再读取它们）。回填失败按行记警告并跳过（绝不因历史脏数据阻塞模块启动），
- * 失败不缓存（下次访问重试）。
+ * 模块此后不再读取它们）。
+ * - **有界载入**：主键游标分批（每批 `BACKFILL_BATCH_SIZE` 行、每批单次 createMany）——绝不 `findMany`
+ *   无界载入、绝不逐行 N+1；
+ * - **逐行隔离**：批内出现毒行（外键/枚举不成立）时退化为逐行插入并跳过该行——绝不因一行历史脏数据
+ *   丢掉整批，也绝不阻塞模块启动；
+ * - **失败退避**：扫描级失败（DB 不可用等）在 `BACKFILL_RETRY_BACKOFF_MS` 窗口内不重扫——失败绝不在
+ *   请求路径上被反复放大；窗口后自动重试（回填幂等，重试安全）。
  *
- * 服务层接口（StoredDoc / HypothesisStore / InsightStore）公开方法签名保持不变
- * （仅 `StoredDoc` 增补 `version`——CAS 锚点；服务层改动限于把"非状态字段更新"改走 version CAS）。
+ * 回填谓词边界：`Artifact.content` 是 JSONB，判别谓词 `content->>'kind'` 在既有 schema 下**无表达式
+ * 索引**（也无 GIN 索引可用：`type` + path 组合超出既有索引面）→ 该查询是**顺序扫描**。故它只在首次
+ * 访问触发一次，绝不进入常规读路径（常规读写一律走专表直列谓词，见各方法注释）。
+ *
+ * 服务层接口（StoredDoc / HypothesisStore / InsightStore）：两个条件写入方法显式接收 `expectedVersion`
+ * （`cas(id, from, next, expectedVersion)` / `saveInterpretation(id, factsHash, next, expectedVersion)`）——
+ * **先读后写处必须传入读取时的 `StoredDoc.version`**（调用方读取即拿到锚点，绝不"读一次版本猜一次"）。
  */
 
 import { Inject, Injectable, Logger } from '@nestjs/common';
@@ -125,108 +140,201 @@ export interface StoredDoc<T> {
 /** 旧容器行的内容形状（回填时按字段尽可能还原；缺字段一律按空值处理） */
 type LegacyDoc = Record<string, unknown>;
 
-// ===== 存量回填（幂等；首次访问触发，失败不缓存） =====
+// ===== 存量回填（幂等 + 有界分批 + 逐行隔离 + 失败退避；首次访问触发） =====
 
-/** 每个 PrismaService 实例一份（进程内共享；失败不缓存 → 下次访问重试） */
-const backfill = new WeakMap<PrismaService, Promise<void>>();
+/** 回填批大小（主键游标分页——**有界载入**：单批行数上限，绝不一次把旧容器全表读进内存） */
+export const BACKFILL_BATCH_SIZE = 500;
+/** 扫描级失败后的退避窗口（窗口内不重扫：失败绝不在请求路径上被反复放大） */
+export const BACKFILL_RETRY_BACKOFF_MS = 60_000;
+
+/** 每个 PrismaService 实例一份（进程内共享）：成功 → 永久记忆；扫描级失败 → 退避窗口后重试 */
+interface BackfillMemo {
+  /** 回填任务（进行中或已完成；成功后常驻 = 只扫一次） */
+  task?: Promise<void>;
+  /** 最近一次扫描级失败时刻（退避锚点） */
+  failedAt?: number;
+}
+const backfill = new WeakMap<PrismaService, BackfillMemo>();
 const backfillLogger = new Logger('CreativeLoopBackfill');
 
+/** 旧容器行（回填读取的最小列集——不读用不到的列） */
+interface LegacyArtifactRow {
+  id: string;
+  userId: string;
+  content: unknown;
+  createdAt: Date;
+}
+
 /**
- * 旧容器行 → 专表（**只读迁移**：不删旧行、按 id 幂等插入、单行失败不阻塞其余行）。
+ * 旧容器行 → 专表（**只读迁移**：不删旧行、按 id 幂等插入、毒行跳过不阻塞其余行）。
  * 组织归属取 `content.organizationId`（旧实现的组织判别同源），缺失/失联（外键不成立）→ 跳过并告警。
+ *
+ * 分页：`orderBy id asc` + `cursor (skip 1)`（主键唯一有序 → 游标稳定，绝不漏行/重行）；
+ * 判别谓词是 JSONB path（**无表达式索引可用**，见文件头"回填谓词边界"）→ 顺序扫描，故仅首次触发。
  */
 async function runLegacyBackfill(prisma: PrismaService): Promise<void> {
-  const rows = await prisma.artifact.findMany({
-    where: {
-      type: CREATIVE_LOOP_ARTIFACT_TYPE as never,
-      OR: [kindEquals(HYPOTHESIS_KIND), kindEquals(INSIGHT_KIND)],
-    },
-    select: { id: true, userId: true, content: true, createdAt: true },
-  });
-  if (rows.length === 0) return;
+  let cursor: string | undefined;
+  let scanned = 0;
   let migrated = 0;
+  let skipped = 0;
+  for (;;) {
+    const rows: LegacyArtifactRow[] = await prisma.artifact.findMany({
+      where: {
+        type: CREATIVE_LOOP_ARTIFACT_TYPE as never,
+        OR: [kindEquals(HYPOTHESIS_KIND), kindEquals(INSIGHT_KIND)],
+      },
+      select: { id: true, userId: true, content: true, createdAt: true },
+      orderBy: { id: 'asc' },
+      take: BACKFILL_BATCH_SIZE,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+    if (rows.length === 0) break;
+    scanned += rows.length;
+    cursor = rows[rows.length - 1].id;
+    const batch = await migrateBatch(prisma, rows);
+    migrated += batch.migrated;
+    skipped += batch.skipped;
+    if (rows.length < BACKFILL_BATCH_SIZE) break; // 不满一批 = 已到尾批
+  }
+  backfillLogger.log({ scanned, migrated, skipped }, 'M10-P4 存量回填完成（幂等只读迁移；主键游标分批）');
+}
+
+/**
+ * 单批回填：先服务端筛（缺 organizationId / 状态非法 → 跳过并告警），再**每张表一次 createMany**
+ * （`skipDuplicates` → 重复执行安全：既有专表行绝不被旧容器内容回滚）。
+ */
+async function migrateBatch(
+  prisma: PrismaService,
+  rows: readonly LegacyArtifactRow[],
+): Promise<{ migrated: number; skipped: number }> {
+  const hypotheses: Array<Record<string, unknown>> = [];
+  const insights: Array<Record<string, unknown>> = [];
   let skipped = 0;
   for (const row of rows) {
     const doc = (row.content ?? {}) as LegacyDoc;
-    const kind = doc.kind;
     const organizationId = typeof doc.organizationId === 'string' ? doc.organizationId : '';
     if (!organizationId) {
       skipped++;
       backfillLogger.warn({ artifactId: row.id }, '旧容器行缺少 organizationId，跳过回填（保留原行）');
       continue;
     }
-    try {
-      if (kind === HYPOTHESIS_KIND) {
-        const status = doc.status;
-        if (!isHypothesisStatus(status)) {
-          skipped++;
-          backfillLogger.warn({ artifactId: row.id, status }, '旧假设状态非法，跳过回填（保留原行）');
-          continue;
-        }
-        const created = await prisma.creativeHypothesis.createMany({
-          data: [{
-            id: row.id,
-            organizationId,
-            projectId: typeof doc.projectId === 'string' ? doc.projectId : null,
-            userId: row.userId,
-            status: status as never,
-            statement: typeof doc.statement === 'string' ? doc.statement : '',
-            rationale: typeof doc.rationale === 'string' ? doc.rationale : null,
-            target: typeof doc.target === 'string' ? doc.target : null,
-            platform: typeof doc.platform === 'string' ? doc.platform : null,
-            insightId: typeof doc.insightId === 'string' ? doc.insightId : null,
-            successCriteria: jsonOrNull(doc.successCriteria),
-            loop: jsonOrNull(doc.loop),
-            evaluationRunId: typeof doc.evaluationRunId === 'string' ? doc.evaluationRunId : null,
-            baselineRunId: typeof doc.baselineRunId === 'string' ? doc.baselineRunId : null,
-            experimentId: typeof doc.experimentId === 'string' ? doc.experimentId : null,
-            verdict: jsonOrNull(doc.verdict),
-            history: jsonOrEmptyArray(doc.history),
-            version: 1,
-            createdAt: row.createdAt, // 保留原时间线（updatedAt 由 Prisma @updatedAt 落为回填时刻）
-          }],
-          skipDuplicates: true, // 已回填（同 id）→ 不动既有专表行
-        });
-        migrated += created.count;
-      } else {
-        const created = await prisma.creativeInsight.createMany({
-          data: [{
-            id: row.id,
-            organizationId,
-            projectId: typeof doc.projectId === 'string' ? doc.projectId : null,
-            userId: row.userId,
-            window: jsonOrObject(doc.window),
-            filters: jsonOrObject(doc.filters),
-            facts: jsonOrObject(doc.facts),
-            derived: jsonOrObject(doc.derived),
-            factsHash: typeof doc.factsHash === 'string' ? doc.factsHash : '',
-            interpretation: jsonOrNull(doc.interpretation),
-            layering: jsonOrObject(doc.layering),
-            version: 1,
-            createdAt: row.createdAt,
-          }],
-          skipDuplicates: true,
-        });
-        migrated += created.count;
+    if (doc.kind === HYPOTHESIS_KIND) {
+      const status = doc.status;
+      if (!isHypothesisStatus(status)) {
+        skipped++;
+        backfillLogger.warn({ artifactId: row.id, status }, '旧假设状态非法，跳过回填（保留原行）');
+        continue;
       }
-    } catch (err) {
-      // 常见：历史行的组织/用户/项目已被删除（外键不成立）——跳过该行，绝不让历史脏数据阻塞模块
-      skipped++;
-      backfillLogger.warn({ artifactId: row.id, err: (err as Error).message }, '旧容器行回填失败，已跳过（保留原行）');
+      hypotheses.push({
+        id: row.id,
+        organizationId,
+        projectId: typeof doc.projectId === 'string' ? doc.projectId : null,
+        userId: row.userId,
+        status: status as never,
+        statement: typeof doc.statement === 'string' ? doc.statement : '',
+        rationale: typeof doc.rationale === 'string' ? doc.rationale : null,
+        target: typeof doc.target === 'string' ? doc.target : null,
+        platform: typeof doc.platform === 'string' ? doc.platform : null,
+        insightId: typeof doc.insightId === 'string' ? doc.insightId : null,
+        successCriteria: jsonOrNull(doc.successCriteria),
+        loop: jsonOrNull(doc.loop),
+        evaluationRunId: typeof doc.evaluationRunId === 'string' ? doc.evaluationRunId : null,
+        baselineRunId: typeof doc.baselineRunId === 'string' ? doc.baselineRunId : null,
+        experimentId: typeof doc.experimentId === 'string' ? doc.experimentId : null,
+        verdict: jsonOrNull(doc.verdict),
+        history: jsonOrEmptyArray(doc.history),
+        version: 1,
+        createdAt: row.createdAt, // 保留原时间线（updatedAt 由 Prisma @updatedAt 落为回填时刻）
+      });
+    } else {
+      insights.push({
+        id: row.id,
+        organizationId,
+        projectId: typeof doc.projectId === 'string' ? doc.projectId : null,
+        userId: row.userId,
+        window: jsonOrObject(doc.window),
+        filters: jsonOrObject(doc.filters),
+        facts: jsonOrObject(doc.facts),
+        derived: jsonOrObject(doc.derived),
+        factsHash: typeof doc.factsHash === 'string' ? doc.factsHash : '',
+        interpretation: jsonOrNull(doc.interpretation),
+        layering: jsonOrObject(doc.layering),
+        version: 1,
+        createdAt: row.createdAt,
+      });
     }
   }
-  backfillLogger.log({ scanned: rows.length, migrated, skipped }, 'M10-P4 存量回填完成（幂等只读迁移）');
+  const h = await insertBatch(
+    (data) => prisma.creativeHypothesis.createMany({ data: data as never, skipDuplicates: true }),
+    hypotheses,
+    'CreativeHypothesis',
+  );
+  const i = await insertBatch(
+    (data) => prisma.creativeInsight.createMany({ data: data as never, skipDuplicates: true }),
+    insights,
+    'CreativeInsight',
+  );
+  return { migrated: h.migrated + i.migrated, skipped: skipped + h.skipped + i.skipped };
 }
 
-/** 幂等触发（并发首次访问共用同一 Promise；失败不缓存 → 下次访问重试） */
+/**
+ * 批量插入（**每批一次往返**，绝不逐行 N+1）；批失败 → 退化为逐行以**隔离毒行**：
+ * 常见毒行 = 历史行的组织/用户/项目已被删除（外键不成立）——跳过该行并告警，其余行照常回填
+ * （绝不因一行历史脏数据丢掉整批，也绝不阻塞模块启动）。
+ */
+async function insertBatch(
+  insert: (data: Array<Record<string, unknown>>) => Promise<{ count: number }>,
+  data: Array<Record<string, unknown>>,
+  label: string,
+): Promise<{ migrated: number; skipped: number }> {
+  if (data.length === 0) return { migrated: 0, skipped: 0 };
+  try {
+    const res = await insert(data);
+    return { migrated: res.count, skipped: 0 };
+  } catch (err) {
+    backfillLogger.warn(
+      { label, rows: data.length, err: (err as Error).message },
+      '批量回填失败，退化为逐行隔离（毒行跳过并保留原行）',
+    );
+    let migrated = 0;
+    let skipped = 0;
+    for (const row of data) {
+      try {
+        const res = await insert([row]);
+        migrated += res.count;
+      } catch (rowErr) {
+        skipped++;
+        backfillLogger.warn({ id: row.id, err: (rowErr as Error).message }, '旧容器行回填失败，已跳过（保留原行）');
+      }
+    }
+    return { migrated, skipped };
+  }
+}
+
+/**
+ * 幂等触发（并发首次访问共用同一 Promise；成功后永久记忆 = 只扫一次）。
+ * 扫描级失败（如 DB 不可用）→ 记退避锚点：`BACKFILL_RETRY_BACKOFF_MS` 窗口内**不再重扫**
+ * （读路径绝不因回填失败而失败，也绝不把失败放大成每次请求一次全表扫描）；窗口后下一次访问重试。
+ */
 function ensureLegacyBackfill(prisma: PrismaService): Promise<void> {
-  const running = backfill.get(prisma);
-  if (running) return running;
+  let memo = backfill.get(prisma);
+  if (!memo) {
+    memo = {};
+    backfill.set(prisma, memo);
+  }
+  if (memo.task) return memo.task;
+  if (memo.failedAt !== undefined && Date.now() - memo.failedAt < BACKFILL_RETRY_BACKOFF_MS) {
+    return Promise.resolve(); // 退避窗口内：本次不重扫（读路径照常返回专表现状）
+  }
   const task = runLegacyBackfill(prisma).catch((err) => {
-    backfill.delete(prisma); // 失败不缓存：下次访问重试（绝不因回填失败让模块不可用）
-    backfillLogger.warn({ err: (err as Error).message }, '存量回填失败（本次跳过；下次访问重试）');
+    memo!.failedAt = Date.now();
+    memo!.task = undefined; // 失败不记忆：退避窗口后重试（绝不因回填失败让模块不可用）
+    backfillLogger.warn(
+      { err: (err as Error).message, retryAfterMs: BACKFILL_RETRY_BACKOFF_MS },
+      '存量回填失败（本次跳过；退避窗口后重试）',
+    );
   });
-  backfill.set(prisma, task);
+  memo.task = task;
   return task;
 }
 
@@ -420,16 +528,23 @@ export class HypothesisStore {
   }
 
   /**
-   * 状态推进（**status CAS**）：仅当当前 status ∈ from 时写入整份新文档。
-   * 返回受影响行数（0 = 并发/状态已变 → 调用方转错，绝不盲目覆盖）；成功则 version +1。
+   * 状态推进（**status CAS + version CAS**）：仅当当前 status ∈ from **且行版本仍等于调用方读取时的
+   * version** 时才写入整份新文档。返回受影响行数（0 = 并发/状态已变 → 调用方转错，绝不盲目覆盖）；
+   * 成功则 version +1。
+   *
+   * version 谓词为何不可省（M11-P5/D2-02，lost update）：本方法写整份文档，若只锚定 status，
+   * 则 `读(v) → 并发 casFields 改非状态字段(v+1) → 本转移落库` 中 status 谓词仍然成立 →
+   * 状态转移会把读到的**旧**非状态字段一并写回，静默覆盖对方的写入（双方都返回成功）。
+   * 锚定 version 后，任何并发写入都会让后到者 count=0（调用方转 400/静默重读），不变量重新成立。
    */
-  async cas(id: string, from: readonly HypothesisStatus[], next: HypothesisDoc): Promise<number> {
+  async cas(id: string, from: readonly HypothesisStatus[], next: HypothesisDoc, expectedVersion: number): Promise<number> {
     await ensureLegacyBackfill(this.prisma);
     const res = await this.prisma.creativeHypothesis.updateMany({
       where: {
         id,
         organizationId: next.organizationId, // server-side 组织 scope（归属不可变，谓词恒真；防御性收口）
         status: { in: from as never[] },
+        version: expectedVersion, // 读取时版本锚点（并发编辑/解读挂接一律让本转移失效）
       },
       data: { ...hypothesisColumns(next), version: { increment: 1 } } as never,
     });
@@ -498,14 +613,17 @@ export class InsightStore {
   }
 
   /**
-   * 解读写入（**隔离不变量**）：条件更新谓词含 factsHash——
-   * 仅当行内事实指纹与调用方读取时一致才写入；事实层已变化 → count=0（解读必须基于最新事实重写）。
+   * 解读写入（**隔离不变量 + 并发不覆盖**，双锚点条件更新）：
+   * - 锚点① `factsHash`：仅当行内事实指纹与调用方读取时一致才写入；事实层已变化 → count=0
+   *   （解读必须基于最新事实重写）；
+   * - 锚点② `version`：仅当行版本仍等于调用方读取时的版本才写入——期间任何其它写入（解读覆盖/
+   *   事实层重建）都会让 count=0，绝不静默覆盖对方（与 `cas` 同一 lost update 防护）。
    * 写入内容 = 原文档逐字段复制 + interpretation 覆盖（facts/derived 绝不进入本方法的构造路径）。
    */
-  async saveInterpretation(id: string, factsHash: string, next: InsightDoc): Promise<number> {
+  async saveInterpretation(id: string, factsHash: string, next: InsightDoc, expectedVersion: number): Promise<number> {
     await ensureLegacyBackfill(this.prisma);
     const res = await this.prisma.creativeInsight.updateMany({
-      where: { id, factsHash, organizationId: next.organizationId },
+      where: { id, factsHash, organizationId: next.organizationId, version: expectedVersion },
       data: { ...insightColumns(next), version: { increment: 1 } } as never,
     });
     return res.count;
