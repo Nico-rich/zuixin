@@ -13,6 +13,12 @@ const refreshWaitMs = (): number => Number(process.env.CONNECTION_REFRESH_WAIT_M
 const REFRESH_POLL_MS = 50;
 
 /**
+ * M11-P1：读路径"旧密钥版本欠账"的告警节流——第 1 次必然告警，之后每 N 次一条。
+ * 读路径是热路径：计数在内存（零 IO），只有日志按节流输出，绝不因为观测而拖慢或阻断读取。
+ */
+const STALE_KEY_VERSION_WARN_EVERY = 100;
+
+/**
  * M7-P2 凭证服务（六不原则的执行者）：
  * - at rest 全部 AES-256-GCM 密文（复用 CryptoService；e2e 断言 DB 密文 ≠ 明文）；
  * - 明文只在本服务内存中出现，绝不进 DTO/API 响应/prompt/log；
@@ -28,6 +34,8 @@ export class CredentialService {
   private readonly refreshes = new Map<string, Promise<{ accessToken: string }>>();
   /** 实例标识（C5 租约归属：只清理自己持有的租约） */
   private readonly instanceId = `cred:${process.pid}:${randomBytes(4).toString('hex')}`;
+  /** M11-P1：读到的旧版本密文计数（`密钥版本 → 次数`，进程内、只增；诊断/运维用，不含任何凭证内容） */
+  private readonly staleKeyVersionReads = new Map<number, number>();
 
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
@@ -41,12 +49,12 @@ export class CredentialService {
     await this.prisma.$transaction(async (tx) => {
       await tx.credential.deleteMany({ where: { connectionId, type: 'access_token' } });
       await tx.credential.create({
-        data: { connectionId, type: 'access_token', encryptedValue: this.crypto.encrypt(tokens.accessToken), expiresAt },
+        data: { connectionId, type: 'access_token', ...this.seal(tokens.accessToken), expiresAt },
       });
       if (tokens.refreshToken) {
         await tx.credential.deleteMany({ where: { connectionId, type: 'refresh_token' } });
         await tx.credential.create({
-          data: { connectionId, type: 'refresh_token', encryptedValue: this.crypto.encrypt(tokens.refreshToken) },
+          data: { connectionId, type: 'refresh_token', ...this.seal(tokens.refreshToken) },
         });
       }
       await tx.connection.update({
@@ -56,6 +64,60 @@ export class CredentialService {
     });
   }
 
+  /**
+   * M11-P1（D1-09）：把明文旅程"封装"成落库字段——**`keyVersion` 从密文自述版本解析**，
+   * 与 `encryptedValue` 同一条语句写出。二者因此不可能失配（列恒等于密文自述版本），
+   * 而不是"再算一次当前版本"：后者在轮换中途（`ENCRYPTION_KEYS` 热更新/多实例配置不同）会写出
+   * "列说 v2、密文是 v1"的行，令 rewrap 扫描漏掉真正的旧密文。
+   */
+  private seal(plain: string): { encryptedValue: string; keyVersion: number } {
+    const encryptedValue = this.crypto.encrypt(plain);
+    return { encryptedValue, keyVersion: this.crypto.keyVersionOf(encryptedValue) };
+  }
+
+  /**
+   * M11-P1：读路径的密钥版本裁决（`assertCurrentVersion` 的"读面"对应物——读面**不阻断**迁移窗口）。
+   *
+   * - 密文版本未知/格式非法 → `decrypt` 抛 `KEY_VERSION_INVALID`（**既有行为保持**，绝不静默降级）；
+   * - 密文版本落后于当前版本（多密钥并存窗口：`ENCRYPTION_KEYS` 同时配了新旧）→ 旧密钥仍可解，
+   *   正常返回明文，但记一次"迁移欠账"计数 + 节流 warn —— 轮换期的读不能被旧版本密文卡死，
+   *   同时欠账必须可观测（否则"旧密钥何时可摘除"永远没有依据）；
+   * - 当前版本 → 直接返回。
+   *
+   * 观测失败绝不影响读：计数/取版本本身若异常（理论上不会——decrypt 已成功）一律吞掉。
+   */
+  private open(payload: string, where: { connectionId: string; type: 'access_token' | 'refresh_token' }): string {
+    const plain = this.crypto.decrypt(payload);
+    try {
+      if (this.crypto.needsRewrap(payload)) {
+        const version = this.crypto.keyVersionOf(payload);
+        const count = (this.staleKeyVersionReads.get(version) ?? 0) + 1;
+        this.staleKeyVersionReads.set(version, count);
+        if (count === 1 || count % STALE_KEY_VERSION_WARN_EVERY === 0) {
+          this.logger.warn({
+            connectionId: where.connectionId, type: where.type,
+            keyVersion: version, currentKeyVersion: this.crypto.currentKeyVersion,
+            configuredVersions: this.crypto.versions(), staleReads: count,
+          }, '读取到旧密钥版本凭证：已正常解密（多密钥并存窗口），但存在密钥迁移欠账——请运行 scripts/rewrap.ts 迁移');
+        }
+      }
+    } catch {
+      // 观测路径 best-effort：绝不让计数/日志影响凭证读取结果
+    }
+    return plain;
+  }
+
+  /** M11-P1：旧版本凭证读取统计（诊断/运维用；进程内累计，不含任何凭证内容） */
+  staleKeyVersionStats(): { total: number; byVersion: Record<string, number>; currentKeyVersion: number; configuredVersions: number[] } {
+    const byVersion: Record<string, number> = {};
+    let total = 0;
+    for (const [version, count] of this.staleKeyVersionReads) {
+      byVersion[String(version)] = count;
+      total += count;
+    }
+    return { total, byVersion, currentKeyVersion: this.crypto.currentKeyVersion, configuredVersions: this.crypto.versions() };
+  }
+
   /** 服务端解密 access token（仅 Provider Adapter 调用链使用；绝不返回给 HTTP/Tool 结果） */
   async getAccessToken(connectionId: string): Promise<{ token: string; expiresAt: Date | null } | null> {
     const row = await this.prisma.credential.findFirst({
@@ -63,7 +125,7 @@ export class CredentialService {
       orderBy: { createdAt: 'desc' },
     });
     if (!row) return null;
-    return { token: this.crypto.decrypt(row.encryptedValue), expiresAt: row.expiresAt };
+    return { token: this.open(row.encryptedValue, { connectionId, type: 'access_token' }), expiresAt: row.expiresAt };
   }
 
   /** 服务端解密 refresh token */
@@ -72,7 +134,7 @@ export class CredentialService {
       where: { connectionId, type: 'refresh_token' },
       orderBy: { createdAt: 'desc' },
     });
-    return row ? this.crypto.decrypt(row.encryptedValue) : null;
+    return row ? this.open(row.encryptedValue, { connectionId, type: 'refresh_token' }) : null;
   }
 
   /**
