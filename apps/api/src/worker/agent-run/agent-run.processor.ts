@@ -12,18 +12,31 @@ import { TraceContext, newTraceId } from '../../core/tracing/trace-context';
 import { AsyncAgentRunDriver } from './async-agent-run.driver';
 import { ShutdownStep } from '../../lifecycle/lifecycle-registry';
 
+/** 单次在途执行的控制面（runId 为键——一个 worker 并发 N 时同时存在 N 条） */
+interface ActiveRun {
+  abort: AbortController;
+  controls: { active: boolean };
+  workerId: string;
+}
+
 /**
  * M6-P3 AgentRun Worker：
  * job {runId} → DB 加载（身份唯一事实来源）→ 原子 claim（split-brain 防线，失败即退出）
  * → heartbeat（续期 fencing + 取消检测）→ Async Driver → Engine → release。
  * 优雅停机：controls.active=false（Engine 跳过终态写入）+ release lease + abort + job 抛错回退重试。
+ *
+ * X-01：在途执行登记为 **集合**（Map<runId, ActiveRun>）而非单值——worker concurrency 默认 2，
+ * 单值只记住"最近一个 active"，取消快通道与优雅停机都会漏掉其余在途 run（cancel 提示丢失 →
+ * 只能等心跳 15s 或 DB 兜底；shutdown 漏 release lease → 该 run 需等 lease TTL 过期才被接管）。
+ * 集合使两条路径覆盖**全部**在途 run，且逐条清理（finally delete 只删自己的键，绝不影响他人）。
  */
 @Processor(AGENT_RUN_QUEUE, { concurrency: Number(process.env.AGENT_RUN_WORKER_CONCURRENCY ?? 2) })
 @Injectable()
 export class AgentRunProcessor extends WorkerHost implements OnApplicationShutdown, OnModuleInit {
   private readonly logger = new Logger('AgentRunWorker');
   private readonly instanceId = `${hostname()}:${process.pid}:${randomBytes(4).toString('hex')}`;
-  private active: { abort: AbortController; controls: { active: boolean }; runId: string; workerId: string } | null = null;
+  /** X-01：全部在途 run（runId 唯一；claim 原子性保证同一 run 不会出现两条） */
+  private readonly active = new Map<string, ActiveRun>();
 
   constructor(
     @Inject(AgentRunLeaseService) private readonly lease: AgentRunLeaseService,
@@ -38,10 +51,15 @@ export class AgentRunProcessor extends WorkerHost implements OnApplicationShutdo
   async onModuleInit(): Promise<void> {
     await this.events.subscribe(AGENT_RUN_CANCEL_CHANNEL, (event) => {
       const runId = event.runId as string | undefined;
-      if (runId && this.active?.runId === runId) {
+      if (!runId) return;
+      const entry = this.active.get(runId);
+      if (entry) {
         this.logger.warn({ runId }, '收到 cancel 提示（快速通道）→ abort Engine');
-        this.active.abort.abort();
+        entry.abort.abort();
+        return;
       }
+      // 非本进程在途（已被接管/已终态/队列归属其他实例）：DB 条件更新与心跳仍是事实兜底
+      this.logger.debug({ runId }, '收到 cancel 提示但本 worker 无该 in-flight run（由 DB/心跳兜底）');
     });
   }
 
@@ -59,7 +77,8 @@ export class AgentRunProcessor extends WorkerHost implements OnApplicationShutdo
 
     const abort = new AbortController();
     const controls = { active: true };
-    this.active = { abort, controls, runId, workerId };
+    // X-01：登记到集合（并发 N 时互不覆盖）——cancel 快通道与优雅停机据此覆盖全部在途 run
+    this.active.set(runId, { abort, controls, workerId });
     const intervalMs = await this.lease.heartbeatIntervalMs();
     const heartbeat = setInterval(() => void this.heartbeatTick(runId, workerId, abort), intervalMs);
     this.logger.log({ runId, workerId }, 'claim 成功，开始执行');
@@ -69,7 +88,8 @@ export class AgentRunProcessor extends WorkerHost implements OnApplicationShutdo
       await TraceContext.runWithContext({ runId, traceId: newTraceId() }, () => this.driver.execute(runId, abort.signal, controls));
     } finally {
       clearInterval(heartbeat);
-      this.active = null;
+      // X-01：只移除本次执行的条目（同一 worker 内其他 in-flight run 不受影响）
+      this.active.delete(runId);
       // M8-P3：run 时长采样（best-effort——ObservabilityService 内部吞异常，绝不影响 lease/重试语义）
       await this.metrics.recordRunDuration('agent_run', runId, Date.now() - startedAtMs, {
         workerId, outcome: controls.active ? 'finished' : 'shutdown',
@@ -100,13 +120,19 @@ export class AgentRunProcessor extends WorkerHost implements OnApplicationShutdo
     }
   }
 
+  /**
+   * X-01：优雅停机覆盖**全部**在途 run（原实现只处理单值 active，并发>1 时其余 run 的 lease
+   * 不释放、Engine 不中止 → 需等 lease TTL 过期才被接管）。Nest 钩子与 lifecycle 阶段可能各调一次
+   * ——集合已空即为 no-op（幂等）。
+   */
   async onApplicationShutdown(): Promise<void> {
-    const a = this.active;
-    if (!a) return;
-    a.controls.active = false; // Engine 跳过终态写入（不伪造 cancelled/failed）
-    await this.lease.release(a.runId, a.workerId).catch(() => undefined); // 释放 → 新 worker 立即可接管
-    a.abort.abort();
-    this.logger.log({ runId: a.runId }, '优雅停机：已释放 lease 并中止当前执行');
+    const entries = [...this.active.entries()];
+    if (entries.length === 0) return;
+    for (const [, entry] of entries) entry.controls.active = false; // Engine 跳过终态写入（不伪造 cancelled/failed）
+    // 先释放全部 lease（新 worker 立即可接管），再统一 abort 本进程执行
+    await Promise.all(entries.map(([runId, entry]) => this.lease.release(runId, entry.workerId).catch(() => undefined)));
+    for (const [, entry] of entries) entry.abort.abort();
+    this.logger.log({ count: entries.length, runIds: entries.map(([runId]) => runId) }, '优雅停机：已释放全部在途 lease 并中止执行');
   }
 
   /** Pre-M9 G3：有序停机阶段接线（finalizeLeases = 释放 lease + 中止在途执行；幂等，Nest 钩子会再调一次为 no-op） */

@@ -87,8 +87,23 @@ export interface AgentRunOutcome {
 const DEFAULT_MAX_STEPS = 8;
 const DEFAULT_DEADLINE_MS = 120_000;
 const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
+/**
+ * X-02：LLM **单回合** watchdog 默认上限。
+ * 取 60s 的理由：run 总 deadline（client 120s / limits.agentRunTimeoutMs）只保证 run 最终会停，
+ * 但单个回合可以吞掉整个 deadline（provider 适配器的四层流超时属 G6 适配器内部；此处是引擎侧第二道闸门）：
+ * 60s 已是正常回合（含长回答流式输出）的宽松上界，又远小于总 deadline——超时即归因 PROVIDER_TIMEOUT
+ * （可重试/可进回退链），既不会误杀慢但正常的回合，也不会让一个卡死的回合吃光整个 run 预算。
+ * env AGENT_RUN_LLM_TURN_MS（兼容计划文档命名 agentRunLlmTurnMs）可覆盖；非法/<=0 → 回落本默认值。
+ */
+const DEFAULT_LLM_TURN_TIMEOUT_MS = 60_000;
 /** M7-P1：审批默认有效期（limits.approvalExpiresMs 可覆盖；0 = 不过期） */
 const DEFAULT_APPROVAL_TTL_MS = 24 * 3600_000;
+/** X-04：未声明 retryPolicy 的工具默认消费瞬态码（与 RETRYABLE_STEP_CODES 同源的平台瞬态码口径）重试 1 次小退避 */
+const DEFAULT_TOOL_MAX_RETRIES = 1;
+/** X-04 缺省策略退避基数（小退避：瞬态抖动多为毫秒级，重试应快速发生；含全幅 jitter ±30%） */
+const DEFAULT_TOOL_RETRY_BACKOFF_MS = 200;
+/** 工具**自行声明** policy 时的退避基数（M6-P5 起生效的既有语义，绝不改动） */
+const DECLARED_TOOL_RETRY_BACKOFF_MS = 500;
 /** P5-10：LLM 瞬时故障回合内重试上限与退避（1s/4s + 调用侧全幅 jitter ±30%） */
 const LLM_MAX_RETRIES = 2;
 const DEFAULT_RETRY_BACKOFF_MS = [1000, 4000];
@@ -224,6 +239,8 @@ export class AgentRuntimeEngine {
         }
         const toolsToSend = toolDefs.length && supportsTools ? toolDefs : undefined;
         const turnStarted = Date.now();
+        // X-02：本 run 的回合 watchdog 上限（每次尝试独立计时；run 总 deadline 的正交第二道闸门）
+        const turnTimeoutMs = this.llmTurnTimeoutMs();
         // P5-10：LLM 瞬时故障回合内自动重试（maxRetries=2，指数退避 + 全幅 jitter ±30%）；
         // 每回合一条 usage（回合粒度，非尝试粒度）；不可重试错误/取消直通（不重试）。
         let toolCalls: Array<{ id: string; name: string; arguments: string }> | undefined;
@@ -241,12 +258,17 @@ export class AgentRuntimeEngine {
           for (let attempt = 0; attempt <= LLM_MAX_RETRIES; attempt++) {
             const contentLenAtAttempt = content.length; // 失败重试回滚本回合部分文本（避免重复计入最终回答）
             const turnLenAtAttempt = turnText.length;
+            // X-02：回合级 watchdog——abort 本回合（组合信号绝不覆盖用户取消信号；每次尝试独立计时）
+            const watchdog = this.startTurnWatchdog(turnTimeoutMs);
             try {
               const stream = resolved.adapter.stream({
                 model: resolved.apiModelId, messages, temperature: ctx.agent.temperature ?? 0.7,
-                maxTokens: ctx.agent.maxTokens, tools: toolsToSend, signal: ctx.signal,
+                maxTokens: ctx.agent.maxTokens, tools: toolsToSend,
+                signal: AbortSignal.any([ctx.signal, watchdog.signal]),
               });
               for await (const chunk of stream) {
+                // 适配器若忽略 signal（流未中断）→ 逐块兜底检查：卡死回合绝不无界占用 worker
+                if (watchdog.timedOut()) throw new AppError(ErrorCode.PROVIDER_TIMEOUT, `LLM 单回合超时（>${turnTimeoutMs}ms）`);
                 if (chunk.type === 'text') {
                   content += chunk.text; turnText += chunk.text;
                   yield { type: 'text.delta', text: chunk.text };
@@ -256,12 +278,16 @@ export class AgentRuntimeEngine {
               turnError = null;
               break;
             } catch (err) {
-              turnError = err;
+              // 用户取消优先：原因原样保留（绝不伪装 provider failure）；watchdog 命中则归因 PROVIDER_TIMEOUT（可重试/可回退）
+              turnError = watchdog.timedOut() && !ctx.signal.aborted
+                ? new AppError(ErrorCode.PROVIDER_TIMEOUT, `LLM 单回合超时（>${turnTimeoutMs}ms）`)
+                : err;
               content = content.slice(0, contentLenAtAttempt);
               turnText = turnText.slice(0, turnLenAtAttempt);
               // M6-A8：用户取消优先识别（绝不伪装 provider failure，也绝不重试已取消的回合）
               if (ctx.signal.aborted) break;
-              const appErr = err instanceof AppError ? err : mapProviderError(err as ProviderLikeError);
+              // 按**归因后**的错误判定可重试性（watchdog 超时已归因 PROVIDER_TIMEOUT）
+              const appErr = turnError instanceof AppError ? turnError : mapProviderError(turnError as ProviderLikeError);
               if (!appErr.retryable || attempt >= LLM_MAX_RETRIES) break;
               const jitter = 0.7 + Math.random() * 0.6;
               yield { type: 'status', stage: 'agent', message: '模型暂时不可用，正在重试…' };
@@ -270,6 +296,8 @@ export class AgentRuntimeEngine {
               } catch {
                 break; // 退避被取消打断 → 走取消路径（turnError 保留 → AGENT_CANCELLED usage）
               }
+            } finally {
+              watchdog.clear(); // 成功/失败/重试都清定时器（绝不残留计时器跨越回合）
             }
           }
           if (!turnError || ctx.signal.aborted) break;
@@ -636,10 +664,16 @@ export class AgentRuntimeEngine {
       toolCallId, idempotencyKey, signal,
     };
     const startedAt = Date.now();
-    // P5-10：tool.retryPolicy 消费（M6 起生效；未声明 policy = 不重试，M0~M5 行为冻结）。
-    // 同一 ToolCall 行内重试；瞬时失败（retryableCodes/RETRYABLE_CODES）才重试，入参非法/权限/取消不重试。
+    // P5-10 + X-04 tool.retryPolicy 消费：
+    //  - 工具**声明了** policy → 按声明（maxRetries 次；瞬态判定 = retryableCodes ∪ 平台瞬态码，并集语义不变）；
+    //  - 工具**未声明**（X-04 起）→ 默认消费平台瞬态码（与 RETRYABLE_STEP_CODES 同源的 RETRYABLE_CODES 口径）
+    //    重试 1 次小退避：超时/限流/过载是**环境**问题，重试一次即成功是常态，"不声明"不再等于"绝不重试"。
+    //     非瞬态（参数/鉴权/校验/权限/循环）一律不重试；取消（signal.aborted）绝不重试。
+    // 同一 ToolCall 行内重试（幂等键不变，副作用靠工具幂等键收敛），attempts 可观测。
     const policy = tool.retryPolicy;
-    const maxToolAttempts = policy ? policy.maxRetries + 1 : 1;
+    const maxRetries = policy ? Math.max(0, policy.maxRetries) : DEFAULT_TOOL_MAX_RETRIES;
+    const backoffBaseMs = policy ? DECLARED_TOOL_RETRY_BACKOFF_MS : DEFAULT_TOOL_RETRY_BACKOFF_MS;
+    const maxToolAttempts = maxRetries + 1;
     let output: unknown;
     let lastErr: unknown = null;
     let attemptsUsed = 0;
@@ -652,12 +686,12 @@ export class AgentRuntimeEngine {
         break;
       } catch (err) {
         lastErr = err;
-        if (!policy || signal.aborted) break; // 无策略 / 已取消 → 不重试（取消在下一步步首检查中被识别）
+        if (signal.aborted) break; // 已取消 → 不重试（取消在下一步步首检查中被识别）
         const appErr = err instanceof AppError ? err : new AppError(ErrorCode.PROVIDER_UNKNOWN, (err as Error).message);
-        const retryable = policy.retryableCodes.includes(appErr.code) || appErr.retryable;
-        if (!retryable || attemptIdx >= policy.maxRetries) break;
+        const retryable = (policy?.retryableCodes?.includes(appErr.code) ?? false) || appErr.retryable;
+        if (!retryable || attemptIdx >= maxRetries) break;
         try {
-          await this.sleep(Math.round(500 * (attemptIdx + 1) * (0.7 + Math.random() * 0.6)), signal);
+          await this.sleep(Math.round(backoffBaseMs * (attemptIdx + 1) * (0.7 + Math.random() * 0.6)), signal);
         } catch {
           break; // 退避被取消打断 → 失败回喂（取消在下一步步首检查中被识别）
         }
@@ -676,6 +710,28 @@ export class AgentRuntimeEngine {
       status: 'failed', errorCode: appErr.code, errorMessage: appErr.message, completedAt: new Date(), durationMs: Date.now() - startedAt,
     }).catch((e) => this.logger.warn(`ToolCall 失败更新异常: ${(e as Error).message}`));
     return { status: 'failed', error: appErr.message, outputSummary: `${tool.name}：执行失败` };
+  }
+
+  /**
+   * X-02：LLM 单回合 watchdog。
+   * - 每次**尝试**独立计时（重试是新回合，绝不复用已耗尽的预算）；
+   * - 命中 → abort 本回合的组合信号 + `timedOut()` 供 catch 归因 PROVIDER_TIMEOUT（可重试/可回退），
+   *   **绝不**写成用户取消（ctx.signal 未被触发时）——取消与超时是两种语义，绝不混同；
+   * - 定时器 unref + 每次尝试 finally 清理（绝不残留计时器）。
+   */
+  private startTurnWatchdog(timeoutMs: number): { signal: AbortSignal; timedOut: () => boolean; clear: () => void } {
+    const controller = new AbortController();
+    let fired = false;
+    const timer = setTimeout(() => { fired = true; controller.abort(); }, timeoutMs);
+    timer.unref?.();
+    return { signal: controller.signal, timedOut: () => fired, clear: () => clearTimeout(timer) };
+  }
+
+  /** X-02 上限解析（env AGENT_RUN_LLM_TURN_MS / agentRunLlmTurnMs；<=0 或非法 → 默认 60s，watchdog 绝不被静默关闭） */
+  private llmTurnTimeoutMs(): number {
+    const raw = process.env.AGENT_RUN_LLM_TURN_MS ?? process.env.agentRunLlmTurnMs;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? Math.trunc(n) : DEFAULT_LLM_TURN_TIMEOUT_MS;
   }
 
   /** 测试友好开关（与 MOCK_DELAY_MS 同模式）：LLM_RETRY_BACKOFF_MS=1,2 时退避近零——单测确定性；生产绝不受影响 */

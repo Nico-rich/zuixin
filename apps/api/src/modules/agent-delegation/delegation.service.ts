@@ -9,6 +9,8 @@ import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { AuditService } from '../audit/audit.service';
 
 const CHILD_TERMINAL = ['completed', 'failed', 'cancelled', 'timeout'] as const;
+/** 子 run 终态事件（订阅侧过滤：非终态事件绝不触发唤醒） */
+const CHILD_TERMINAL_EVENTS: readonly string[] = ['run.completed', 'run.failed', 'run.cancelled', 'run.timeout'];
 const DEFAULT_MAX_DEPTH = 3;
 const DEFAULT_MAX_CHILDREN = 5;
 
@@ -34,6 +36,15 @@ export interface DelegateInput {
 @Injectable()
 export class DelegationService {
   private readonly logger = new Logger('Delegation');
+  /**
+   * X-05：子 run 终态订阅表（childRunId → handler）。
+   * EventBusService 的 handler 登记是**进程内常驻**资源（Map 里的 Set + 闭包捕获 this），
+   * 子 run 终态后若不移除，订阅随委派次数线性累积（长驻 worker 内存泄漏；且终态后的事件仍会
+   * 触发无意义的 onChildTerminal 调用）。清理时机 = 终态确认/唤醒路径：
+   * 终态 run 不会再产生终态事件；唤醒的**事实源是 DB**（父 run 条件更新），
+   * 兜底通道 recoverStale（AgentRunLeaseService）不依赖本订阅——丢订阅绝不丢唤醒。
+   */
+  private readonly childSubscriptions = new Map<string, (event: Record<string, unknown>) => void>();
 
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
@@ -57,6 +68,8 @@ export class DelegationService {
     if (existing) {
       const child = await this.prisma.agentRun.findUnique({ where: { id: existing.childRunId } });
       if (child && (CHILD_TERMINAL as readonly string[]).includes(child.status)) {
+        // X-05：子已终态 → 本进程若仍持有该子 run 的观察订阅（终态事件可能已丢失/未经本进程）→ 立即回收
+        this.clearChildSubscription(existing.childRunId);
         return await this.childResult(existing.id, child);
       }
       return { __waiting_delegation: true, delegationId: existing.id, childRunId: existing.childRunId };
@@ -125,12 +138,7 @@ export class DelegationService {
       { jobId: `run-${child.id}`, attempts: 2, backoff: { type: 'exponential', delay: 2000 }, removeOnComplete: true, removeOnFail: { count: 500 } },
       'delegation-child');
     // 6. 子 run 终态 → 唤醒父 run（本进程订阅；recoverStale 兜底事件丢失）
-    await this.events.subscribe(agentRunChannel(child.id), (event) => {
-      const type = event.type as string | undefined;
-      if (type && ['run.completed', 'run.failed', 'run.cancelled', 'run.timeout'].includes(type)) {
-        void this.onChildTerminal(child.id).catch(() => undefined);
-      }
-    });
+    await this.subscribeChildTerminal(child.id);
     this.logger.log({ parentRunId: parent.id, childRunId: child.id, depth: parent.depth + 1 }, '委派子任务已创建');
     await this.audit.write({
       userId: input.userId, action: 'delegation.created', projectId: parent.projectId,
@@ -140,12 +148,51 @@ export class DelegationService {
     return { __waiting_delegation: true, delegationId: delegationRow.id, childRunId: child.id };
   }
 
+  /**
+   * X-05：登记子 run 终态订阅（同一 childRunId 重复登记先移除旧 handler——绝不双份投递）。
+   * 订阅建立失败时（EventBusService 有界订阅会显式抛错）不记录 handler，绝不留下"看似已订阅"的假象。
+   */
+  private async subscribeChildTerminal(childRunId: string): Promise<void> {
+    this.clearChildSubscription(childRunId);
+    const handler = (event: Record<string, unknown>) => {
+      const type = event.type as string | undefined;
+      if (!type || !CHILD_TERMINAL_EVENTS.includes(type)) return; // 非终态事件：绝不触发唤醒
+      // 终态事件本身就是本订阅的终点：先回收订阅再唤醒（终态 run 不会再发终态事件）
+      this.clearChildSubscription(childRunId);
+      void this.onChildTerminal(childRunId).catch(() => undefined);
+    };
+    await this.events.subscribe(agentRunChannel(childRunId), handler);
+    this.childSubscriptions.set(childRunId, handler);
+  }
+
+  /** X-05：回收子 run 终态订阅（幂等；未登记则 no-op——绝不误删他人 handler） */
+  private clearChildSubscription(childRunId: string): void {
+    const handler = this.childSubscriptions.get(childRunId);
+    if (!handler) return;
+    this.childSubscriptions.delete(childRunId);
+    this.events.unsubscribe(agentRunChannel(childRunId), handler);
+  }
+
+  /** X-05：在途子 run 订阅数（可观测；长驻进程内终态后必须回落，绝不随委派次数累积） */
+  pendingChildSubscriptions(): number {
+    return this.childSubscriptions.size;
+  }
+
   /** 子 run 终态：同步 delegation 行 + 唤醒父 run（waitingOnDelegationId 条件更新 + 唯一 jobId） */
   async onChildTerminal(childRunId: string): Promise<void> {
     const delegation = await this.prisma.agentDelegation.findUnique({ where: { childRunId } });
-    if (!delegation) return;
+    if (!delegation) {
+      this.clearChildSubscription(childRunId); // X-05：无 delegation 行 → 永无唤醒 → 订阅必须回收
+      return;
+    }
     const child = await this.prisma.agentRun.findUnique({ where: { id: childRunId } });
-    if (!child || !(CHILD_TERMINAL as readonly string[]).includes(child.status)) return;
+    if (!child) {
+      this.clearChildSubscription(childRunId); // X-05：子 run 行不存在 → 同上
+      return;
+    }
+    if (!(CHILD_TERMINAL as readonly string[]).includes(child.status)) return; // 非终态（如 waiting）：订阅保留，等待后续终态
+    // X-05：子 run 已确认终态 → 本订阅使命结束（父 run 唤醒是 DB 条件更新 + recoverStale 兜底，不依赖订阅存活）
+    this.clearChildSubscription(childRunId);
     // resultSummary：子终态结构化摘要（engine 复用行刷新用；绝不含内部推理——transcript 只存 assistant 产出）
     const lastAssistant = await this.prisma.agentRunMessage.findFirst({
       where: { runId: childRunId, role: 'assistant' }, orderBy: { sequence: 'desc' },
@@ -228,6 +275,9 @@ export class DelegationService {
       for (const d of delegations) {
         if (visited.has(d.childRunId)) continue;
         visited.add(d.childRunId);
+        // X-05：级联取消下子 run 不会再跑（queued 态被取消时**不会**产生终态事件）→ 订阅必须在此回收，
+        // 否则该 handler 在进程内常驻到进程退出。父链已被取消，唤醒路径（条件更新 status='waiting'）天然不可能命中。
+        this.clearChildSubscription(d.childRunId);
         const done = await this.prisma.agentRun.updateMany({
           where: { id: d.childRunId, status: { in: ['queued', 'running', 'waiting'] } },
           data: { status: 'cancelled', completedAt: new Date() },

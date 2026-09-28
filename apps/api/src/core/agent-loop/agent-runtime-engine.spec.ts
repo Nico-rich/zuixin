@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 import { z } from 'zod';
 import { AgentRuntimeEngine, AgentRuntimeContext, AgentRunOutcome } from './agent-runtime-engine';
 import { ToolRegistry } from '../tools/tool-registry.service';
@@ -51,7 +51,7 @@ function makePersistence() {
 
 function makeEngine(opts: {
   tools?: Tool[];
-  streamFn?: (params: { tools?: unknown; messages?: Array<{ role: string; content: string; tool_calls?: unknown[] }> }) => AsyncIterable<unknown>;
+  streamFn?: (params: { tools?: unknown; messages?: Array<{ role: string; content: string; tool_calls?: unknown[] }>; signal?: AbortSignal }) => AsyncIterable<unknown>;
   agent?: Partial<AgentRuntimeContext['agent']>;
   capabilities?: Record<string, unknown>;
   deadlineMs?: number;
@@ -782,7 +782,25 @@ describe('AgentRuntimeEngine（M6-P5 LLM 瞬时重试 + tool retryPolicy）', ()
     expect(strictTool.execute).toHaveBeenCalledTimes(1); // 权限类错误绝不重试
   });
 
-  it('P5-10 未声明 retryPolicy → 单次执行（M0~M5 行为冻结）', async () => {
+  it('X-04 未声明 retryPolicy：瞬态失败（PROVIDER_TIMEOUT）默认重试 1 次 → 第 2 次成功', async () => {
+    const plainTool: Tool = {
+      name: 'image.generate', description: 'x', permission: 'generate',
+      inputSchema: z.strictObject({ prompt: z.string().min(1) }),
+      // 无 retryPolicy：X-04 起默认消费平台瞬态码（RETRYABLE_CODES 同源口径）
+      execute: vi.fn()
+        .mockRejectedValueOnce(new AppError(ErrorCode.PROVIDER_TIMEOUT, 't'))
+        .mockResolvedValue({ taskId: 'task-7', status: 'completed' }),
+    };
+    const streamFn = vi.fn(async function* () { yield { type: 'text', text: '完成' }; });
+    const { engine, state } = makeEngine({ tools: [plainTool], streamFn });
+    const { outcome } = await run(engine, asyncInput({ resume: { mode: 'tools', startStep: 0, pendingCalls: [{ llmCallId: 'c1', name: 'image.generate', arguments: '{"prompt":"x"}', toolIndex: 0 }], lastToolSignature: null } }, [plainTool]));
+    expect(plainTool.execute).toHaveBeenCalledTimes(2); // 1 次默认重试
+    expect(outcome.status).toBe('completed');
+    // 同一 ToolCall 行内重试（行 id 不变）+ attempts 可观测
+    expect(state.toolCallUpdates[0]).toMatchObject({ data: { status: 'completed', incrementAttempts: true } });
+  });
+
+  it('X-04 未声明 retryPolicy：重试上限仍是 1 次（持续瞬态失败 → 2 次执行后失败回喂，绝不无限重试）', async () => {
     const plainTool: Tool = {
       name: 'image.generate', description: 'x', permission: 'generate',
       inputSchema: z.strictObject({ prompt: z.string().min(1) }),
@@ -791,7 +809,129 @@ describe('AgentRuntimeEngine（M6-P5 LLM 瞬时重试 + tool retryPolicy）', ()
     const streamFn = vi.fn(async function* () { yield { type: 'text', text: '完成' }; });
     const { engine } = makeEngine({ tools: [plainTool], streamFn });
     await run(engine, asyncInput({ resume: { mode: 'tools', startStep: 0, pendingCalls: [{ llmCallId: 'c1', name: 'image.generate', arguments: '{"prompt":"x"}', toolIndex: 0 }], lastToolSignature: null } }, [plainTool]));
+    expect(plainTool.execute).toHaveBeenCalledTimes(2);
+  });
+
+  it('X-04 未声明 retryPolicy：非瞬态错误（鉴权/参数）绝不重试（默认策略只覆盖瞬态码）', async () => {
+    const plainTool: Tool = {
+      name: 'image.generate', description: 'x', permission: 'generate',
+      inputSchema: z.strictObject({ prompt: z.string().min(1) }),
+      execute: vi.fn().mockRejectedValue(new AppError(ErrorCode.PROVIDER_AUTH, 'no')),
+    };
+    const streamFn = vi.fn(async function* () { yield { type: 'text', text: '完成' }; });
+    const { engine } = makeEngine({ tools: [plainTool], streamFn });
+    await run(engine, asyncInput({ resume: { mode: 'tools', startStep: 0, pendingCalls: [{ llmCallId: 'c1', name: 'image.generate', arguments: '{"prompt":"x"}', toolIndex: 0 }], lastToolSignature: null } }, [plainTool]));
     expect(plainTool.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('X-04 声明了 retryPolicy：并集语义保持（retryableCodes 之外的平台瞬态码仍可重试）', async () => {
+    const declared: Tool = {
+      name: 'image.generate', description: 'x', permission: 'generate',
+      inputSchema: z.strictObject({ prompt: z.string().min(1) }),
+      retryPolicy: { maxRetries: 1, retryableCodes: [ErrorCode.PROVIDER_TIMEOUT] }, // 未列 RATE_LIMITED
+      execute: vi.fn()
+        .mockRejectedValueOnce(new AppError(ErrorCode.PROVIDER_RATE_LIMITED, '429'))
+        .mockResolvedValue({ taskId: 'task-8', status: 'completed' }),
+    };
+    const streamFn = vi.fn(async function* () { yield { type: 'text', text: '完成' }; });
+    const { engine } = makeEngine({ tools: [declared], streamFn });
+    await run(engine, asyncInput({ resume: { mode: 'tools', startStep: 0, pendingCalls: [{ llmCallId: 'c1', name: 'image.generate', arguments: '{"prompt":"x"}', toolIndex: 0 }], lastToolSignature: null } }, [declared]));
+    expect(declared.execute).toHaveBeenCalledTimes(2); // 平台瞬态码 ∪ 声明码（并集，绝不收窄）
+  });
+
+  it('X-04 声明了 maxRetries=0：显式"不重试"仍被尊重（声明优先于默认策略）', async () => {
+    const noRetry: Tool = {
+      name: 'image.generate', description: 'x', permission: 'generate',
+      inputSchema: z.strictObject({ prompt: z.string().min(1) }),
+      retryPolicy: { maxRetries: 0, retryableCodes: [ErrorCode.PROVIDER_TIMEOUT] },
+      execute: vi.fn().mockRejectedValue(new AppError(ErrorCode.PROVIDER_TIMEOUT, 't')),
+    };
+    const streamFn = vi.fn(async function* () { yield { type: 'text', text: '完成' }; });
+    const { engine } = makeEngine({ tools: [noRetry], streamFn });
+    await run(engine, asyncInput({ resume: { mode: 'tools', startStep: 0, pendingCalls: [{ llmCallId: 'c1', name: 'image.generate', arguments: '{"prompt":"x"}', toolIndex: 0 }], lastToolSignature: null } }, [noRetry]));
+    expect(noRetry.execute).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('AgentRuntimeEngine（X-02 LLM 单回合 watchdog：回合级超时归因 PROVIDER_TIMEOUT，与 run 总 deadline 正交）', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+  afterEach(() => { delete process.env.AGENT_RUN_LLM_TURN_MS; delete process.env.agentRunLlmTurnMs; });
+
+  /** 卡死流（尊重 signal 的适配器语义）：abort 后抛 AbortError——与真实适配器一致 */
+  const stalledStream = (params: { signal?: AbortSignal }) => (async function* () {
+    await new Promise<never>((_r, reject) => {
+      params.signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+    });
+  })();
+
+  it('回合超时（env 覆盖）→ 重试耗尽后终态 failed + PROVIDER_TIMEOUT（绝不伪装成功/取消）', async () => {
+    process.env.AGENT_RUN_LLM_TURN_MS = '30';
+    const streamFn = vi.fn((params: { signal?: AbortSignal }) => stalledStream(params));
+    const { engine, state } = makeEngine({ streamFn });
+    const { outcome } = await run(engine, makeEngine().input);
+    expect(outcome.status).toBe('failed');
+    expect(outcome.errorCode).toBe(ErrorCode.PROVIDER_TIMEOUT);
+    expect(streamFn).toHaveBeenCalledTimes(3); // LLM_MAX_RETRIES=2 → 共 3 次尝试（每次独立计时）
+    // 每回合一条 usage（回合粒度）：全部归因 PROVIDER_TIMEOUT（可重试语义，非 AGENT_CANCELLED）
+    expect(state.usage).toHaveLength(1);
+    expect(state.usage[0]).toMatchObject({ status: 'failed', errorCode: ErrorCode.PROVIDER_TIMEOUT });
+  }, 15_000);
+
+  it('回合超时是**每次尝试**独立的：首次卡死超时，重试成功 → run completed（仅丢弃超时回合的部分文本）', async () => {
+    process.env.AGENT_RUN_LLM_TURN_MS = '30';
+    let call = 0;
+    const streamFn = vi.fn((params: { signal?: AbortSignal }) => {
+      call++;
+      if (call === 1) {
+        return (async function* () {
+          yield { type: 'text', text: '半截' }; // 超时回合的部分文本必须被回滚
+          await new Promise<never>((_r, reject) => {
+            params.signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+          });
+        })();
+      }
+      return (async function* () { yield { type: 'text', text: '恢复输出' }; })();
+    });
+    const { engine } = makeEngine({ streamFn });
+    const { outcome } = await run(engine, makeEngine().input);
+    expect(outcome.status).toBe('completed');
+    expect(outcome.content).toBe('恢复输出'); // 超时回合的部分文本不重复计入
+  }, 15_000);
+
+  it('watchdog 生效期间用户取消优先：abort 原因归因为 cancelled（绝不写成 PROVIDER_TIMEOUT）', async () => {
+    process.env.AGENT_RUN_LLM_TURN_MS = '30';
+    const ac = new AbortController();
+    const streamFn = vi.fn((params: { signal?: AbortSignal }) => (async function* () {
+      // 用户取消（外部 signal）先于 watchdog：组合信号 abort → 抛 AbortError
+      await new Promise<never>((_r, reject) => {
+        params.signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+      });
+    })());
+    const { engine, state } = makeEngine({ streamFn });
+    setTimeout(() => ac.abort(), 5); // 5ms 取消 < 30ms watchdog
+    const { outcome } = await run(engine, { ...makeEngine().input, signal: ac.signal });
+    expect(outcome.status).toBe('cancelled');
+    expect(state.usage[0]).toMatchObject({ status: 'failed', errorCode: ErrorCode.AGENT_CANCELLED });
+  }, 15_000);
+
+  it('正常快回合不受影响（默认 60s 上限；env 未设置时不误杀）', async () => {
+    const streamFn = vi.fn(async function* () { yield { type: 'text', text: '正常' }; });
+    const { engine } = makeEngine({ streamFn });
+    const { outcome } = await run(engine, makeEngine().input);
+    expect(outcome.status).toBe('completed');
+    expect(streamFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('非法/非正 env 值 → 回落默认 60s（watchdog 绝不被静默关闭），也绝不过度收紧', async () => {
+    process.env.AGENT_RUN_LLM_TURN_MS = '0';
+    const slowButOk = vi.fn(async function* () {
+      await new Promise((r) => setTimeout(r, 60)); // 60ms < 60s 默认上限
+      yield { type: 'text', text: '慢但正常' };
+    });
+    const { engine } = makeEngine({ streamFn: slowButOk });
+    const { outcome } = await run(engine, makeEngine().input);
+    expect(outcome.status).toBe('completed');
+    expect(outcome.content).toBe('慢但正常');
   });
 });
 

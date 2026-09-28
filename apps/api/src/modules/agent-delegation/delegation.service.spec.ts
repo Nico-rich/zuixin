@@ -31,9 +31,26 @@ function makeService(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
   const queue = { add: vi.fn().mockResolvedValue({ id: 'j1' }) };
-  const events = { subscribe: vi.fn().mockResolvedValue(undefined) };
+  // EventBusService 语义替身：handler 登记在 channel → Set（subscribe 加入 / unsubscribe 精确移除 / emit 分发）
+  const handlersByChannel = new Map<string, Set<(event: Record<string, unknown>) => void>>();
+  const events = {
+    subscribe: vi.fn(async (channel: string, handler: (event: Record<string, unknown>) => void) => {
+      if (!handlersByChannel.has(channel)) handlersByChannel.set(channel, new Set());
+      handlersByChannel.get(channel)!.add(handler);
+    }),
+    unsubscribe: vi.fn((channel: string, handler: (event: Record<string, unknown>) => void) => {
+      const set = handlersByChannel.get(channel);
+      if (!set) return;
+      set.delete(handler);
+      if (set.size === 0) handlersByChannel.delete(channel);
+    }),
+  };
+  const emit = (channel: string, event: Record<string, unknown>) => {
+    for (const h of [...(handlersByChannel.get(channel) ?? [])]) h(event);
+  };
+  const subscribedChannels = () => [...handlersByChannel.keys()];
   const svc = new DelegationService(prisma as never, queue as never, events as never, { write: vi.fn().mockResolvedValue(undefined) } as never);
-  return { svc, prisma, queue, events };
+  return { svc, prisma, queue, events, emit, subscribedChannels };
 }
 
 /** 父 run 行（含版本工具） */
@@ -133,5 +150,110 @@ describe('DelegationService（M7-P7 安全委派：上限/环/权限子集/幂�
     expect(prisma.agentRun.create).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ metadata: { delegation: true, delegationTools: [] } }),
     }));
+  });
+});
+
+/**
+ * X-05：子 run 观察订阅的回收。
+ * 回归靶心：原实现 `await this.events.subscribe(agentRunChannel(child.id), handler)` 从不 unsubscribe ——
+ * EventBusService 的 handler 表是进程内常驻结构，长驻 worker 每委派一次就残留一条闭包
+ * （内存随委派次数线性增长；终态后同 channel 的迟到事件仍会触发无意义的唤醒调用）。
+ * 契约：终态确认后 / 无 delegation 行 / 级联取消 → 订阅必须消失；
+ *       唤醒的事实源仍是 DB 条件更新 + recoverStale 兜底（丢订阅绝不丢唤醒）。
+ */
+describe('DelegationService（X-05 子 run 订阅回收：终态/级联取消后绝不常驻）', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const terminalChild = { id: 'child-1', status: 'completed', errorCode: null };
+
+  it('委派成功 → 订阅登记；子 run 终态事件到达 → 触发唤醒并**回收订阅**（channel handler 集合清空）', async () => {
+    const { svc, prisma, emit, subscribedChannels, events } = makeService();
+    prisma.agentRun.findUnique.mockResolvedValue(parentRun);
+    await svc.delegate(input());
+    const channel = `agent-run:child-1`;
+    expect(subscribedChannels()).toEqual([channel]);
+    expect(svc.pendingChildSubscriptions()).toBe(1);
+
+    // 终态事件 → 唤醒路径
+    prisma.agentRun.findUnique.mockResolvedValue(terminalChild); // onChildTerminal 读子 run
+    prisma.agentDelegation.findUnique.mockResolvedValue({ id: 'del-1', childRunId: 'child-1', parentRunId: 'run-parent' });
+    prisma.agentRun.findFirst.mockResolvedValue({ id: 'run-parent' });
+    emit(channel, { type: 'run.completed' });
+    await vi.waitFor(() => expect(prisma.agentRun.updateMany).toHaveBeenCalled());
+
+    expect(events.unsubscribe).toHaveBeenCalledTimes(1); // 精确移除本 handler（绝不误删他人）
+    expect(subscribedChannels()).toEqual([]); // 常驻 handler 表已无该 channel
+    expect(svc.pendingChildSubscriptions()).toBe(0);
+  });
+
+  it('非终态事件（如 run.started/text.delta）绝不触发唤醒，订阅保留（子 run 仍在跑）', async () => {
+    const { svc, prisma, emit, events } = makeService();
+    prisma.agentRun.findUnique.mockResolvedValue(parentRun);
+    await svc.delegate(input());
+    prisma.agentDelegation.findUnique.mockClear(); // 排除 delegate() 自身的幂等查询
+    emit('agent-run:child-1', { type: 'run.started' });
+    emit('agent-run:child-1', { type: 'text.delta', text: 'x' });
+    expect(prisma.agentDelegation.findUnique).not.toHaveBeenCalled();
+    expect(events.unsubscribe).not.toHaveBeenCalled();
+    expect(svc.pendingChildSubscriptions()).toBe(1);
+  });
+
+  it('终态事件只唤醒一次：迟到事件不再重复调用 onChildTerminal（订阅已移除 → 集合为空）', async () => {
+    const { svc, prisma, emit } = makeService();
+    prisma.agentRun.findUnique.mockResolvedValue(parentRun);
+    await svc.delegate(input());
+    prisma.agentDelegation.findUnique.mockResolvedValue({ id: 'del-1', childRunId: 'child-1', parentRunId: 'run-parent' });
+    prisma.agentRun.findUnique.mockResolvedValue(terminalChild);
+    prisma.agentRun.findFirst.mockResolvedValue({ id: 'run-parent' });
+    prisma.agentDelegation.findUnique.mockClear(); // 排除 delegate() 自身的幂等查询
+    emit('agent-run:child-1', { type: 'run.completed' });
+    await vi.waitFor(() => expect(prisma.agentDelegation.findUnique).toHaveBeenCalledTimes(1));
+    emit('agent-run:child-1', { type: 'run.completed' }); // 迟到/重复事件
+    await new Promise((r) => setTimeout(r, 5));
+    expect(prisma.agentDelegation.findUnique).toHaveBeenCalledTimes(1); // 绝无第二次唤醒调用
+  });
+
+  it('onChildTerminal 幂等：重复调用（订阅 + recoverStale 双通道竞争）不重复 unsubscribe、不抛错', async () => {
+    const { svc, prisma, events } = makeService();
+    prisma.agentRun.findUnique.mockResolvedValue(parentRun);
+    await svc.delegate(input());
+    prisma.agentDelegation.findUnique.mockResolvedValue({ id: 'del-1', childRunId: 'child-1', parentRunId: 'run-parent' });
+    prisma.agentRun.findUnique.mockResolvedValue(terminalChild);
+    prisma.agentRun.findFirst.mockResolvedValue({ id: 'run-parent' });
+    await svc.onChildTerminal('child-1');
+    await svc.onChildTerminal('child-1'); // 兜底通道再次进入
+    expect(events.unsubscribe).toHaveBeenCalledTimes(1); // 第二次为 no-op（绝不重复移除/误删）
+    expect(svc.pendingChildSubscriptions()).toBe(0);
+  });
+
+  it('无 delegation 行 / 子 run 行缺失 → 订阅同样回收（永无唤醒 → 绝不常驻）', async () => {
+    const { svc, prisma } = makeService();
+    prisma.agentRun.findUnique.mockResolvedValue(parentRun);
+    await svc.delegate(input());
+    prisma.agentDelegation.findUnique.mockResolvedValue(null);
+    await svc.onChildTerminal('child-1');
+    expect(svc.pendingChildSubscriptions()).toBe(0);
+  });
+
+  it('幂等 resume 且子 run 已终态 → 回收本进程可能残留的订阅（结构化结果路径）', async () => {
+    const { svc, prisma } = makeService();
+    prisma.agentRun.findUnique.mockResolvedValue(parentRun);
+    await svc.delegate(input());
+    expect(svc.pendingChildSubscriptions()).toBe(1);
+    prisma.agentDelegation.findUnique.mockResolvedValue({ id: 'del-1', childRunId: 'child-1' });
+    prisma.agentRun.findUnique.mockResolvedValue({ id: 'child-1', status: 'completed', errorCode: null });
+    await svc.delegate(input()); // 同 idempotencyKey → 复用行
+    expect(svc.pendingChildSubscriptions()).toBe(0);
+  });
+
+  it('级联取消：queued 子 run 被直接取消（不会产生终态事件）→ 订阅必须在此回收，绝不泄漏', async () => {
+    const { svc, prisma } = makeService();
+    prisma.agentRun.findUnique.mockResolvedValue(parentRun);
+    await svc.delegate(input());
+    expect(svc.pendingChildSubscriptions()).toBe(1);
+    prisma.agentDelegation.findMany.mockResolvedValueOnce([{ childRunId: 'child-1' }]);
+    prisma.agentRun.updateMany.mockResolvedValueOnce({ count: 1 }); // queued → cancelled（无引擎运行 → 无事件）
+    await svc.cancelChildren('run-parent');
+    expect(svc.pendingChildSubscriptions()).toBe(0);
   });
 });
