@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 import { EmbeddingProvider } from '../embedding.types';
 import { manualRedirectFetch } from '../../../modules/security/provider-base-url.guard';
+import { mapSdkError } from '../../llm/errors';
 
 export interface OpenAIEmbeddingConfig { baseUrl: string; apiKey: string; timeoutMs: number; }
 
@@ -17,7 +18,11 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   getDimensions(): number { return this.dimensions; }
 
   async embed(inputs: string[]): Promise<number[][]> {
-    const res = await this.client.embeddings.create({ model: this.model, input: inputs });
-    return res.data.map((d) => d.embedding);
+    // M10-P2：SDK timeout/abort（无 status/code）归一为 PROVIDER_TIMEOUT（可重试），
+    // 而非不可重试的 PROVIDER_UNKNOWN/裸 INTERNAL（与 openai-compatible adapter 同一归一管道）
+    try {
+      const res = await this.client.embeddings.create({ model: this.model, input: inputs });
+      return res.data.map((d) => d.embedding);
+    } catch (err) { throw mapSdkError(err); }
   }
 }

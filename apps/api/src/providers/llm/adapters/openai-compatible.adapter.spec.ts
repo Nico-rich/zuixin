@@ -115,6 +115,24 @@ describe('OpenAICompatibleAdapter', () => {
     expect(handedSignal?.aborted).toBe(true);
   });
 
+  // M10-P2（契约 e2e + SDK 源码取证）：openai@4 的 Stream 在请求被 abort 时**静默结束迭代**
+  // （`catch (e) { if (e.name === 'AbortError') return; }`）——若不显式判定，被截断的流会被当成
+  // "生成完成"（脏内容落库、丢 usage）。本用例复刻该形状：abort 后迭代器 return。
+  it('M10-P2：中止后迭代器**静默结束**（真实 SDK 形状）→ 必须归一 PROVIDER_TIMEOUT，绝不把截断流当成功', async () => {
+    const external = new AbortController();
+    const adapter = new OpenAICompatibleAdapter(cfg, {
+      stream: (_body, options) => (async function* () {
+        yield { choices: [{ delta: { content: '半' } }] };
+        if (options?.signal?.aborted) return; // 真实 SDK：abort → return（done:true，不抛错）
+        await new Promise<void>((r) => options?.signal?.addEventListener('abort', () => r()));
+      })(),
+    });
+    const it = adapter.stream({ ...params, signal: external.signal })[Symbol.asyncIterator]();
+    await expect(it.next()).resolves.toEqual({ value: { type: 'text', text: '半' }, done: false });
+    external.abort();
+    await expect(it.next()).rejects.toMatchObject({ code: 'PROVIDER_TIMEOUT', retryable: true });
+  });
+
   it('Pre-M9 G6：首包超时 → PROVIDER_TIMEOUT（连接建立后供应商不吐数据也算超时）', async () => {
     process.env.LLM_STREAM_FIRST_BYTE_TIMEOUT_MS = '20';
     try {

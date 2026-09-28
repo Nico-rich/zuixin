@@ -1,7 +1,7 @@
 import OpenAI from 'openai';
 import { AppError, ErrorCode } from '@ai-agent/shared';
 import { ChatMessage, ChatParams, ChatResponse, LLMChunk, LLMProvider } from '../llm.types';
-import { mapProviderError, ProviderLikeError } from '../../../common/errors/provider-error';
+import { mapSdkError } from '../errors';
 import { manualRedirectFetch } from '../../../modules/security/provider-base-url.guard';
 import { StreamGuard, StreamTimeoutError, streamTimeoutsFrom } from '../../../core/http/stream-guard';
 
@@ -37,7 +37,9 @@ export class OpenAICompatibleAdapter implements LLMProvider {
         toolCalls: this.mapToolCalls(choice?.message?.tool_calls),
         usage: usage ? { inputTokens: usage.prompt_tokens ?? 0, outputTokens: usage.completion_tokens ?? 0 } : undefined,
       };
-    } catch (err) { throw err instanceof AppError ? err : mapProviderError(err as ProviderLikeError); }
+      // M10-P2：（真实 HTTP 下）SDK 自身 timeout → APIConnectionTimeoutError（无 status/code），
+      // 必须归一为 PROVIDER_TIMEOUT（可重试/可回退），绝不放任其降级为不可重试的 PROVIDER_UNKNOWN
+    } catch (err) { throw mapSdkError(err); }
   }
 
   async *stream(params: ChatParams): AsyncIterable<LLMChunk> {
@@ -68,6 +70,13 @@ export class OpenAICompatibleAdapter implements LLMProvider {
         const u = chunk.usage as { prompt_tokens?: number; completion_tokens?: number } | undefined;
         if (u) usage = u;
       }
+      // M10-P2（契约 e2e + SDK 源码取证）：openai@4 的 Stream 在**请求被 abort 时静默结束迭代**
+      // （streaming.js: `catch (e) { if (e.name === 'AbortError') return; }`，`[DONE]` 只是 `continue`）。
+      // 于是总时长层/外部 deadline（AbortSignal）中断后，`iterator.next()` 会 resolve `{done:true}`，
+      // 循环正常收尾——被**截断**的流会被上层当成"生成完成"（脏内容落库、丢 usage）。守卫信号已中止
+      // ⇒ 本次流没跑完，必须归一 PROVIDER_TIMEOUT（可重试/可回退，与既有取消语义一致）。
+      // 注：正常结束（服务端发完 [DONE] 并关闭响应体）时信号未中止，不受影响。
+      if (guard.signal.aborted) throw new AppError(ErrorCode.PROVIDER_TIMEOUT, '模型流式响应被中断（超时/取消）');
       if (acc.size > 0) {
         yield { type: 'tool_calls', toolCalls: [...acc.values()].map((t) => ({ id: t.id ?? `call_${Math.random()}`, name: t.name ?? '', arguments: t.args })) };
       }
@@ -77,7 +86,11 @@ export class OpenAICompatibleAdapter implements LLMProvider {
     } catch (err) {
       // 超时层 → PROVIDER_TIMEOUT（可重试/可回退）；AppError 原样透传（绝不被 mapProviderError 降级）
       if (err instanceof StreamTimeoutError) throw new AppError(ErrorCode.PROVIDER_TIMEOUT, err.message);
-      throw err instanceof AppError ? err : mapProviderError(err as ProviderLikeError);
+      // M10-P2：guard.abort() 会让真实 SDK 立刻抛出 APIUserAbortError（"Request was aborted."）。
+      // 它与 StreamTimeoutError 在同一 tick 竞争 Promise.race 的胜者（SDK 拒绝先入队 → 可能胜出），
+      // 因此这里必须兜底：SDK 中止/超时形状一律归一为 PROVIDER_TIMEOUT，绝不变成不可重试的 unknown。
+      // （层特定的中文文案仅在 StreamTimeoutError 胜出时保留；错误码/可重试性是契约保证。）
+      throw mapSdkError(err);
     } finally {
       // 收尾（正常结束/异常/消费者提前 return）都中断在途请求：绝不把连接挂在服务端
       guard.abort();
