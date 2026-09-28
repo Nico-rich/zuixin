@@ -39,9 +39,16 @@ export class JwtAuthGuard implements CanActivate {
       if (payload.jti && (await this.access.isJtiBlocked(payload.jti))) {
         throw new AppError(ErrorCode.UNAUTHORIZED, '登录已失效，请重新登录');
       }
-      // 1) 会话撤销：token 携带 sid 时校验会话仍然有效（登出/轮换后 access token 立即失效）
+      // 1) 会话撤销：token 携带 sid 时校验会话仍然有效（登出/轮换/设备下线后 access token 立即失效）
       if (payload.sid && !(await this.access.isSessionLive(payload.sid))) {
-        throw new AppError(ErrorCode.UNAUTHORIZED, '登录已失效，请重新登录');
+        // M11-P2（D1-01，**DEVICE_REVOKED 的唯一业务抛出点**）：拒绝结论恒来自 DB 会话状态（上一行），
+        // 此处只把"原因"细化为 DEVICE_REVOKED —— 客户端据此提示"该设备已被下线"并**停止重试**，
+        // 而不是笼统的"登录已过期"（后者会让客户端反复刷新换不回会话）。
+        // 原因标记缺失/Redis 故障 → 退化回 UNAUTHORIZED：**只影响文案，绝不影响放行/拒绝**。
+        const deviceRevoked = await this.access.isSessionDeviceRevoked(payload.sid);
+        throw deviceRevoked
+          ? new AppError(ErrorCode.DEVICE_REVOKED, '该设备已被下线，请重新登录')
+          : new AppError(ErrorCode.UNAUTHORIZED, '登录已失效，请重新登录');
       }
       // 2) 禁用用户阻断：access token 未过期 ≠ 用户仍可用（禁用后不得再访问任何受保护端点）
       if (!(await this.access.isUserActive(payload.sub))) {

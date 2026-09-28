@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { AccessGuardService } from './access-guard.service';
 
 function makePrisma() {
@@ -13,6 +13,7 @@ function makeEvents() {
   let listener: ((e: { type: string; sessionId?: string; userId?: string }) => void) | undefined;
   return {
     isJtiBlacklisted: vi.fn().mockResolvedValue(false),
+    isSessionDeviceRevoked: vi.fn().mockResolvedValue(false), // M11-P2
     registerListener: vi.fn((fn: typeof listener) => { listener = fn; }),
     emit: (e: { type: string; sessionId?: string; userId?: string }) => listener?.(e),
     get hasListener(): boolean { return listener !== undefined; },
@@ -27,6 +28,10 @@ describe('AccessGuardService', () => {
     process.env.SECURITY_GUARD_CACHE_TTL_MS = '5000';
     prisma = makePrisma();
     svc = new AccessGuardService(prisma as never);
+  });
+
+  afterEach(() => {
+    delete process.env.SECURITY_GUARD_CACHE_MAX_ENTRIES;
   });
 
   it('active 用户 → true；disabled → false；不存在 → false', async () => {
@@ -201,6 +206,92 @@ describe('AccessGuardService', () => {
       expect(svc.stats().jti).toBe(1);
       events.emit({ type: 'session.revoked', sessionId: 's-other' });
       expect(svc.stats().jti).toBe(0);
+    });
+  });
+
+  /**
+   * M11-P2（D1-01）：设备下线后的 401 需要**可区分的原因**（DEVICE_REVOKED vs UNAUTHORIZED）。
+   * 本层只做"原因查询"，拒绝结论恒来自 DB 会话状态（调用点在后）。
+   */
+  describe('M11-P2：设备下线原因（DEVICE_REVOKED 的判定面）', () => {
+    let events: ReturnType<typeof makeEvents>;
+    beforeEach(() => {
+      events = makeEvents();
+      svc = new AccessGuardService(prisma as never, events as never);
+    });
+
+    it('远端/本进程标记为"设备下线" → true；否则 false', async () => {
+      events.isSessionDeviceRevoked.mockResolvedValue(true);
+      expect(await svc.isSessionDeviceRevoked('s1')).toBe(true);
+      events.isSessionDeviceRevoked.mockResolvedValue(false);
+      expect(await svc.isSessionDeviceRevoked('s2')).toBe(false);
+      expect(events.isSessionDeviceRevoked).toHaveBeenCalledWith('s1');
+    });
+
+    it('SessionEventsService 缺失（@Optional 未注入）→ false（退化回通用 UNAUTHORIZED，不影响拒绝本身）', async () => {
+      const bare = new AccessGuardService(prisma as never);
+      expect(await bare.isSessionDeviceRevoked('s1')).toBe(false);
+    });
+  });
+
+  /**
+   * M11-P2（D1-11）：三个缓存的**容量上限**。
+   * M10 审计：原实现只受 TTL 约束（TTL 只影响"命中"，不影响"驻留"）→ 条目随历史用户/会话/jti 单调增长。
+   * 策略：整表清空重建（简单有界；丢失的肯定结论只值一次重新查库）。
+   */
+  describe('M11-P2：缓存容量上限（有界策略）', () => {
+    it('默认上限 5000（env SECURITY_GUARD_CACHE_MAX_ENTRIES 可覆盖；非法值回落默认）', () => {
+      expect(new AccessGuardService(prisma as never).maxEntries).toBe(5000);
+      process.env.SECURITY_GUARD_CACHE_MAX_ENTRIES = '7';
+      expect(new AccessGuardService(prisma as never).maxEntries).toBe(7);
+      process.env.SECURITY_GUARD_CACHE_MAX_ENTRIES = 'abc';
+      expect(new AccessGuardService(prisma as never).maxEntries).toBe(5000);
+      process.env.SECURITY_GUARD_CACHE_MAX_ENTRIES = '0';
+      expect(new AccessGuardService(prisma as never).maxEntries).toBe(5000); // 0/负 = 非法（不可配成"无缓存"）
+    });
+
+    it('userStatusCache：达到上限后整表清空并写入新条目（size 恒 ≤ 上限，绝不无界增长）', async () => {
+      process.env.SECURITY_GUARD_CACHE_MAX_ENTRIES = '3';
+      svc = new AccessGuardService(prisma as never);
+      prisma.user.findUnique.mockResolvedValue({ status: 'active' });
+      for (let i = 0; i < 10; i += 1) await svc.isUserActive(`u${i}`);
+      expect(svc.stats().users).toBeLessThanOrEqual(3);
+      expect(svc.stats().users).toBeGreaterThan(0);
+      // 清空后写入的条目**没有丢**：最后一次查询的结论仍被缓存（命中 → 不再查库）
+      const calls = prisma.user.findUnique.mock.calls.length;
+      expect(await svc.isUserActive('u9')).toBe(true);
+      expect(prisma.user.findUnique.mock.calls.length).toBe(calls);
+    });
+
+    it('sessionCache：达到上限后整表清空（size 恒 ≤ 上限）', async () => {
+      process.env.SECURITY_GUARD_CACHE_MAX_ENTRIES = '2';
+      svc = new AccessGuardService(prisma as never);
+      prisma.session.findUnique.mockResolvedValue({ revokedAt: null, expiresAt: new Date(Date.now() + 60_000) });
+      for (let i = 0; i < 8; i += 1) await svc.isSessionLive(`s${i}`);
+      expect(svc.stats().sessions).toBeLessThanOrEqual(2);
+      expect(await svc.isSessionLive('s7')).toBe(true); // 最近一次仍被记住
+    });
+
+    it('jtiOkCache：达到上限后整表清空（jti 面按 token 计，增长最快）', async () => {
+      process.env.SECURITY_GUARD_CACHE_MAX_ENTRIES = '2';
+      const events = makeEvents();
+      svc = new AccessGuardService(prisma as never, events as never);
+      for (let i = 0; i < 8; i += 1) await svc.isJtiBlocked(`j${i}`);
+      expect(svc.stats().jti).toBeLessThanOrEqual(2);
+      // 清空是**保守**方向：丢失肯定缓存只会多查一次 Redis，绝不改变放行/拒绝结论
+      expect(await svc.isJtiBlocked('j7')).toBe(false);
+    });
+
+    it('上限内不触发清空（清空只在越界那一刻发生，稳态零额外开销）', async () => {
+      process.env.SECURITY_GUARD_CACHE_MAX_ENTRIES = '3';
+      svc = new AccessGuardService(prisma as never);
+      prisma.user.findUnique.mockResolvedValue({ status: 'active' });
+      await svc.isUserActive('u1');
+      await svc.isUserActive('u2');
+      await svc.isUserActive('u3');
+      expect(svc.stats().users).toBe(3); // 恰好等于上限：未清空（>= 判定只在**新增**越界时生效）
+      await svc.isUserActive('u1');
+      expect(svc.stats().users).toBe(3);
     });
   });
 });

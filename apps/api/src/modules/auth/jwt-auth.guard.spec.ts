@@ -10,7 +10,12 @@ function makeCtx(req: FakeReq) {
 
 function makeGuard() {
   const jwt = { verifyAsync: vi.fn() };
-  const access = { isUserActive: vi.fn().mockResolvedValue(true), isSessionLive: vi.fn().mockResolvedValue(true) };
+  const access = {
+    isUserActive: vi.fn().mockResolvedValue(true),
+    isSessionLive: vi.fn().mockResolvedValue(true),
+    // M11-P2：设备下线原因（默认"非设备下线" → 通用 UNAUTHORIZED）
+    isSessionDeviceRevoked: vi.fn().mockResolvedValue(false),
+  };
   return { guard: new JwtAuthGuard(jwt as never, access as never), jwt, access };
 }
 
@@ -80,6 +85,40 @@ describe('JwtAuthGuard', () => {
     jwt.verifyAsync.mockResolvedValue({ sub: 'u1', role: 'user' });
     access.isUserActive.mockResolvedValue(false);
     await expect(guard.canActivate(makeCtx({ cookies: { [COOKIE_ACCESS]: 't' } }))).rejects.toMatchObject({ message: '账号不可用' });
+  });
+
+  /**
+   * M11-P2（D1-01）：**DEVICE_REVOKED 的唯一业务抛出点**。
+   * 拒绝结论恒来自 DB 会话状态（isSessionLive=false）；原因标记只决定错误码/文案细度。
+   */
+  describe('M11-P2：设备下线后的 401 原因细化（DEVICE_REVOKED）', () => {
+    it('会话因"设备下线"被撤销 → 401 DEVICE_REVOKED（客户端据此停止重试，而不是反复刷新）', async () => {
+      const { guard, jwt, access } = makeGuard();
+      jwt.verifyAsync.mockResolvedValue({ sub: 'u1', role: 'user', sid: 's1' });
+      access.isSessionLive.mockResolvedValue(false);
+      access.isSessionDeviceRevoked.mockResolvedValue(true);
+      const req: FakeReq = { cookies: { [COOKIE_ACCESS]: 't' } };
+      await expect(guard.canActivate(makeCtx(req)))
+        .rejects.toMatchObject({ code: 'DEVICE_REVOKED', message: '该设备已被下线，请重新登录' });
+      expect(access.isSessionDeviceRevoked).toHaveBeenCalledWith('s1');
+      expect(req.user).toBeUndefined();
+    });
+
+    it('普通撤销（登出/轮换/管理踢出）→ 仍是通用 UNAUTHORIZED（不误报"设备下线"）', async () => {
+      const { guard, jwt, access } = makeGuard();
+      jwt.verifyAsync.mockResolvedValue({ sub: 'u1', role: 'user', sid: 's1' });
+      access.isSessionLive.mockResolvedValue(false);
+      access.isSessionDeviceRevoked.mockResolvedValue(false);
+      await expect(guard.canActivate(makeCtx({ cookies: { [COOKIE_ACCESS]: 't' } })))
+        .rejects.toMatchObject({ code: 'UNAUTHORIZED', message: '登录已失效，请重新登录' });
+    });
+
+    it('会话有效时不查"设备下线"原因（该查询只在已决定拒绝的路径上发生）', async () => {
+      const { guard, jwt, access } = makeGuard();
+      jwt.verifyAsync.mockResolvedValue({ sub: 'u1', role: 'user', sid: 's1' });
+      expect(await guard.canActivate(makeCtx({ cookies: { [COOKIE_ACCESS]: 't' } }))).toBe(true);
+      expect(access.isSessionDeviceRevoked).not.toHaveBeenCalled();
+    });
   });
 
   it('安全面缺失（最小模块构造）时不降级为"放行一切"：仍要求有效签名', async () => {

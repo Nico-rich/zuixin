@@ -20,7 +20,24 @@ class FakeRedis {
   disconnected = false;
   /** 故障注入：命中一次后自清（op = 方法名） */
   failure: { op: string; error: Error } | null = null;
+  /** 命令台账（M11-P2：区分"直接命令"与"pipeline 内命令"——断言往返次数用） */
+  readonly ops: Array<{ op: string; viaPipeline: boolean }> = [];
+  /** pipeline exec 次数 = 该路径的 Redis 往返次数 */
+  pipelineRuns = 0;
+  private pipelineDepth = 0;
   private readonly handlers = new Map<string, Array<(...args: unknown[]) => void>>();
+
+  /** ioredis pipeline 替身（M11-P2）：命令入队，exec() 时**逐条应用**——与真实 pipeline 的
+   *  "非事务、可部分应用、逐条返回 [err, result]"语义一致（pipeline ≠ MULTI/EXEC）。 */
+  pipeline(): FakePipeline { return new FakePipeline(this); }
+
+  /** pipeline 内部执行时标记台账（供断言"这些命令走的是 pipeline"） */
+  enterPipeline(): void { this.pipelineDepth += 1; }
+  exitPipeline(): void { this.pipelineDepth -= 1; this.pipelineRuns += 1; }
+
+  private log(op: string): void {
+    this.ops.push({ op, viaPipeline: this.pipelineDepth > 0 });
+  }
 
   private guard(op: string): void {
     if (this.failure && this.failure.op === op) {
@@ -32,12 +49,14 @@ class FakeRedis {
 
   async publish(channel: string, message: string): Promise<number> {
     this.guard('publish');
+    this.log('publish');
     this.published.push({ channel, message });
     return 1;
   }
 
   async zadd(key: string, score: number, member: string): Promise<number> {
     this.guard('zadd');
+    this.log('zadd');
     const z = this.zsets.get(key) ?? new Map<string, number>();
     const added = z.has(member) ? 0 : 1;
     z.set(member, Number(score));
@@ -47,18 +66,21 @@ class FakeRedis {
 
   async expire(key: string, ttl: number): Promise<number> {
     this.guard('expire');
+    this.log('expire');
     this.expires.push({ key, ttl });
     return 1;
   }
 
   async set(key: string, value: string, _ex?: string, ttl?: number): Promise<'OK'> {
     this.guard('set');
+    this.log('set');
     this.strings.set(key, ttl);
     return 'OK';
   }
 
   async zrangebyscore(key: string, min: string, max: string, ...rest: string[]): Promise<string[]> {
     this.guard('zrangebyscore');
+    this.log('zrangebyscore');
     const z = this.zsets.get(key);
     if (!z) return [];
     const exclusive = min.startsWith('(');
@@ -70,8 +92,24 @@ class FakeRedis {
     return rest.includes('WITHSCORES') ? rows.flatMap(([m, s]) => [m, String(s)]) : rows.map(([m]) => m);
   }
 
+  /** M11-P2：按 score 区间删成员（ZREMRANGEBYSCORE） */
+  async zremrangebyscore(key: string, min: string, max: string): Promise<number> {
+    this.guard('zremrangebyscore');
+    this.log('zremrangebyscore');
+    const z = this.zsets.get(key);
+    if (!z) return 0;
+    const lo = min === '-inf' ? Number.NEGATIVE_INFINITY : min.startsWith('(') ? Number(min.slice(1)) : Number(min);
+    const hi = max === '+inf' ? Number.POSITIVE_INFINITY : Number(max);
+    let removed = 0;
+    for (const [member, score] of [...z.entries()]) {
+      if (score >= lo && score <= hi) { z.delete(member); removed += 1; }
+    }
+    return removed;
+  }
+
   async del(key: string): Promise<number> {
     this.guard('del');
+    this.log('del');
     const a = this.zsets.delete(key);
     const b = this.strings.delete(key);
     return a || b ? 1 : 0;
@@ -79,6 +117,7 @@ class FakeRedis {
 
   async exists(key: string): Promise<number> {
     this.guard('exists');
+    this.log('exists');
     return this.strings.has(key) ? 1 : 0;
   }
 
@@ -102,6 +141,46 @@ class FakeRedis {
   }
 
   disconnect(): void { this.disconnected = true; }
+}
+
+/** pipeline 替身：顺序入队，exec() 逐条应用并返回 [err, result]（与 ioredis 语义一致） */
+class FakePipeline {
+  private readonly queue: Array<() => Promise<unknown>> = [];
+  constructor(private readonly client: FakeRedis) {}
+
+  zadd(key: string, score: number, member: string): this {
+    this.queue.push(() => this.client.zadd(key, score, member));
+    return this;
+  }
+  zremrangebyscore(key: string, min: string, max: string): this {
+    this.queue.push(() => this.client.zremrangebyscore(key, min, max));
+    return this;
+  }
+  expire(key: string, ttl: number): this {
+    this.queue.push(() => this.client.expire(key, ttl));
+    return this;
+  }
+  set(key: string, value: string, ex?: string, ttl?: number): this {
+    this.queue.push(() => this.client.set(key, value, ex, ttl));
+    return this;
+  }
+  del(key: string): this {
+    this.queue.push(() => this.client.del(key));
+    return this;
+  }
+
+  async exec(): Promise<Array<[Error | null, unknown]>> {
+    const out: Array<[Error | null, unknown]> = [];
+    this.client.enterPipeline();
+    try {
+      for (const run of this.queue) {
+        try { out.push([null, await run()]); } catch (err) { out.push([err as Error, null]); }
+      }
+    } finally {
+      this.client.exitPipeline();
+    }
+    return out;
+  }
 }
 
 function makeService() {
@@ -322,5 +401,131 @@ describe('SessionEventsService：jti 记账与黑名单（SA-4/X-20）', () => {
     const { svc, command } = makeService();
     command.failure = { op: 'exists', error: new Error('Redis 不可用') };
     await expect(svc.isJtiBlacklisted('jti-1')).resolves.toBe(false);
+  });
+});
+
+/**
+ * M11-P2（D1-11）jti ZSET 治理：懒触发清理 + 批量写入。
+ * M10 审计两条：① ZSET 成员无逐条过期（集合 key 的 TTL 被每次签发刷新 → 过期成员永久堆积）；
+ * ② `blacklistAllUserJtis` 逐条 SET 串行（尾部延迟 = N×RTT）。
+ */
+describe('SessionEventsService：M11-P2 jti ZSET 治理（懒清理 + pipeline 批量）', () => {
+  it('trackJti：ZADD 后顺手 ZREMRANGEBYSCORE 删掉已过期成员（集合规模 = 最近 ACCESS_TTL 内签发数）', async () => {
+    const { svc, command } = makeService();
+    const now = Math.floor(Date.now() / 1000);
+    await command.zadd('auth:jti:u1', now - 5000, 'jti-ancient'); // 早已过期的历史成员（模拟无清理时的堆积）
+    await command.zadd('auth:jti:u1', now - 10, 'jti-just-expired');
+
+    await svc.trackJti('u1', 'jti-new', now + 900);
+
+    const z = command.zsets.get('auth:jti:u1');
+    expect(z?.has('jti-ancient')).toBe(false);      // 过期成员被清理
+    expect(z?.has('jti-just-expired')).toBe(false); // 边界：score ≤ now 即过期
+    expect(z?.get('jti-new')).toBe(now + 900);      // 本次签发保留
+    expect(command.ops.some((o) => o.op === 'zremrangebyscore')).toBe(true);
+  });
+
+  it('trackJti：ZADD + 清理 + TTL 合并为**单次 pipeline**（3 条命令 1 个往返）', async () => {
+    const { svc, command } = makeService();
+    await svc.trackJti('u1', 'jti-1', Math.floor(Date.now() / 1000) + 900);
+
+    expect(command.pipelineRuns).toBe(1);
+    const direct = command.ops.filter((o) => !o.viaPipeline).map((o) => o.op);
+    expect(direct).not.toContain('zadd');              // 三条命令都在 pipeline 里
+    expect(direct).not.toContain('zremrangebyscore');
+    expect(direct).not.toContain('expire');
+    expect(command.ops.filter((o) => o.viaPipeline).map((o) => o.op)).toEqual(['zadd', 'zremrangebyscore', 'expire']);
+    expect(command.expires[0].key).toBe('auth:jti:u1');
+  });
+
+  it('trackJti：pipeline 失败 → warn 且不抛（记账丢失只影响"登出全部"覆盖面，会话撤销不受影响）', async () => {
+    const { svc, command } = makeService();
+    command.failure = { op: 'zadd', error: new Error('Redis 不可用') };
+    await expect(svc.trackJti('u1', 'jti-1', Math.floor(Date.now() / 1000) + 60)).resolves.toBeUndefined();
+  });
+
+  it('blacklistAllUserJtis：N 条墓碑改**单次 pipeline**（往返 2 次：zrange + pipeline，而不是 N+2 次串行）', async () => {
+    const { svc, command } = makeService();
+    const now = Math.floor(Date.now() / 1000);
+    for (let i = 0; i < 25; i += 1) await command.zadd('auth:jti:u1', now + 100 + i, `jti-${i}`);
+    command.ops.length = 0; // 只统计被测调用的命令台账
+
+    const count = await svc.blacklistAllUserJtis('u1');
+
+    expect(count).toBe(25);
+    expect(command.pipelineRuns).toBe(1);
+    // 直连命令只有 1 条（读集合）；25 条墓碑 + 清集合全部在同一次 pipeline 内
+    expect(command.ops.filter((o) => !o.viaPipeline).map((o) => o.op)).toEqual(['zrangebyscore']);
+    const pipelined = command.ops.filter((o) => o.viaPipeline).map((o) => o.op);
+    expect(pipelined.filter((op) => op === 'set')).toHaveLength(25);
+    expect(pipelined).toContain('del');
+    // TTL 语义不变：每条墓碑 TTL = 该 token 剩余寿命
+    expect(command.strings.get('auth:jti:blacklist:jti-0')).toBeGreaterThan(90);
+    expect(command.strings.get('auth:jti:blacklist:jti-0')).toBeLessThanOrEqual(101);
+  });
+
+  it('blacklistAllUserJtis：pipeline 内**逐条**核对返回项——失败条目不计数（绝不乐观上报）', async () => {
+    const { svc, command } = makeService();
+    const now = Math.floor(Date.now() / 1000);
+    await command.zadd('auth:jti:u1', now + 100, 'jti-a');
+    await command.zadd('auth:jti:u1', now + 100, 'jti-b');
+    await command.zadd('auth:jti:u1', now + 100, 'jti-c');
+    command.failure = { op: 'set', error: new Error('单条命令失败（pipeline 非事务）') };
+
+    const count = await svc.blacklistAllUserJtis('u1');
+
+    expect(count).toBe(2); // 3 条中 1 条失败 → 只报 2（真实成功的条数）
+    expect(command.strings.has('auth:jti:blacklist:jti-a')).toBe(false); // 失败那条确实没有墓碑
+    expect(command.strings.has('auth:jti:blacklist:jti-b')).toBe(true);
+    expect(command.strings.has('auth:jti:blacklist:jti-c')).toBe(true);
+  });
+});
+
+/**
+ * M11-P2（D1-01）：设备下线**原因标记**。
+ * 只用于把"已拒绝"的 401 细化为 DEVICE_REVOKED —— 撤销权威恒在 DB `revokedAt`（见 AccessGuardService 注释）。
+ */
+describe('SessionEventsService：M11-P2 设备下线原因标记', () => {
+  it('markDeviceRevoked：批量写 `auth:session:device-revoked:{sid}`，TTL = 传入的 token 上限寿命（单次 pipeline）', async () => {
+    const { svc, command } = makeService();
+    await svc.markDeviceRevoked(['s1', 's2'], 900);
+
+    expect(command.pipelineRuns).toBe(1);
+    expect(command.strings.get('auth:session:device-revoked:s1')).toBe(900);
+    expect(command.strings.get('auth:session:device-revoked:s2')).toBe(900);
+  });
+
+  it('markDeviceRevoked：空集合/TTL ≤ 0 → 不发任何命令（无意义写入不发）', async () => {
+    const { svc, command } = makeService();
+    await svc.markDeviceRevoked([], 900);
+    await svc.markDeviceRevoked(['s1'], 0);
+    await svc.markDeviceRevoked(['s1'], Number.NaN);
+    expect(command.pipelineRuns).toBe(0);
+    expect(command.strings.size).toBe(0);
+  });
+
+  it('markDeviceRevoked 失败只 warn（撤销仍生效；随后 401 退化为通用文案）', async () => {
+    const { svc, command } = makeService();
+    command.failure = { op: 'set', error: new Error('Redis 不可用') };
+    await expect(svc.markDeviceRevoked(['s1'], 900)).resolves.toBeUndefined();
+  });
+
+  it('isSessionDeviceRevoked：有标记 → true；无标记 → false（fail-open，只有文案受影响）', async () => {
+    const { svc } = makeService();
+    await svc.markDeviceRevoked(['s1'], 900);
+    expect(await svc.isSessionDeviceRevoked('s1')).toBe(true);
+    expect(await svc.isSessionDeviceRevoked('s-other')).toBe(false);
+  });
+
+  it('isSessionDeviceRevoked：Redis 故障 → false + warn（**绝不**因查不到原因而改变放行/拒绝结论）', async () => {
+    const { svc, command } = makeService();
+    command.failure = { op: 'exists', error: new Error('Redis 不可用') };
+    await expect(svc.isSessionDeviceRevoked('s1')).resolves.toBe(false);
+  });
+
+  it('设备标记与 jti 面互不影响：标记不写任何 jti 键（撤销权威仍在 DB）', async () => {
+    const { svc, command } = makeService();
+    await svc.markDeviceRevoked(['s1'], 900);
+    expect([...command.strings.keys()]).toEqual(['auth:session:device-revoked:s1']);
   });
 });

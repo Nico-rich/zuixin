@@ -11,14 +11,23 @@ import { AccessGuardService } from '../security/access-guard.service';
 import { SessionEventsService } from '../security/session-events.service';
 import {
   ACCESS_TTL_SEC, LOGIN_FAIL_WINDOW_SEC, LOGIN_MAX_FAILS, REFRESH_TTL_SEC,
-  sessionConcurrencyPolicy, sessionMaxConcurrent,
+  normalizeDeviceId, sessionConcurrencyPolicy, sessionMaxConcurrent,
 } from './auth.constants';
 
-export interface RequestMeta { ip: string; userAgent?: string; }
+/** M11-P2：`deviceId` 为可选的设备分组标识（来源见 auth.constants；服务端不信任其内容） */
+export interface RequestMeta { ip: string; userAgent?: string; deviceId?: string; }
 
 export interface AuthResult {
   accessToken: string; refreshToken: string;
   user: { id: string; email: string; displayName: string | null; role: string };
+}
+
+/** 会话管理端点回传的会话摘要（**绝不含 tokenHash/refresh token**） */
+export interface SessionSummary {
+  id: string; deviceId: string | null; userAgent: string | null; ip: string | null;
+  createdAt: Date; expiresAt: Date;
+  /** 是否为发起本次请求的会话（前端据此标注"当前设备"并禁止误下线自己） */
+  current: boolean;
 }
 
 /** access token 里与本服务治理相关的声明（M10-P1：sid 定位会话、jti 支持主动轮换黑名单） */
@@ -140,7 +149,109 @@ export class AuthService {
     const user = await this.prisma.user.findUnique({ where: { id: session.userId } });
     if (!user || user.status !== 'active') throw new AppError(ErrorCode.UNAUTHORIZED, '账号不可用');
     await this.prisma.session.update({ where: { id: session.id }, data: { revokedAt: new Date() } }); // 轮换
-    return this.issueTokens(user, meta);
+    // M11-P2：deviceId **继承**既有会话而非重新采集——续期不改变"这是哪台设备"，
+    // 否则设备分组会在刷新后被清空，按设备下线将漏掉刷新过的会话。
+    return this.issueTokens(user, { ...meta, deviceId: session.deviceId ?? undefined });
+  }
+
+  /**
+   * M11-P2（D1-10）token 轮换：旧 refresh + 旧 access → 新 refresh + 新 access。
+   *
+   * 语义（**由测试锁定**）：
+   * - 旧会话行被**撤销**（`revokedAt`），新会话行**新建**——与 `refresh` 同构，而非"同 Session 改 tokenHash"。
+   *   取舍理由：sid 随新会话更换 → 旧 access token 在 DB 面即失效（`isSessionLive(sid)=false`），
+   *   不依赖 Redis jti 墓碑（墓碑写入是纵深、可降级）；"同 Session 改 hash"则让旧 access token 只剩
+   *   黑名单这一层防线，Redis 抖动时旧 token 会活到自然过期。
+   * - 旧 access token 的 jti **同时**进黑名单（纵深第二层）+ 发布 `session.revoked`（跨实例立即失效）。
+   * - deviceId/userAgent/ip 由旧会话继承（轮换不改变设备分组，见 refresh 注释）。
+   *
+   * 绑定性：access token 的 sid 必须与 refresh token 指向**同一会话**，否则拒绝——
+   * 否则"持有他人 refresh token 但没有对应 access token"或"access/refresh 混用"都能换来新凭证。
+   * 并发：旧会话撤销走 CAS（`revokedAt: null`），两个并发 rotate 只有一个成功，另一个 401（旧 refresh 不可重放）。
+   */
+  async rotate(rawRefresh: string | undefined, claims: AccessClaims | null | undefined, meta: RequestMeta): Promise<AuthResult> {
+    if (!rawRefresh) throw new AppError(ErrorCode.UNAUTHORIZED, '未登录');
+    if (!claims?.sessionId) throw new AppError(ErrorCode.UNAUTHORIZED, '登录已失效，请重新登录');
+    const session = await this.prisma.session.findUnique({ where: { tokenHash: this.hash(rawRefresh) } });
+    if (!session || session.revokedAt || session.expiresAt < new Date()) {
+      throw new AppError(ErrorCode.UNAUTHORIZED, '登录已过期，请重新登录');
+    }
+    if (session.id !== claims.sessionId) {
+      throw new AppError(ErrorCode.UNAUTHORIZED, '登录凭证不匹配，请重新登录');
+    }
+    const user = await this.prisma.user.findUnique({ where: { id: session.userId } });
+    if (!user || user.status !== 'active') throw new AppError(ErrorCode.UNAUTHORIZED, '账号不可用');
+    const revoked = await this.prisma.session.updateMany({
+      where: { id: session.id, revokedAt: null }, data: { revokedAt: new Date() },
+    });
+    if (revoked.count === 0) throw new AppError(ErrorCode.UNAUTHORIZED, '登录已失效，请重新登录'); // 并发轮换的败者
+    this.access?.invalidateSession(session.id); // 本进程立即失效
+    await this.blacklistAccessToken(claims);    // 旧 jti 进黑名单（纵深）
+    await this.events?.publish({ type: 'session.revoked', sessionId: session.id, userId: session.userId });
+    return this.issueTokens(user, { ...meta, deviceId: session.deviceId ?? undefined });
+  }
+
+  /**
+   * M11-P2（D1-10）本人会话列表（会话管理端点）。
+   * 只回**活跃**会话（未撤销且未过期）：撤销过的会话对用户没有管理价值，且会把"历史设备"变成信息噪音。
+   * 脱敏口径：白名单字段（id/deviceId/userAgent/ip/createdAt/expiresAt/current）——
+   * tokenHash 与任何 token **绝不出现在响应里**（含错误路径）。
+   */
+  async listSessions(userId: string, currentSessionId?: string): Promise<SessionSummary[]> {
+    const rows = await this.prisma.session.findMany({
+      where: { userId, revokedAt: null, expiresAt: { gt: new Date() } },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, deviceId: true, userAgent: true, ip: true, createdAt: true, expiresAt: true },
+    });
+    return rows.map((r) => ({ ...r, current: currentSessionId === r.id }));
+  }
+
+  /**
+   * M11-P2（D1-10）本人单会话下线。
+   * **IDOR 口径**：查询与撤销恒带 `userId`（令牌主体），他人会话与幽灵 id **同码同文案**（404 防枚举）；
+   * 已撤销/已过期会话 → 幂等返回 `{ revokedSessions: 0 }`（不报错，也不假装撤销成功）。
+   */
+  async revokeSession(userId: string, sessionId: string): Promise<{ revokedSessions: number }> {
+    const owned = await this.prisma.session.findFirst({ where: { id: sessionId, userId }, select: { id: true } });
+    if (!owned) throw new AppError(ErrorCode.NOT_FOUND, '会话不存在');
+    const res = await this.prisma.session.updateMany({
+      where: { id: sessionId, userId, revokedAt: null }, data: { revokedAt: new Date() },
+    });
+    if (res.count === 0) return { revokedSessions: 0 }; // 已撤销/已过期：幂等
+    this.access?.invalidateSession(sessionId);
+    await this.events?.publish({ type: 'session.revoked', sessionId, userId });
+    return { revokedSessions: res.count };
+  }
+
+  /**
+   * M11-P2（D1-01）按设备下线：撤销**本人在该设备上**的全部活跃会话。
+   *
+   * - 作用域恒为"令牌主体 + 该 deviceId"，因此伪造 deviceId 只能影响伪造者自己的会话分组，无跨租户面。
+   * - 该设备无活跃会话 → 幂等 `{ revokedSessions: 0 }`（不抛错：把"重复下线"变成客户端错误会带来
+   *   误判性登出，且幂等语义更容易重试；见 jwt-auth.guard 中 DEVICE_REVOKED 的真实抛出点）。
+   * - 每个被撤销会话各发一条 `session.revoked`（**沿用既有事件载荷，不新增字段**）：远端实例按
+   *   sessionId 精确清肯定缓存（若只发 userId，`session.revoked` 不清会话面缓存 → 远端仍放行 ≤ TTL）。
+   * - 另写"设备下线原因标记"（Redis，TTL = access token 上限寿命）：仅用于把这些会话随后的 401
+   *   **细化为 DEVICE_REVOKED**；撤销的权威判定仍是 DB 的 `revokedAt`（标记丢失只降级错误码，绝不放行）。
+   */
+  async revokeDeviceSessions(userId: string, rawDeviceId: string): Promise<{ revokedSessions: number; sessionIds: string[] }> {
+    const deviceId = normalizeDeviceId(rawDeviceId);
+    if (!deviceId) throw new AppError(ErrorCode.VALIDATION_ERROR, '设备标识不合法');
+    const targets = await this.prisma.session.findMany({
+      where: { userId, deviceId, revokedAt: null, expiresAt: { gt: new Date() } },
+      select: { id: true },
+    });
+    if (targets.length === 0) return { revokedSessions: 0, sessionIds: [] };
+    await this.prisma.session.updateMany({
+      where: { userId, deviceId, revokedAt: null }, data: { revokedAt: new Date() },
+    });
+    const sessionIds = targets.map((t) => t.id);
+    await this.events?.markDeviceRevoked(sessionIds, ACCESS_TTL_SEC);
+    for (const id of sessionIds) {
+      this.access?.invalidateSession(id);
+      await this.events?.publish({ type: 'session.revoked', sessionId: id, userId });
+    }
+    return { revokedSessions: sessionIds.length, sessionIds };
   }
 
   /**
@@ -274,6 +385,8 @@ export class AuthService {
         userId: user.id, tokenHash: this.hash(refreshToken),
         expiresAt: new Date(Date.now() + REFRESH_TTL_SEC * 1000),
         userAgent: meta.userAgent, ip: meta.ip,
+        // M11-P2：设备分组标识（清洗后写入；来源缺失 → null，会话照常可用）
+        deviceId: normalizeDeviceId(meta.deviceId) ?? null,
       },
     });
     // M10-P1 SA-4：jti 由本服务生成（而非依赖库随机）——签发即可记账，供"登出全部/主动轮换"精确拉黑
