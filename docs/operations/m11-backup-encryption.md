@@ -13,6 +13,7 @@
 | --- | --- |
 | `backup.ts --encrypt gpg` 对称加密 + **解密自检**（回读 sha256 == 明文 dump） | ✅ 真实执行（§3.1，退出码 0，自检 284ms） |
 | 加密产物 **恢复演练**（临时库 → 6 项校验 → 自动 DROP） | ✅ 真实执行（§3.3，PASS，88/88 表 + 3 张表逐行一致，合计 67,938 行） |
+| `.sql.gpg`（只加密不压缩）形态的备份 + 恢复 | ✅ 真实执行（§3.4，两边都 PASS） |
 | `--upload` **真实桶**端到端（建桶 → 上传 → 体积 + **ETag/md5 内容级**核对） | ✅ 真实执行（§4，ETag `5b3bf9e6…` == 本地 md5） |
 | 失败路径退出码（口令错/缺失、公钥缺失、`.gpg.gz` 逆序、自检失败） | ✅ 真实执行（§6：4 / 4 / 4 / 2 / 3） |
 | 脚本单测（扩展名链、保留策略、gpg argv、真实加解密往返） | ✅ 75 用例 / 5 文件全绿（`apps/api/scripts/vitest.config.ts`） |
@@ -102,6 +103,20 @@ npx tsx scripts/backup.ts --encrypt gpg --encrypt-recipient ops@example.com
 
 同一脚本在早前的加密产物上也跑过一次完整演练（`m10p9_m11enc`）：回灌 14.50 s、总计 26.77 s、PASS。
 两次都是**临时库**，源库 `agent_platform` 全程只读（pg_dump 只读 + 校验只读），从未被写入。
+
+### 3.4 另一种形态：`.sql.gpg`（只加密不压缩）
+
+`--no-compress --encrypt gpg`（大库不想付压缩 CPU、或产物已经是压缩内容时用）：
+
+| 指标 | 数值 |
+| --- | --- |
+| 明文 dump | 23,864,248 字节（sha256 `a0274fde…`）——`--keep-plain`/`--no-compress` 下**保留**（`preEncryptionSha256` 与明文一致） |
+| gpg AES256 | 23,864,423 字节（+175 字节）/ **409 ms**；产物 sha256 `86c84aa6…` |
+| 校验 | 6/6 通过（含 `encrypted-artifact-decryptable`）；耗时 dump 1290 / 统计 67 / 压缩 0 / 加密 409 / 合计 **2,692 ms** |
+| 恢复演练 | 临时库 `m10p9_m11enc4` **PASS**（88/88 表行数一致 + 3 张表逐行一致），总计 **6.88 s**，临时库已 DROP |
+
+至此四种形态（`.sql` / `.sql.gz` / `.sql.gpg` / `.sql.gz.gpg`）的**读取链路**都经过真实数据的演练
+（前两种在 M10 已演练，本 Phase 复用了同一条链路）。
 
 ## 4. 真实桶归档 e2e（NV-25）
 
