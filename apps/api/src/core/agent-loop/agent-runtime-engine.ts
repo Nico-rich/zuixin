@@ -96,6 +96,24 @@ const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
  * env AGENT_RUN_LLM_TURN_MS（兼容计划文档命名 agentRunLlmTurnMs）可覆盖；非法/<=0 → 回落本默认值。
  */
 const DEFAULT_LLM_TURN_TIMEOUT_MS = 60_000;
+/**
+ * M11-P4（D1-06 保守子集）：**未知 token 但已占用 provider** 的回合最少可计费输入单位。
+ *
+ * 背景：watchdog 超时/用户中断的回合里，provider 权威用量（流末 usage 块）永远不会到达——
+ * 此前 token 一律记 0，而账本镜像 `UsageService.mirrorLedger` 对 quantity<=0 的行直接跳过，
+ * 于是"已占用 provider 资源"的回合**零账单**（绝不漏计原则被破坏）。
+ *
+ * 口径（保守，绝不漏计）：仅当回合**确实已把请求交给 provider** 且用量不可知时，按最少 1 个
+ * 输入 token 记账（请求送达必然消耗 >=1 prompt token；1 是最小可表达量，绝不放大估算）。
+ * 该 1 单位同时是 **UsageRecord 事实列**的值（UsageRecord 仍是唯一事实源；账本行是其投影，
+ * 对账期望 llm_tokens = inputTokens+outputTokens 依然自洽，绝不产生 wrongAmount 漂移）。
+ *
+ * 政策面（Deferred，M11 §13「LLM 用量裁决口径完整包（超时 token 计费政策）」）：按"未报告用量"
+ * 究竟记 0 / 记 1 单位 / 按流内已产出的部分文本估算，是**产品定价决策**，本修复不做定价设计，
+ * 只保证"占用过 provider 的回合至少产生一条账本行"。非超时/非中断的失败（401/429 等 provider
+ * 拒答，无实际算力消耗）仍记 0，绝不借本兜底虚增。
+ */
+const UNKNOWN_USAGE_PROVIDER_OCCUPIED_INPUT_TOKENS = 1;
 /** M7-P1：审批默认有效期（limits.approvalExpiresMs 可覆盖；0 = 不过期） */
 const DEFAULT_APPROVAL_TTL_MS = 24 * 3600_000;
 /** X-04：未声明 retryPolicy 的工具默认消费瞬态码（与 RETRYABLE_STEP_CODES 同源的平台瞬态码口径）重试 1 次小退避 */
@@ -331,7 +349,8 @@ export class AgentRuntimeEngine {
             await this.persistence.recordChatUsage({
               userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.messageId ?? '',
               providerId: resolved.providerId, modelId: resolved.modelId, runId,
-              inputTokens: 0, outputTokens: 0, latencyMs: Date.now() - turnStarted,
+              // M11-P4：中断回合 = 已占用 provider 但用量不可知 → 至少 1 单位（绝不漏计，见常量注释）
+              inputTokens: UNKNOWN_USAGE_PROVIDER_OCCUPIED_INPUT_TOKENS, outputTokens: 0, latencyMs: Date.now() - turnStarted,
               status: 'failed', errorCode: ErrorCode.AGENT_CANCELLED,
               organizationId: ctx.organizationId,
             });
@@ -341,7 +360,10 @@ export class AgentRuntimeEngine {
           await this.persistence.recordChatUsage({
             userId: ctx.userId, conversationId: ctx.conversationId, messageId: ctx.messageId ?? '',
             providerId: resolved.providerId, modelId: resolved.modelId, runId,
-            inputTokens: 0, outputTokens: 0, latencyMs: Date.now() - turnStarted,
+            // M11-P4：watchdog 超时（PROVIDER_TIMEOUT）= 请求已送达 provider 但用量不可知 → 至少 1 单位；
+            // 其余失败码（鉴权/限流等 provider 拒答，无算力消耗）仍记 0——绝不借兜底虚增。
+            inputTokens: appErr.code === ErrorCode.PROVIDER_TIMEOUT ? UNKNOWN_USAGE_PROVIDER_OCCUPIED_INPUT_TOKENS : 0,
+            outputTokens: 0, latencyMs: Date.now() - turnStarted,
             status: 'failed', errorCode: appErr.code,
             organizationId: ctx.organizationId,
           });

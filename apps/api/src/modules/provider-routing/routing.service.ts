@@ -19,6 +19,35 @@ type ModelRow = ProviderWithModels['models'][number];
 /** 延迟采样窗口（只读事实：usage_records.latencyMs 聚合；不新建事实表） */
 const LATENCY_WINDOW_MS = 24 * 3600_000;
 
+/**
+ * M11-P4（维度2#8）：延迟聚合的**进程内 TTL 缓存**默认时长。
+ *
+ * 背景：`collectFacts` 的 24h `usage_records` groupBy 是 route() 里最贵的一次读，且每次 route()
+ * 都无条件执行（LLM 每回合、每次媒体提交、每次 embedding 都各一次）——高并发下同一批 provider
+ * 的同一份聚合被反复重算。
+ *
+ * 取值理由：延迟在排序里是**低级软输入**（排在偏好/策略/优先级/健康分/成本之后，仅在与
+ * stickyKey 平局前后起作用，见 compareRank），24h 窗口本身的粒度就意味着"几十秒陈旧"对排序
+ * 结果的影响远小于窗口抖动；45s 既显著削峰（同一进程内 45s 内的 N 次路由共享一次聚合），
+ * 又保证故障/恢复/新 provider 的真实延迟最多 45s 后进入决策。可用 env 覆盖（运维调参）。
+ *
+ * 陈旧容忍面（绝不越过事实边界）：缓存只存「providerId → 24h 均值」这一派生观测值，
+ * 不缓存熔断窗口计数（那是准入过滤的输入，必须新鲜——windowStats 仍每次实读）；
+ * 缓存未命中/已过期/查询失败时一律**直查**（失败绝不写缓存，下次 route() 自然重试）；
+ * 一次 route() 内排序与审计行读的是**同一份** facts（决策与"为什么是它"的审计证据绝不背离）。
+ */
+const LATENCY_CACHE_TTL_MS_DEFAULT = 45_000;
+/** 缓存容量上限（防御 provider 数量异常增长导致进程内 Map 无界） */
+const LATENCY_CACHE_MAX_ENTRIES = 500;
+
+/** M11-P4 延迟缓存 TTL 解析（env ROUTING_LATENCY_CACHE_TTL_MS；非正/非法 → 默认 45s） */
+function latencyCacheTtlMs(): number {
+  const n = Number(process.env.ROUTING_LATENCY_CACHE_TTL_MS);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : LATENCY_CACHE_TTL_MS_DEFAULT;
+}
+
+interface LatencyCacheEntry { latencyMs: number | null; expiresAt: number }
+
 /** 无观测事实的候选（评分为「无样本」中性值，绝不臆造延迟/失败率） */
 const NO_FACTS: ProviderFacts = { latencyMs: null, windowFailures: 0, windowSuccesses: 0 };
 
@@ -54,6 +83,9 @@ interface AcceptedCandidate extends RouteTarget {
 @Injectable()
 export class RoutingService {
   private readonly logger = new Logger('ProviderRouting');
+  /** M11-P4：延迟聚合进程内 TTL 缓存（构造期解析一次；进程内单实例，多副本各自持有副本，无需一致性） */
+  private readonly latencyCache = new Map<string, LatencyCacheEntry>();
+  private readonly latencyCacheTtlMs = latencyCacheTtlMs();
 
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
@@ -311,21 +343,12 @@ export class RoutingService {
   private async collectFacts(providerIds: string[]): Promise<Map<string, ProviderFacts>> {
     const map = new Map<string, ProviderFacts>();
     if (providerIds.length === 0) return map;
-    const since = new Date(Date.now() - LATENCY_WINDOW_MS);
-    const [latencyRows, windowRows] = await Promise.all([
-      this.prisma.usageRecord.groupBy({
-        by: ['providerId'],
-        where: { providerId: { in: providerIds }, latencyMs: { not: null }, createdAt: { gte: since } },
-        _avg: { latencyMs: true },
-      }).catch((err) => {
-        this.logger.warn(`延迟采样聚合失败（按无样本处理）: ${(err as Error).message}`);
-        return [] as Array<{ providerId: string | null; _avg: { latencyMs: number | null } }>;
-      }),
+    const now = Date.now();
+    // 延迟（24h 均值，M11-P4：TTL 缓存；熔断窗口计数不进缓存——准入过滤输入必须新鲜）
+    const [latencyByProvider, windowRows] = await Promise.all([
+      this.latencyByProvider(providerIds, now),
       Promise.all(providerIds.map(async (id) => [id, await this.breaker.windowStats(id)] as const)),
     ]);
-    const latencyByProvider = new Map(
-      latencyRows.map((row) => [row.providerId, row._avg.latencyMs ?? null] as const),
-    );
     for (const [providerId, window] of windowRows) {
       map.set(providerId, {
         latencyMs: latencyByProvider.get(providerId) ?? null,
@@ -334,6 +357,61 @@ export class RoutingService {
       });
     }
     return map;
+  }
+
+  /**
+   * M11-P4（维度2#8）：延迟均值读取（providerId → 24h 均值）——**进程内 TTL 缓存**包裹 groupBy。
+   *
+   * 语义保证（详见 LATENCY_CACHE_TTL_MS_DEFAULT 注释）：
+   * - 命中且未过期 → 直接用缓存（与审计行同源：本方法返回的 map 同时供排序与决策审计）；
+   * - 未命中/已过期 → 直查（绝不返回过期值）；
+   * - 查询失败 → 未命中的 provider 一律按「无样本」（null）处理，且**不写缓存**——
+   *   失败绝不被缓存放大，下一次 route() 仍会直查（与原 catch 降级语义一致，只是不再整批复算）。
+   * 缓存键 = providerId（与查询的 `by: ['providerId']` 一致）；未出现在聚合结果里的 provider 缓存 null。
+   */
+  private async latencyByProvider(providerIds: string[], now: number): Promise<Map<string, number | null>> {
+    const result = new Map<string, number | null>();
+    const stale: string[] = [];
+    for (const id of providerIds) {
+      const hit = this.latencyCache.get(id);
+      if (hit && hit.expiresAt > now) result.set(id, hit.latencyMs);
+      else stale.push(id);
+    }
+    if (stale.length === 0) return result;
+    const since = new Date(now - LATENCY_WINDOW_MS);
+    const latencyRows = await this.prisma.usageRecord.groupBy({
+      by: ['providerId'],
+      where: { providerId: { in: stale }, latencyMs: { not: null }, createdAt: { gte: since } },
+      _avg: { latencyMs: true },
+    }).catch((err) => {
+      this.logger.warn(`延迟采样聚合失败（按无样本处理）: ${(err as Error).message}`);
+      return null; // null 区分「查询失败」与「查到了但无样本」
+    });
+    if (!latencyRows) {
+      for (const id of stale) result.set(id, null); // 失败降级：无样本，且不污染缓存
+      return result;
+    }
+    const avgById = new Map(latencyRows.map((row) => [row.providerId, row._avg.latencyMs ?? null] as const));
+    const expiresAt = now + this.latencyCacheTtlMs;
+    for (const id of stale) {
+      const latencyMs = avgById.get(id) ?? null;
+      this.latencyCache.set(id, { latencyMs, expiresAt });
+      result.set(id, latencyMs);
+    }
+    this.pruneLatencyCache(now);
+    return result;
+  }
+
+  /** 过期条目清理 + 容量上限（Map 迭代顺序 = 插入顺序 → 先淘汰最早写入的；绝不无界增长） */
+  private pruneLatencyCache(now: number): void {
+    for (const [id, entry] of this.latencyCache) {
+      if (entry.expiresAt <= now) this.latencyCache.delete(id);
+    }
+    while (this.latencyCache.size > LATENCY_CACHE_MAX_ENTRIES) {
+      const oldest = this.latencyCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.latencyCache.delete(oldest);
+    }
   }
 
   /**

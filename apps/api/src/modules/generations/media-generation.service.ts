@@ -137,7 +137,8 @@ export class MediaGenerationService {
 
     const executor = this.executors.get(task.type);
     if (!executor) {
-      await this.failTask(taskId, ErrorCode.INTERNAL, `未注册的媒体执行器: ${task.type}`, startedAt);
+      // M11-P4（维度2#12）：服务端配置缺陷（执行器未注册）——从未触达 provider，绝不虚计 1 单位
+      await this.failTask(taskId, ErrorCode.INTERNAL, `未注册的媒体执行器: ${task.type}`, startedAt, { providerContacted: false });
       return;
     }
 
@@ -205,7 +206,10 @@ export class MediaGenerationService {
       return 'processing';
     }
     if (remote.status === 'failed') {
-      await this.failTask(taskId, ErrorCode.PROVIDER_UNKNOWN, remote.error, startedAt, ['pending', 'processing']);
+      // remoteTaskId 非空（本方法入口已保证）→ 已触达 provider，损耗真实发生过，照记
+      await this.failTask(taskId, ErrorCode.PROVIDER_UNKNOWN, remote.error, startedAt, {
+        fromStatuses: ['pending', 'processing'], providerContacted: true,
+      });
       return 'failed';
     }
     this.logger.log({ taskId, remoteTaskId: task.remoteTaskId }, '远端任务已完成 → 按真实结果恢复落库');
@@ -257,23 +261,50 @@ export class MediaGenerationService {
     return true;
   }
 
-  /** 失败终态（条件更新，不覆盖已终态的任务）；usage 失败归因取自 attempt 时写入的 provider/model */
+  /**
+   * 失败终态（条件更新，不覆盖已终态的任务）；usage 失败归因取自 attempt 时写入的 provider/model。
+   *
+   * M11-P4（维度2#12）：**从未触达 provider 的预检失败不虚计**。
+   * 旧口径下失败恒走 `recordMediaUsage(imageCount:0, videoSeconds:0)`，而账本镜像按
+   * `Math.max(units, 1)`（usage.service，失败/超时 attempt 至少 1 单位）放大成 1 单位——
+   * 于是"参数能力预检拒绝/执行器未注册"这类**一次 HTTP 都没发出**的失败也扣了 1 单位
+   * （provider 侧零消耗 → 虚假计费）。本方法据此对"确定未触达"的失败**不写 usage**
+   * （无 UsageRecord 事实 → 无账本镜像行；对账期望按记录计算，零记录即零期望，绝不产生漂移）。
+   *
+   * 判定（保守：只有**能证明没触达**的才豁免，其余一律照记，绝不漏计）：
+   *  - `providerContacted === true`（显式传入：remoteTaskId 非空的恢复路径）→ 照记；
+   *  - `ErrorCode.UNSUPPORTED_PARAMETER` → 执行器参数能力预检（video.executor.assertCapabilities）
+   *    在 submit/HTTP **之前**抛出，请求未送达 provider → 豁免；
+   *  - `providerContacted === false`（显式传入：执行器未注册）→ 豁免；
+   *  - 其余（provider 报错/超时、下载失败、崩溃后清扫）→ 默认照记（可能已消耗 provider 资源）。
+   * 已知残留（登记，不在本 Phase 范围）：模型解析/路由失败（如模型未配置）同样在 HTTP 之前，
+   * 但当前无"接触事实"字段可区分 → 仍按旧口径记 1 单位（宁可多计，绝不漏计）。
+   */
   private async failTask(
     taskId: string, code: string, message: string, startedAt: number,
-    fromStatuses: Array<'pending' | 'processing'> = ['processing'],
+    opts: { fromStatuses?: Array<'pending' | 'processing'>; providerContacted?: boolean } = {},
   ) {
+    const fromStatuses = opts.fromStatuses ?? ['processing'];
     const current = await this.prisma.generationTask.findUnique({ where: { id: taskId } });
     const failed = await this.prisma.generationTask.updateMany({
       where: { id: taskId, status: { in: fromStatuses } },
       data: { status: 'failed', statusMessage: message, errorCode: code, errorMessage: message, completedAt: new Date() },
     });
     if (failed.count === 0) return; // 已被清扫/其他路径终态
-    await this.usage.recordMediaUsage({
-      userId: current!.userId, conversationId: current!.conversationId ?? undefined, messageId: current!.messageId ?? undefined, taskId,
-      kind: current!.type, providerId: current!.providerId ?? '', modelId: current!.modelId ?? '',
-      imageCount: 0, videoSeconds: 0, latencyMs: Date.now() - startedAt, status: 'failed', errorCode: code,
-      runId: current!.runId ?? undefined, // M6-A9：失败归因补齐 runId（与成功/清扫路径一致）
-    }).catch(() => undefined);
+    const providerContacted = opts.providerContacted ?? (!!current!.remoteTaskId || code !== ErrorCode.UNSUPPORTED_PARAMETER);
+    if (providerContacted) {
+      await this.usage.recordMediaUsage({
+        userId: current!.userId, conversationId: current!.conversationId ?? undefined, messageId: current!.messageId ?? undefined, taskId,
+        kind: current!.type, providerId: current!.providerId ?? '', modelId: current!.modelId ?? '',
+        imageCount: 0, videoSeconds: 0, latencyMs: Date.now() - startedAt, status: 'failed', errorCode: code,
+        runId: current!.runId ?? undefined, // M6-A9：失败归因补齐 runId（与成功/清扫路径一致）
+      }).catch(() => undefined);
+    } else {
+      this.logger.log(
+        { taskId, code, type: current!.type },
+        '预检失败（从未触达 provider）→ 不记用量/不产生账本镜像行（M11-P4：绝不虚计 1 单位）',
+      );
+    }
     await this.events.publish('task', { type: 'task.progress', taskId, progress: 100, message: '失败' });
     // M6-P4：任务失败也是终态 → 唤醒 run（P4-9：失败回喂模型，由 LLM 决定重试/降级/终态）
     await this.resume.onTaskTerminal(taskId).catch(() => undefined);

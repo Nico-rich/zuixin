@@ -875,6 +875,23 @@ describe('AgentRuntimeEngine（X-02 LLM 单回合 watchdog：回合级超时归�
     // 每回合一条 usage（回合粒度）：全部归因 PROVIDER_TIMEOUT（可重试语义，非 AGENT_CANCELLED）
     expect(state.usage).toHaveLength(1);
     expect(state.usage[0]).toMatchObject({ status: 'failed', errorCode: ErrorCode.PROVIDER_TIMEOUT });
+    // M11-P4（D1-06）：超时回合已占用 provider 但用量不可知 → 至少 1 单位（账本镜像对 quantity<=0 直接跳过，
+    // 记 0 = 已占用 provider 零账单 → 绝不漏计）
+    expect(state.usage[0]).toMatchObject({ inputTokens: 1, outputTokens: 0 });
+  }, 15_000);
+
+  it('M11-P4：非超时失败（provider 拒答：鉴权/限流，无算力消耗）仍记 0——绝不借兜底虚增', async () => {
+    const streamFn = vi.fn(async function* () {
+      throw new AppError(ErrorCode.PROVIDER_AUTH, '模型服务鉴权失败');
+      // eslint-disable-next-line no-unreachable
+      yield { type: 'text', text: 'never' };
+    });
+    const { engine, state } = makeEngine({ streamFn });
+    const { outcome } = await run(engine, makeEngine().input);
+    expect(outcome.status).toBe('failed');
+    expect(outcome.errorCode).toBe(ErrorCode.PROVIDER_AUTH);
+    expect(state.usage).toHaveLength(1);
+    expect(state.usage[0]).toMatchObject({ status: 'failed', errorCode: ErrorCode.PROVIDER_AUTH, inputTokens: 0, outputTokens: 0 });
   }, 15_000);
 
   it('回合超时是**每次尝试**独立的：首次卡死超时，重试成功 → run completed（仅丢弃超时回合的部分文本）', async () => {
@@ -912,6 +929,8 @@ describe('AgentRuntimeEngine（X-02 LLM 单回合 watchdog：回合级超时归�
     const { outcome } = await run(engine, { ...makeEngine().input, signal: ac.signal });
     expect(outcome.status).toBe('cancelled');
     expect(state.usage[0]).toMatchObject({ status: 'failed', errorCode: ErrorCode.AGENT_CANCELLED });
+    // M11-P4：中断回合同样已占用 provider（请求可能已在服务端计费）→ 至少 1 单位，绝不零账单
+    expect(state.usage[0]).toMatchObject({ inputTokens: 1, outputTokens: 0 });
   }, 15_000);
 
   it('正常快回合不受影响（默认 60s 上限；env 未设置时不误杀）', async () => {
