@@ -74,8 +74,8 @@ Final Audit（七维） → 自动修复循环 → 最终验收
 
 | Agent | Phase | Worktree 文件所有权 | Redis DB（e2e 隔离铁律） |
 |---|---|---|---|
-| A1 | P1 | auth/、security/、audit/、crypto/、main.ts、seed.ts、.env.example、新 session 逻辑 | /21 |
-| A2 | P2 | providers/**、scripts/fake-openai-server/、新 test/pre-m10-provider-contract.e2e-spec.ts | /22 |
+| A1 | P1 | auth/、security/（**含 AccessGuard**：jti 黑名单/跨实例缓存失效/登录路径 org.status 检查）、audit/、core/crypto/、main.ts、seed.ts、.env.example、新 session 逻辑 | /21 |
+| A2 | P2 | providers/**、core/tracing/observability.service.ts（仅 provider-degraded 计数）、scripts/fake-openai-server/、新 test/pre-m10-provider-contract.e2e-spec.ts | /22 |
 | A3 | P3 | modules/chat/、modules/conversations/ | /23 |
 | A4 | P4 | modules/creative-loop/、test/m9-p5-creative-loop.e2e-spec.ts | /24 |
 | A5 | P5 | modules/workflows/（唯一 owner）、test/m9-p4-workflow.e2e-spec.ts、webhook e2e | /25 |
@@ -84,10 +84,10 @@ Final Audit（七维） → 自动修复循环 → 最终验收
 | A8 | P8 | core/rate-limit/、app.module.ts（唯一改权） | /28 |
 | A9 | P9 | scripts/、docs/operations/、k8s/、monitoring/（纯新文件） | — |
 | A10 | P10 | worker/agent-run/、core/agent-loop/engine、modules/agent-delegation/、modules/billing/quota.service.ts、modules/events/、modules/scheduler/ | /29 |
-| A11 | P11 | core/memory/ | /30 |
+| A11 | P11 | core/memory/、core/context/（降级摘要处理+types.ts 注释修复） | /30 |
 | A12 | P12 | test/ 新文件（pre-m10-confused-deputy、pre-m10-multiprocess、pre-m10-production-cookie） | /31 |
-| A13 | P13 | apps/web/lib/、apps/web/app/(chat)/chat/components/、core/sse/ | /32 |
-| A14 | P14 | modules/extensions/、modules/organizations/、common/guards/ | /33 |
+| A13 | P13 | apps/web/**、core/sse/、core/events/event-bus.service.ts（降级信号）、modules/agent-runs/agent-runs.controller.ts（SSE 降级信号） | /32 |
+| A14 | P14 | modules/extensions/、modules/organizations/、common/guards/org-status.guard.ts（**新文件**；全局挂载由集成阶段统一） | /33 |
 
 **热点文件纪律**（R4 快照结论）：`schema.prisma`=W0 独占；`queue.module.ts`/`worker.module.ts`=本 M10 不新增队列、全不碰；`app.module.ts`=A8 唯一；`shared/errors.ts`、`shared/events.ts`=W0 预置后只读；`health.service.ts`=不碰。workflows 模块 18 文件由 A5 独享（P5 内部两项合并避免同模块并行冲突）。主工作树仅 Coordinator 操作 merge，Agent 永不直接写主树。
 
@@ -112,6 +112,7 @@ Coordinator 单点预整合（W0，一个 commit，含全部 M10 schema）：
   errors：`ORG_DISABLED`、`SESSION_CONCURRENCY_EXCEEDED`、`DEVICE_REVOKED`、`WEBHOOK_SECRET_ROTATION_REQUIRED`、`ATTACHMENT_UNZIP_REJECTED`、`ATTACHMENT_QUOTA_EXCEEDED`、`CREDENTIAL_REWRAP_REQUIRED`、`KEY_VERSION_INVALID`、`MESSAGE_EDIT_FORBIDDEN`、`MESSAGE_DELETE_FORBIDDEN`、`PROVIDER_CONFIG_INVALID` 等（P 期定稿）
 - 新端点必须：zod 校验、JWT 守卫、RBAC、org 隔离、IDOR 测试（既有纪律）
 - Web 契约：P13 的 SSE 分帧/事件沿用 shared/events.ts 现有 schema，不新造
+- **跨 Agent 契约（A1↔A12）**：会话撤销跨实例传播用 Redis pub/sub channel **`session-events`**（A1 发布、A12 多进程 e2e 断言复用同一通道名）；org.status 登录检查在 A1（AccessGuard/auth 路径），资源守卫在 A14（新文件 OrgStatusGuard），全局挂载由集成阶段统一
 
 ## 9. 安全边界（M0–M9 冻结原则，全文适用）
 
