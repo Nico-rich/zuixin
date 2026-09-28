@@ -63,6 +63,13 @@ export class WorkflowProcessor extends WorkerHost implements OnApplicationShutdo
     const runId = job.data?.runId;
     if (!runId) return; // 非法 payload → 直接完成
 
+    // M9-P4：时间窗 wait 的延迟唤醒作业（kind='wait-wake'）——先做**到期条件唤醒**（waiting→queued）；
+    // 未到期（早到）/已非 waiting → 直接完成（不 claim、不执行；等待状态由落库期限与 recoverStale 兜底）。
+    if (job.data?.kind === 'wait-wake' && !(await this.wake.wakeByWaitDue(runId))) {
+      this.logger.log({ runId }, 'wait 唤醒作业未生效（未到期/已前进/已非等待态）→ 本次作业完成');
+      return;
+    }
+
     const workerId = this.instanceId;
     const claimed = await this.lease.claim(runId, workerId, 60_000);
     if (!claimed.acquired) {
@@ -89,6 +96,8 @@ export class WorkflowProcessor extends WorkerHost implements OnApplicationShutdo
         );
         if (abort.signal.aborted) return; // 步骤内被中止（在途调用已 abort）→ 结果不可信，直接退出
         if (result.outcome === 'waiting') {
+          // M9-P4：时间窗 wait → 投递**延迟唤醒**（唯一 jobId 含期限；主路径 = 延迟作业，recoverStale wait 到期分支兜底）
+          if (result.waitUntilMs) await this.wake.scheduleWaitWake(runId, result.waitUntilMs);
           // 观察子 AgentRun 实时终态（审批唤醒由全局订阅承担；两类都有 recoverStale 兜底）
           const row = await this.prisma.workflowRun.findUnique({
             where: { id: runId }, select: { waitingOnAgentRunId: true },

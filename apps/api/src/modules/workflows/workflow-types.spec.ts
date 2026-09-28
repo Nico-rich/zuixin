@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
-  WorkflowContext, evaluateCondition, getPath, renderTemplate, validateDefinition,
+  WorkflowContext, compensationTargetIds, effectiveMaxRetries, evaluateCondition, getPath,
+  isCompensationTarget, isRetryableStepError, lockedDefinition, renderTemplate, validateDefinition,
 } from './workflow-types';
 
 const ctx: WorkflowContext = {
@@ -62,5 +63,86 @@ describe('Workflow 求值原语（M7-P6 确定性、无 eval）', () => {
         { id: 'b', type: 'output' },
       ],
     })).toBeNull();
+  });
+});
+
+/** M9-P4 定义校验增量：wait / timeoutMs / retryPolicy / compensate */
+describe('Workflow 定义校验（M9-P4 增量）', () => {
+  it('wait：三选一 + 类型存在 + 取值范围（缺条件/多条件/越界/非法 ISO 一律拒绝）', () => {
+    const withWait = (wait: unknown) => validateDefinition({
+      triggers: [], steps: [{ id: 'w', type: 'wait', wait: wait as never }],
+    });
+    expect(withWait({ untilMs: 1000 })).toBeNull();
+    expect(withWait({ untilIso: new Date(Date.now() + 60_000).toISOString() })).toBeNull();
+    expect(withWait({ childRunId: '{{input.childRunId}}' })).toBeNull();
+    expect(withWait(undefined)).toContain('缺少 wait 条件定义');
+    expect(withWait({})).toContain('缺少等待条件');
+    expect(withWait({ untilMs: 1, untilIso: '2030-01-01T00:00:00Z' })).toContain('三选一');
+    expect(withWait({ untilMs: -1 })).toContain('untilMs 非法');
+    expect(withWait({ untilMs: 8 * 86400_000 })).toContain('untilMs 非法');
+    expect(withWait({ untilIso: 'tomorrow' })).toContain('untilIso 非法');
+  });
+
+  it('compensate：目标必须存在且类型收敛为 tool/external_action，且不可自补偿', () => {
+    expect(validateDefinition({
+      triggers: [], steps: [
+        { id: 'a', type: 'tool', tool: { name: 'read.a', arguments: {} }, compensate: 'undo' },
+        { id: 'undo', type: 'tool', tool: { name: 'undo.a', arguments: {} } },
+      ],
+    })).toBeNull();
+    expect(validateDefinition({
+      triggers: [], steps: [
+        { id: 'a', type: 'tool', tool: { name: 'read.a', arguments: {} }, compensate: 'ghost' },
+      ],
+    })).toContain('补偿目标不存在');
+    expect(validateDefinition({
+      triggers: [], steps: [{ id: 'a', type: 'tool', tool: { name: 'read.a', arguments: {} }, compensate: 'a' }],
+    })).toContain('不可补偿自身');
+    expect(validateDefinition({
+      triggers: [], steps: [
+        { id: 'a', type: 'tool', tool: { name: 'read.a', arguments: {} }, compensate: 'out' },
+        { id: 'out', type: 'output', output: {} },
+      ],
+    })).toContain('类型不支持');
+  });
+
+  it('timeoutMs / retryPolicy：范围校验 + retryableCodes 只能是平台瞬态码', () => {
+    const one = (over: Record<string, unknown>) => validateDefinition({
+      triggers: [], steps: [{ id: 'a', type: 'tool', tool: { name: 'read.a', arguments: {} }, ...over }],
+    });
+    expect(one({ timeoutMs: 500 })).toBeNull();
+    expect(one({ timeoutMs: 50 })).toContain('timeoutMs 非法');
+    expect(one({ retryPolicy: { maxRetries: 2 } })).toBeNull();
+    expect(one({ retryPolicy: { maxRetries: 2, retryableCodes: ['PROVIDER_TIMEOUT'] } })).toBeNull();
+    expect(one({ retryPolicy: { maxRetries: -1 } })).toContain('maxRetries 非法');
+    expect(one({ retryPolicy: { maxRetries: 1, retryableCodes: ['VALIDATION_ERROR'] } })).toContain('非瞬态码');
+  });
+
+  it('isCompensationTarget/compensationTargetIds：只认被引用的补偿步骤', () => {
+    const steps = [
+      { id: 'a', type: 'tool' as const, compensate: 'undo_a' },
+      { id: 'undo_a', type: 'tool' as const },
+      { id: 'x', type: 'output' as const },
+    ];
+    expect(isCompensationTarget(steps, 'undo_a')).toBe(true);
+    expect(isCompensationTarget(steps, 'x')).toBe(false);
+    expect([...compensationTargetIds(steps)]).toEqual(['undo_a']);
+  });
+
+  it('effectiveMaxRetries/isRetryableStepError：maxAttempts 与 retryPolicy 取并集（既有语义绝不收窄）', () => {
+    expect(effectiveMaxRetries({ id: 'a', type: 'tool', maxAttempts: 3 })).toBe(3);
+    expect(effectiveMaxRetries({ id: 'a', type: 'tool', retryPolicy: { maxRetries: 2 } })).toBe(2);
+    expect(effectiveMaxRetries({ id: 'a', type: 'tool', maxAttempts: 1, retryPolicy: { maxRetries: 4 } })).toBe(4);
+    expect(effectiveMaxRetries({ id: 'a', type: 'tool' })).toBe(0);
+    // 缺省 = 平台瞬态码全集；声明后按声明收窄
+    expect(isRetryableStepError({ id: 'a', type: 'tool' }, 'PROVIDER_TIMEOUT')).toBe(true);
+    expect(isRetryableStepError({ id: 'a', type: 'tool' }, 'VALIDATION_ERROR')).toBe(false);
+    expect(isRetryableStepError({ id: 'a', type: 'tool', retryPolicy: { maxRetries: 1, retryableCodes: ['PROVIDER_RATE_LIMITED'] } }, 'PROVIDER_TIMEOUT')).toBe(false);
+  });
+
+  it('lockedDefinition：版本行/定义为空 → 拒绝执行（版本锁定不变量被破坏时不静默降级）', () => {
+    expect(lockedDefinition({ definition: { triggers: [], steps: [{ id: 'a', type: 'output' }] } }).steps).toHaveLength(1);
+    expect(() => lockedDefinition(null)).toThrowError(/版本锁定/);
+    expect(() => lockedDefinition({ definition: null })).toThrowError(/版本锁定/);
   });
 });

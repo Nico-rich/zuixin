@@ -6,8 +6,10 @@ import { WORKFLOW_QUEUE } from '../../core/queue/queue.module';
 import { addJobBestEffort } from '../../core/queue/bounded-add';
 import { DEFAULT_LEASE_TTL_MS } from '../../core/agent-run-lease/agent-run-lease.service';
 import { QuotaService } from '../../modules/billing/quota.service';
+import { WORKFLOW_DEADLINE_DEFAULT_MS, workflowDeadlineMsFromSetting } from '../../modules/workflows/workflow-types';
+import { parseWaitingUntil } from '../../modules/workflows/workflow-wait.service';
 
-export const WORKFLOW_DEADLINE_MS = 60 * 60_000; // workflow run 上限 1h（可被 limits.workflowDeadlineMs 覆盖）
+export const WORKFLOW_DEADLINE_MS = WORKFLOW_DEADLINE_DEFAULT_MS; // workflow run 上限 1h（可被 limits.workflowDeadlineMs 覆盖）
 
 /**
  * M7-P6 WorkflowRun Lease——复用 M6 AgentRun Lease 原语集（同一状态机形状，独立表）：
@@ -27,8 +29,7 @@ export class WorkflowLeaseService {
 
   async deadlineMs(): Promise<number> {
     const row = await this.prisma.systemSetting.findUnique({ where: { key: 'limits' } });
-    const n = Number((row?.value as { workflowDeadlineMs?: number } | null)?.workflowDeadlineMs);
-    return Number.isFinite(n) && n > 0 ? n : WORKFLOW_DEADLINE_MS;
+    return workflowDeadlineMsFromSetting(row?.value);
   }
 
   async claim(runId: string, workerId: string, ttlMs: number): Promise<{ acquired: boolean; status?: string }> {
@@ -84,12 +85,26 @@ export class WorkflowLeaseService {
       `recover:${runId}`).then(() => undefined);
   }
 
+  /** M9-P4 ⑥：当前步骤是否为「已到期的时间窗 wait」（stepType='wait' + waitingUntil <= now） */
+  private async isDueTimeWait(runId: string, stepIndex: number, now: Date): Promise<boolean> {
+    const row = await this.prisma.workflowStepRun.findUnique({
+      where: { workflowRunId_stepIndex: { workflowRunId: runId, stepIndex } },
+      select: { stepType: true, status: true, output: true },
+    });
+    if (!row || row.stepType !== 'wait' || row.status !== 'waiting') return false;
+    const until = parseWaitingUntil(row.output);
+    return until !== null && until <= now.getTime();
+  }
+
   async recoverStale(): Promise<{ reEnqueued: number; timedOut: number }> {
     const now = new Date();
     const deadlineMs = await this.deadlineMs();
     const rows = await this.prisma.workflowRun.findMany({
       where: { status: { in: ['queued', 'running', 'waiting'] } },
-      select: { id: true, status: true, startedAt: true, workerId: true, leaseUntil: true, waitingOnApprovalId: true, waitingOnAgentRunId: true },
+      select: {
+        id: true, status: true, startedAt: true, workerId: true, leaseUntil: true,
+        waitingOnApprovalId: true, waitingOnAgentRunId: true, currentStep: true,
+      },
     });
     let reEnqueued = 0;
     let timedOut = 0;
@@ -153,6 +168,21 @@ export class WorkflowLeaseService {
             await this.enqueueRecover(row.id, now.getTime());
             reEnqueued++;
             this.logger.warn({ runId: row.id }, 'waiting 且子 AgentRun 已终态（唤醒丢失）→ 兜底唤醒');
+          }
+        }
+        continue;
+      }
+      // ⑥ M9-P4：wait 步骤到期（时间窗）——主路径是 processor 投递的延迟作业；此处兜底丢 job / 调度丢失
+      if (row.status === 'waiting' && !row.waitingOnApprovalId && !row.waitingOnAgentRunId) {
+        if (await this.isDueTimeWait(row.id, row.currentStep, now)) {
+          const woken = await this.prisma.workflowRun.updateMany({
+            where: { id: row.id, status: 'waiting' },
+            data: { status: 'queued', workerId: null, leaseUntil: null, heartbeatAt: null },
+          });
+          if (woken.count > 0) {
+            await this.enqueueRecover(row.id, now.getTime());
+            reEnqueued++;
+            this.logger.warn({ runId: row.id }, 'wait 步骤已到期（延迟唤醒丢失）→ 兜底唤醒');
           }
         }
         continue;

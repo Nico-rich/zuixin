@@ -6,7 +6,7 @@ import { WorkflowProcessor } from './workflow.processor';
  * 核心不变式：**lease 续期 count=0（已被接管）→ 立即中止当前执行**——不再进入下一步、不写任何状态；
  * 原实现只 warn 不停止，分叉 worker 会继续跑完后续步骤（agent 步骤重复建子 run / external_action 重复执行 = 双写）。
  */
-type ExecOutcome = { outcome: 'continue' | 'done' | 'waiting' };
+type ExecOutcome = { outcome: 'continue' | 'done' | 'waiting'; waitUntilMs?: number };
 
 function makeProcessor() {
   const lease = {
@@ -20,7 +20,11 @@ function makeProcessor() {
       _runId: string, _workerId: string, _signal?: AbortSignal,
     ): Promise<ExecOutcome> => ({ outcome: 'continue' })),
   };
-  const wake = { watchChildRun: vi.fn(async () => undefined) };
+  const wake = {
+    watchChildRun: vi.fn(async () => undefined),
+    scheduleWaitWake: vi.fn(async () => true),
+    wakeByWaitDue: vi.fn(async () => true),
+  };
   const prisma = { workflowRun: { findUnique: vi.fn(async () => ({ waitingOnAgentRunId: null })) } };
   const proc = new WorkflowProcessor(
     lease as never, executor as never, wake as never,
@@ -96,6 +100,39 @@ describe('WorkflowProcessor（Pre-M9 D5：lease fencing → 立即中止执行�
     releaseExec!({ outcome: 'continue' });
     await running;
     expect(executor.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('M9-P4 wait：outcome=waiting 且带 waitUntilMs → 投递延迟唤醒（唯一 jobId 由 wake 服务负责）', async () => {
+    const { proc, executor, wake } = makeProcessor();
+    const until = Date.now() + 5_000;
+    executor.execute.mockResolvedValueOnce({ outcome: 'waiting', waitUntilMs: until });
+    await proc.process({ data: { runId: 'run-6' } } as never);
+    expect(wake.scheduleWaitWake).toHaveBeenCalledWith('run-6', until);
+    expect(executor.execute).toHaveBeenCalledTimes(1); // 等待即让出 lease，绝不自旋
+  });
+
+  it('M9-P4 wait：无 waitUntilMs 的 waiting（审批/子 run）绝不调度等待唤醒', async () => {
+    const { proc, executor, wake } = makeProcessor();
+    executor.execute.mockResolvedValueOnce({ outcome: 'waiting' });
+    await proc.process({ data: { runId: 'run-7' } } as never);
+    expect(wake.scheduleWaitWake).not.toHaveBeenCalled();
+  });
+
+  it('M9-P4 wait-wake：到期条件唤醒成功（waiting→queued）→ 继续 claim + 执行（唯一执行路径）', async () => {
+    const { proc, executor, lease, wake } = makeProcessor();
+    executor.execute.mockResolvedValueOnce({ outcome: 'done' });
+    await proc.process({ data: { runId: 'run-8', kind: 'wait-wake' } } as never);
+    expect(wake.wakeByWaitDue).toHaveBeenCalledWith('run-8');
+    expect(lease.claim).toHaveBeenCalled();
+    expect(executor.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('M9-P4 wait-wake：未到期/已非等待态（wakeByWaitDue=false）→ 绝不 claim/绝不执行（绝不提前前进）', async () => {
+    const { proc, executor, lease, wake } = makeProcessor();
+    wake.wakeByWaitDue.mockResolvedValueOnce(false);
+    await proc.process({ data: { runId: 'run-9', kind: 'wait-wake' } } as never);
+    expect(lease.claim).not.toHaveBeenCalled();
+    expect(executor.execute).not.toHaveBeenCalled();
   });
 
   it('migration 路径：{kind:scheduled} job 只触发 tickScheduled（不 claim/不执行）', async () => {
