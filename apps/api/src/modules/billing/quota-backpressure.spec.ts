@@ -25,14 +25,45 @@ function makeService(queue: unknown) {
   return { svc, prisma };
 }
 
-describe('M8-P9 背压：队列深度水位（waiting + active）', () => {
+describe('M8-P9 背压：队列深度水位（waiting + active + paused，X-27/PR-3）', () => {
   beforeEach(() => vi.clearAllMocks());
 
   it('未超水位 → 放行，返回 depth/maxDepth 供审计', async () => {
     const queue = { getJobCounts: vi.fn().mockResolvedValue({ waiting: 3, active: 2 }) };
     const { svc } = makeService(queue);
     await expect(svc.assertQueueDepth()).resolves.toMatchObject({ depth: 5, maxDepth: 1_000 });
-    expect(queue.getJobCounts).toHaveBeenCalledWith('waiting', 'active');
+    expect(queue.getJobCounts).toHaveBeenCalledWith('waiting', 'active', 'paused');
+  });
+
+  it('X-27/PR-3 暂停队列（paused）计入积压：waiting=0 但 paused 超水位 → 仍 429（暂停≠无积压）', async () => {
+    const queue = { getJobCounts: vi.fn().mockResolvedValue({ waiting: 0, active: 0, paused: 1_500 }) };
+    const { svc } = makeService(queue);
+    await expect(svc.assertQueueDepth()).rejects.toMatchObject({ code: 'QUOTA_EXCEEDED' });
+  });
+
+  it('X-27/PR-3 paused 参与求和：waiting 500 + active 200 + paused 300 = 1000 ≥ 水位 → 拒绝', async () => {
+    const queue = { getJobCounts: vi.fn().mockResolvedValue({ waiting: 500, active: 200, paused: 300 }) };
+    const { svc } = makeService(queue);
+    await expect(svc.assertQueueDepth()).rejects.toMatchObject({ code: 'QUOTA_EXCEEDED' });
+  });
+
+  it('X-27/PR-3 paused 缺失/未返回 → 按 0 计（绝不因探针字段缺失变成 NaN 而放行或误拒）', async () => {
+    const queue = { getJobCounts: vi.fn().mockResolvedValue({ waiting: 2, active: 1 }) };
+    const { svc } = makeService(queue);
+    await expect(svc.assertQueueDepth()).resolves.toMatchObject({ depth: 3 });
+  });
+
+  it('X-27/PR-3 暂停期间的 assertQuota(agent_run) 同样被拦截（背压先于配额查询）', async () => {
+    const queue = { getJobCounts: vi.fn().mockResolvedValue({ waiting: 0, active: 0, paused: 5_000 }) };
+    const { svc, prisma } = makeService(queue);
+    await expect(svc.assertQuota('u1', null, 'agent_run', 1)).rejects.toMatchObject({ code: 'QUOTA_EXCEEDED' });
+    expect(prisma.usageLedgerEntry.aggregate).not.toHaveBeenCalled();
+  });
+
+  it('fail 集合不计入积压（终态不占执行容量；探针不查 fail)', async () => {
+    const queue = { getJobCounts: vi.fn().mockResolvedValue({ waiting: 1, active: 1, paused: 1, failed: 9_999 }) };
+    const { svc } = makeService(queue);
+    await expect(svc.assertQueueDepth()).resolves.toMatchObject({ depth: 3 });
   });
 
   it('超水位（≥ maxDepth）→ QUOTA_EXCEEDED（HTTP 429）', async () => {

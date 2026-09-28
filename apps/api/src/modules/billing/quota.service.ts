@@ -183,10 +183,15 @@ export class QuotaService {
   }
 
   /**
-   * M8-P9 背压：全局执行队列深度（waiting + active）≥ 水位 → 429 QUOTA_EXCEEDED。
+   * M8-P9 背压：全局执行队列深度（waiting + active + **paused**）≥ 水位 → 429 QUOTA_EXCEEDED。
    *
    * 与 per-org 并发配额互补：并发配额防止**单个租户**占满 worker，本检查防止**所有租户合计**
    * 把队列堆到不可恢复（积压越深，恢复时间越长，且 BullMQ 的 job 保留/重试会放大内存占用）。
+   *
+   * X-27/PR-3：**暂停（paused）必须计入积压**——BullMQ 的 queue.pause() 把 waiting 整体挪进 paused
+   * 集合（getJobCounts('waiting') 归零），运维暂停/降级期间只数 waiting+active 会读到 depth≈0 →
+   * 背压形同关闭，入口继续往一个**不会消费**的队列灌入（恢复时洪峰 + 内存放大）。paused 里的 job
+   * 就是"已受理未消费"的积压，语义上与 waiting 等价。fail 集合不计（终态，不占执行容量）。
    *
    * 绝不误拒（fail-open）：队列未装配 / Redis 不可达 / 探测超时 → 放行并 warn。
    * 理由：拒绝全部请求造成的伤害大于接受积压；Redis 故障时真正该熔断的是 Redis 依赖方，
@@ -197,12 +202,12 @@ export class QuotaService {
     if (!this.agentRunQueue) return { depth: 0, maxDepth, skipped: 'queue-not-wired' };
     let counts: Record<string, number>;
     try {
-      counts = await this.withProbeTimeout(this.agentRunQueue.getJobCounts('waiting', 'active'), 1_000);
+      counts = await this.withProbeTimeout(this.agentRunQueue.getJobCounts('waiting', 'active', 'paused'), 1_000);
     } catch (err) {
       this.logger.warn(`队列深度探测失败，背压降级放行: ${(err as Error).message}`);
       return { depth: 0, maxDepth, skipped: 'queue-unavailable' };
     }
-    const depth = (counts.waiting ?? 0) + (counts.active ?? 0);
+    const depth = (counts.waiting ?? 0) + (counts.active ?? 0) + (counts.paused ?? 0);
     if (depth >= maxDepth) {
       throw new AppError(ErrorCode.QUOTA_EXCEEDED, `系统繁忙：执行队列积压 ${depth}/${maxDepth}，请稍后重试`);
     }
