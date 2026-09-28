@@ -73,6 +73,16 @@ export class GlobalExceptionFilter implements ExceptionFilter {
       case 'PROVIDER_UNSUPPORTED': return HttpStatus.NOT_FOUND; // M7-P2
       case 'PROVIDER_UNAVAILABLE': return HttpStatus.SERVICE_UNAVAILABLE; // M8-P7：无可用 provider（服务端裁决，非客户端错误）
       case 'UNSUPPORTED_PARAMETER': return HttpStatus.BAD_REQUEST;
+      // ===== M10 专码（W0 预置；集成期统一映射——各 Phase 的 HttpException 可切回 AppError，契约不变）=====
+      case 'ORG_DISABLED': return HttpStatus.FORBIDDEN; // M10-P14：组织禁用态
+      case 'SESSION_CONCURRENCY_EXCEEDED': return HttpStatus.TOO_MANY_REQUESTS; // M10-P1
+      case 'CREDENTIAL_REWRAP_REQUIRED': return HttpStatus.CONFLICT; // M10-P1
+      case 'KEY_VERSION_INVALID': return HttpStatus.INTERNAL_SERVER_ERROR; // M10-P1：绝不静默降级
+      case 'MESSAGE_EDIT_FORBIDDEN': case 'MESSAGE_DELETE_FORBIDDEN': return HttpStatus.FORBIDDEN; // M10-P3
+      case 'WEBHOOK_SECRET_ROTATION_REQUIRED': return HttpStatus.CONFLICT; // M10-P5
+      case 'ATTACHMENT_UNZIP_REJECTED': return HttpStatus.BAD_REQUEST; // M10-P7
+      case 'ATTACHMENT_QUOTA_EXCEEDED': return HttpStatus.TOO_MANY_REQUESTS; // M10-P7
+      case 'PROVIDER_CONFIG_INVALID': return HttpStatus.SERVICE_UNAVAILABLE; // M10-P2：调用期 provider 未加载
       default: return HttpStatus.BAD_GATEWAY; // provider 类错误
     }
   }

@@ -168,7 +168,8 @@ export class HealthService implements OnModuleInit, OnModuleDestroy {
 
   protected probeStorage(timeoutMs: number): Promise<ProbeResult> {
     const driver = process.env.STORAGE_DRIVER ?? 'local';
-    if (driver === 's3-compatible') {
+    // M10 集成：A7 扩展 s3/minio 别名——健康面驱动标识对齐（resolveStorageDriver 同源口径）
+    if (driver === 's3-compatible' || driver === 's3' || driver === 'minio') {
       return probeS3Storage({
         endpoint: process.env.STORAGE_ENDPOINT ?? '',
         region: process.env.STORAGE_REGION ?? 'us-east-1',

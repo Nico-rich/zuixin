@@ -114,6 +114,27 @@ export class QuotaService {
           throw new AppError(ErrorCode.QUOTA_EXCEEDED, `今日 ${kind} 配额已用尽（${consumedDaily}/${dailyLimit}）`);
         }
       }
+
+      // concurrent：org 活跃 run 计数（agent/workflow 两域）
+      // M10 集成修复（m8-p2 并发配额 e2e 实抓）：原在 try/catch 之外——concurrent 超限抛错时
+      // 预留不回滚（泄漏行 refId 指向未建成的 run，TTL 1h 才自愈）。移入 try 块同享回滚语义。
+      if (kind === 'agent_run' && entitlements.concurrentAgentRuns != null) {
+        const active = await this.countActiveAgentRuns(organizationId);
+        if (active >= entitlements.concurrentAgentRuns) {
+          throw new AppError(ErrorCode.QUOTA_EXCEEDED, `并发 AgentRun 配额已用尽（${active}/${entitlements.concurrentAgentRuns}）`);
+        }
+      }
+      if (kind === 'workflow_run' && entitlements.concurrentWorkflowRuns != null) {
+        const active = await this.prisma.workflowRun.count({
+          where: {
+            status: { in: ['queued', 'running', 'waiting'] },
+            workflow: { organizationId },
+          },
+        });
+        if (active >= entitlements.concurrentWorkflowRuns) {
+          throw new AppError(ErrorCode.QUOTA_EXCEEDED, `并发 WorkflowRun 配额已用尽（${active}/${entitlements.concurrentWorkflowRuns}）`);
+        }
+      }
     } catch (err) {
       // 超限 → 回滚自己的预留行（绝不残留占用）；并发输家各自回滚，赢家行保留
       if (reservationId) {
@@ -122,24 +143,6 @@ export class QuotaService {
       throw err;
     }
 
-    // concurrent：org 活跃 run 计数（agent/workflow 两域）
-    if (kind === 'agent_run' && entitlements.concurrentAgentRuns != null) {
-      const active = await this.countActiveAgentRuns(organizationId);
-      if (active >= entitlements.concurrentAgentRuns) {
-        throw new AppError(ErrorCode.QUOTA_EXCEEDED, `并发 AgentRun 配额已用尽（${active}/${entitlements.concurrentAgentRuns}）`);
-      }
-    }
-    if (kind === 'workflow_run' && entitlements.concurrentWorkflowRuns != null) {
-      const active = await this.prisma.workflowRun.count({
-        where: {
-          status: { in: ['queued', 'running', 'waiting'] },
-          workflow: { organizationId },
-        },
-      });
-      if (active >= entitlements.concurrentWorkflowRuns) {
-        throw new AppError(ErrorCode.QUOTA_EXCEEDED, `并发 WorkflowRun 配额已用尽（${active}/${entitlements.concurrentWorkflowRuns}）`);
-      }
-    }
     return { organizationId, consumed: 0, total: monthlyLimit ?? 0, reservationId };
   }
 

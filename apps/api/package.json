@@ -6,7 +6,7 @@
     "dev": "nest start --watch",
     "dev:worker": "tsx watch src/worker.ts",
     "build": "nest build",
-    "start": "node dist/main.js",
+    "start": "node dist/src/main.js",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "prisma:migrate": "prisma migrate dev",

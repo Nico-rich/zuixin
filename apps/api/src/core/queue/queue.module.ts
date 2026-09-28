@@ -10,8 +10,12 @@ export const EVALUATION_QUEUE = 'evaluation'; // M9-P1：EvaluationRun 执行队
 
 @Module({
   imports: [
-    BullModule.forRoot({
-      connection: { url: process.env.REDIS_URL ?? 'redis://localhost:6379', maxRetriesPerRequest: null },
+    // M10 集成修复（A1/A12 实抓的潜伏缺陷）：forRoot 静态配置在模块**导入期**读 REDIS_URL——
+    // spec 的 beforeAll 赋值对队列无效（并行 worktree 全落 DB0）。改 factory 在**编译期**惰性读取。
+    BullModule.forRootAsync({
+      useFactory: () => ({
+        connection: { url: process.env.REDIS_URL ?? 'redis://localhost:6379', maxRetriesPerRequest: null },
+      }),
     }),
     BullModule.registerQueue(
       { name: IMAGE_QUEUE }, { name: VIDEO_QUEUE }, { name: MEDIA_CLEANUP_QUEUE }, { name: AGENT_RUN_QUEUE }, { name: WORKFLOW_QUEUE }, { name: EVALUATION_QUEUE },

@@ -24,6 +24,21 @@ async function waitForStatus(prisma: PrismaService, runId: string, targets: stri
   throw new Error(`run ${runId} 未在 ${timeoutMs}ms 内到达 ${targets.join('/')}（当前 ${last}）`);
 }
 
+/** M10 集成修复（A7 诊断）：配额断言前等待该 org+kind 的未过期预留释放——C1 预留参与消耗口径，
+ *  终态 release 是最终一致（driver 收尾阶段），负载/并行下窗口拉宽，必须轮询而非即时断言 */
+async function waitForReservationsDrained(prisma: PrismaService, organizationId: string, kind: string, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  let remaining = -1;
+  while (Date.now() < deadline) {
+    remaining = await prisma.quotaReservation.count({
+      where: { organizationId, kind, expiresAt: { gt: new Date() } },
+    });
+    if (remaining === 0) return;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error(`org ${organizationId} 的 ${kind} 预留未在 ${timeoutMs}ms 内释放（剩余 ${remaining}）`);
+}
+
 /**
  * M8-P2 Billing / Subscription / Quota e2e（真实 PostgreSQL/Redis/Worker）：
  * 计划/订阅（mock 计费）/用量计量（复用 UsageRecord 归因 + ledger 幂等）/
@@ -170,11 +185,14 @@ describe('M8-P2 Billing / Subscription / Quota (e2e)', () => {
     // 切到 tiny 计划（billing.write = owner）
     await request(app.getHttpServer()).post('/api/v1/billing/subscribe').set(XRW).set('Cookie', cookie)
       .send({ organizationId: orgId, planId: tinyPlanId }).expect(201);
+    // M10 集成修复：前序用例/并行套件的预留可能尚未释放（C1 口径计入消耗）——先等排空再断言精确配额
+    await waitForReservationsDrained(prisma, orgId, 'agent_run');
     // 先跑满 2 个（月度已消费 1 个——上一条测试；再补 1 个）
     const fill = await request(app.getHttpServer()).post('/api/v1/agent-runs').set(XRW).set('Cookie', cookie)
       .send({ message: '你好' }).expect(201);
     runIds.push(fill.body.data.runId);
     await waitForStatus(prisma, fill.body.data.runId, ['completed', 'failed'], 30_000);
+    await waitForReservationsDrained(prisma, orgId, 'agent_run');
 
     // 第 3 个 → 429（服务端裁决，LLM 不参与）
     const blocked = await request(app.getHttpServer()).post('/api/v1/agent-runs').set(XRW).set('Cookie', cookie)
@@ -199,6 +217,7 @@ describe('M8-P2 Billing / Subscription / Quota (e2e)', () => {
 
     await imageQueue.resume();
     await waitForStatus(prisma, activeId, ['completed', 'failed'], 30_000);
+    await waitForReservationsDrained(prisma, orgId, 'agent_run'); // M10 集成修复：预留释放后再断言放行
     const after = await request(app.getHttpServer()).post('/api/v1/agent-runs').set(XRW).set('Cookie', cookie)
       .send({ message: '你好' }).expect(201);
     runIds.push(after.body.data.runId);

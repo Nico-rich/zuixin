@@ -53,6 +53,14 @@ describe('QuotaService（M8-P2 月度/每日/并发三态；服务端裁决）',
     prisma.agentRun.count.mockResolvedValue(2); // = concurrentAgentRuns
     await expect(svc.assertQuota('u1', null, 'agent_run', 1)).rejects.toMatchObject({ code: 'QUOTA_EXCEEDED' });
   });
+  it('M10 集成修复：concurrent 超限时预留行必须回滚（refId 预留先落库再检查）', async () => {
+    const { svc, prisma } = makeService();
+    prisma.usageLedgerEntry.aggregate.mockResolvedValue({ _sum: { quantity: 0 } });
+    prisma.agentRun.count.mockResolvedValue(2); // concurrent 超限
+    prisma.quotaReservation.create.mockResolvedValue({ id: 'res-new' });
+    await expect(svc.assertQuota('u1', null, 'agent_run', 1, 'run-x')).rejects.toMatchObject({ code: 'QUOTA_EXCEEDED' });
+    expect(prisma.quotaReservation.deleteMany).toHaveBeenCalledWith({ where: { id: 'res-new' } });
+  });
 
   it('并发 WorkflowRun：活跃 ≥ concurrentWorkflowRuns → QUOTA_EXCEEDED', async () => {
     const { svc, prisma } = makeService();
