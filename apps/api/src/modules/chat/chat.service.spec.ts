@@ -15,6 +15,9 @@ function makeChat(agentEvents?: () => AsyncIterable<AgentEvent>, agentId = 'gene
     message: {
       create: vi.fn().mockImplementation(({ data }) => Promise.resolve({ id: 'm-' + data.role, ...data })),
       update: vi.fn().mockResolvedValue({}),
+      // M10-P3 编辑/删除：归属+角色取数（默认"查不到"，用例内按需 mock）
+      findFirst: vi.fn().mockResolvedValue(null),
+      delete: vi.fn().mockResolvedValue({}),
     },
   };
   const kv = {
@@ -34,7 +37,13 @@ function makeChat(agentEvents?: () => AsyncIterable<AgentEvent>, agentId = 'gene
   const agentRegistry = { resolveForIntent: vi.fn().mockResolvedValue(agent) };
   const quota = { assertQuota: vi.fn().mockResolvedValue({ organizationId: 'personal-test', consumed: 0, total: 1, reservationId: 'r-1' }), release: vi.fn().mockResolvedValue(undefined) };
   // M9-P2：增量摘要 + 候选提炼（fire-and-forget；单测只验证调用不被阻塞/失败不冒泡）
-  const summaryRefiner = { maybeRefine: vi.fn().mockResolvedValue({ created: [], pendingMessages: 0 }) };
+  const summaryRefiner = {
+    maybeRefine: vi.fn().mockResolvedValue({ created: [], pendingMessages: 0 }),
+    // M10-P3：编辑/删除路径接线的既有公开方法（markStale/detectStale/recomputeStale）
+    markStale: vi.fn().mockResolvedValue(0),
+    detectStale: vi.fn().mockResolvedValue(0),
+    recomputeStale: vi.fn().mockResolvedValue({ removed: 0, created: [] }),
+  };
   const memoryCandidates = { extractFromSummary: vi.fn().mockResolvedValue({ summaryId: null, skipped: null, extracted: 0, promoted: 0, rejected: 0, duplicated: 0 }) };
   const svc = new ChatService(prisma as never, kv as never, router as never, context as never, attachmentsService as never, memoryExtractor as never, agentRegistry as never, quota as never, summaryRefiner as never, memoryCandidates as never);
   return { svc, prisma, kv, context, memoryExtractor, agentRegistry, agent, summaryRefiner, memoryCandidates };
@@ -125,6 +134,115 @@ describe('ChatService.prepareChat', () => {
     prisma.message.create.mockRejectedValueOnce(new Error('db down'));
     await expect(svc.prepareChat('u1', { conversationId: 'c1', message: 'hi' }, 'req1')).rejects.toThrow();
     expect(kv.del).toHaveBeenCalledWith('chat:lock:c1');
+  });
+});
+
+/** 冲刷 fire-and-forget 的微任务链（摘要自愈是后台副作用，不阻塞响应） */
+const flushAsync = () => new Promise((r) => setTimeout(r, 0));
+
+/** 编辑/删除的授权取数命中行：本人 user 消息，挂在本人的会话下 */
+function hitMessage(role = 'user') {
+  return {
+    id: 'm-1', conversationId: 'c1', role,
+    conversation: { projectId: 'p1' },
+  };
+}
+
+describe('ChatService 消息编辑/删除（M10-P3）', () => {
+  it('编辑本人 user 消息：写 content + editedAt，并触发摘要陈旧传播', async () => {
+    const { svc, prisma, summaryRefiner } = makeChat();
+    prisma.message.findFirst.mockResolvedValue(hitMessage());
+    prisma.message.update.mockResolvedValue({ id: 'm-1', content: '改后' });
+
+    const r = await svc.editMessage('u1', 'm-1', { content: '改后' });
+
+    // 归属校验同时约束消息 userId 与所在会话 userId（可靠归属链）
+    expect(prisma.message.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'm-1', userId: 'u1', conversation: { userId: 'u1', deletedAt: null } },
+    }));
+    expect(prisma.message.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'm-1' },
+      data: { content: '改后', editedAt: expect.any(Date) },
+    }));
+    expect(summaryRefiner.markStale).toHaveBeenCalledWith('c1', ['m-1']);
+    await flushAsync();
+    expect(summaryRefiner.detectStale).toHaveBeenCalledWith('c1');
+    expect(summaryRefiner.recomputeStale).toHaveBeenCalledWith('c1', { userId: 'u1', projectId: 'p1' });
+    expect(r).toMatchObject({ id: 'm-1' });
+  });
+
+  it('编辑他人/跨租户/不存在的消息 → 404（同一分支，不做存在性区分）且无写入副作用', async () => {
+    const { svc, prisma, summaryRefiner } = makeChat();
+    prisma.message.findFirst.mockResolvedValue(null); // 非本人消息对调用方不可见
+
+    await expect(svc.editMessage('u1', 'm-other', { content: 'x' })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(prisma.message.update).not.toHaveBeenCalled();
+    expect(summaryRefiner.markStale).not.toHaveBeenCalled();
+  });
+
+  it('编辑本人的 assistant 消息 → 403 MESSAGE_EDIT_FORBIDDEN（不落库）', async () => {
+    const { svc, prisma } = makeChat();
+    prisma.message.findFirst.mockResolvedValue(hitMessage('assistant'));
+
+    const err = await svc.editMessage('u1', 'm-1', { content: '冒充模型发言' }).catch((e) => e);
+    expect(err).toMatchObject({ status: 403 });
+    expect((err as { getResponse(): { code: string } }).getResponse()).toMatchObject({ code: 'MESSAGE_EDIT_FORBIDDEN' });
+    expect(prisma.message.update).not.toHaveBeenCalled();
+  });
+
+  it('编辑成功但摘要钩子失败 → 编辑结果不受影响（副作用绝不回滚用户操作）', async () => {
+    const { svc, prisma, summaryRefiner } = makeChat();
+    prisma.message.findFirst.mockResolvedValue(hitMessage());
+    prisma.message.update.mockResolvedValue({ id: 'm-1' });
+    summaryRefiner.markStale.mockRejectedValue(new Error('summary db down'));
+    summaryRefiner.detectStale.mockRejectedValue(new Error('summary db down'));
+    summaryRefiner.recomputeStale.mockRejectedValue(new Error('summary db down'));
+
+    await expect(svc.editMessage('u1', 'm-1', { content: '改后' })).resolves.toMatchObject({ id: 'm-1' });
+    await flushAsync(); // 后台自愈失败不上抛（unhandled rejection 会让测试失败）
+  });
+
+  it('删除本人 user 消息：**先**标陈旧再硬删（顺序是正确性前提），随后自愈重算', async () => {
+    const { svc, prisma, summaryRefiner } = makeChat();
+    prisma.message.findFirst.mockResolvedValue(hitMessage());
+    const order: string[] = [];
+    summaryRefiner.markStale.mockImplementation(() => { order.push('markStale'); return Promise.resolve(1); });
+    prisma.message.delete.mockImplementation(() => { order.push('delete'); return Promise.resolve({}); });
+
+    const r = await svc.deleteMessage('u1', 'm-1');
+
+    expect(order).toEqual(['markStale', 'delete']); // 先标后删（先删会导致锚点缺失漏标）
+    expect(prisma.message.delete).toHaveBeenCalledWith({ where: { id: 'm-1' } }); // schema 无 deletedAt → 硬删
+    await flushAsync();
+    expect(summaryRefiner.detectStale).toHaveBeenCalledWith('c1');
+    expect(summaryRefiner.recomputeStale).toHaveBeenCalledWith('c1', { userId: 'u1', projectId: 'p1' });
+    expect(r).toEqual({ id: 'm-1', conversationId: 'c1', deleted: true });
+  });
+
+  it('删除他人的 assistant 消息 → 404（非 User 消息对非本人连存在性都不暴露）', async () => {
+    const { svc, prisma } = makeChat();
+    prisma.message.findFirst.mockResolvedValue(null);
+    await expect(svc.deleteMessage('u1', 'm-other')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(prisma.message.delete).not.toHaveBeenCalled();
+  });
+
+  it('删除本人的 assistant 消息 → 403 MESSAGE_DELETE_FORBIDDEN（不删除历史回答）', async () => {
+    const { svc, prisma } = makeChat();
+    prisma.message.findFirst.mockResolvedValue(hitMessage('assistant'));
+
+    const err = await svc.deleteMessage('u1', 'm-1').catch((e) => e);
+    expect(err).toMatchObject({ status: 403 });
+    expect((err as { getResponse(): { code: string } }).getResponse()).toMatchObject({ code: 'MESSAGE_DELETE_FORBIDDEN' });
+    expect(prisma.message.delete).not.toHaveBeenCalled();
+  });
+
+  it('删除：stale 钩子失败不阻塞删除（用户操作优先）', async () => {
+    const { svc, prisma, summaryRefiner } = makeChat();
+    prisma.message.findFirst.mockResolvedValue(hitMessage());
+    summaryRefiner.markStale.mockRejectedValue(new Error('db down'));
+    await expect(svc.deleteMessage('u1', 'm-1')).resolves.toMatchObject({ deleted: true });
+    expect(prisma.message.delete).toHaveBeenCalled();
+    await flushAsync();
   });
 });
 
