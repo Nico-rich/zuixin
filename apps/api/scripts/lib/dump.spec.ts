@@ -1,5 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { buildPgDumpArgs, compareRowCounts, createDumpStatsCollector, parseDumpStatsText, unqualifyIdentifier, verifyDumpStats } from './dump';
+import {
+  buildPgDumpArgs,
+  buildTableDataDumpArgs,
+  compareCopyRows,
+  compareRowCounts,
+  createCopyRowCollector,
+  createDumpStatsCollector,
+  parseCopyRowsText,
+  parseDumpStatsText,
+  pickSampleTables,
+  unqualifyIdentifier,
+  verifyDumpStats,
+} from './dump';
 
 /** 取一段真实形态的 pg_dump plain 输出（结构照抄，内容简化）。 */
 const SAMPLE = `--
@@ -152,6 +164,115 @@ describe('恢复侧逐表比对（口径：与 dump 的 COPY 段比，不与源�
     expect(diffs).toContainEqual({ table: 'C', expected: 3, actual: -1 });
     expect(diffs).toContainEqual({ table: 'D', expected: -1, actual: 9 });
     expect(diffs.find((d) => d.table === 'B')).toBeUndefined();
+  });
+});
+
+describe('内容级抽样（恢复后逐行比对：比"行数相同"更硬的一层）', () => {
+  it('buildTableDataDumpArgs：只取数据 + 引号表名（大小写敏感表名必须引号）+ 不带 DROP/CREATE', () => {
+    const args = buildTableDataDumpArgs({ user: 'agent', database: 'agent_platform', table: 'User' });
+    expect(args.slice(0, 5)).toEqual(['pg_dump', '-U', 'agent', '-d', 'agent_platform']);
+    expect(args).toContain('--data-only');
+    expect(args).toContain('public."User"');
+    expect(args).not.toContain('--clean'); // 单表采样产物只用来比对，绝不能带 --clean/--if-exists
+    expect(args).not.toContain('--if-exists');
+  });
+
+  it('只收集目标表的 COPY 行，未列入的表完全不进内存', () => {
+    const sample = parseCopyRowsText(SAMPLE, ['User']);
+    expect(Object.keys(sample.rows)).toEqual(['User']);
+    expect(sample.rows.User).toEqual(['u1\ta@example.com', 'u2\tb@example.com']);
+    expect(sample.skipped).toEqual([]);
+
+    const none = parseCopyRowsText(SAMPLE, []);
+    expect(none.rows).toEqual({});
+    expect(none.skipped).toEqual([]);
+  });
+
+  it('空表与超限表一律标 skipped —— 否则两侧同样被截断会得出"相等"的假通过', () => {
+    const text = [
+      'COPY public."Empty" (id) FROM stdin;',
+      '\\.',
+      'COPY public."Tiny" (id) FROM stdin;',
+      'r1',
+      'r2',
+      '\\.',
+      'COPY public."Big" (id) FROM stdin;',
+      'r1',
+      'r2',
+      'r3',
+      '\\.',
+    ].join('\n');
+    const sample = parseCopyRowsText(text, ['Empty', 'Tiny', 'Big'], 3);
+    expect(sample.rows.Tiny).toEqual(['r1', 'r2']);
+    expect(sample.rows.Empty).toEqual([]);
+    expect(sample.skipped.sort()).toEqual(['Big', 'Empty']); // 空表：无可比内容；超限表：内容被截断，不可作证
+    expect(sample.rows.Big).toHaveLength(3); // 超限表的内容仍在，但调用方必须按 skipped 排除它
+  });
+
+  it('流式 collector 与一次性解析结果一致（readline 不产出结尾空行）', () => {
+    const lines = SAMPLE.split('\n');
+    if (lines[lines.length - 1] === '') lines.pop();
+    const collector = createCopyRowCollector(['User', 'AgentRun']);
+    for (const line of lines) collector.pushLine(line);
+    const streamed = collector.finish();
+    expect(streamed).toEqual(parseCopyRowsText(SAMPLE, ['User', 'AgentRun']));
+    expect(Object.keys(streamed.rows).sort()).toEqual(['AgentRun', 'User']);
+  });
+
+  it('截断的 COPY 段照收（差异由比对环节判定，不在收集环节丢数据）', () => {
+    const sample = parseCopyRowsText('COPY public."User" (id) FROM stdin;\nu1\nu2\n', ['User']);
+    expect(sample.rows.User).toEqual(['u1', 'u2']);
+    expect(sample.skipped).toEqual([]);
+  });
+
+  it('compareCopyRows：一致 / 行数不同 / 内容不同（只报位置，不回显数据）', () => {
+    expect(compareCopyRows(['a', 'b'], ['a', 'b'])).toEqual({ ok: true, detail: '2 行逐行一致' });
+
+    const fewer = compareCopyRows(['a', 'b'], ['a']);
+    expect(fewer.ok).toBe(false);
+    expect(fewer.detail).toContain('行数不同');
+
+    const content = compareCopyRows(['a', 'b', 'c'], ['a', 'SECRET-VALUE', 'c']);
+    expect(content.ok).toBe(false);
+    expect(content.detail).toContain('第 2 行');
+    expect(content.detail).not.toContain('SECRET'); // 数据行可能含用户数据/密文：只报位置
+  });
+
+  it('内容差异最多报 5 处（再多会淹没有效信息）', () => {
+    const expected = ['a', 'b', 'c', 'd', 'e', 'f', 'g'];
+    const actual = ['x', 'x', 'x', 'x', 'x', 'x', 'x'];
+    const result = compareCopyRows(expected, actual);
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain('1、2、3、4、5');
+    expect(result.detail).not.toContain('6');
+  });
+});
+
+describe('抽样选表（确定性：同一份 dump 永远抽同一批，演练结果可比）', () => {
+  const rowCounts: Record<string, number> = { User: 5, AgentRun: 0, Credential: 3, Big: 99_999 };
+  for (let i = 1; i <= 10; i += 1) rowCounts[`A${String(i).padStart(2, '0')}`] = i;
+
+  it('一半名额给关键表（有数据且不过大），其余等距抽且首尾都取到', () => {
+    const picked = pickSampleTables(rowCounts, 5, { preferred: ['User', 'AgentRun', 'Credential', 'Missing'] });
+    expect(picked.slice(0, 2)).toEqual(['User', 'Credential']); // 优先关键表；AgentRun=0 行、Missing 不存在 ⇒ 跳过
+    expect(picked).toHaveLength(5);
+    expect(picked).toContain('A01'); // 首
+    expect(picked).toContain('A10'); // 尾
+    expect(picked).not.toContain('Big'); // 超限表不采样（大表全量比对会把秒级演练拖成分钟级）
+    expect(picked).not.toContain('AgentRun');
+  });
+
+  it('同一输入两次抽表结果完全相同（演练报告可比）', () => {
+    const a = pickSampleTables(rowCounts, 4, { preferred: ['User'] });
+    const b = pickSampleTables({ ...rowCounts }, 4, { preferred: ['User'] });
+    expect(a).toEqual(b);
+  });
+
+  it('n<=0 / 全部表超限 / 全部表为空 ⇒ 空数组（不采样，也绝不误报"通过"）', () => {
+    expect(pickSampleTables(rowCounts, 0)).toEqual([]);
+    expect(pickSampleTables(rowCounts, -1)).toEqual([]);
+    expect(pickSampleTables({ Big: 99_999 }, 3)).toEqual([]);
+    expect(pickSampleTables({ Empty: 0 }, 3)).toEqual([]);
   });
 });
 

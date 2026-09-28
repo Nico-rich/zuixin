@@ -206,6 +206,20 @@ export class PgClient {
   }
 
   /** 用 `psql -v ON_ERROR_STOP=1 -f -` 回灌 SQL 流：任何一条 SQL 失败立即非 0 退出（绝不"带错恢复"）。 */
+  /**
+   * 单表数据 dump（`--data-only -t public."X"`）——恢复后**内容级抽样**用。
+   * 为什么用"再 dump 一次"而不是自己格式化行：两侧都是 pg_dump 的 COPY text 输出，
+   * 逐行原样比较即可；自己实现 COPY 转义/PG 文本输出格式必然与 PG 不一致（假失败的源头）。
+   */
+  async dumpTableData(database: string, table: string, timeoutMs = 300_000): Promise<string> {
+    const res = await this.exec(
+      [this.clientBin('pg_dump'), '-U', this.target.user, '-d', database, '--data-only', '--no-owner', '--no-privileges', '-t', `public."${table}"`],
+      { quiet: true, timeoutMs },
+    );
+    if (res.code !== 0) throw new Error(`单表 dump 失败（${table}，退出码 ${res.code}）：${redactSecrets(res.stderr.trim()).slice(0, 300)}`);
+    return res.stdout;
+  }
+
   async loadScript(database: string, stdin: NodeJS.ReadableStream | Buffer | string, timeoutMs = 3_600_000): Promise<RunResult> {
     return this.exec([this.clientBin('psql'), '-U', this.target.user, '-d', database, '-v', 'ON_ERROR_STOP=1', '-f', '-'], {
       stdin,

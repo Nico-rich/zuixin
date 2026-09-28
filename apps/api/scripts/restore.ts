@@ -25,7 +25,10 @@ import {
   createLogger, fail, formatBytes, formatDuration, stamp,
 } from './lib/cli';
 import { loadEnv, parseDatabaseUrl } from './lib/env';
-import { compareRowCounts, createDumpStatsCollector, type DumpStats } from './lib/dump';
+import {
+  DEFAULT_MAX_SAMPLED_ROWS, compareCopyRows, compareRowCounts, createCopyRowCollector, createDumpStatsCollector,
+  parseCopyRowsText, pickSampleTables, type CopyRowSample, type DumpStats,
+} from './lib/dump';
 import { KEY_TABLES, PgClient, assertSafeTargetDatabase, type PgMode } from './lib/pg';
 import { helpText, parseArgs, type FlagSpec } from './lib/args';
 
@@ -42,6 +45,7 @@ const SPECS: readonly FlagSpec[] = [
   { name: 'pg-container', type: 'string', valueName: '<name>', default: 'docker-postgres-1', help: 'docker 模式容器名' },
   { name: 'pg-client-dir', type: 'string', valueName: '<dir>', help: 'direct 模式客户端目录' },
   { name: 'skip-rowcount-all', type: 'boolean', help: '跳过"全表行数"比对（只做关键表 + 指纹；超大库演练用）' },
+  { name: 'verify-sample', type: 'number', valueName: '<n>', default: 3, help: '抽样做**内容级**核对（逐行比对 COPY 文本）的表数；0=关闭（默认：3）' },
   { name: 'timeout-ms', type: 'number', valueName: '<ms>', default: 3_600_000, help: '回灌超时（默认 1h）' },
 ];
 
@@ -50,6 +54,22 @@ const TARGET_PREFIX_HINT = 'm10p9_';
 async function collectStats(file: string): Promise<DumpStats> {
   const collector = createDumpStatsCollector();
   const input = file.endsWith('.gz') ? createReadStream(file).pipe(createGunzip()) : createReadStream(file);
+  const rl = createInterface({ input, crlfDelay: Infinity });
+  for await (const line of rl) collector.pushLine(line);
+  return collector.finish();
+}
+
+/**
+ * 第二遍读 dump：只采集抽样表的 COPY 数据行（内容级核对用）。
+ * 为什么要第二遍：抽哪几张表要靠**第一遍得到的逐表行数**决定（只抽有数据且不过大的表），
+ * 而一遍读完才知道行数。代价是一次额外的解压/读取——对演练频率而言可忽略，
+ * 换来的好处是采样目标确定（同一份 dump 永远抽同一批）而不是"边读边猜"。
+ */
+async function collectSampleRows(file: string, targets: readonly string[], maxRowsPerTable: number): Promise<CopyRowSample> {
+  if (targets.length === 0) return { rows: {}, skipped: [] };
+  const collector = createCopyRowCollector(targets, maxRowsPerTable);
+  const input = file.endsWith('.gz') ? createReadStream(file).pipe(createGunzip()) : createReadStream(file);
+  input.on('error', () => undefined); // 与回灌路径同样：读流错误不能变成未捕获异常
   const rl = createInterface({ input, crlfDelay: Infinity });
   for await (const line of rl) collector.pushLine(line);
   return collector.finish();
@@ -71,6 +91,8 @@ async function main(): Promise<void> {
           '默认行为是 dry-run：不给 --confirm 时只做前置检查与计划打印，不创建/写入任何库。',
           '硬闸门：目标库名 ≠ DATABASE_URL 的库名；目标库不存在（除非 --reuse-existing）；目标库名必须是合法标识符。',
           '行数校验与 **dump 文件自身的 COPY 段**比对（不与源库当前行数比——那会因源库持续写入而假失败）。',
+          '内容级抽样（--verify-sample，默认 3 张）：回灌后**再 dump 单表**，与备份里的 COPY 行逐行原样比对——'
+            + '行数一致不等于内容一致（截断/转义损坏能骗过计数）。优先抽关键业务表，其余名额抽小表（秒级可跑）。',
           '恢复完成后打印"凭证解密抽查"步骤；ENCRYPTION_KEY 不正确时凭证全部作废（无需回灌即可发现）。',
         ],
         examples: [
@@ -143,6 +165,16 @@ async function main(): Promise<void> {
       EXIT_VERIFY,
     );
   }
+
+  // ---- 抽样内容核对：只**选表**（纯函数，秒级）----
+  // 从 dump 里采集数据行是**第二遍读文件**，刻意推迟到"确认要真恢复之后"：
+  // dry-run 只该给计划（不能因为看一眼计划就把 GB 级备份解压一遍），被安全闸门拒绝时更不该读。
+  const sampleCap = DEFAULT_MAX_SAMPLED_ROWS;
+  const sampleTargets = pickSampleTables(stats.rowCounts, Number(v['verify-sample'] ?? 0), {
+    preferred: KEY_TABLES.map((k) => k.table),
+    maxRows: sampleCap,
+  });
+  logger.raw(`抽样表      ：${sampleTargets.length > 0 ? `${sampleTargets.join(', ')}（内容级逐行比对）` : '不抽样（--verify-sample 0）'}`);
 
   const resolved = await resolveClient(String(v['pg-mode']), String(v['pg-container']), v['pg-client-dir'] as string | undefined, target, logger, fail);
   logger.raw(`pg 客户端   ：${resolved.mode} — ${resolved.client.description}`);
@@ -256,11 +288,52 @@ async function main(): Promise<void> {
       detail: Object.entries(keyTableReport).map(([t, r]) => `${t}: dump=${r.dump} restored=${r.restored}`).join('  '),
     });
 
+    // ---- 校验 D：抽样**内容级**一致性（逐行比对 COPY 文本）----
+    // 行数一致 ≠ 内容一致（截断/编码/转义损坏都能骗过计数）。这里对抽样表把 dump 里的
+    // COPY 数据行与"从恢复库再 dump 一次"的输出逐行原样比对（两侧同为 pg_dump 输出）。
+    const sampleReport: Record<string, { rows: number; ok: boolean; detail: string }> = {};
+    if (sampleTargets.length === 0) {
+      steps.push({ name: 'sample-consistency', ok: true, detail: '未抽样（--verify-sample 0 或没有符合条件的小表）' });
+    } else {
+      logger.step(`校验 D：抽样内容一致性（${sampleTargets.length} 张表：${sampleTargets.join(', ')}）`);
+      const dumpSample: CopyRowSample = await collectSampleRows(dumpPath, sampleTargets, sampleCap);
+      let sampleOk = true;
+      const skipped: string[] = [];
+      for (const table of sampleTargets) {
+        if (dumpSample.skipped.includes(table)) {
+          skipped.push(table); // 空表/超限：**不能算通过**，如实记为跳过
+          continue;
+        }
+        const dumpRows = dumpSample.rows[table] ?? [];
+        let restoredRows: string[] = [];
+        try {
+          const text = await resolved.client.dumpTableData(targetArg, table);
+          restoredRows = parseCopyRowsText(text, [table], sampleCap).rows[table] ?? [];
+        } catch (err) {
+          sampleOk = false;
+          sampleReport[table] = { rows: dumpRows.length, ok: false, detail: `再 dump 失败：${(err as Error).message}` };
+          logger.raw(`  [FAIL] ${table} — 再 dump 失败`);
+          continue;
+        }
+        const cmp = compareCopyRows(dumpRows, restoredRows);
+        sampleReport[table] = { rows: dumpRows.length, ok: cmp.ok, detail: cmp.detail };
+        if (!cmp.ok) sampleOk = false;
+        logger.raw(`  [${cmp.ok ? 'ok' : 'FAIL'}] ${table}（${dumpRows.length} 行）— ${cmp.detail}`);
+      }
+      if (skipped.length > 0) logger.warn(`抽样跳过 ${skipped.length} 张表（空表或超过 ${sampleCap} 行上限）：${skipped.join(', ')}`);
+      steps.push({
+        name: 'sample-consistency',
+        ok: sampleOk,
+        detail: `抽样 ${sampleTargets.length} 张表逐行比对${sampleOk ? '全部一致' : '**存在差异**'}${skipped.length > 0 ? `（跳过 ${skipped.length} 张：${skipped.join(',')}）` : ''}`,
+      });
+    }
+
     const verdict = steps.every((s) => s.ok);
     report.finishedAt = new Date().toISOString();
     report.verdict = verdict ? 'PASS' : 'FAIL';
     report.rowCounts = { dumpTotal: stats.totalRows, restoredTotal: Object.values(actual).reduce((a, b) => a + b, 0) };
     report.keyTables = keyTableReport;
+    report.samples = sampleReport;
     report.totalMs = Date.now() - startedAll;
 
     const reportPath = resolve(outDir, `restore-${targetArg}-${stamp()}.report.json`);

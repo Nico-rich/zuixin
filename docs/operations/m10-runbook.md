@@ -12,10 +12,10 @@
 | 内容 | 状态 |
 | --- | --- |
 | `backup.ts` 对**本机 dev 库**真实执行（只读，未写入源库）| ✅ 真实执行（§2.4：13.58MB / 88 表 / 44,072 行 / 1.11s） |
-| `restore.ts` 回灌到**新建临时库** + 指纹/逐表行数/关键表校验 | ✅ 真实执行（§4.4：88/88 表一致，临时库已销毁） |
+| `restore.ts` 回灌到**新建临时库** + 指纹/逐表行数/关键表/**抽样内容**校验 | ✅ 真实执行（§4.4：88/88 表行数一致 + 3 张表逐行一致，临时库已销毁） |
 | `restore.ts` 安全闸门（拒绝恢复到源库/系统库/非法标识符）| ✅ 真实执行（退出码 4，§4.2） |
 | `minio-mirror.ts` 三条链路（目录→桶、桶→目录、桶→桶）+ 内容 md5 抽样 | ✅ 真实执行（§5.3，临时桶已删除） |
-| 脚本单测 | ✅ 40 用例 / 4 文件全绿（`apps/api/scripts/vitest.config.ts`） |
+| 脚本单测 | ✅ 50 用例 / 4 文件全绿（`apps/api/scripts/vitest.config.ts`） |
 | **生产量级**（TB 级库、百万对象桶）的耗时/内存 | ❌ **未验证**——本机库 13.58MB、桶 3 个对象，数字**不可外推**（§9） |
 | **PITR**（WAL 归档 → `recovery_target_time`）| ❌ **未演练**——本脚本只做逻辑备份，RPO = 备份时刻（§2.1、§9） |
 | K8s 清单在**真实集群**中的行为（探针、HPA、Ingress SSE）| ❌ **未验证**——本机无可用集群；且仓库**尚无 Dockerfile**（§6.1、§9） |
@@ -43,7 +43,7 @@ npx tsx scripts/backup.ts --help          # 先看帮助：每个脚本都有 --
 | 脚本 | 作用 | 危险面 |
 | --- | --- | --- |
 | `scripts/backup.ts` | `pg_dump` 一致性快照 → 内容校验 → gzip → manifest → 可选上传 MinIO | **只读**（不对源库写入） |
-| `scripts/restore.ts` | 回灌到**新建临时库** → 指纹 + 逐表行数 + 关键表校验 → 报告 | **默认 dry-run**；需 `--confirm` 才写库；硬闸门拒绝源库 |
+| `scripts/restore.ts` | 回灌到**新建临时库** → 指纹 + 逐表行数 + 关键表 + **抽样内容逐行**校验 → 报告 | **默认 dry-run**；需 `--confirm` 才写库；硬闸门拒绝源库 |
 | `scripts/minio-mirror.ts` | 桶/目录 mirror（mc）+ 对象数/体积核对 + 可选内容 md5 抽样 | 默认不删目标（`--delete` 才删） |
 
 ### 1.3 退出码契约（所有脚本统一，便于 CI/告警判定）
@@ -215,6 +215,9 @@ npx tsx scripts/restore.ts -f <上面同一个文件> -t drill_20260928 --confir
 
 # ③ 让临时库留下来做人工取证（默认会删）
 npx tsx scripts/restore.ts -f <...> -t drill_20260928 --confirm --keep
+
+# ④ 拧抽样内容核对的表数（默认 3 张；0=关闭；超大库想只跑行数就加 --skip-rowcount-all）
+npx tsx scripts/restore.ts -f <...> -t drill_20260928 --confirm --verify-sample 5
 ```
 
 **为什么必须是"新建临时库"**：`--clean --if-exists` 的 dump 回灌到已有库会**先 DROP 再建**。
@@ -228,8 +231,16 @@ npx tsx scripts/restore.ts -f <...> -t drill_20260928 --confirm --keep
 ### 4.2 安全闸门实测
 
 ```bash
+# 例 1：目标 = 系统库（可随时复跑的安全示例）
+npx tsx scripts/restore.ts -f <backup> -t postgres --confirm --env-file <env>
+# → 安全闸门：拒绝 — 拒绝以系统库 "postgres" 作为恢复目标
+# → [error] 安全闸门拒绝：...      ← 退出码 4
+#   拒绝发生在**任何库操作之前**：不建库、不写入、连备份的数据段都不读
+#   （计划/选表照打——它们只依赖"解析 dump 得到行数"这一步）
+
+# 例 2：目标 = 源库（"就地覆盖"，同样拒绝；不要在生产/共享环境上试这条，除非你只是想看它被拒绝）
 npx tsx scripts/restore.ts -f <backup> -t agent_platform --confirm
-# → 拒绝恢复到源库 "agent_platform"：恢复脚本只在**新建的临时库**上工作（就地恢复见 runbook §4.2，需人工执行）
+# → 拒绝恢复到源库 "agent_platform"：恢复脚本只在**新建的临时库**上工作（就地恢复见 §4.2，需人工执行）
 # → 退出码 4
 ```
 
@@ -239,17 +250,47 @@ npx tsx scripts/restore.ts -f <backup> -t agent_platform --confirm
 源库在备份之后仍在被写入，拿源库当前行数当基准只会得到假失败（m8 手册 §4.1 ⑤ 的教训）。
 脚本的做法：先解析 dump 得到"备份时刻的逐表行数"，回灌后逐表 `count(*)` 比对，并额外点名关键表。
 
-### 4.4 实测（2026-09-28，临时库 `m10p9_drill_20260928`）
+**四层校验（A→D），一层比一层硬**：
 
-| 步骤 | 结果 |
-| --- | --- |
-| 建库 | `CREATE DATABASE m10p9_drill_20260928 TEMPLATE template0`（模板库隔离，不受生产模板污染） |
-| 回灌 | `psql -v ON_ERROR_STOP=1 -f -` 退出码 0，**stderr 0 字节**，耗时 **3,336ms** |
-| 指纹（七项） | 表 88 / 列 1026 / 索引 280 / 枚举 38 / 外键 152 / 迁移行 33 / 扩展 `pgcrypto,plpgsql,vector` |
-| 逐表行数 | **88/88 张表全部一致**，恢复库合计 44,072 行 == dump 44,072 行 |
-| 关键表 | User 611/611、Organization 551/551、AgentRun 884/884、UsageRecord 1264/1264、Credential 2/2、`_prisma_migrations` 33/33 |
-| 结论 | `verdict: PASS`，报告 `totalMs` **4,988ms**（含建库、回灌、全部校验与报告落盘） |
-| 清理 | 临时库已 DROP；实测 `pg_database` 仅剩 `agent_platform`、`agent_platform_shadow`、`postgres`、`template0/1`——**dev 主库未被触碰** |
+| 层 | 查什么 | 查不出什么 |
+| --- | --- | --- |
+| A 指纹 | 表/列/索引/枚举/外键/迁移数/扩展 七项与 dump 声明一致 | 数据对不对 |
+| B 逐表行数 | 88/88 张表 count(*) 与 dump 的 COPY 段一致（含"恢复库多出的表"） | **行数相同但内容损坏**（截断、转义错误、字符集问题） |
+| C 关键表 | 6 张业务表逐张点名（User/Organization/AgentRun/UsageRecord/Credential/`_prisma_migrations`） | 同上 |
+| **D 抽样内容**（`--verify-sample`，默认 3） | 回灌后对抽中的表**再 `pg_dump --data-only -t` 一次**，与备份里那一段 COPY **逐行原样文本**比对 | 未被抽中的表（抽样，不是全量） |
+
+D 层的两个关键取舍：
+- **为什么"再 dump 一次"而不是自己格式化行**：两侧都来自 `pg_dump`，同一个值必然渲染成同一行文本；
+  原样比较比"解码后比较"更严格（连转义写法不一致都能发现），也没有自己实现 COPY 转义（`\N`/`\t`/`\\`）
+  出错而**把真实损坏误判成通过**的空间。
+- **选表规则**：一半名额给关键业务表（有数据且 ≤2000 行），其余从合格表里**等距抽**（首尾都取到）；
+  空表与超限表一律跳过并打印告警——**超限表"两侧同样被截断"会得出假通过**，所以宁可不比。
+  同一份 dump 每次抽到同一批表（确定性），演练报告才可比。差异**只报行号不回显数据**（数据行可能含用户数据/密文）。
+
+代价：默认抽样给本机演练加了约 1.3~1.8s（3 张表各一次 `pg_dump -t`；本机负载有噪声，量级参考即可）。
+超大库可 `--verify-sample 0` 关闭，但那样 B/C 层就回到"行数对了不代表内容对"的强度——**演练时不要关**。
+另外注意：**选表**（纯函数，秒级）在计划阶段就打印，**采集数据行**（第二遍读备份文件）只在真正执行恢复时才做——
+所以 dry-run 不会因为"看一眼计划"就把 GB 级备份解压一遍；这也是安全闸门拒绝后不再读文件的原因。
+
+### 4.4 实测（2026-09-28，临时库 `m10p9_drill_20260928` / `m10p9_drill2_20260928` / `m10p9_drill3_20260928`）
+
+同一份备份（`agent_platform-m10p9-drill-20260928-132425.sql.gz`，sha256 `560fa815…cdf34`）跑了三轮：
+首轮只有 A/B/C 三层校验，之后两轮都带上默认的 D 层抽样内容比对（末轮在上面的"计划阶段不读文件"调整之后）。
+
+| 步骤 | 首轮（无内容抽样） | 复跑（默认 `--verify-sample 3`，同一份备份连跑两次） |
+| --- | --- | --- |
+| 建库 | `CREATE DATABASE <临时库> TEMPLATE template0`（模板库隔离，不受生产模板污染） | 同 |
+| 回灌 | `psql -v ON_ERROR_STOP=1 -f -` 退出码 0，**stderr 0 字节**，耗时 **3,336ms** | 退出码 0，stderr 0 字节，耗时 **2.80s / 4.16s** |
+| A 指纹（七项） | 表 88 / 列 1026 / 索引 280 / 枚举 38 / 外键 152 / 迁移行 33 / 扩展 `pgcrypto,plpgsql,vector` | 同（逐项相同） |
+| B 逐表行数 | **88/88 张表全部一致**，恢复库合计 44,072 行 == dump 44,072 行 | 同 |
+| C 关键表 | User 611/611、Organization 551/551、AgentRun 884/884、UsageRecord 1264/1264、Credential 2/2、`_prisma_migrations` 33/33 | 同 |
+| **D 抽样内容** | —（该轮尚未实现） | 抽中 **User 611 行、Organization 551 行、Plan 36 行**：三张表**逐行原样文本全部一致** |
+| 结论 | `verdict: PASS`，报告 `totalMs` **4,988ms** | `verdict: PASS`，报告 `totalMs` **4,321ms / 6,758ms**（进程总耗时 4.89s / 8.15s，含 env 加载与报告落盘） |
+| 清理 | 临时库已 DROP；`pg_database` 仅剩 `agent_platform`、`agent_platform_shadow`、`postgres`、`template0/1` | 同（三次演练后再次核对，仍只剩这 5 项）——**dev 主库全程未被触碰** |
+
+> D 层为什么抽到 `Plan` 而不是别的：一半名额被关键表 `User`/`Organization` 拿走（`n=3` ⇒ `ceil(3/2)=2`），
+> 剩 1 个名额从合格表里等距抽（`n=1` 时取排序后的中位）。这是**刻意的确定性**——同一份 dump 每次抽同一批，
+> 演练报告才有可比性。想覆盖更多表就用 `--verify-sample <n>`。
 
 > 注意指纹里的 `plpgsql`：它在恢复库中作为扩展出现（template0 自带），dump 侧只记录 `pgcrypto,vector`。
 > 脚本据此只比对 dump 声明过的扩展，不会把这种模板差异误报为失败——但**值得知道**，
@@ -343,6 +384,7 @@ USER 非 root、`.dockerignore` 排除 `.env`）。**特别注意**：`apps/api/
 | API 副本 | 2（RollingUpdate `maxUnavailable: 0`） | 无本地会话状态：JWT 无状态 + Redis 承载队列/总线 |
 | Worker 副本 | 2（独立 Deployment + HPA 2→12） | 负载特征与故障域都与 API 不同；`worker-hpa.yaml` 有"CPU 只是代理信号"的诚实标注 |
 | Worker 探针 | **无** | Worker 用 `createApplicationContext`，**不监听端口**；进程真死会退出→重启。**盲区**：Redis 长时间抖动时进程活着但不消费，编排层看不见 ⇒ 靠 `queue_depth` 告警与 §7 的人工判据 |
+| `TRUSTED_PROXY_HOPS`（全局限流） | **1**（= 客户端→Ingress→Pod 的代理层数） | 全局限流按 IP 分桶，IP 取自 XFF 链**右起第 N 跳**（抗伪造：客户端只能往左追加）。**写大了**：链长不足会回退 socket 地址（此时是 Ingress Pod IP）⇒ 全员共用一个桶、正常用户先被打爆；**写小了/0**：同上退化为共享桶。**加一层代理（CDN/mesh）必须 +1**。排查见 §7.4 |
 
 ### 6.3 SSE（最容易配错的一处）
 
@@ -391,6 +433,7 @@ YAML 解析校验，**未**做过 `kubectl apply` / 探针行为 / HPA 缩放 / 
 | `GracefulShutdownTimeout` | 30s 内没关完，被强退 ⇒ 在途 job 被打断、lease 靠 `recoverStale` 兜底 | 日志搜「优雅停机超时」/ `phase=timeout` | 查谁挂住了：Redis/PG 半开导致 `close()` 挂住、长任务远超窗口 | **不要靠调大 `terminationGracePeriodSeconds` 掩盖**——先找到挂住的钩子 |
 | 队列积压（`queue.depth/maxDepth > 0.5`，人工判据：`curl /api/v1/health`） | 消费跟不上生产，涨到 maxDepth 即 429 | Worker 副本是否被 HPA 顶到上限；单 run 是否长尾；provider 错误率 | 扩容 Worker（`kubectl scale deploy/worker`）；修 provider/超时问题 | 抬高 `AGENT_RUN_QUEUE_MAX_DEPTH` 只是把 429 推迟，不解决吞吐 |
 | 队列已满（`depth ≥ maxDepth`） | 用户侧**已在**被 429 拒绝 | 同上一行 | 先止血（扩容/抬水位）再找根因 | 不要只看队列数字——用户可见失败已经发生，别当预警处理 |
+| 用户报 429 `RATE_LIMITED`（非队列满） | 命中**限流**：全局 per-IP 桶（M10-P8）或端点级 `@RateLimit` 桶 | Redis 里 `SCAN` 匹配 `ratelimit:global:*`（按桶 `ratelimit:global:write:*` 等）看是哪个 IP/路由在涨、`TTL` 还剩多久；同时看 API 日志有无「限流器异常/超时（放行）」 | 见 **§7.4**：先分清"脚本/攻击"与"自己人（共享出口 IP）"，前者交上游 WAF/Ingress，后者调阈值或修 `TRUSTED_PROXY_HOPS` | **不要** `DEL ratelimit:*` 当修复——那只是抹掉观测证据，几秒后计数照涨；也**不要**把 `GLOBAL_RATE_LIMIT_ENABLED=false` 当默认状态 |
 | `SchedulerJobDead`（人工判据：`SELECT count(*) FROM "ScheduledJob" WHERE status='dead' AND "completedAt" > now() - interval '1 day'`；或查 `"EventEnvelope"` 里 `eventType='scheduler.job.dead'`） | 周期性作业**已停摆**，dead 是终态、不自动重投 | `ScheduledJob.lastError`：心跳中断（worker 失联/长任务超时）还是重试超限 | 先修 worker 侧的根因，再用人工显式路径重投 | 不要批量把 dead 改回 scheduled——那会跳过"为什么死"这个信息 |
 | `StorageDependencyDegraded`（人工判据：`curl /api/v1/health` 的 `storage.state`） | 对象存储降级：上传/生成受影响，核心路径仍可用 | MinIO/S3 端点与凭证 | 修端点/凭证；若桶被误删 → 用 `minio-mirror.ts` 回灌到**新桶**再切 | **不要**因此摘 API 流量（非关键依赖，摘流量只会放大故障） |
 | SSE 客户端"卡住不动" | 某层代理在缓冲（应用没出问题） | `curl -N` 直连 Pod 对比经 Ingress 的表现 | 补 `proxy-buffering: off` 等三条注解（§6.3） | 不要先怀疑应用代码——先用 `curl -N` 二分定位 |
@@ -404,6 +447,72 @@ YAML 解析校验，**未**做过 `kubectl apply` / 探针行为 / HPA 缩放 / 
    受网络策略保护的 `/metrics`，**不要**复用 JWT 面），或经 otel-collector 转换；
 3. 为 `scheduler.job.dead` 与停机超时打计数器（各一次代码改动，规则表达式已写在注释里）。
 
+### 7.4 全局限流（429）排查入口与 fail-open 语义
+
+M10-P8（审计 SA-25）加的**全局 per-IP 限流**在 Redis 里的键空间是**可直接翻的**——
+这是它按"IP×方法×路由"分桶（而非一个黑盒计数器）的运维回报。
+
+**键格式**（`core/rate-limit/global-rate-limit.policy.ts` 生成 `global:...`，`RateLimitService` 再加前缀）：
+
+```
+ratelimit:global:{bucket}:{ip}:{method}:{route}
+             ↑           ↑       ↑        ↑
+             read|write|auth|upload    路由模板（如 /api/v1/conversations/:id）
+```
+
+**桶与阈值**（生产默认值，`NODE_ENV !== 'production'` 时阈值 ×100，窗口不变）：
+
+| 桶 | 落桶条件 | 阈值（每分钟） |
+| --- | --- | --- |
+| `auth` | `POST /auth/login`、`POST /auth/refresh` | 30 |
+| `upload` | `POST /attachments` | 30 |
+| `write` | 其余 POST/PUT/PATCH/DELETE | 60 |
+| `read` | 其余（含 GET） | 300 |
+
+**豁免（绝不计数，也就绝不会出现它们的键）**：健康探针（`/health`、`/live`、`/ready`）、CORS 预检、
+`hooks/*`（webhook 另有 per-token 桶）、SSE 长连接（`/:id/events`、`/stream`）。
+⇒ **若探针或 SSE 报 429**，那不是全局桶干的（去查端点级 `@RateLimit` 或上游 WAF），别在 `ratelimit:global:*` 里浪费时间。
+
+**今天就能用的三条命令**（本机 Redis 在容器里；生产把 `docker exec` 换成对 Redis 的直接 `redis-cli`）：
+
+```bash
+# ① 看有没有被限流的桶在涨（按桶过滤，先看最容易出事的 write/upload）
+docker exec docker-redis-1 redis-cli --scan --pattern 'ratelimit:global:write:*'
+
+# ② 看某个键的计数与窗口剩余时间（固定窗口：首次 INCR 时 PEXPIRE 60s）
+docker exec docker-redis-1 redis-cli get 'ratelimit:global:read:<IP>:GET:/api/v1/agent-runs/:id'
+docker exec docker-redis-1 redis-cli ttl 'ratelimit:global:read:<IP>:GET:/api/v1/agent-runs/:id'
+
+# ③ 换个桶再扫一遍（auth/upload 的阈值只有 30，共享出口 IP 下最先触发）
+docker exec docker-redis-1 redis-cli --scan --pattern 'ratelimit:global:auth:*'
+```
+
+> **`--scan --pattern` 是 O(整库键数)**：小库随便扫；生产库请用游标式 `SCAN`（`redis-cli --scan` 本身就是
+> 游标实现，但仍会遍历全部键空间），并在 Redis 负载低时做，别在故障复盘的高峰期全量扫。
+> 另外：多实例/多环境共用 Redis 时按 **DB 段**隔离 keyspace（`REDIS_URL` 尾部的 `/<db>`），
+> 排查前先确认自己连的是应用的**那个 DB 段**，否则会得出"一个键都没有"的错误结论。
+
+**fail-open 语义（必须知道，否则会误判）**：`RateLimitService.consume` 在 **Redis 不可用/命令超时**时
+**返回放行**（`true`）并打一条 `限流器异常/超时（放行）` 的 warn。这是 M7-P9/Pre-M9 G4 以来的既定口径：
+
+- **故障期间限流完全失效**，脚本洪泛不会被拦——别把"Redis 故障期间没有 429"当成"没有攻击"；
+- 但此时 `/ready` 已经是 503（Redis 是 readiness 的 critical 依赖，见 k8s/api-deployment.yaml），
+  LB 已把流量摘走，**用户侧可见的是"服务不可用"而不是"服务可用但没限流"**；
+- 反过来说：**只要看到 `限流器异常/超时（放行）` 的日志，就必须去查 Redis**，这是一条"保护面已失效"的证据。
+
+**阈值调错 / IP 解析错的典型症状与处置**：
+
+| 症状 | 含义 | 处置 |
+| --- | --- | --- |
+| 大批用户同时 429，且 `ratelimit:global:*` 里**同一个 IP** 的键在涨（多半是 Pod CIDR 或单个代理地址） | IP 解析退化成"所有用户共用一个桶"：`TRUSTED_PROXY_HOPS` 与实际代理层数不符（写大了，XFF 链长不足 → 回退 socket 地址） | 按**实际**入口层数改 `k8s/configmap.yaml` 的 `TRUSTED_PROXY_HOPS`（客户端→Ingress→Pod = `1`），改完滚动重启 |
+| 单个账号/脚本把某个端点打满（其他桶正常） | 正常限流在工作 | 攻击/爬虫 → 上游 WAF/Ingress 处置；自家压测 → 显式调大对应 `GLOBAL_RATE_LIMIT_*_PER_MIN` |
+| 办公网 NAT 出口的多个用户互相"挤掉" | 一个出口 IP = 一个桶，属**已知取舍**（跨端点聚合桶未实施，见 X-08 Deferred） | 调大阈值，或推动上游按账号维度而非 IP 维度扩展限流 |
+| `POST /auth/login` 偶发 429 但失败计数（5 次/5 分钟）没到 | 两条计数**口径不同**：全局 auth 桶按**请求**计（含成功），失败计数按**失败**计 | 正常现象；反代场景下 auth 失败计数用的是 `req.ip`（socket 地址）⇒ 会退化为"所有用户共用一个代理 IP"，这是 P8 已记录的跨模块风险 |
+
+**不要做的事**：不要把 `ratelimit:*` 删掉当修复（键会在几秒内重新计数，而你丢掉了唯一的观测证据）；
+不要为了"先让用户进来"把 `GLOBAL_RATE_LIMIT_ENABLED` 改成 `false` 并留在配置里——那是把防护永久关掉，
+要用就把阈值调到一个**能挡住脚本**的数。
+
 ## 8. 季度演练清单（5 步，不可省步）
 
 在**隔离环境**（预发/临时命名空间）执行，全程只操作新建的临时库/临时桶，**绝不触碰生产库**。
@@ -412,8 +521,9 @@ YAML 解析校验，**未**做过 `kubectl apply` / 探针行为 / HPA 缩放 / 
    要求退出码 0 且 manifest 的 `checks` 全绿；记录大小/耗时/sha256/表数/行数。
 2. **密钥备份 + 指纹**：按 §3.3 导出 `.env`（或密钥管理系统快照）→ 加密 → 异地；
    记录 `ENCRYPTION_KEY` 的长度与 sha256 前 8 位（**不记值**）。
-3. **临时库恢复 + 比对**：`restore.ts --confirm`；要求 `verdict: PASS`、逐表行数 100% 一致、
-   关键表逐张点名一致；记录指纹七项与耗时。
+3. **临时库恢复 + 比对**：`restore.ts --confirm --verify-sample 5`（加大抽样表数）；
+   要求 `verdict: PASS`、逐表行数 100% 一致、关键表逐张点名一致、**抽样表逐行内容一致**；
+   记录指纹七项与耗时。
 4. **凭证解密抽查**（§4.5）：用**备份的密钥**解 1~2 条 `Credential`；
    这是**唯一能证明"密钥与数据配套"**的一步——跳过它，前 3 步只证明了"字节被搬过来了"。
 5. **对象存储 mirror 往返**：临时桶 `--checksum-sample 3`；要求对象数/体积全等且抽样 md5 全 match；
@@ -438,6 +548,7 @@ YAML 解析校验，**未**做过 `kubectl apply` / 探针行为 / HPA 缩放 / 
 | `.env` 备份的加密与取回（§3.3/§3.4） | ❌ 纯流程项，未演练 | 与运维确认工具链后走一次完整"导出→加密→异地→取回→核对指纹" |
 | 告警规则里的 `[待导出]` 项 | ⛔ 未生效 | 见 §7.3；生效前用 §7.2 的人工判据 |
 | 多副本下的 /ready 与滚动更新行为 | ❌ 未验证 | 需在集群里做一次滚动更新，观察摘流顺序与 SSE 断线重连（客户端依赖 `last-event-id` 续传） |
+| 全局限流在**真实代理层数**下的分桶（`TRUSTED_PROXY_HOPS=1`） | ❌ 未验证 | 本机没有 Ingress，且 `NODE_ENV≠production` 时阈值 ×100；需在预发用真实 Ingress 抓一次 `X-Forwarded-For` 链长，并核对 `ratelimit:global:*` 的键里出现的是客户端 IP 而不是 Ingress Pod IP。`k8s/ingress.yaml` 的 `use-forwarded-headers` 等注解也需实机确认（§6.4） |
 
 ## 10. 边界与依赖
 
@@ -450,6 +561,7 @@ YAML 解析校验，**未**做过 `kubectl apply` / 探针行为 / HPA 缩放 / 
 **对其他 Agent / 后续工作的依赖**：
 | 依赖 | 影响 | 现状 |
 | --- | --- | --- |
+| **M10-P8 全局限流**（审计 SA-25） | 本 Phase 只**消费**它的两个事实：① `k8s/configmap.yaml` 的 `TRUSTED_PROXY_HOPS` 必须等于实际代理层数（否则全站共用一个桶，§7.4）；② §7.4 的键空间 `ratelimit:global:*` 与 fail-open 语义（Redis 故障期间限流失效）写进排查口径。**代码侧一行未改**（键名/阈值/豁免均只读确认：`core/rate-limit/global-rate-limit.policy.ts`、`rate-limit.service.ts`） | **已合并**（本 Runbook 与 manifests 已按它写的口径对齐） |
 | `ENCRYPTION_KEY` 版本化 + rewrap 工具（M10-P1） | 密钥轮换落地后，§3 的清单要加"旧版本密钥保留到全部凭证 rewrap 完成"一条；`Credential.keyVersion` 列会让 §4.5 的抽查多一步"确认 keyVersion 与密钥匹配" | 并行进行中 |
 | 真多进程 e2e（M10-P12） | 本 Runbook 的停机/探针结论仍来自单进程；多进程的 SIGTERM 行为需交叉验证 | 并行进行中 |
 | 压测/Soak 基线（M10-P17） | `k8s/*` 的 `resources.requests/limits` 目前是**起手值**，需按压测结果调整；HPA 的 CPU 目标同理 | 未开始 |

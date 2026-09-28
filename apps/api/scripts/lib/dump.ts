@@ -216,3 +216,144 @@ export const PG_DUMP_CONSISTENCY_ARGS: readonly string[] = [
 export function buildPgDumpArgs(opts: { user: string; database: string; extra?: readonly string[] }): string[] {
   return ['pg_dump', '-U', opts.user, '-d', opts.database, ...PG_DUMP_CONSISTENCY_ARGS, ...(opts.extra ?? [])];
 }
+
+/** 单表数据 dump（恢复后内容级抽样用）：只取数据、不做 owner/权限语句。 */
+export function buildTableDataDumpArgs(opts: { user: string; database: string; table: string }): string[] {
+  // -t 的模式里带引号才能正确匹配大小写敏感的表名（User / _prisma_migrations）
+  return ['pg_dump', '-U', opts.user, '-d', opts.database, '--data-only', '--no-owner', '--no-privileges', '-t', `public."${opts.table}"`];
+}
+
+/** COPY 段内被判定为"表数据行"的数量上限；超过则放弃采样该表（大表全量比对不是抽样的目的）。 */
+export const DEFAULT_MAX_SAMPLED_ROWS = 2_000;
+
+export interface CopyRowSample {
+  /** 表名 → COPY 数据行（**原样文本**，不解码转义） */
+  rows: Record<string, string[]>;
+  /** 因超过行数上限或未出现在 dump 里而放弃采样的表 */
+  skipped: string[];
+}
+
+export interface CopyRowCollector {
+  pushLine(line: string): void;
+  finish(): CopyRowSample;
+}
+
+/**
+ * 按表收集 COPY 数据行（流式；两侧都来自 pg_dump ⇒ 逐行**原样文本**比较即可）。
+ *
+ * 为什么不做转义解码：两侧都是 pg_dump 的 COPY text 输出，同一个值必然渲染成同一行文本；
+ * 原样比较比"解码后比较"更严格——连转义写法不一致都能发现，且没有自己实现 COPY 转义的出错空间
+ * （`\N` / `\t` / `\\` 的处理错一处就会把真实损坏掩盖掉）。
+ */
+export function createCopyRowCollector(targets: Iterable<string>, maxRowsPerTable = DEFAULT_MAX_SAMPLED_ROWS): CopyRowCollector {
+  const wanted = new Set(targets);
+  const rows: Record<string, string[]> = {};
+  const skipped = new Set<string>();
+  /** 当前正在收集的表；null = 不在目标表的 COPY 段内 */
+  let current: string | null = null;
+
+  const close = () => {
+    if (current === null) return;
+    const bucket = rows[current];
+    // 空表：一致性无从谈起；超限表：**必须标跳过**——否则两侧同样被截断会得出"相等"的假通过
+    if (bucket.length === 0 || bucket.length >= maxRowsPerTable) skipped.add(current);
+    current = null;
+  };
+
+  return {
+    pushLine(line: string): void {
+      if (current !== null) {
+        if (line === '\\' + '.') {
+          close();
+          return;
+        }
+        const bucket = rows[current];
+        if (bucket.length < maxRowsPerTable) bucket.push(line);
+        return;
+      }
+      if (wanted.size === 0) return;
+      const copy = RE_COPY_FROM_STDIN.exec(line);
+      if (!copy) return;
+      const table = copy[1];
+      if (!wanted.has(table)) return;
+      current = table;
+      rows[table] = rows[table] ?? [];
+    },
+    finish(): CopyRowSample {
+      close();
+      return { rows, skipped: [...skipped] };
+    },
+  };
+}
+
+/** 小输出用（"回灌后再 dump 单表"的产物很小，直接整段解析）：同 collector 语义。 */
+export function parseCopyRowsText(text: string, targets: Iterable<string>, maxRowsPerTable = DEFAULT_MAX_SAMPLED_ROWS): CopyRowSample {
+  const lines = text.split(/\r?\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  const collector = createCopyRowCollector(targets, maxRowsPerTable);
+  for (const line of lines) collector.pushLine(line);
+  return collector.finish();
+}
+
+/**
+ * 确定性抽取用于内容核对的表（同一份 dump 永远抽同一批，演练结果可比）。
+ *
+ * 选表规则（两条互补，缺一不可）：
+ *  1. **优先关键业务表**（KEY_TABLES 里的），一半名额——它们是"这份备份是不是业务库"的证据；
+ *  2. 其余名额从**有数据且不过大**的表里等距抽（首尾都取到）——小表更容易暴露"少一行"，
+ *     而大表全量比对会把秒级演练拖成分钟级。
+ */
+export function pickSampleTables(
+  rowCounts: Record<string, number>,
+  n: number,
+  opts: { preferred?: readonly string[]; maxRows?: number } = {},
+): string[] {
+  if (n <= 0) return [];
+  const preferred = opts.preferred ?? [];
+  const maxRows = opts.maxRows ?? DEFAULT_MAX_SAMPLED_ROWS;
+  const eligible = (t: string) => (rowCounts[t] ?? 0) > 0 && (rowCounts[t] ?? 0) <= maxRows;
+  const picked: string[] = [];
+  const preferredSlots = Math.ceil(n / 2);
+  for (const t of preferred) {
+    if (picked.length >= preferredSlots) break;
+    if (eligible(t) && !picked.includes(t)) picked.push(t);
+  }
+  const rest = Object.keys(rowCounts)
+    .filter((t) => eligible(t) && !picked.includes(t))
+    .sort();
+  const need = n - picked.length;
+  if (need > 0 && rest.length > 0) {
+    if (rest.length <= need) picked.push(...rest);
+    else {
+      const step = (rest.length - 1) / (need - 1 || 1);
+      for (let i = 0; i < need; i += 1) {
+        const idx = need === 1 ? Math.floor(rest.length / 2) : Math.min(rest.length - 1, Math.round(i * step));
+        if (!picked.includes(rest[idx])) picked.push(rest[idx]);
+      }
+    }
+  }
+  return picked;
+}
+
+export interface SampleComparison {
+  ok: boolean;
+  detail: string;
+}
+
+/**
+ * 逐行比较两侧的 COPY 数据行。
+ * **先比长度再比内容**：少一行时逐行比对会从第一个差异点开始雪崩式误报，
+ * 而"行数不同"这一条信息本身就已经足够定位问题。
+ * 内容差异最多报 5 处（再多会淹没有效信息）；**只报位置不报值**——数据行可能含用户数据/密文。
+ */
+export function compareCopyRows(expected: string[], actual: string[]): SampleComparison {
+  if (expected.length !== actual.length) {
+    return { ok: false, detail: `行数不同：dump ${expected.length} 行 / 恢复库 ${actual.length} 行` };
+  }
+  const bad: number[] = [];
+  for (let i = 0; i < expected.length && bad.length < 5; i += 1) {
+    if (expected[i] !== actual[i]) bad.push(i + 1);
+  }
+  if (bad.length === 0) return { ok: true, detail: `${expected.length} 行逐行一致` };
+  return { ok: false, detail: `共 ${expected.length} 行，其中第 ${bad.join('、')} 行内容不一致（只报位置，不回显数据）` };
+}

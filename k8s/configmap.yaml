@@ -31,6 +31,25 @@ data:
   # --- 健康探测 ---
   HEALTH_PROBE_TIMEOUT_MS: "1000"           # 单个探测硬超时；三项并行 ⇒ /ready 最坏 ≈2×该值
 
+  # --- 反向代理 / 全局限流（M10-P8，审计 SA-25）---
+  # TRUSTED_PROXY_HOPS = **本 API 前面可信代理的层数**，供全局限流解析客户端 IP：
+  # 取 X-Forwarded-For 链「右起第 N 跳」，语义与 Express `trust proxy = N` 一致
+  # （core/rate-limit/global-rate-limit.policy.ts 的 resolveClientIp；`main.ts` 未设 Express trust proxy，
+  #   故由策略层自行解析）。默认 0 = **完全忽略 XFF**（一律用 socket 地址）。
+  #
+  # 本 manifests 的入口路径：客户端 → Ingress（1 层） → Service → Pod。
+  #   * Ingress-NGINX 会在 XFF 链**末尾追加**真实对端地址；取右起第 1 跳 = 拿到的正是 Ingress 看到的那个 IP；
+  #   * 取右起（而非最左）是抗伪造的关键：客户端只能往左**追加**垃圾，右起位置由边界代理写入，篡改无效；
+  #   * 因此本值必须 == 实际代理层数（这里 1）。**写大了**（如 5）：链长不足时回退 socket 地址（此时是
+  #     Ingress Pod IP ⇒ 把全部用户合成一个桶，误伤；若攻击者能直连 Pod 且链够长，还能自选桶）；
+  #   **写小了/写 0**：所有请求按 Ingress 来源 IP 分桶 ⇒ 限流退化为全站共享一个计数器，最先被打爆的是正常用户。
+  #   * 后面若再加一层（CDN / 第二级 Ingress / Service Mesh sidecar），此值必须**同步 +1**，
+  #     否则同一个人拿到两个桶、且限流可被绕过（换 IP 无效但换代理路径有效）。
+  #   * 直连 Pod（kubectl port-forward / 无 Ingress 的调试环境）时链长为 0 → 自动回退 socket 地址，
+  #     不会因为"没走代理"而误判。
+  # 处置与排查入口见 docs/operations/m10-runbook.md §7。
+  TRUSTED_PROXY_HOPS: "1"
+
   # --- 观测 ---
   QUEUE_DEPTH_INTERVAL_MS: "60000"          # Worker 独有的队列深度采样周期（core/tracing/queue-depth.sampler.ts）
 
