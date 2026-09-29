@@ -4,6 +4,7 @@ import { dirname, join, relative, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { StorageAdapter, StorageListOptions, StorageListPage, StorageObjectInfo } from '../storage.types';
+import { AppError, ErrorCode } from '../../../common/errors/app-error';
 
 /** 单页上限的驱动侧硬上界（防止调用方传 Infinity 把整棵树读进内存） */
 const MAX_LIST_LIMIT = 10_000;
@@ -23,7 +24,13 @@ export class StorageLocalAdapter implements StorageAdapter {
 
   async getStream(key: string): Promise<Readable> {
     const { createReadStream } = await import('node:fs');
-    return createReadStream(this.safePath(key));
+    const path = this.safePath(key);
+    // 快速失败：元数据在库但字节不在盘（上传中断/清理错位/e2e 临时存储与共享库错配）→ 确定性 NOT_FOUND。
+    // 绝不返回一个随后 emit 'error' 的裸读流——读流 error 事件若无消费者会直接打崩整个进程。
+    if (!existsSync(path) || !statSync(path, { throwIfNoEntry: false })?.isFile()) {
+      throw new AppError(ErrorCode.NOT_FOUND, '文件不存在或已清理');
+    }
+    return createReadStream(path);
   }
 
   async delete(key: string): Promise<void> {

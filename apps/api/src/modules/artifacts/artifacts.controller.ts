@@ -45,6 +45,14 @@ export class ArtifactsController {
     res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(artifact.title)}`);
     res.setHeader('Cache-Control', 'private, max-age=3600');
     res.setHeader('X-Content-Type-Options', 'nosniff');
+    // 读流 error 绝不裸奔（同 attachments 控制器）：未发头 → 404；已发头 → 断连。
+    stream.on('error', () => {
+      if (!res.headersSent) {
+        res.status(404).json({ error: { code: 'NOT_FOUND', message: '制品文件缺失' } });
+      } else {
+        res.destroy();
+      }
+    });
     stream.pipe(res);
   }
 }

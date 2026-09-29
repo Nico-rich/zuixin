@@ -47,6 +47,19 @@ test.describe('任务卡（生图任务，真实 worker 消费）', () => {
       // 无论成败都恢复队列（后续用例/清理依赖它）
       await imageQueue.resume().catch(() => undefined);
       await imageQueue.close().catch(() => undefined);
+      // 自清理：本用例在**共享库**建会话+消息+附件行（文件落在 e2e 临时存储，套件结束即消失）。
+      // 不删则产品聊天列表残留"行在字节失"的测试会话（2026-09-29 实抓：曾把生产 API 进程打崩）。
+      // 会话级 DELETE 级联消息；附件行无 HTTP 删除面，残留为 messageId=null 行（GET 已 404 兜底）。
+      try {
+        const cid = page.url().split('/chat/')[1]?.split('?')[0];
+        if (cid) {
+          await page.request.delete(`/api/v1/conversations/${cid}`, {
+            headers: { 'X-Requested-With': 'XMLHttpRequest' },
+          });
+        }
+      } catch {
+        // 清理失败不掩盖用例结论（残留无害：GET 已 404 兜底）
+      }
     }
   });
 });

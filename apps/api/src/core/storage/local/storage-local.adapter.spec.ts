@@ -27,6 +27,21 @@ describe('StorageLocalAdapter', () => {
     await expect(adapter.put('../evil.txt', Readable.from(['x']), { contentType: 'text/plain', sizeBytes: 1 }))
       .rejects.toThrow();
   });
+
+  it('getStream：文件存在 → 可读流；不存在 → 确定性 NOT_FOUND（绝不返回裸 error 流打崩进程）', async () => {
+    await adapter.put('u1/ok.txt', Readable.from(['ok']), { contentType: 'text/plain', sizeBytes: 2 });
+    const stream = await adapter.getStream('u1/ok.txt');
+    const chunks: Buffer[] = [];
+    for await (const c of stream) chunks.push(c as Buffer);
+    expect(Buffer.concat(chunks).toString()).toBe('ok');
+
+    await expect(adapter.getStream('u1/missing.png')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('getStream：key 指向目录 → NOT_FOUND（EISDIR 不得以 error 流形式漏出）', async () => {
+    await adapter.put('u1/sub/a.txt', Readable.from(['x']), { contentType: 'text/plain', sizeBytes: 1 });
+    await expect(adapter.getStream('u1/sub')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
 });
 
 /**

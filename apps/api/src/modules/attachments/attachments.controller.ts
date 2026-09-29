@@ -53,6 +53,15 @@ export class AttachmentsController {
     res.setHeader('Content-Type', att.mimeType);
     res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(att.originalName ?? att.id)}`);
     res.setHeader('Cache-Control', 'private, max-age=3600');
+    // 读流 error 绝不裸奔（字节-行错位的 TOCTOU 兜底）：未发头 → 404；已发头 → 断连。缺此处理，
+    // unhandled 'error' 事件会打崩整个 API 进程（2026-09-29 实抓：e2e 临时存储与共享库错配触发）。
+    stream.on('error', () => {
+      if (!res.headersSent) {
+        res.status(404).json({ error: { code: 'NOT_FOUND', message: '附件文件缺失' } });
+      } else {
+        res.destroy();
+      }
+    });
     stream.pipe(res);
   }
 }

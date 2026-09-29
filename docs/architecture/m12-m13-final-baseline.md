@@ -48,6 +48,18 @@
 - 25 条红线全程无违反（偏离登记制沿用）；迁移纪律：无 DROP INDEX 混入；LLM 零治理判定。
 - Deferred/Future 不实现；无 M14 能力落地。
 
-## 6. 关键 commit
+## 6. 上线后事故与修复（用户实机触发）
+
+**事故**：用户浏览产品时打开 e2e 残留会话 → 附件行在库、字节不在盘（Playwright 临时存储与共享库错配）→ `createReadStream` 的 `error` 事件无消费者 → **整个 API 进程被打崩**（node unhandled 'error'）。
+
+**修复（三层）**：
+1. `storage-local.adapter.getStream`：字节缺失 → 确定性 `NOT_FOUND`（绝不返回裸 error 流）；
+2. attachments / artifacts 两控制器：读流 error → 未发头 404、已发头断连（S3 等驱动 TOCTOU 兜底）；
+3. e2e 自清理：task-card spec 结束删除测试会话（软删除语义，产品视图零残留）+ 新增回归测试
+   （adapter 缺失文件/目录 NOT_FOUND ×2；attachments e2e「行在字节失 → 404 进程不崩」）。
+
+**残留清理**：删除共享库中当日测试残留（131 会话/37 运行/14 任务/33 附件/2 制品，单事务 FK 安全序）+ 31 个对应磁盘文件。
+
+## 7. 关键 commit
 
 `d42c678` `1417c76` `a84ad45` `90c6741` `e843d4e`（M12 五并行）→ `961c38a`（F1）→ `133e3e3`~`f2e80d5`（W2~W10）→ `afe6bda`（Final Audit 修复）→ `d2c3b42` `36c0506`（最终验证实抓修复）

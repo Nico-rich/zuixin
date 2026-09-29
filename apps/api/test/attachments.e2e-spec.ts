@@ -7,6 +7,7 @@ import { AppModule } from '../src/app.module';
 import { GlobalExceptionFilter } from '../src/common/filters/global-exception.filter';
 import { TransformInterceptor } from '../src/common/interceptors/transform.interceptor';
 import { csrfProtection } from '../src/modules/auth/csrf.middleware';
+import { PrismaService } from '../src/modules/prisma/prisma.service';
 
 const XRW = { 'X-Requested-With': 'XMLHttpRequest' };
 
@@ -17,6 +18,7 @@ describe('Attachments (e2e)', () => {
   let app: INestApplication;
   let cookie: string;
   let attachmentId: string;
+  let adminUserId: string;
 
   beforeAll(async () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
@@ -30,6 +32,7 @@ describe('Attachments (e2e)', () => {
     const login = await request(app.getHttpServer()).post('/api/v1/auth/login').set(XRW)
       .send({ email: process.env.SEED_ADMIN_EMAIL ?? 'admin@example.com', password: process.env.SEED_ADMIN_PASSWORD ?? 'admin123456' });
     cookie = (login.headers['set-cookie'] as unknown as string[]).map((c) => c.split(';')[0]).join('; ');
+    adminUserId = login.body.data.user.id;
   });
 
   afterAll(async () => { await app.close(); });
@@ -67,5 +70,24 @@ describe('Attachments (e2e)', () => {
 
   it('越权访问他人附件 → 404', async () => {
     await request(app.getHttpServer()).get(`/api/v1/attachments/${'0'.repeat(32)}`).set('Cookie', cookie).expect(404);
+  });
+
+  it('行在字节失（元数据在库、文件不在盘）→ 404 NOT_FOUND，进程不崩（读流 error 绝不裸奔）', async () => {
+    // 2026-09-29 实抓：e2e 临时存储 + 共享库错配使这类行真实存在，此前直接把整个 API 进程打崩
+    const moduleRef = app.get(PrismaService);
+    const row = await moduleRef.attachment.create({
+      data: {
+        userId: adminUserId,
+        kind: 'generated_image',
+        type: 'image',
+        mimeType: 'image/png',
+        storageKey: `${adminUserId}/2026/09/definitely-missing.png`,
+        sizeBytes: 1,
+      },
+    });
+    const res = await request(app.getHttpServer()).get(`/api/v1/attachments/${row.id}`)
+      .set('Cookie', cookie).expect(404);
+    expect(res.body.error.code).toBe('NOT_FOUND');
+    await moduleRef.attachment.delete({ where: { id: row.id } }); // 自清理
   });
 });
