@@ -3,14 +3,22 @@ import { PrismaService } from '../prisma/prisma.service';
 import { MemoryService } from '../../core/memory/memory.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { withToolCallLedger } from '../../core/tools/tool-call-ledger';
+<<<<<<< HEAD
 import { MEMORY_ORIGIN_KEY, type MemoryOrigin } from '../../core/memory/memory-provenance';
+import { readPolicyThresholds } from '../system-settings/policy-thresholds';
 
 const SUBJECT_TYPES = ['artifact', 'creativeBrief', 'product', 'campaign', 'ad', 'generationTask', 'agentRun', 'analysis'] as const;
-/** 绩效记忆阈值（服务端规则，非 LLM）：好/差两档 */
-const GOOD_CTR = 0.03;
-const GOOD_ROAS = 2;
-const BAD_CTR = 0.01;
-const BAD_ROAS = 1;
+/**
+ * 绩效记忆阈值（服务端规则，非 LLM）：好/差两档。
+ *
+ * M12-P4：由编译期常量改为 **SystemSetting('policyThresholds').feedback 优先、本常量兜底**
+ * （运营者可在 `PATCH /system-settings/policyThresholds` 调档；仅平台管理员可写、强制审计）。
+ * 本常量仍是**最后一跳兜底**——与 `DEFAULT_POLICY_THRESHOLDS.feedback` 逐字节一致（单测锁死）。
+ */
+export const GOOD_CTR = 0.03;
+export const GOOD_ROAS = 2;
+export const BAD_CTR = 0.01;
+export const BAD_ROAS = 1;
 
 /**
  * 记忆来源标注（M12-P3 来源可信度闸门）：**服务端判定，绝不看请求体**。
@@ -161,9 +169,12 @@ export class FeedbackService {
     });
 
     // 阈值记忆：好/差（服务端规则；learning = Memory，不改模型）——metadata 幂等，重放再走也不产第二条。
-    // 内容全为**服务端计算事实**（derived 由 derive() 从数值算出，不含任何 LLM 文本）；来源标注同上。
+<<<<<<< HEAD
+    // M12-P3：内容全为服务端计算事实（derived 由 derive() 从数值算出，不含任何 LLM 文本）；来源标注同上。
     const origin = memoryOriginOf(opts);
-    if (derived.ctr >= GOOD_CTR || derived.roas >= GOOD_ROAS) {
+    // M12-P4：阈值 = SystemSetting 优先 / 编译期常量兜底（绝不采信 LLM 或调用方传入的阈值）。
+    const { feedback: t } = await readPolicyThresholds(this.prisma);
+    if (derived.ctr >= t.goodCtr || derived.roas >= t.goodRoas) {
       await this.upsertPerformanceMemory(userId, input.projectId ?? null, {
         kind: 'performance',
         subjectType: 'creativePerformance', subjectId: result.performanceId,
@@ -171,7 +182,7 @@ export class FeedbackService {
         importance: 70,
         origin,
       });
-    } else if (derived.ctr <= BAD_CTR || derived.roas <= BAD_ROAS) {
+    } else if (derived.ctr <= t.badCtr || derived.roas <= t.badRoas) {
       await this.upsertPerformanceMemory(userId, input.projectId ?? null, {
         kind: 'performance',
         subjectType: 'creativePerformance', subjectId: result.performanceId,

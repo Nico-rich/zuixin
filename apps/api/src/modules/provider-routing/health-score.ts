@@ -10,6 +10,20 @@
  */
 import { HealthStatus } from '@prisma/client';
 
+/**
+ * M12-P4：评分参数可由 `SystemSetting('policyThresholds').providerHealth` 覆盖（运营者调档）；
+ * 下列编译期常量是**最后一跳兜底**（缺省行为逐字节不变——单测锁死两处口径一致）。
+ * 覆盖只影响**排序**（分数高低），绝不改变准入门槛：健康过滤/熔断过滤仍由 healthStatus 与熔断器独立裁决。
+ */
+export interface HealthScoring {
+  baseScores?: Partial<Record<HealthStatus, number>>;
+  failurePenaltyMax?: number;
+  failureRateMinSamples?: number;
+  latencyPenaltyMax?: number;
+  latencyPenaltyFullMs?: number;
+  latencyNeutralPenalty?: number;
+}
+
 /** 健康状态基分（unhealthy 在准入阶段已被剔除，此处兜底 0 分） */
 export const HEALTH_BASE_SCORE: Record<HealthStatus, number> = {
   healthy: 100,
@@ -51,9 +65,12 @@ export function failureRate(facts: Pick<HealthFacts, 'windowFailures' | 'windowS
 }
 
 /** 延迟罚分：线性折算并有上限；无样本 → 中性分 */
-export function latencyPenalty(latencyMs: number | null): number {
-  if (latencyMs == null || !Number.isFinite(latencyMs) || latencyMs < 0) return LATENCY_NEUTRAL_PENALTY;
-  return Math.min(LATENCY_PENALTY_MAX, (latencyMs / LATENCY_PENALTY_FULL_MS) * LATENCY_PENALTY_MAX);
+export function latencyPenalty(latencyMs: number | null, scoring: HealthScoring = {}): number {
+  const max = scoring.latencyPenaltyMax ?? LATENCY_PENALTY_MAX;
+  const fullMs = scoring.latencyPenaltyFullMs ?? LATENCY_PENALTY_FULL_MS;
+  const neutral = scoring.latencyNeutralPenalty ?? (scoring.latencyPenaltyMax != null ? max / 2 : LATENCY_NEUTRAL_PENALTY);
+  if (latencyMs == null || !Number.isFinite(latencyMs) || latencyMs < 0) return neutral;
+  return Math.min(max, (latencyMs / fullMs) * max);
 }
 
 /** 窗口观测总数（失败 + 成功；脏事实按 0 计） */
@@ -61,13 +78,15 @@ export function sampleSize(facts: Pick<HealthFacts, 'windowFailures' | 'windowSu
   return Math.max(0, facts.windowFailures) + Math.max(0, facts.windowSuccesses);
 }
 
-/** 健康分（0~100，保留 4 位小数避免浮点噪声影响确定性排序） */
-export function healthScore(facts: HealthFacts): number {
-  const base = HEALTH_BASE_SCORE[facts.healthStatus as HealthStatus] ?? HEALTH_BASE_SCORE.untested;
-  const failurePenalty = sampleSize(facts) >= FAILURE_RATE_MIN_SAMPLES
-    ? failureRate(facts) * FAILURE_PENALTY_MAX
+/** 健康分（0~100，保留 4 位小数避免浮点噪声影响确定性排序）；`scoring` 缺省 = 编译期常量口径 */
+export function healthScore(facts: HealthFacts, scoring: HealthScoring = {}): number {
+  const base = scoring.baseScores?.[facts.healthStatus as HealthStatus] ?? HEALTH_BASE_SCORE[facts.healthStatus as HealthStatus] ?? HEALTH_BASE_SCORE.untested;
+  const minSamples = scoring.failureRateMinSamples ?? FAILURE_RATE_MIN_SAMPLES;
+  const penaltyMax = scoring.failurePenaltyMax ?? FAILURE_PENALTY_MAX;
+  const failurePenalty = sampleSize(facts) >= minSamples
+    ? failureRate(facts) * penaltyMax
     : 0; // 证据不足（<3 次观测）→ 不因单次历史失败改变排序
-  const score = base - failurePenalty - latencyPenalty(facts.latencyMs);
+  const score = base - failurePenalty - latencyPenalty(facts.latencyMs, scoring);
   return Math.round(Math.max(0, Math.min(100, score)) * 1e4) / 1e4;
 }
 

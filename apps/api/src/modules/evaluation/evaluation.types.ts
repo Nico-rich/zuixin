@@ -1,5 +1,7 @@
 /** M9-P1 评测共享类型（纯数据；无 DI） */
 
+import type { ToolDefinitionWire } from '../../providers/llm/llm.types';
+
 /** EvaluationRun.configSnapshot 的形状（版本化：schema 字段演进时旧 run 仍可解释） */
 export interface EvaluationConfigSnapshot {
   schema: 1;
@@ -16,7 +18,20 @@ export interface EvaluationConfigSnapshot {
   temperature: number;
   maxTokens: number | null;
   systemPrompt: string;
+  /** AgentVersion 声明的工具清单（**身份事实**；执行面用它做子集裁决，绝不等于"下发给模型的工具"） */
   tools: string[];
+  // ===== M12-P4：评测工具能力（可选；缺省 = 不下发任何工具 = M9 行为逐字节保持）=====
+  /**
+   * 本次评测**实际下发给模型**的工具白名单（run 创建时声明；恒为 `tools` 的子集）。
+   * 缺省 `[]`：既不声明工具，也不诱导模型发出会被丢弃的调用（M9 原语义）。
+   */
+  evaluationTools?: string[];
+  /**
+   * 冻结的工具定义（创建时从 ToolRegistry 解析并锁定；执行期只读）。
+   * runner **只下发定义、绝不执行工具**——评测零副作用（发布/外发/审批一律不触发），
+   * 工具调用只作为事实记录（`EvaluationCaseRun.toolCalls`，output 恒为 null），供 rule/llm-judge 评测器判定。
+   */
+  toolDefinitions?: ToolDefinitionWire[];
   // ===== 锁定的评测绑定与数据版本 =====
   evaluatorIds: string[];
   datasetId: string;

@@ -24,10 +24,12 @@ import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { CreativeLoopAccessService, LoopScope } from './creative-loop-access.service';
 import { HypothesisStore, InsightDoc, InsightStore, StoredDoc, VERDICT_PRECEDENT_TAKE } from './creative-loop-store';
 import {
-  ComparisonEntry, RatingFacts, assertFactsUnchanged, comparePeriods, derivePerfMetrics,
+<<<<<<< HEAD
+  ComparisonEntry, InsightThresholds, RatingFacts, assertFactsUnchanged, comparePeriods, derivePerfMetrics,
   excludeAgentPerformance, factsHashOf, sumPerfFacts, summarizeRatings,
 } from './insight-rules';
 import { PerformanceProvenanceService } from './performance-provenance.service';
+import { readPolicyThresholds } from '../system-settings/policy-thresholds';
 
 /** 洞察窗口默认跨度（天） */
 export const DEFAULT_INSIGHT_DAYS = 30;
@@ -108,11 +110,14 @@ export class InsightService {
     const previousFacts = sumPerfFacts(previous.rows);
     const currentDerived = derivePerfMetrics(currentFacts);
     const previousDerived = derivePerfMetrics(previousFacts);
-    const ratings: RatingFacts = summarizeRatings(feedbackRows.map((f) => f.rating));
+    // M12-P4：洞察阈值 = SystemSetting 优先 / 编译期常量兜底（纯函数只接收显式阈值——无隐式全局态）
+    const thresholds: InsightThresholds = (await readPolicyThresholds(this.prisma)).insight;
+    const ratings: RatingFacts = summarizeRatings(feedbackRows.map((f) => f.rating), thresholds);
     const comparison: ComparisonEntry[] = comparePeriods(
       currentDerived as unknown as Record<string, number>,
       previousDerived as unknown as Record<string, number>,
       ['ctr', 'cvr', 'roas', 'cpc'],
+      thresholds.comparisonPct,
     );
     const evaluation = input.includeEvaluation === false
       ? { runs: [], aggregate: null }

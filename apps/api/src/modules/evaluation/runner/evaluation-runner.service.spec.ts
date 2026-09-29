@@ -41,6 +41,10 @@ function harness(opts: {
   caseClaim?: boolean;
   usageRejects?: boolean;
   onStream?: (userContent: string, index: number) => void;
+  /** M12-P4：快照附加字段（如 evaluationTools/toolDefinitions——冻结的工具声明） */
+  snapshotExtra?: Record<string, unknown>;
+  /** M12-P4：目标模型声明的能力（能力闸门用） */
+  capabilities?: Record<string, unknown>;
 } = {}): Harness {
   const caseRuns = opts.caseRuns ?? [
     { id: 'cr1', caseId: 'c1', input: '问题一' },
@@ -67,7 +71,7 @@ function harness(opts: {
         if (!args?.include) return { status: state.runStatus };
         return {
           id: 'run1', organizationId: 'org1', userId: 'u1', datasetId: 'ds1', datasetVersion: 1,
-          status: state.runStatus, configSnapshot: SNAPSHOT, caseRuns,
+          status: state.runStatus, configSnapshot: { ...SNAPSHOT, ...opts.snapshotExtra }, caseRuns,
         };
       }),
       updateMany: vi.fn(async (args: { where: { status?: string }; data: Record<string, unknown> }) => {
@@ -138,7 +142,7 @@ function harness(opts: {
   };
   const resolved = {
     providerId: 'p1', providerName: 'mock', modelId: 'model-1', apiModelId: 'mock-echo',
-    adapter, timeoutMs: 1000, capabilities: {},
+    adapter, timeoutMs: 1000, capabilities: { ...(opts.capabilities ?? {}) },
   };
   const runner = new EvaluationRunnerService(
     prisma as never,
@@ -339,6 +343,61 @@ describe('EvaluationRunnerService 评测器（含 llm_judge）', () => {
     expect(h.state.upserts[0]).toMatchObject({ passed: true, score: 1 });
     const caseRun = h.state.caseUpdates.filter((u) => u.status === 'completed')[0];
     expect(caseRun.toolCalls).toEqual([{ name: 'search', arguments: '{"q":"x"}', output: null }]);
+  });
+});
+
+/**
+ * M12-P4 评测工具声明（快照 → stream；**只声明不执行**）。
+ * 缺省行为 = M9（不传 tools）；能力不支持时**显式失败**（绝不静默不下发——那等于评测结论失真）。
+ */
+describe('EvaluationRunnerService M12-P4 工具声明（只声明不执行）', () => {
+  const TOOL_DEFS = [{
+    type: 'function',
+    function: { name: 'search', description: '检索', parameters: { type: 'object', properties: { q: { type: 'string' } } } },
+  }];
+
+  it('快照含冻结的 toolDefinitions → 原样下传 stream（模型因此知道有哪些工具，tool_called 规则才可能成立）', async () => {
+    const h = harness({ snapshotExtra: { tools: ['search'], evaluationTools: ['search'], toolDefinitions: TOOL_DEFS } });
+    await h.runner.executeRun('run1');
+    expect(h.streamCalls).toHaveLength(2);
+    expect(h.streamCalls[0].tools).toEqual(TOOL_DEFS);
+    // 定义来自快照（**创建即锁定**）：执行期无任何"再解析/再补全"路径
+    expect(h.streamCalls[0]).toMatchObject({ model: 'mock-echo', temperature: 0.2 });
+  });
+
+  it('快照无 toolDefinitions（缺省/旧快照）→ 不下发工具（M9 行为逐字节保持）', async () => {
+    const h = harness();
+    await h.runner.executeRun('run1');
+    expect(h.streamCalls[0].tools).toBeUndefined();
+  });
+
+  it('模型声明 functionCalling=false 且快照带工具 → case 显式失败（绝不静默不下发后照跑），零 LLM 调用', async () => {
+    const h = harness({
+      snapshotExtra: { tools: ['search'], evaluationTools: ['search'], toolDefinitions: TOOL_DEFS },
+      capabilities: { functionCalling: false },
+    });
+    const outcome = await h.runner.executeRun('run1');
+    expect(outcome).toMatchObject({ claimed: true, failedCases: 2, results: 0 });
+    expect(h.streamCalls).toHaveLength(0); // 连一次上游调用都没发起
+    const failed = h.state.caseUpdates.filter((u) => u.status === 'failed');
+    expect(failed).toHaveLength(2);
+    expect(failed[0]).toMatchObject({ errorCode: 'NO_TOOL_CAPABILITY', promptTokens: 0, completionTokens: 0 });
+    expect(h.state.runStatus).toBe('failed');
+  });
+
+  it('能力未声明（capabilities 缺 functionCalling 键）→ 放行（不阻断：未知 ≠ 不支持）', async () => {
+    const h = harness({ snapshotExtra: { toolDefinitions: TOOL_DEFS } });
+    const outcome = await h.runner.executeRun('run1');
+    expect(outcome.status).toBe('completed');
+    expect(h.streamCalls[0].tools).toEqual(TOOL_DEFS);
+  });
+
+  it('结构性红线：runner 构造函数不含任何工具执行依赖（无 ToolRegistry/执行器 → 结构上不可能执行工具）', () => {
+    // 声明工具 ≠ 获得执行能力：工具执行只在 agent-run 面；评测面工具调用恒为事实（output: null）
+    expect(EvaluationRunnerService.length).toBe(4);
+    const deps = String(EvaluationRunnerService.toString());
+    expect(deps).not.toContain('ToolRegistry');
+    expect(deps).not.toContain('ToolExecutor');
   });
 });
 

@@ -1,8 +1,10 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { SystemSettingsService } from '../system-settings/system-settings.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
-import { CreateExperimentDto, CreateVariantDto } from './evaluation.dto';
+import { CreateExperimentDto, CreateVariantDto, PromoteExperimentDto } from './evaluation.dto';
 import { summarizeScores } from './score-aggregation';
+import { PromotionProposal, buildPromotionProposal, readPromotionTarget } from './experiments.promotion';
 
 /** 实验状态机（唯一权威迁移表；终态 archived 不可再迁出） */
 const TRANSITIONS: Record<string, string[]> = {
@@ -18,10 +20,18 @@ const TRANSITIONS: Record<string, string[]> = {
  * - variant.trafficPercent 之和 ≤ 100（服务端校验——流量切分是配置事实，绝不靠调用方自觉）；
  * - variant.metrics 是**由评测 run 聚合的对照事实**（只读派生；本服务读路径派生，绝不写入任何判定面）；
  * - 实验/变体绝不下发、绝不改变线上路由（M9-P3 Provider Routing 也不读本表——评测与流量选路严格分离）。
+ *
+ * M12-P4 受控晋级（本服务新增的唯一写通道）：
+ * - 实验结论（variantEvaluation 对照）→ **平台管理员人工确认**（`promote`）→ 写入 SystemSettings 受控键白名单；
+ * - 晋级**绝不写**本表任何行：`trafficPercent` / 变体 / 实验状态一律不动（谁都不自动切流——红线）；
+ * - 胜出判定是服务端规则（确定性排序），LLM 无权决定；确认时用 proposalHash 做 CAS（事实变了 → 400）。
  */
 @Injectable()
 export class ExperimentsService {
-  constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
+  constructor(
+    @Inject(PrismaService) private readonly prisma: PrismaService,
+    @Inject(SystemSettingsService) private readonly settings: SystemSettingsService,
+  ) {}
 
   async create(userId: string, organizationId: string, dto: CreateExperimentDto) {
     return this.prisma.experiment.create({
@@ -112,6 +122,9 @@ export class ExperimentsService {
       if (!version) throw new AppError(ErrorCode.NOT_FOUND, 'Agent 版本不存在');
     }
     const isBaseline = dto.isBaseline ?? existing.length === 0;
+    // M12-P4：晋级目标在**创建期**即按受控键白名单校验（无效目标绝不进快照——绝不"存着等以后再说"）
+    const promotion = readPromotionTarget(dto.configSnapshot);
+    if (promotion) this.settings.validatePatch(promotion.key, promotion.value);
     if (isBaseline && existing.some((v) => v.isBaseline)) {
       // 单一基线不变量：显式指定新基线时清除旧的（条件写在同一事务语义内：先清除再写入）
       await this.prisma.experimentVariant.updateMany({ where: { experimentId: id, isBaseline: true }, data: { isBaseline: false } });
@@ -128,6 +141,73 @@ export class ExperimentsService {
       },
     });
     return this.get(organizationId, id);
+  }
+
+  // ===== M12-P4 受控晋级 =====
+
+  /**
+   * 晋级结论（**只读**；绝不写任何行）：变体评测对照事实 → 确定性胜出判定 + 目标 + 结论指纹。
+   * 结论里的每个字段都可由同一份事实复算（审计可复现），权威性来自"确认时的 CAS 复核"。
+   */
+  async promotionProposal(organizationId: string, id: string): Promise<PromotionProposal> {
+    const experiment = await this.prisma.experiment.findFirst({ where: { id, organizationId } });
+    if (!experiment) throw new AppError(ErrorCode.NOT_FOUND, '实验不存在');
+    const variants = await this.prisma.experimentVariant.findMany({ where: { experimentId: id }, orderBy: { createdAt: 'asc' } });
+    const withFacts = await Promise.all(variants.map(async (v) => ({
+      id: v.id,
+      name: v.name,
+      isBaseline: v.isBaseline,
+      agentVersionId: v.agentVersionId,
+      configSnapshot: v.configSnapshot,
+      evaluation: await this.variantEvaluation(organizationId, v.agentVersionId),
+    })));
+    return buildPromotionProposal({ experimentId: id, variants: withFacts });
+  }
+
+  /**
+   * 晋级确认（**平台管理员**）：把实验结论写入受控策略键。
+   *
+   * 三重裁决，任一不过即拒（绝不部分生效）：
+   * 1. 平台管理员（DB 权威；组织 owner/admin 也不行——策略阈值是平台级事实）；
+   * 2. 结论状态 = candidate（无事实/基线保持/未声明目标 → 400，绝不臆造晋级）；
+   * 3. `proposalHash` CAS：确认时重算结论，指纹不一致（事实或目标已变）→ 400，请刷新后重新确认。
+   *
+   * 写库走 `SystemSettingsService.patch`（同一白名单 + 值校验 + 强制审计 action=experiment.promotion）。
+   * **本方法绝不触碰 experiment / experimentVariant 任何行**——`trafficPercent` 恒不变（流量分配不自动改变）。
+   */
+  async promote(userId: string, organizationId: string, id: string, dto: PromoteExperimentDto) {
+    await this.settings.assertPlatformAdmin(userId); // 红线：LLM/实验/普通成员无晋级写路径
+    const experiment = await this.requireExperiment(organizationId, id);
+    if (experiment.status !== 'completed') {
+      throw new AppError(ErrorCode.VALIDATION_ERROR, `仅已完成的实验可晋级（当前 ${experiment.status}）`);
+    }
+    const proposal = await this.promotionProposal(organizationId, id);
+    if (proposal.status !== 'candidate' || !proposal.target) {
+      throw new AppError(ErrorCode.VALIDATION_ERROR, `无可晋级的实验结论（${proposal.status}）：${proposal.reason}`);
+    }
+    if (dto.proposalHash !== proposal.proposalHash) {
+      throw new AppError(ErrorCode.VALIDATION_ERROR, '实验结论已变化（事实或目标与申请时不一致），请刷新结论后重新确认');
+    }
+    const target = proposal.target;
+    const view = await this.settings.patch(userId, target.key, target.value, {
+      action: 'experiment.promotion',
+      metadata: {
+        experimentId: id,
+        variantId: proposal.winner?.variantId ?? null,
+        proposalHash: proposal.proposalHash,
+        ...(dto.reason ? { reason: dto.reason } : {}),
+      },
+    });
+    return {
+      experimentId: id,
+      key: target.key,
+      value: view.value,
+      winner: proposal.winner,
+      proposalHash: proposal.proposalHash,
+      // 显式声明：晋级只写受控策略键；实验/变体/流量百分比一行未动
+      trafficUnchanged: true,
+      layering: { decision: 'server-rule', confirmation: 'platform-admin', write: 'system-settings-whitelist' },
+    };
   }
 
   private async requireExperiment(organizationId: string, id: string) {

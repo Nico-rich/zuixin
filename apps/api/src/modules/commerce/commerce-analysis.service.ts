@@ -4,6 +4,7 @@ import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { CommerceService, TimeRangeInput } from './commerce.service';
 import { ArtifactService } from '../artifacts/artifact.service';
 import { withToolCallLedger } from '../../core/tools/tool-call-ledger';
+import { readPolicyThresholds } from '../system-settings/policy-thresholds';
 
 export interface AnalysisToolInput {
   provider?: string;
@@ -28,8 +29,12 @@ export interface BriefToolInput {
 }
 
 const ANALYSIS_TYPES = new Set(['sales', 'traffic', 'conversion', 'ads', 'roas', 'revenue', 'inventory', 'composite']);
-/** 异常规则阈值（服务端规则，非 LLM）：较前一期变化超过阈值 → anomaly（含 base/compare 事实） */
-const ANOMALY_THRESHOLD_PCT = 10;
+/**
+ * 异常规则阈值（服务端规则，非 LLM）：较前一期变化超过阈值 → anomaly（含 base/compare 事实）。
+ * M12-P4：由编译期常量改为 **SystemSetting('policyThresholds').commerce.anomalyPct 优先、本常量兜底**
+ * （调用方仍可显式传参——纯函数的确定性不变；阈值永远来自服务端配置，绝不来自 LLM/请求体）。
+ */
+export const ANOMALY_THRESHOLD_PCT = 10;
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -54,6 +59,7 @@ export class CommerceAnalysisService {
   private detectAnomalies(
     current: { facts: Record<string, unknown>; derived: Record<string, unknown> },
     previous: { facts: Record<string, unknown>; derived: Record<string, unknown> },
+    thresholdPct: number = ANOMALY_THRESHOLD_PCT,
   ): Array<Record<string, unknown>> {
     const anomalies: Array<Record<string, unknown>> = [];
     const watch = ['revenue', 'netRevenue', 'orders', 'conversionRate', 'roas', 'ctr', 'visits'] as const;
@@ -64,11 +70,11 @@ export class CommerceAnalysisService {
       const prev = Number(valueOf(previous, metric));
       if (!Number.isFinite(cur) || !Number.isFinite(prev) || prev === 0) continue;
       const changePct = round2(((cur - prev) / prev) * 100);
-      if (changePct <= -ANOMALY_THRESHOLD_PCT) {
+      if (changePct <= -thresholdPct) {
         anomalies.push({
           metric, direction: 'decline', changePct,
           base: prev, compare: cur,
-          threshold: `较前一期下降 ≥ ${ANOMALY_THRESHOLD_PCT}%`,
+          threshold: `较前一期下降 ≥ ${thresholdPct}%`,
           rule: 'server-threshold', // 服务端规则，非 LLM 判定
         });
       }
@@ -87,7 +93,9 @@ export class CommerceAnalysisService {
       this.gather(userId, input.analysisType, base),
       this.gather(userId, input.analysisType, prev).catch(() => null), // 前一期无数据 → 无异常（不阻断）
     ]);
-    const anomalies = prevSummary ? this.detectAnomalies(summary, prevSummary) : [];
+    // M12-P4：异常阈值 = SystemSetting 优先 / 编译期常量兜底（服务端规则，绝不采信 LLM 或请求体阈值）
+    const { commerce } = await readPolicyThresholds(this.prisma);
+    const anomalies = prevSummary ? this.detectAnomalies(summary, prevSummary, commerce.anomalyPct) : [];
 
     // G11：分析事实写入走 ToolCall 幂等账本（崩溃重放复用首次结果，绝不产生第二份分析事实）
     return withToolCallLedger(this.prisma, ctx.toolCallId, async (tx) => {
