@@ -23,6 +23,12 @@ export function GlobalSidebar() {
   const { logoutAndRedirect } = useAuthActions();
   const email = me?.data.user.email;
   const displayName = me?.data.user.displayName;
+  // adminOnly 项：仅平台管理员可见入口（只控可见性；服务端 403 才是权威裁决）。
+  // me 未返回时隐藏（加载完成后出现）——不得据导航项数量做断言。
+  const isAdmin = me?.data.user.role === 'admin';
+  const sections = NAV_SECTIONS
+    .map((section) => ({ ...section, items: section.items.filter((item) => !item.adminOnly || isAdmin) }))
+    .filter((section) => section.items.length > 0);
 
   return (
     <aside aria-label="全局导航栏" className="flex w-56 shrink-0 flex-col border-r border-zinc-800 bg-zinc-900/50">
@@ -32,7 +38,7 @@ export function GlobalSidebar() {
       </div>
 
       <nav aria-label="全局导航" className="flex-1 space-y-4 overflow-y-auto px-2 py-2">
-        {NAV_SECTIONS.map((section) => (
+        {sections.map((section) => (
           <div key={section.id}>
             <p className="px-2 pb-1 text-[10px] font-medium uppercase tracking-wider text-zinc-600">{section.label}</p>
             <div className="space-y-0.5">

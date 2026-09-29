@@ -121,6 +121,8 @@ export function buildEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv 
     API_PORT: String(API_PORT),
     STORAGE_LOCAL_DIR: STORAGE_DIR,
     MOCK_DELAY_MS,
+    // M13+ 测试基建：进程启动幂等启用 mock 替身（用户在生产库的停用配置不影响本套件）
+    TEST_ENSURE_MOCK_PROVIDERS: '1',
     // 白名单 = 本套件的 web 源（默认 http://localhost:3000，与 DEFAULT_CORS_ORIGINS 一致）
     CORS_ORIGINS: `http://localhost:${WEB_PORT}`,
     NEXT_TELEMETRY_DISABLED: '1',

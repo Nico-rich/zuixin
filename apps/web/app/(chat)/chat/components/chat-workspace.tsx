@@ -45,6 +45,8 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
   const [runIds, setRunIds] = useState<Record<string, string>>({});
   const [streaming, setStreaming] = useState(false);
   const [fatalError, setFatalError] = useState('');
+  /** 错误码（SSE error 帧 / ApiError 均带）；PROVIDER_UNAVAILABLE 呈现「去模型配置」引导而非裸文案 */
+  const [fatalErrorCode, setFatalErrorCode] = useState<string | null>(null);
   // M13-W10：消息编辑/删除（后端 M10-P3：仅本人 user 消息，服务端独立裁决）
   const [editing, setEditing] = useState<ChatMessage | null>(null);
   const [deleting, setDeleting] = useState<ChatMessage | null>(null);
@@ -124,6 +126,7 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
   const send = useCallback(async (text: string, attachmentIds: string[]) => {
     if (streaming || !text.trim()) return;
     setFatalError('');
+    setFatalErrorCode(null);
     setMessages((prev) => [...prev, { id: `local-${Date.now()}`, role: 'user', content: text, status: 'completed' }]);
     setStreaming(true); setThinking('正在分析需求…');
     const ac = new AbortController();
@@ -228,6 +231,7 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
           case 'error': {
             const d = data as ChatStreamEventMap['error'];
             setFatalError(d.message);
+            setFatalErrorCode(d.code);
             if (assistantIdRef.current) {
               setMessages((prev) => prev.map((m) => (m.id === assistantIdRef.current ? { ...m, status: 'failed', errorCode: d.code } : m)));
             }
@@ -241,6 +245,7 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
         setMessages((prev) => prev.map((m) => (m.status === 'streaming' ? { ...m, status: 'cancelled' } : m)));
       } else {
         setFatalError(err instanceof ApiError ? err.message : '网络错误，请重试');
+        setFatalErrorCode(err instanceof ApiError ? err.code : null);
         setMessages((prev) => prev.map((m) => (m.status === 'streaming' ? { ...m, status: 'failed' } : m)));
       }
     } finally {
@@ -353,7 +358,15 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
               </div>
             )}
             {thinking && <p className="text-xs text-zinc-500">💭 {thinking}</p>}
-            {fatalError && <p className="text-sm text-red-400">⚠ {fatalError}</p>}
+            {/* PROVIDER_UNAVAILABLE = 尚无可用模型（未配置/已停用）：引导去模型配置页。
+                刻意不用 p.text-red-400（那是既有 e2e 的"页面错误"口径，此处是**可恢复的配置态**） */}
+            {fatalError && fatalErrorCode === 'PROVIDER_UNAVAILABLE' && (
+              <div data-testid="provider-unavailable-hint" className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-700/50 bg-amber-950/40 px-3 py-2 text-sm text-amber-400">
+                <span>⚠ 当前没有可用的模型服务（未配置或已全部停用）。</span>
+                <a href="/settings/models" className="underline underline-offset-2 hover:text-amber-300">前往模型配置 →</a>
+              </div>
+            )}
+            {fatalError && fatalErrorCode !== 'PROVIDER_UNAVAILABLE' && <p className="text-sm text-red-400">⚠ {fatalError}</p>}
           </div>
         </div>
         <div className="border-t border-zinc-800 p-4">

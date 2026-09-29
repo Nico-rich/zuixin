@@ -83,6 +83,11 @@ export class LLMManagerService implements OnModuleInit {
 
   getProvider(providerId: string): LLMProvider | undefined { return this.providers.get(providerId); }
 
+  /** 只读状态访问器（模型配置页/管理面）：loaded = 内存 adapter 已建；degradedReason = 加载失败归因（缺失即未加载的其它情形） */
+  providerStatus(providerId: string): { loaded: boolean; degradedReason: string | null } {
+    return { loaded: this.providers.has(providerId), degradedReason: this.degraded.reasonOf(providerId) ?? null };
+  }
+
   /** degraded 原因归因（配置校验失败时把真实原因带给调用方；缺失则说明是未加载的其它情形） */
   private notLoadedMessage(name: string, providerId: string): string {
     const reason = this.degraded.reasonOf(providerId);

@@ -6,7 +6,7 @@ export default defineConfig({
     environment: 'node',
     globals: false,
     include: ['test/**/*.e2e-spec.ts', 'src/**/*.spec.ts'],
-    setupFiles: ['./src/env.ts'],
+    setupFiles: ['./src/env.ts', './test/ensure-mock-providers.ts'], // 顺序敏感：env.ts 先载 .env，测试基建标记后写
     testTimeout: 20000,
     // M6-P5 起串行执行套件：e2e 共享真实 PostgreSQL/Redis/BullMQ（并行时不同套件的 Worker 会互抢
     // 队列 job、时序断言失去确定性）。单测不受影响。

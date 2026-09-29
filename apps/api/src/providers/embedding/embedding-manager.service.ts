@@ -57,6 +57,11 @@ export class EmbeddingManagerService implements OnModuleInit {
     await this.degraded.report();
   }
 
+  /** 只读状态访问器（模型配置页/管理面）：loaded = 内存 adapter 已建；degradedReason = 加载失败归因（缺失即未加载的其它情形） */
+  providerStatus(providerId: string): { loaded: boolean; degradedReason: string | null } {
+    return { loaded: this.providers.has(providerId), degradedReason: this.degraded.reasonOf(providerId) ?? null };
+  }
+
   /**
    * 默认 embedding 模型解析（M9-P3：与 LLM/媒体同一条 RoutingService 管道，capability=embedding）：
    * 组织策略/健康/延迟/成本/熔断事实排序；routingPolicy.defaults.embedding 仅作**偏好排序**（不做硬过滤）。

@@ -55,6 +55,11 @@ export class ImageManagerService implements OnModuleInit {
     await this.degraded.report();
   }
 
+  /** 只读状态访问器（模型配置页/管理面）：loaded = 内存 adapter 已建；degradedReason = 加载失败归因（缺失即未加载的其它情形） */
+  providerStatus(providerId: string): { loaded: boolean; degradedReason: string | null } {
+    return { loaded: this.providers.has(providerId), degradedReason: this.degraded.reasonOf(providerId) ?? null };
+  }
+
   async resolve(modelId: string): Promise<ResolvedImage> {
     const model = await this.prisma.model.findUnique({ where: { id: modelId }, include: { provider: true } });
     if (!model || !model.enabled || !model.provider.enabled) throw new Error(`生图模型不可用: ${modelId}`);

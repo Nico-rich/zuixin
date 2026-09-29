@@ -15,6 +15,7 @@ import * as feedback from '@/lib/services/feedback';
 import * as extensions from '@/lib/services/extensions';
 import * as usage from '@/lib/services/usage';
 import * as settings from '@/lib/services/settings';
+import * as providers from '@/lib/services/providers';
 
 /**
  * service 层契约（M13-F1）——**这是后续页面 agents 的接口事实源**。
@@ -302,13 +303,25 @@ describe('service 契约：usage / settings', () => {
     await expectRequest({ name: 'getRunUsage', call: () => usage.getRunUsage('r1'), method: 'GET', url: '/api/v1/usage/agent-runs/r1' });
   });
 
-  it('settings 目前只有会话/设备面（后端无 settings 控制器，前端不伪造）', async () => {
+  it('settings 会话/设备面 + 受控设置面（routingPolicy 只经模型配置页有意开放）', async () => {
     const cases: Case[] = [
       { name: 'listSessions', call: () => settings.listSessions(), method: 'GET', url: '/api/v1/auth/sessions' },
       { name: 'revokeSession', call: () => settings.revokeSession('s1'), method: 'DELETE', url: '/api/v1/auth/sessions/s1' },
       { name: 'revokeDeviceSessions', call: () => settings.revokeDeviceSessions('d 1'), method: 'DELETE', url: '/api/v1/auth/sessions/device/d%201' },
       { name: 'logoutAll', call: () => settings.logoutAll(), method: 'POST', url: '/api/v1/auth/logout-all' },
       { name: 'rotateSession', call: () => settings.rotateSession(), method: 'POST', url: '/api/v1/auth/rotate' },
+      { name: 'getSystemSetting', call: () => settings.getSystemSetting('routingPolicy'), method: 'GET', url: '/api/v1/system-settings/routingPolicy' },
+      { name: 'patchSystemSetting', call: () => settings.patchSystemSetting('routingPolicy', { defaults: { llm: 'm1' } }), method: 'PATCH', url: '/api/v1/system-settings/routingPolicy', body: { defaults: { llm: 'm1' } } },
+    ];
+    for (const c of cases) await expectRequest(c);
+  });
+
+  it('providers（M13+ 模型配置页）：list + PATCH（apiKey 只写进请求体，服务端绝无回显）', async () => {
+    const cases: Case[] = [
+      { name: 'listProviders', call: () => providers.listProviders(), method: 'GET', url: '/api/v1/providers' },
+      { name: 'updateProvider enabled', call: () => providers.updateProvider('seed-llm-mock', { enabled: false }), method: 'PATCH', url: '/api/v1/providers/seed-llm-mock', body: { enabled: false } },
+      { name: 'updateProvider key+priority', call: () => providers.updateProvider('seed-llm-OpenAI', { apiKey: 'sk-x', priority: 5 }), method: 'PATCH', url: '/api/v1/providers/seed-llm-OpenAI', body: { apiKey: 'sk-x', priority: 5 } },
+      { name: 'updateProvider 路径编码', call: () => providers.updateProvider('p id/1', { enabled: true }), method: 'PATCH', url: '/api/v1/providers/p%20id%2F1', body: { enabled: true } },
     ];
     for (const c of cases) await expectRequest(c);
   });
@@ -333,5 +346,7 @@ describe('service 契约：queryKey 工厂（页面失效缓存必须复用同�
     expect(extensions.extensionKeys.catalog('o1')).toEqual(['extensions-catalog', 'o1']);
     expect(usage.usageKeys.run('r1')).toEqual(['usage-run', 'r1']);
     expect(settings.settingsKeys.sessions).toEqual(['auth-sessions']);
+    expect(settings.systemSettingKeys.detail('routingPolicy')).toEqual(['system-setting', 'routingPolicy']);
+    expect(providers.providerKeys.list).toEqual(['providers']);
   });
 });

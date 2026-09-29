@@ -3,7 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { PolicyThresholds, deepMerge } from './policy-thresholds';
-import { SYSTEM_SETTING_KEYS, SystemSettingKeySpec, findSystemSettingKey } from './system-settings.keys';
+import { SYSTEM_SETTING_KEYS, SystemSettingKeySpec, SettingValidationDeps, findSystemSettingKey } from './system-settings.keys';
 import { ZodError } from 'zod';
 
 export interface SystemSettingView {
@@ -126,7 +126,7 @@ export class SystemSettingsService {
       throw new AppError(ErrorCode.VALIDATION_ERROR, `${key} 合并后值非法：${formatIssues(merged.error)}`);
     }
     const stored = merged.data as Record<string, unknown>;
-    spec.validateEffective?.(stored); // 严格生效值校验（跨字段一致性）
+    await spec.validateEffective?.(stored, this.validationDeps()); // 严格生效值校验（跨字段一致性；可查库）
 
     await this.prisma.systemSetting.upsert({
       where: { key },
@@ -163,6 +163,14 @@ export class SystemSettingsService {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
     const parsed = spec.readSchema.safeParse(raw);
     return parsed.success ? (parsed.data as Record<string, unknown>) : {};
+  }
+
+  /** 生效值校验的注入依赖（M13+：routingPolicy.defaults 校验需要 Model 表读面；单测可替身） */
+  private validationDeps(): SettingValidationDeps {
+    return {
+      findModels: (ids) =>
+        this.prisma.model.findMany({ where: { id: { in: ids } }, select: { id: true, type: true, enabled: true } }),
+    };
   }
 
   private view(spec: SystemSettingKeySpec, row: { key: string; value: unknown; updatedAt: Date } | null): SystemSettingView {

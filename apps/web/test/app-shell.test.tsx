@@ -13,7 +13,7 @@ vi.mock('next/navigation', () => ({
   usePathname: () => currentPath,
 }));
 
-const ME = { data: { user: { id: 'u1', email: 'admin@example.com', displayName: '管理员', role: 'owner' } } };
+const ME = { data: { user: { id: 'u1', email: 'admin@example.com', displayName: '管理员', role: 'admin' } } };
 
 function mockApi(me: unknown = ME, meStatus = 200) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
@@ -33,6 +33,7 @@ describe('AppShell 全局导航', () => {
     renderWithQuery(<AppShell><p>页面内容</p></AppShell>);
 
     const nav = await screen.findByRole('navigation', { name: '全局导航' });
+    await within(nav).findByRole('link', { name: '模型配置' }); // adminOnly 项在 me 解析后出现
     for (const item of allNavItems()) {
       const link = within(nav).getByRole('link', { name: item.label });
       expect(link, `${item.label} 应指向 ${item.href}`).toHaveAttribute('href', item.href);
@@ -42,13 +43,30 @@ describe('AppShell 全局导航', () => {
 
   it('导航分组与顺序稳定（工作区 → 能力 → 运营 → 系统）', () => {
     expect(NAV_SECTIONS.map((s) => s.id)).toEqual(['workspace', 'capabilities', 'operations', 'system']);
-    // 产品规格要求的左栏顺序（对话/工作流/评测/扩展市场/…/设置）
+    // 产品规格要求的左栏顺序（对话/工作流/评测/扩展市场/…/设置/模型配置）
     expect(allNavItems().map((i) => i.label)).toEqual([
       '首页', '对话', '工作流', '审批', '评测', '扩展市场',
       'Agents', 'Agent 运行', '知识库', '记忆', '创意工作台', '制品',
       '连接', '分析', '电商', '反馈', '用量', '账单', '组织团队',
-      '扩展管理', '设置',
+      '扩展管理', '设置', '模型配置',
     ]);
+  });
+
+  it('adminOnly 入口：平台管理员可见；非管理员（含组织 owner）不可见（权限裁决永远在服务端）', async () => {
+    mockApi();
+    const first = renderWithQuery(<AppShell><p>内容</p></AppShell>);
+    const nav = await screen.findByRole('navigation', { name: '全局导航' });
+    expect(await within(nav).findByRole('link', { name: '模型配置' })).toHaveAttribute('href', '/settings/models');
+    first.unmount(); // 避免两个外壳共存导致查询命中旧渲染
+
+    const nonAdmin = { data: { user: { id: 'u2', email: 'owner@example.com', displayName: 'Owner', role: 'owner' } } };
+    mockApi(nonAdmin);
+    renderWithQuery(<AppShell><p>内容</p></AppShell>);
+    const nav2 = await screen.findByRole('navigation', { name: '全局导航' });
+    await within(nav2).findByRole('link', { name: '设置' }); // me 已解析（owner）
+    expect(within(nav2).queryByRole('link', { name: '模型配置' })).toBeNull();
+    // 其余导航不受影响
+    expect(within(nav2).getByRole('link', { name: '设置' })).toHaveAttribute('href', '/settings');
   });
 
   it('激活态：分段边界前缀匹配（/chat/abc 命中对话；/agent-runs 不命中 /agents；/workflows 命中）', async () => {

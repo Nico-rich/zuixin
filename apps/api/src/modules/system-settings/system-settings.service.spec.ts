@@ -19,6 +19,7 @@ function makeHarness(over: {
   role?: string;
   rows?: StoredRow[];
   auditFails?: boolean;
+  models?: Array<{ id: string; type: string; enabled: boolean }>;
 } = {}) {
   const rows: StoredRow[] = over.rows ?? [];
   const prisma = {
@@ -32,6 +33,7 @@ function makeHarness(over: {
         return row;
       }),
     },
+    model: { findMany: vi.fn(async (_args?: unknown): Promise<Array<{ id: string; type: string; enabled: boolean }>> => over.models ?? []) },
   };
   const audit = {
     write: vi.fn(async (_args: AuditArgs): Promise<void> => {
@@ -245,5 +247,72 @@ describe('SystemSettingsService.patch（深合并 + 审计）', () => {
     const h = makeHarness({ rows: [{ key: 'policyThresholds', value: { commerce: { anomalyPct: 20 } }, updatedAt: new Date(0) }] });
     const view = await h.service.get('policyThresholds');
     expect(view.value).toMatchObject({ commerce: { anomalyPct: 20 }, feedback: DEFAULT_POLICY_THRESHOLDS.feedback });
+  });
+});
+
+describe('SystemSettingsService routingPolicy.defaults 生效值校验（M13+ 模型配置页）', () => {
+  it('合法：默认模型存在且类型匹配且已启用 → 落库', async () => {
+    const h = makeHarness({ models: [{ id: 'seed-model-mock-echo', type: 'llm', enabled: true }] });
+    await h.service.patch('u1', 'routingPolicy', { defaults: { llm: 'seed-model-mock-echo' } });
+    expect(h.prisma.model.findMany).toHaveBeenCalledWith({
+      where: { id: { in: ['seed-model-mock-echo'] } }, select: { id: true, type: true, enabled: true },
+    });
+    expect(h.prisma.systemSetting.upsert.mock.calls[0][0].create.value)
+      .toEqual({ defaults: { llm: 'seed-model-mock-echo' } });
+  });
+
+  it('默认模型不存在 → 400 且绝不落库', async () => {
+    const h = makeHarness();
+    await expect(h.service.patch('u1', 'routingPolicy', { defaults: { llm: 'no-such-model' } }))
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR', message: expect.stringContaining('默认模型不存在') });
+    expect(h.prisma.systemSetting.upsert).not.toHaveBeenCalled();
+    expect(h.audit.write).not.toHaveBeenCalled();
+  });
+
+  it('默认模型已停用 → 400（停用模型在路由候选里恒为 no_model，写进去等于静默无效）', async () => {
+    const h = makeHarness({ models: [{ id: 'm-off', type: 'llm', enabled: false }] });
+    await expect(h.service.patch('u1', 'routingPolicy', { defaults: { llm: 'm-off' } }))
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR', message: expect.stringContaining('已停用') });
+    expect(h.prisma.systemSetting.upsert).not.toHaveBeenCalled();
+  });
+
+  it('类型不匹配 → 400（defaults.image 必须是 image 模型）', async () => {
+    const h = makeHarness({ models: [{ id: 'm-llm', type: 'llm', enabled: true }] });
+    await expect(h.service.patch('u1', 'routingPolicy', { defaults: { image: 'm-llm' } }))
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR', message: expect.stringContaining('必须是 image 类型模型') });
+    expect(h.prisma.systemSetting.upsert).not.toHaveBeenCalled();
+  });
+
+  it('未知能力键（strict 写面）→ 400；空 defaults 补丁 → 400', async () => {
+    const h = makeHarness();
+    await expect(h.service.patch('u1', 'routingPolicy', { defaults: { vision: null } }))
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    await expect(h.service.patch('u1', 'routingPolicy', { defaults: {} }))
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR', message: expect.stringContaining('补丁不能为空') });
+    expect(h.prisma.systemSetting.upsert).not.toHaveBeenCalled();
+  });
+
+  it('深合并保留存量非能力键（seed 的 vision 绝不被 PATCH 静默剔除）', async () => {
+    const h = makeHarness({
+      rows: [{ key: 'routingPolicy', value: { defaults: { llm: 'seed-model-mock-echo', vision: 'v-model' } }, updatedAt: new Date(0) }],
+      models: [{ id: 'm-real', type: 'llm', enabled: true }],
+    });
+    await h.service.patch('u1', 'routingPolicy', { defaults: { llm: 'm-real' } });
+    const stored = h.prisma.systemSetting.upsert.mock.calls[0][0].create.value as { defaults: Record<string, string | null> };
+    expect(stored.defaults).toEqual({ llm: 'm-real', vision: 'v-model' });
+  });
+
+  it('无 defaults 的既有写入路径零额外查询（confidenceThreshold/实验晋级不受影响）', async () => {
+    const h = makeHarness();
+    await h.service.patch('u1', 'routingPolicy', { confidenceThreshold: 0.5 });
+    await h.service.patch('u1', 'policyThresholds', { commerce: { anomalyPct: 12 } });
+    expect(h.prisma.model.findMany).not.toHaveBeenCalled();
+  });
+
+  it('null 显式清除能力默认值：不清除场景不查库、清除场景查库', async () => {
+    const h = makeHarness();
+    await h.service.patch('u1', 'routingPolicy', { defaults: { llm: null } });
+    expect(h.prisma.model.findMany).not.toHaveBeenCalled(); // 无待校验 id
+    expect(h.prisma.systemSetting.upsert.mock.calls[0][0].create.value).toEqual({ defaults: { llm: null } });
   });
 });

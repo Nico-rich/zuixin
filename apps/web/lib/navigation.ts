@@ -1,5 +1,5 @@
 import {
-  Activity, BarChart3, Blocks, Bot, Brain, CreditCard, FlaskConical, Gauge, LayoutDashboard,
+  Activity, BarChart3, Blocks, Bot, Brain, CreditCard, Cpu, FlaskConical, Gauge, LayoutDashboard,
   Library, MessagesSquare, Package, Plug, Puzzle, Settings, ShieldCheck, ShoppingCart, Sparkles, Store, Users, Workflow,
   type LucideIcon,
 } from 'lucide-react';
@@ -23,6 +23,11 @@ export interface NavItem {
   exact?: boolean;
   /** 悬浮提示（如页面尚未落地时的说明）；不影响激活与渲染结构 */
   hint?: string;
+  /**
+   * true = 仅平台管理员可见入口（M13+ 模型配置页）。
+   * **只控入口可见性**——权限裁决永远在服务端（API 403 是权威），前端隐藏只是体验。
+   */
+  adminOnly?: boolean;
 }
 
 export interface NavSection {
@@ -76,6 +81,7 @@ export const NAV_SECTIONS: readonly NavSection[] = [
     items: [
       { href: '/extensions', label: '扩展管理', icon: Puzzle },
       { href: '/settings', label: '设置', icon: Settings },
+      { href: '/settings/models', label: '模型配置', icon: Cpu, adminOnly: true },
     ],
   },
 ];

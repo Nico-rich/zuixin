@@ -25,10 +25,16 @@ import {
   resolvePolicyThresholds,
   resolvePolicyThresholdsStrict,
 } from './policy-thresholds';
+import { AppError, ErrorCode } from '../../common/errors/app-error';
 
 const Ms = z.number().int().min(1).max(86_400_000);
 const NonNegInt = z.number().int().min(0).max(1_000_000);
 const PosInt = z.number().int().min(1).max(1_000_000);
+
+/** 生效值校验所需的注入依赖（由服务层提供；单测可替身） */
+export interface SettingValidationDeps {
+  findModels(ids: string[]): Promise<Array<{ id: string; type: string; enabled: boolean }>>;
+}
 
 export interface SystemSettingKeySpec {
   key: string;
@@ -40,8 +46,8 @@ export interface SystemSettingKeySpec {
   readSchema: z.ZodTypeAny;
   /** 读路径生效值解析（缺省 = 原样返回投影后的存储值；可在此叠加编译期兜底） */
   resolveEffective?: (stored: unknown) => unknown;
-  /** 写路径生效值校验（合并后严格校验：非法组合 → 抛 AppError(VALIDATION_ERROR)） */
-  validateEffective?: (stored: unknown) => void;
+  /** 写路径生效值校验（合并后严格校验：非法组合 → 抛 AppError(VALIDATION_ERROR)；可异步查库） */
+  validateEffective?: (stored: unknown, deps: SettingValidationDeps) => void | Promise<void>;
   /** 显式拒绝面：命中即 400（附带精准原因，绝不靠"未知键"泛化报错） */
   blockedSubKeys?: { names: readonly string[]; reason: string };
 }
@@ -53,11 +59,29 @@ const RoutingPolicySchema = z.object({
   defaults: z.record(z.string().min(1).max(64), z.string().min(1).max(200).nullable()).optional(),
   agentMapping: z.record(z.string().min(1).max(64), z.string().min(1).max(200)).optional(),
 });
+
+/** 能力键 → Model.type（默认模型只接受与能力同类型的模型） */
+const CAPABILITY_MODEL_TYPES: Record<string, string> = { llm: 'llm', image: 'image', video: 'video', embedding: 'embedding' };
+const CapabilityDefaultModelId = z.string().min(1).max(200).nullable();
+/**
+ * M13+（模型配置页）：defaults 的**写面**收紧为四个能力键（strict：未知能力键 400；null = 显式清除）。
+ * 读面（RoutingPolicySchema.defaults）保持宽松 record——存量非能力键（如 seed 的 vision）
+ * 绝不能被任何一次 PATCH 静默剔除（读投影是深合并基线）。
+ */
+const RoutingDefaultsPatchSchema = z
+  .strictObject({
+    llm: CapabilityDefaultModelId.optional(),
+    image: CapabilityDefaultModelId.optional(),
+    video: CapabilityDefaultModelId.optional(),
+    embedding: CapabilityDefaultModelId.optional(),
+  })
+  .refine((o) => Object.keys(o).length > 0, { message: 'defaults 补丁不能为空' });
+
 const RoutingPolicyPatchSchema = z
   .strictObject({
     confidenceThreshold: z.number().min(0).max(1).optional(),
     routerModelId: z.string().min(1).max(200).nullable().optional(),
-    defaults: z.record(z.string().min(1).max(64), z.string().min(1).max(200).nullable()).optional(),
+    defaults: RoutingDefaultsPatchSchema.optional(),
     agentMapping: z.record(z.string().min(1).max(64), z.string().min(1).max(200)).optional(),
   });
 
@@ -108,6 +132,29 @@ export const SYSTEM_SETTING_KEYS: readonly SystemSettingKeySpec[] = [
     description: '路由策略（置信阈值 / 路由模型 / 各能力默认模型 / 意图→Agent 映射）——只影响排序与兜底，不做硬过滤',
     patchSchema: RoutingPolicyPatchSchema,
     readSchema: RoutingPolicySchema,
+    /**
+     * M13+（模型配置页）生效值校验：defaults 里的每个能力默认模型必须是**存在、已启用、类型匹配**的模型
+     * （一次 findMany，绝不循环查库；无能力键时零额外查询——既有 confidenceThreshold/实验晋级路径不受影响）。
+     * 不要求 provider.enabled：运营者可先配默认模型再开通厂商（defaults 只影响排序，已证不构成硬门禁）。
+     */
+    validateEffective: async (stored, deps) => {
+      const defaults = (stored as { defaults?: unknown }).defaults;
+      if (!defaults || typeof defaults !== 'object' || Array.isArray(defaults)) return;
+      const entries = Object.entries(defaults as Record<string, unknown>)
+        .filter(([cap]) => cap in CAPABILITY_MODEL_TYPES)
+        .filter(([, id]) => typeof id === 'string' && id.length > 0);
+      if (entries.length === 0) return;
+      const models = await deps.findModels(entries.map(([, id]) => id as string));
+      const byId = new Map(models.map((m) => [m.id, m]));
+      for (const [cap, id] of entries) {
+        const model = byId.get(id as string);
+        if (!model) throw new AppError(ErrorCode.VALIDATION_ERROR, `默认模型不存在: ${id}`);
+        if (model.type !== CAPABILITY_MODEL_TYPES[cap]) {
+          throw new AppError(ErrorCode.VALIDATION_ERROR, `defaults.${cap} 必须是 ${cap} 类型模型（收到 ${model.type}）`);
+        }
+        if (!model.enabled) throw new AppError(ErrorCode.VALIDATION_ERROR, `默认模型已停用: ${id}`);
+      }
+    },
   },
   {
     key: 'limits',
