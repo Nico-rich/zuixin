@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { RunTimeline } from '@/app/(chat)/chat/components/run-timeline';
 import type { RunTimeline as RunTimelineData, TimelineItem } from '@/app/(chat)/chat/components/types';
@@ -116,5 +116,71 @@ describe('RunTimeline 执行详情面板', () => {
     expand(); // 收起
     expand(); // 重新展开
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * M13-W10：usage 渲染
+ * 后端 RunUsageAggregate（usage.service.ts）此前被 web 整体丢弃（types.ts 声明了 RunTimelineUsage
+ * 却无人消费）→ 用户看不到 token/成本/媒体用量。这里锁定「如实呈现」的三条口径：
+ *  - 用量为 0 的维度照样显示（0 与「没有该维度」是两件事，不用空白冒充）；
+ *  - 小额成本按量级保留有效数字（0.000048 不得被抹成 $0.00）；
+ *  - failedCalls > 0 显式告警（失败调用已计入用量事实表）。
+ * ------------------------------------------------------------------ */
+
+const USAGE = {
+  runId: 'run-1', durationMs: 12_345, totalTokens: 1_801, inputTokens: 1_234, outputTokens: 567,
+  llmCost: 0.123456, imageCost: 0.05, videoCost: 0, totalCost: 0.173456,
+  llmRounds: 3, imageCount: 2, videoSeconds: 4, failedCalls: 1,
+  byKind: [{ kind: 'llm', count: 3, cost: 0.123456, tokens: 1_801 }],
+};
+
+describe('RunTimeline：usage（token/成本/媒体用量）如实呈现', () => {
+  const usagePanel = () => screen.getByTestId('run-usage');
+
+  it('usage 存在时渲染耗时/tokens/成本/媒体计数与逐 kind 明细', async () => {
+    mockTimeline(timeline({ usage: USAGE }));
+    render(<RunTimeline runId="run-1" />);
+    expand();
+    await screen.findByText('开始执行');
+    const panel = usagePanel();
+    expect(within(panel).getByText('12.3s')).toBeInTheDocument();
+    expect(within(panel).getByText('1,234 入 + 567 出 = 1,801')).toBeInTheDocument();
+    expect(within(panel).getByText('$0.1235 LLM + $0.0500 图片 + $0 视频 = $0.1735')).toBeInTheDocument();
+    expect(within(panel).getByText('2 张')).toBeInTheDocument();
+    expect(within(panel).getByText('4 秒')).toBeInTheDocument();
+    expect(within(panel).getByText('llm')).toBeInTheDocument();
+    expect(within(panel).getByText(/3 次 · 1,801 tokens · \$0\.1235/)).toBeInTheDocument();
+    // failedCalls > 0 → 告警配色（不静默）
+    expect(within(panel).getByText('失败调用').nextElementSibling).toHaveTextContent('1');
+    expect(within(panel).getByText('失败调用').nextElementSibling).toHaveClass('text-amber-300');
+  });
+
+  it('usage=null（旧 run 无用量事实）时不渲染用量面板', async () => {
+    mockTimeline(timeline({ usage: null }));
+    render(<RunTimeline runId="run-1" />);
+    expand();
+    await screen.findByText('开始执行');
+    expect(screen.queryByTestId('run-usage')).not.toBeInTheDocument();
+  });
+
+  it('零用量维度照样显示 0；小额成本保留有效数字、不做预算判定', async () => {
+    mockTimeline(timeline({
+      usage: {
+        ...USAGE, durationMs: 0, totalTokens: 0, inputTokens: 0, outputTokens: 0,
+        llmCost: 0, imageCost: 0, videoCost: 0.000048, totalCost: 0.000048,
+        llmRounds: 0, imageCount: 0, videoSeconds: 0, failedCalls: 0, byKind: [],
+      },
+    }));
+    render(<RunTimeline runId="run-1" />);
+    expand();
+    await screen.findByText('开始执行');
+    const panel = usagePanel();
+    expect(within(panel).getByText('0 入 + 0 出 = 0')).toBeInTheDocument();
+    expect(within(panel).getByText('0 张')).toBeInTheDocument();
+    expect(within(panel).getByText('0 秒')).toBeInTheDocument();
+    // 0.000048 若被抹成 $0.00 就等于伪造了「没有成本」
+    expect(within(panel).getByText('$0 LLM + $0 图片 + $0.000048 视频 = $0.000048')).toBeInTheDocument();
+    expect(within(panel).getByText('失败调用').nextElementSibling).toHaveClass('text-zinc-300');
   });
 });

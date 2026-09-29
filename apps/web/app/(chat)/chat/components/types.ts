@@ -13,6 +13,8 @@ export interface ChatMessage {
   status?: 'pending' | 'streaming' | 'completed' | 'failed' | 'cancelled';
   errorCode?: string | null;
   createdAt?: string;
+  /** M10-P3 PATCH /chat/messages/:id 写入（null/缺失 = 未编辑过）；渲染为「已编辑」标记 */
+  editedAt?: string | null;
   attachments?: AttachmentView[];
 }
 

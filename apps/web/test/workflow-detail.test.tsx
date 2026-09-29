@@ -4,6 +4,14 @@ import { describe, expect, it, vi } from 'vitest';
 import WorkflowDetailPage from '@/app/workflows/[id]/page';
 import { jsonResponse, renderWithQuery } from './helpers';
 
+/** 详情页删除成功后会 router.push('/workflows')（M13-W10）→ 必须 mock 掉 App Router */
+const pushMock = vi.fn();
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({ replace: vi.fn(), push: pushMock, back: vi.fn(), forward: vi.fn(), refresh: vi.fn(), prefetch: vi.fn() }),
+  useSearchParams: () => new URLSearchParams(),
+  usePathname: () => '/workflows/wf-1',
+}));
+
 /**
  * apps/web 当前没有独立的「审批 UI」（全仓 grep approval/approved/rejected 无命中，api 的
  * Human Approval 只有接口与事件）；与之最接近的“状态驱动操作按钮”在工作流详情页：
@@ -165,9 +173,14 @@ describe('工作流详情页：Webhook 凭据一次性展示', () => {
     expect(screen.getByText(/POST \/api\/v1\/hooks\/workflows\/tok-abc/)).toBeInTheDocument();
   });
 
-  it('无 secret（已展示过）时不渲染凭据区块', async () => {
+  it('无 secret（已展示过）时凭据区块仍在但不含明文（M13-W10：区块内多了「轮换密钥」入口）', async () => {
     mockWorkflowApi(detail({ status: 'published', triggerInfo: { webhook: { token: 'tok-abc', secret: null } } }));
     await renderPage();
+    // 密钥已不可读 → 一次性提示不出现，且如实说明「明文无法再次读出」
     expect(screen.queryByText(/secret 仅显示这一次/)).not.toBeInTheDocument();
+    expect(screen.getByText(/明文无法再次读出/)).toBeInTheDocument();
+    // 区块本身仍在：端点 + 轮换入口（无明文也必须有轮换路径，否则拿不到新密钥）
+    expect(screen.getByText(/POST \/api\/v1\/hooks\/workflows\/tok-abc/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '轮换密钥' })).toBeInTheDocument();
   });
 });
