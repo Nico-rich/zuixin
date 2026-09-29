@@ -2,6 +2,18 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
+import { addDays, dayRange, periodOf, round } from './analytics-primitives';
+import {
+  finalizeAgentFacts,
+  loadAgentPerformance,
+  normalizePerformanceWindowDays,
+  performanceWindow,
+  type AgentPerfFacts,
+  type AgentPerformanceStat,
+} from './agent-performance';
+
+// 叶子原语（日粒度工具/取整）抽到 analytics-primitives 后仍从本模块 re-export——既有导入路径不变
+export { addDays, dayRange, periodOf, round };
 
 /**
  * M8-P4 Analytics / BI（确定性聚合投影）：
@@ -18,6 +30,9 @@ import { AppError, ErrorCode } from '../../common/errors/app-error';
  * - **历史聚合由显式刷新维护**：POST /analytics/refresh（refreshAll，≤366 天）或后台/运维任务；
  *   读请求只保证「今天」的数字实时（当日聚合随读写变化重算），历史日期的聚合行按刷新时点冻结。
  * - 写路径只在 refresh*（显式入口）；刷新原语 refreshOrganization/refreshAll 语义不变（幂等）。
+ * - **M12-P2 agentId 维度**：kind=agent 聚合的 select 增加 run.agentId，metrics 增 `byAgent`
+ *   （逐 agent 的 runs/状态分布/时长合计+样本，读时派生成功率/失败率/均值），dimensions.agents 列出桶键；
+ *   纯投影——**不建汇总表**；按 agent 读面见 agentMetrics()（有界窗口，只读聚合行）。
  */
 
 export type AnalyticsKind = 'usage' | 'agent' | 'generation' | 'provider' | 'workflow';
@@ -39,24 +54,8 @@ export type AnalyticsRange = 'day' | 'week' | 'month';
 
 /** 跨零点 run 的归因回看窗（run 创建于前一日、其调用发生在当日的兜底；有界，绝不全表扫描） */
 const ATTRIBUTION_LOOKBACK_MS = 7 * 86_400_000;
-const DAY_MS = 86_400_000;
 
-// ===== 日粒度工具（统一 UTC 边界：period 与窗口同源，绝无本地时区漂移）=====
-
-export function periodOf(date: Date = new Date()): string {
-  return date.toISOString().slice(0, 10);
-}
-
-export function dayRange(period: string): { start: Date; end: Date } {
-  const start = new Date(`${period}T00:00:00.000Z`);
-  if (Number.isNaN(start.getTime())) throw new AppError(ErrorCode.VALIDATION_ERROR, `日期格式非法：${period}（期望 YYYY-MM-DD）`);
-  return { start, end: new Date(start.getTime() + DAY_MS) };
-}
-
-export function addDays(period: string, delta: number): string {
-  const { start } = dayRange(period);
-  return periodOf(new Date(start.getTime() + delta * DAY_MS));
-}
+// ===== 日粒度工具（实现见 analytics-primitives；本模块 re-export 保持既有导入路径）=====
 
 export function rangeOf(range: AnalyticsRange, today: Date = new Date()): { from: string; to: string; days: number } {
   const days = range === 'day' ? 1 : range === 'week' ? 7 : 30;
@@ -76,19 +75,23 @@ export function mergeMetrics(target: Record<string, unknown>, source: unknown): 
   return out;
 }
 
-/** 均值类指标绝不跨天求和：读路径按 totals/samples 重算（facts 仍是 totals 与 samples） */
+/** 均值类指标绝不跨天求和：读路径按 totals/samples 重算；byAgent 维度逐 agent 同样重算 */
 export function finalizeMetrics(kind: string, metrics: Record<string, unknown>): Record<string, unknown> {
   const out = { ...metrics };
   const samples = out.durationSamples;
   if (kind === 'agent' && typeof samples === 'number' && samples > 0 && typeof out.durationMsTotal === 'number') {
     out.avgDurationMs = round(out.durationMsTotal / samples);
   }
+  // M12-P2：byAgent 维度（逐 agent 事实）——跨天合并只求和，均值/终态派生一律在读时按 facts 重算
+  const byAgent = out.byAgent;
+  if (kind === 'agent' && byAgent && typeof byAgent === 'object' && !Array.isArray(byAgent)) {
+    const finalized: Record<string, unknown> = {};
+    for (const [agentId, facts] of Object.entries(byAgent as Record<string, unknown>)) {
+      finalized[agentId] = finalizeAgentFacts(facts);
+    }
+    out.byAgent = finalized;
+  }
   return out;
-}
-
-export function round(value: number, digits = 6): number {
-  const factor = 10 ** digits;
-  return Math.round(value * factor) / factor;
 }
 
 function num(value: unknown): number {
@@ -103,6 +106,7 @@ interface OrgAttribution {
 
 interface RunRow {
   id: string;
+  agentId: string;
   status: string;
   startedAt: Date;
   completedAt: Date | null;
@@ -141,11 +145,12 @@ export class AnalyticsService {
     return clauses;
   }
 
-  /** 窗口内归因到该组织的 AgentRun（含状态/时长；后续维度复用同一份归因结果） */
+  /** 窗口内归因到该组织的 AgentRun（含 agentId/状态/时长；后续维度复用同一份归因结果） */
   private async attributedRuns(org: OrgAttribution, start: Date, end: Date): Promise<RunRow[]> {
     return this.prisma.agentRun.findMany({
       where: { createdAt: { gte: start, lt: end }, OR: this.attributionClauses(org) },
-      select: { id: true, status: true, startedAt: true, completedAt: true },
+      // M12-P2：agentId 是「按 agent 聚合」的唯一归因键（= AgentRun.agentId，Agent 主键）
+      select: { id: true, agentId: true, status: true, startedAt: true, completedAt: true },
     });
   }
 
@@ -179,7 +184,7 @@ export class AnalyticsService {
 
     const [usage, agent, generation, provider, workflow] = await Promise.all([
       this.usageMetrics(organizationId, start, end),
-      Promise.resolve(this.agentMetrics(dayRuns)),
+      Promise.resolve(this.agentFacts(dayRuns)),
       this.generationMetrics(org, start, end, runIds),
       this.providerMetrics(org, start, end, runIds),
       this.workflowMetrics(org, start, end),
@@ -228,6 +233,48 @@ export class AnalyticsService {
    */
   private async refreshToday(organizationId: string): Promise<void> {
     await this.refreshOrganization(organizationId, periodOf(new Date()));
+  }
+
+  /**
+   * M12-P2：按 agent 的近期表现（runs/终态分布 + **成功率 / 失败率 / 平均时长**）。
+   *
+   * - **纯查询投影**：只读 AnalyticsAggregate(kind=agent) 行的 byAgent 维度（有界窗口 ≤90 天 + 行数上限），
+   *   绝不写聚合、绝不建汇总表、绝不触发刷新；读取失败向上抛（由调用方决定降级，见 agent-performance）；
+   * - 口径：成功率/失败率分母 = 终态 run（completed+failed+cancelled+timeout），在途 queued/running 不进分母；
+   *   平均时长按 durationMsTotal/durationSamples 重算（绝不跨天求平均的平均）；
+   * - 作用域：给 organizationId = 组织级（HTTP 读面口径，调用方需先过 requireMembership）；
+   *   **缺省 = 平台级（所有组织求和）**——只服务内部候选排序输入，绝不挂 HTTP 面（无租户归属解析即无越权面）；
+   * - 该数据只用于候选**顺序**（agent-registry / delegation），绝不下发模型选择权与权限语义。
+   */
+  async agentMetrics(options: { organizationId?: string; days?: number; now?: Date } = {}): Promise<{
+    scope: 'organization' | 'platform';
+    organizationId: string | null;
+    from: string;
+    to: string;
+    days: number;
+    agents: AgentPerformanceStat[];
+    meta: { source: 'analytics_aggregate'; kind: 'agent'; layering: Record<string, string> };
+  }> {
+    const days = normalizePerformanceWindowDays(options.days);
+    const { from, to } = performanceWindow(days, options.now ?? new Date());
+    const agents = await loadAgentPerformance(this.prisma, {
+      organizationId: options.organizationId,
+      days,
+      now: options.now,
+    });
+    return {
+      scope: options.organizationId ? 'organization' : 'platform',
+      organizationId: options.organizationId ?? null,
+      from,
+      to,
+      days,
+      agents,
+      meta: {
+        source: 'analytics_aggregate',
+        kind: 'agent',
+        layering: { facts: 'deterministic-projection', derived: 'service-computed', interpretation: 'none' },
+      },
+    };
   }
 
   /**
@@ -289,24 +336,51 @@ export class AnalyticsService {
     return { metrics, dimensions: null };
   }
 
-  /** kind=agent / source=agent_run：状态分布 + 时长合计/样本（avg 由读路径重算） */
-  private agentMetrics(runs: RunRow[]): Metrics {
+  /**
+   * kind=agent / source=agent_run：状态分布 + 时长合计/样本（avg 由读路径重算）
+   * + **byAgent 维度**（M12-P2：按 run.agentId 分桶的同一套事实——纯投影，绝不建汇总表）。
+   * 归属未知（历史行 agentId 缺失）时该 run 只进顶层合计，绝不伪造一个 agent 桶。
+   */
+  private agentFacts(runs: RunRow[]): Metrics {
     const metrics: Record<string, unknown> = {
       runs: runs.length, completed: 0, failed: 0, cancelled: 0, timeout: 0,
       queued: 0, running: 0, waiting: 0, durationMsTotal: 0, durationSamples: 0,
     };
+    const byAgent: Record<string, Record<string, number>> = {};
+    const bucket = (agentId: string): Record<string, number> => {
+      if (!byAgent[agentId]) {
+        byAgent[agentId] = {
+          runs: 0, completed: 0, failed: 0, cancelled: 0, timeout: 0,
+          queued: 0, running: 0, waiting: 0, durationMsTotal: 0, durationSamples: 0,
+        };
+      }
+      return byAgent[agentId];
+    };
     for (const run of runs) {
+      const perAgent = typeof run.agentId === 'string' && run.agentId ? bucket(run.agentId) : null;
       if (run.status in metrics && typeof metrics[run.status] === 'number') metrics[run.status] = num(metrics[run.status]) + 1;
+      if (perAgent) {
+        perAgent.runs += 1;
+        if (run.status in perAgent) perAgent[run.status] = num(perAgent[run.status]) + 1;
+      }
       if (run.completedAt) {
         const duration = run.completedAt.getTime() - run.startedAt.getTime();
         if (duration >= 0) {
           metrics.durationMsTotal = num(metrics.durationMsTotal) + duration;
           metrics.durationSamples = num(metrics.durationSamples) + 1;
+          if (perAgent) {
+            perAgent.durationMsTotal += duration;
+            perAgent.durationSamples += 1;
+          }
         }
       }
     }
     if (num(metrics.durationSamples) > 0) metrics.avgDurationMs = round(num(metrics.durationMsTotal) / num(metrics.durationSamples));
-    return { metrics, dimensions: null };
+    // 逐 agent 派生（终态数/成功率/失败率/均值）与顶层同口径：读时由 finalizeMetrics 统一重算
+    const finalized: Record<string, AgentPerfFacts> = {};
+    for (const [agentId, facts] of Object.entries(byAgent)) finalized[agentId] = finalizeAgentFacts(facts);
+    if (Object.keys(finalized).length > 0) metrics.byAgent = finalized;
+    return { metrics, dimensions: { agents: Object.keys(finalized).sort() } };
   }
 
   /** kind=generation / source=generation_task：image/video 成功失败数（按 run 归因；无 run 按个人组织） */
