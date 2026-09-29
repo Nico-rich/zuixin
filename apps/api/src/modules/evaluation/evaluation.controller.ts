@@ -5,13 +5,15 @@ import { EvaluationEvaluatorsService } from './evaluators.service';
 import { EvaluationRunsService } from './evaluation-runs.service';
 import { ExperimentsService } from './experiments.service';
 import { OrganizationsService } from '../organizations/organizations.service';
+import { SystemSettingsService } from '../system-settings/system-settings.service';
 import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe';
 import { AuthedUser, JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import {
   CaseInputDto, CreateDatasetDto, CreateEvaluatorDto, CreateExperimentDto, CreateRunDto, CreateVariantDto,
   CreateDatasetSchema, CreateEvaluatorSchema, CreateExperimentSchema, CreateRunSchema, CreateVariantSchema,
-  ExperimentStatusSchema, ListQuerySchema, ReplaceCasesSchema, UpdateDatasetSchema, UpdateEvaluatorSchema, UpdateExperimentSchema,
+  ExperimentStatusSchema, ListQuerySchema, PromoteExperimentDto, PromoteExperimentSchema, ReplaceCasesSchema,
+  UpdateDatasetSchema, UpdateEvaluatorSchema, UpdateExperimentSchema,
 } from './evaluation.dto';
 
 /**
@@ -34,6 +36,7 @@ export class EvaluationController {
     @Inject(EvaluationRunsService) private readonly runs: EvaluationRunsService,
     @Inject(ExperimentsService) private readonly experiments: ExperimentsService,
     @Inject(OrganizationsService) private readonly orgs: OrganizationsService,
+    @Inject(SystemSettingsService) private readonly settings: SystemSettingsService,
   ) {}
 
   // ===== datasets =====
@@ -247,6 +250,42 @@ export class EvaluationController {
     const scope = await this.experiments.scope(id);
     await this.authorizeResource(req.user.userId, scope, 'evaluation.write');
     return this.experiments.addVariant(scope!.organizationId, id, dto);
+  }
+
+  /**
+   * M12-P4 晋级结论（只读）：变体评测对照事实 → 确定性胜出判定 + 受控目标 + 结论指纹。
+   * 读权限 = evaluation.read（组织成员可见"结论是什么"）；**确认写权限在下方，仅平台管理员**。
+   */
+  @Get('experiments/:id/promotion')
+  async promotionProposal(@Req() req: Request & { user: AuthedUser }, @Param('id') id: string) {
+    const scope = await this.experiments.scope(id);
+    await this.authorizeResource(req.user.userId, scope, 'evaluation.read');
+    return this.experiments.promotionProposal(scope!.organizationId, id);
+  }
+
+  /**
+   * M12-P4 晋级确认（**平台管理员**）：把实验结论写入受控策略键（SystemSettings 白名单）。
+   *
+   * 归属裁决两层（防枚举 + 防自晋级）：
+   * - 非平台管理员：先按常规资源面裁决（非成员 → 404 防枚举；成员 → requirePermission 403），
+   *   再落回服务层的平台管理员断言 → **组织 owner/admin 也 403**（策略阈值是平台级事实）；
+   * - 平台管理员：平台级跨组织动作（与 extensions 的平台级管理同口径），不受组织成员身份限制。
+   *
+   * 本端点**绝不改变流量分配**：只写受控策略键，实验/变体一行不动（服务层保证 + e2e 断言）。
+   */
+  @Post('experiments/:id/promote')
+  async promoteExperiment(
+    @Req() req: Request & { user: AuthedUser },
+    @Param('id') id: string,
+    @Body(new ZodValidationPipe(PromoteExperimentSchema)) dto: PromoteExperimentDto,
+  ) {
+    const scope = await this.experiments.scope(id);
+    if (!scope) throw new AppError(ErrorCode.NOT_FOUND, '资源不存在');
+    if (!(await this.settings.isPlatformAdmin(req.user.userId))) {
+      await this.orgs.assertCanAccess(req.user.userId, scope.organizationId); // 非成员 → 404 防枚举
+      await this.orgs.requirePermission(req.user.userId, scope.organizationId, 'evaluation.write'); // 成员 → 403
+    }
+    return this.experiments.promote(req.user.userId, scope.organizationId, id, dto);
   }
 
   // ===== 归属裁决 =====

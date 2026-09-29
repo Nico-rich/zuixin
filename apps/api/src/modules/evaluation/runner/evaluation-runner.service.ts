@@ -1,6 +1,6 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
-import { AppError } from '../../../common/errors/app-error';
+import { AppError, ErrorCode } from '../../../common/errors/app-error';
 import { LLMManagerService, ResolvedLLM } from '../../../providers/llm/llm-manager.service';
 import { ModelResolverService } from '../../../providers/llm/model-resolver.service';
 import { ChatMessage, LLMChunk } from '../../../providers/llm/llm.types';
@@ -210,12 +210,20 @@ export class EvaluationRunnerService {
       const messages: ChatMessage[] = [];
       if (input.snapshot.systemPrompt) messages.push({ role: 'system', content: input.snapshot.systemPrompt });
       messages.push({ role: 'user', content: buildUserContent(input.input) });
+      // M12-P4：工具定义来自 run 创建时冻结的快照（缺省 [] → 不传 tools，M9 行为逐字节保持）。
+      // **只声明不执行**：本类无 ToolRegistry/执行器依赖，工具调用只作为事实落 EvaluationCaseRun.toolCalls
+      // （output 恒为 null），供 rule/llm-judge 评测器判定"该不该调、调得对不对"。
+      const toolDefs = input.snapshot.toolDefinitions ?? [];
+      if (toolDefs.length > 0 && input.target.llm.capabilities?.['functionCalling'] === false) {
+        // 能力闸门（与 Agent 引擎 MUST-3 同口径）：不下发工具 ≠ 静默降级评测——显式失败，绝不产出失真结论
+        throw new AppError(ErrorCode.NO_TOOL_CAPABILITY, '当前模型不支持工具调用，无法评测带工具的 Agent');
+      }
       const stream = input.target.llm.adapter.stream({
         model: input.target.llm.apiModelId,
         messages,
         temperature: input.snapshot.temperature,
         maxTokens: input.snapshot.maxTokens ?? undefined,
-        // 不传 tools：评测绝不执行工具，也不诱导模型发出会被静默丢弃的调用
+        tools: toolDefs.length > 0 ? toolDefs : undefined,
         signal: upstream.signal,
       });
       for await (const chunk of stream as AsyncIterable<LLMChunk>) {

@@ -3,13 +3,20 @@ import { PrismaService } from '../prisma/prisma.service';
 import { MemoryService } from '../../core/memory/memory.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { withToolCallLedger } from '../../core/tools/tool-call-ledger';
+import { readPolicyThresholds } from '../system-settings/policy-thresholds';
 
 const SUBJECT_TYPES = ['artifact', 'creativeBrief', 'product', 'campaign', 'ad', 'generationTask', 'agentRun', 'analysis'] as const;
-/** 绩效记忆阈值（服务端规则，非 LLM）：好/差两档 */
-const GOOD_CTR = 0.03;
-const GOOD_ROAS = 2;
-const BAD_CTR = 0.01;
-const BAD_ROAS = 1;
+/**
+ * 绩效记忆阈值（服务端规则，非 LLM）：好/差两档。
+ *
+ * M12-P4：由编译期常量改为 **SystemSetting('policyThresholds').feedback 优先、本常量兜底**
+ * （运营者可在 `PATCH /system-settings/policyThresholds` 调档；仅平台管理员可写、强制审计）。
+ * 本常量仍是**最后一跳兜底**——与 `DEFAULT_POLICY_THRESHOLDS.feedback` 逐字节一致（单测锁死）。
+ */
+export const GOOD_CTR = 0.03;
+export const GOOD_ROAS = 2;
+export const BAD_CTR = 0.01;
+export const BAD_ROAS = 1;
 
 /**
  * M7-P8 Feedback + Performance Learning（不改模型权重——学习 = Memory 闭环）：
@@ -131,15 +138,17 @@ export class FeedbackService {
       };
     });
 
-    // 阈值记忆：好/差（服务端规则；learning = Memory，不改模型）——metadata 幂等，重放再走也不产第二条
-    if (derived.ctr >= GOOD_CTR || derived.roas >= GOOD_ROAS) {
+    // 阈值记忆：好/差（服务端规则；learning = Memory，不改模型）——metadata 幂等，重放再走也不产第二条。
+    // M12-P4：阈值 = SystemSetting 优先 / 编译期常量兜底（绝不采信 LLM 或调用方传入的阈值）。
+    const { feedback: t } = await readPolicyThresholds(this.prisma);
+    if (derived.ctr >= t.goodCtr || derived.roas >= t.goodRoas) {
       await this.upsertPerformanceMemory(userId, input.projectId ?? null, {
         kind: 'performance',
         subjectType: 'creativePerformance', subjectId: result.performanceId,
         content: `创意${input.artifactId ? ` ${input.artifactId}` : ''}近一期 CTR ${(derived.ctr * 100).toFixed(1)}% ROAS ${derived.roas}（表现好）`,
         importance: 70,
       });
-    } else if (derived.ctr <= BAD_CTR || derived.roas <= BAD_ROAS) {
+    } else if (derived.ctr <= t.badCtr || derived.roas <= t.badRoas) {
       await this.upsertPerformanceMemory(userId, input.projectId ?? null, {
         kind: 'performance',
         subjectType: 'creativePerformance', subjectId: result.performanceId,

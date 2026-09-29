@@ -67,6 +67,12 @@ export const CreateRunSchema = z.strictObject({
   modelId: ModelId.optional(),
   temperature: z.number().min(0).max(2).optional(),
   maxTokens: z.number().int().min(1).max(128_000).optional(),
+  /**
+   * M12-P4：本次评测下发给模型的工具白名单（可选；**缺省 = 不下发任何工具**）。
+   * 服务端强制 `⊆ AgentVersion.tools`（绝不下发超越 Agent 权限的工具）且必须已注册；
+   * 工具**只声明不执行**（评测零副作用）——声明的定义随 configSnapshot 冻结。
+   */
+  tools: z.array(z.string().min(1).max(120)).max(50).optional(),
   organizationId: Id.optional(),
 });
 
@@ -95,9 +101,20 @@ export const CreateVariantSchema = z.strictObject({
   trafficPercent: z.number().int().min(0).max(100).optional(),
 });
 
+/**
+ * M12-P4 实验受控晋级确认。**只接受结论指纹**：目标键与值都由服务端从实验事实复算
+ * （客户端无法指定"写哪个键、写什么值"——受控键白名单 + 白名单 schema 双闸门）。
+ */
+export const PromoteExperimentSchema = z.strictObject({
+  /** 结论指纹（GET /evaluation/experiments/:id/promotion 返回；事实变化 → 不匹配 → 400） */
+  proposalHash: z.string().length(64),
+  reason: z.string().max(500).optional(),
+});
+
 export type CaseInputDto = z.infer<typeof CaseInputSchema>;
 export type CreateDatasetDto = z.infer<typeof CreateDatasetSchema>;
 export type CreateRunDto = z.infer<typeof CreateRunSchema>;
 export type CreateEvaluatorDto = z.infer<typeof CreateEvaluatorSchema>;
 export type CreateExperimentDto = z.infer<typeof CreateExperimentSchema>;
 export type CreateVariantDto = z.infer<typeof CreateVariantSchema>;
+export type PromoteExperimentDto = z.infer<typeof PromoteExperimentSchema>;

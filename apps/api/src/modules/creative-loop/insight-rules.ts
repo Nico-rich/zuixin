@@ -58,9 +58,26 @@ export function derivePerfMetrics(facts: PerfFacts): { ctr: number; cvr: number;
   };
 }
 
-/** 评分好/差阈值（与 M7-P8 口径一致：>=4 好、<=2 差） */
+/**
+ * 评分好/差阈值（与 M7-P8 口径一致：>=4 好、<=2 差）。
+ * M12-P4：可由 `SystemSetting('policyThresholds').insight` 覆盖（运营者调档，仅平台管理员可写）；
+ * 本常量仍是**最后一跳兜底**（缺省行为逐字节不变）——本文件保持纯函数，阈值由调用方显式传入。
+ */
 export const RATING_GOOD = 4;
 export const RATING_BAD = 2;
+
+/** 洞察阈值（缺省 = 编译期常量口径） */
+export interface InsightThresholds {
+  ratingGood: number;
+  ratingBad: number;
+  comparisonPct: number;
+}
+
+export const DEFAULT_INSIGHT_THRESHOLDS: InsightThresholds = {
+  ratingGood: RATING_GOOD,
+  ratingBad: RATING_BAD,
+  comparisonPct: 10, // = COMPARISON_THRESHOLD_PCT（同文件下方定义；此处字面量避免自引用，由单测锁死一致）
+};
 
 export interface RatingFacts {
   count: number;
@@ -72,7 +89,10 @@ export interface RatingFacts {
   negativeRate: number;
 }
 
-export function summarizeRatings(ratings: readonly number[]): RatingFacts {
+export function summarizeRatings(
+  ratings: readonly number[],
+  thresholds: Pick<InsightThresholds, 'ratingGood' | 'ratingBad'> = DEFAULT_INSIGHT_THRESHOLDS,
+): RatingFacts {
   const distribution: RatingFacts['distribution'] = { '1': 0, '2': 0, '3': 0, '4': 0, '5': 0 };
   let sum = 0;
   let positive = 0;
@@ -82,8 +102,8 @@ export function summarizeRatings(ratings: readonly number[]): RatingFacts {
     if (!Number.isFinite(r) || r < 1 || r > 5) continue;
     distribution[String(r) as keyof RatingFacts['distribution']] += 1;
     sum += r;
-    if (r >= RATING_GOOD) positive += 1;
-    if (r <= RATING_BAD) negative += 1;
+    if (r >= thresholds.ratingGood) positive += 1;
+    if (r <= thresholds.ratingBad) negative += 1;
   }
   const count = Object.values(distribution).reduce((a, b) => a + b, 0);
   return {
@@ -95,7 +115,11 @@ export function summarizeRatings(ratings: readonly number[]): RatingFacts {
   };
 }
 
-/** 环比变化阈值（与 M7-P5 异常检测同口径：10%） */
+/**
+ * 环比变化阈值（与 M7-P5 异常检测同口径：10%）。
+ * M12-P4：可由 `SystemSetting('policyThresholds').insight.comparisonPct` 覆盖（**调用方显式传参**；
+ * `comparePeriods` 的第三参数即该阈值——本文件保持纯函数，绝不自行读配置）。
+ */
 export const COMPARISON_THRESHOLD_PCT = 10;
 
 export interface ComparisonEntry {

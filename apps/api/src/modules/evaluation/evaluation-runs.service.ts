@@ -7,10 +7,12 @@ import { EVALUATION_QUEUE } from '../../core/queue/queue.module';
 import { addJobBounded } from '../../core/queue/bounded-add';
 import { EventBusService } from '../../core/events/event-bus.service';
 import { LLMManagerService } from '../../providers/llm/llm-manager.service';
+import { ToolRegistry } from '../../core/tools/tool-registry.service';
 import { EvaluationDatasetsService } from './datasets.service';
 import { EvaluationEvaluatorsService } from './evaluators.service';
 import { CreateRunDto } from './evaluation.dto';
 import { EvaluationConfigSnapshot, EvaluatorScoreRow, RunComparison, RunScoreSummary } from './evaluation.types';
+import { resolveEvaluationTools } from './evaluation-tools';
 import { compareRuns, ResultFact, summarizeScores } from './score-aggregation';
 
 /**
@@ -37,6 +39,7 @@ export class EvaluationRunsService {
     @Inject(EvaluationDatasetsService) private readonly datasets: EvaluationDatasetsService,
     @Inject(EvaluationEvaluatorsService) private readonly evaluators: EvaluationEvaluatorsService,
     @Inject(LLMManagerService) private readonly llmManager: LLMManagerService,
+    @Inject(ToolRegistry) private readonly tools: ToolRegistry,
     @Inject(EventBusService) private readonly events: EventBusService,
     @InjectQueue(EVALUATION_QUEUE) private readonly queue: Queue,
   ) {}
@@ -79,6 +82,14 @@ export class EvaluationRunsService {
     // 5) 快照冻结（provider 归属为 best-effort 观测值：解析失败不阻断创建，执行期会给出明确失败）
     const modelId = dto.modelId ?? version.modelId ?? null;
     const provider = modelId ? await this.resolveProvider(modelId) : null;
+    // 5b) M12-P4 工具白名单（可选；缺省 [] = 不下发任何工具）：⊆ AgentVersion.tools + 已注册 + 模型能力
+    const agentTools = (version.tools as string[] | null) ?? [];
+    const toolPlan = resolveEvaluationTools({
+      registry: this.tools,
+      requested: dto.tools ?? [],
+      allowedAgentTools: agentTools,
+      capabilities: provider?.capabilities ?? null, // null（模型解析失败/默认模型）→ 执行期能力闸门兜底
+    });
     const configSnapshot: EvaluationConfigSnapshot = {
       schema: 1,
       lockedAt: new Date().toISOString(),
@@ -92,7 +103,9 @@ export class EvaluationRunsService {
       temperature: dto.temperature ?? version.temperature,
       maxTokens: dto.maxTokens ?? version.maxTokens ?? null,
       systemPrompt: version.systemPrompt,
-      tools: (version.tools as string[] | null) ?? [],
+      tools: agentTools, // Agent 身份事实（= 权限边界，非"下发清单"）
+      evaluationTools: toolPlan.tools, // 本次实际下发的工具白名单（恒 ⊆ tools）
+      ...(toolPlan.definitions.length > 0 ? { toolDefinitions: toolPlan.definitions } : {}),
       evaluatorIds: evaluators.map((e) => e.id),
       datasetId: dataset.id,
       datasetVersion: dataset.version,
@@ -248,11 +261,11 @@ export class EvaluationRunsService {
     return rows;
   }
 
-  /** provider 归属解析（best-effort 观测值） */
-  private async resolveProvider(modelId: string): Promise<{ providerId: string; providerName: string } | null> {
+  /** provider 归属解析（best-effort 观测值；M12-P4 起附带模型能力声明，供工具白名单能力闸门裁决） */
+  private async resolveProvider(modelId: string): Promise<{ providerId: string; providerName: string; capabilities: Record<string, unknown> } | null> {
     try {
       const resolved = await this.llmManager.resolve(modelId);
-      return { providerId: resolved.providerId, providerName: resolved.providerName };
+      return { providerId: resolved.providerId, providerName: resolved.providerName, capabilities: resolved.capabilities ?? {} };
     } catch (err) {
       this.logger.warn(`模型解析失败（快照 provider 记为 null，执行期将显式失败）：${modelId} — ${(err as Error).message}`);
       return null;

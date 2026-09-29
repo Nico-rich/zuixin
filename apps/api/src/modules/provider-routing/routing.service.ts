@@ -6,7 +6,8 @@ import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { mapProviderError, ProviderLikeError } from '../../common/errors/provider-error';
 import { estimateCost } from './cost-estimator';
 import { modelSupports } from './capability-match';
-import { healthScore, stableHash } from './health-score';
+import { HealthScoring, healthScore, stableHash } from './health-score';
+import { readPolicyThresholds } from '../system-settings/policy-thresholds';
 import {
   CAPABILITY_PROVIDER_TYPES, CandidateReasonCode, CostBudget, DEFAULT_BREAKER_COOLDOWN_SEC, DEFAULT_BREAKER_FAILURE_THRESHOLD,
   DEFAULT_MAX_FALLBACKS, DEFAULT_POLICY_PRIORITY, DecisionReasonCode, FILTER_TO_DECISION_REASON, RouteInput,
@@ -102,7 +103,7 @@ export class RoutingService {
     const preferCapabilities = (input.preferCapabilities ?? []).filter((c) => ROUTING_CAPABILITY_SET.has(c));
     const preferredRank = new Map((input.preferredModelIds ?? []).map((id, index) => [id, index]));
 
-    const [providers, declared, policies] = await Promise.all([
+    const [providers, declared, policies, scoring] = await Promise.all([
       this.prisma.provider.findMany({
         where: { type: { in: CAPABILITY_PROVIDER_TYPES[capability] } },
         include: { models: { where: { enabled: true }, orderBy: [{ priority: 'asc' }, { id: 'asc' }] } },
@@ -110,6 +111,8 @@ export class RoutingService {
       }),
       this.prisma.providerCapability.findMany({ where: { capability }, select: { providerId: true } }),
       this.prisma.providerPolicy.findMany({ where: { organizationId, enabled: true } }),
+      // M12-P4：评分参数（SystemSetting 优先 / 编译期常量兜底）**每次 route 读一次**（候选循环内复用，不逐候选查库）
+      readPolicyThresholds(this.prisma).then((t) => t.providerHealth as HealthScoring),
     ]);
     const declaredProviderIds = new Set(declared.map((d) => d.providerId));
     const policyByProvider = new Map(policies.map((p) => [p.providerId, p]));
@@ -129,7 +132,7 @@ export class RoutingService {
       // 熔断状态是评分与准入的共同输入（只读派生：openedAt 时间戳；无进程内状态）
       const breakerConfig = this.breakerConfigOf(provider);
       const breakerState = await this.breaker.state(provider.id, breakerConfig);
-      const score = this.scoreOf(provider, facts, breakerState);
+      const score = this.scoreOf(provider, facts, breakerState, scoring);
       const record: RoutingCandidateRecord = {
         providerId: provider.id,
         providerName: provider.name,
@@ -422,14 +425,19 @@ export class RoutingService {
    * 排在健康候选之后，三态自愈的探测路径在有备选时不可达（探测槽/半开探测形同虚设）。
    * 延迟罚分照常计入（延迟样本来自真实调用事实，不因熔断状态失真）。
    */
-  private scoreOf(provider: { healthStatus: HealthStatus }, facts: ProviderFacts, breakerState: BreakerState): number {
+  private scoreOf(
+    provider: { healthStatus: HealthStatus },
+    facts: ProviderFacts,
+    breakerState: BreakerState,
+    scoring: HealthScoring = {},
+  ): number {
     const live = breakerState === 'healthy';
     return healthScore({
       healthStatus: provider.healthStatus,
       windowFailures: live ? facts.windowFailures : 0,
       windowSuccesses: live ? facts.windowSuccesses : 0,
       latencyMs: facts.latencyMs,
-    });
+    }, scoring);
   }
 
   private breakerConfigOf(provider: { retryConfig: Prisma.JsonValue | null }): BreakerConfig {    const bag = (provider.retryConfig ?? {}) as Record<string, unknown>;

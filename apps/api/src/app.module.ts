@@ -37,6 +37,7 @@ import { RateLimitModule } from './core/rate-limit/rate-limit.module';
 import { GlobalRateLimitGuard } from './core/rate-limit/global-rate-limit.guard';
 import { KnowledgeApiModule } from './modules/knowledge/knowledge.module';
 import { EvaluationApiModule } from './modules/evaluation/evaluation-api.module'; // M9-P1 Evaluation
+import { SystemSettingsApiModule } from './modules/system-settings/system-settings-api.module'; // M12-P4 策略设置（平台管理员面）
 import { CreativeLoopApiModule } from './modules/creative-loop/creative-loop-api.module'; // M9-P5 Creative Performance Loop
 import { MarketplaceApiModule } from './modules/marketplace/marketplace-api.module'; // M9-P6 Marketplace 公开层
 import { TracingModule } from './core/tracing/tracing.module';
@@ -97,6 +98,7 @@ import { SseModule } from './core/sse/sse.module';
     AuditApiModule,
     KnowledgeApiModule,
     EvaluationApiModule, // M9-P1 Evaluation / Experimentation
+    SystemSettingsApiModule, // M12-P4 策略阈值外部化（受控键白名单 + 仅平台 admin + 强制审计）
     CreativeLoopApiModule, // M9-P5 创意闭环（洞察/假设/loop 编排）
     MarketplaceApiModule, // M9-P6 Marketplace 公开层（发布/评审/审核/检索）
     GenerationsModule,
