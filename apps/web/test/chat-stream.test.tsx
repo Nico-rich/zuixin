@@ -81,12 +81,26 @@ describe('ChatWorkspace 消息流（SSE 解析 → 渲染）', () => {
     expect((chatCall[1] as RequestInit).method).toBe('POST');
   });
 
-  it('message_start 建立 assistant 气泡；新会话时跳转到 /chat/{conversationId}', async () => {
+  it('message_start 建立 assistant 气泡；新会话仅换地址栏（不触发路由导航 → 不重挂载、流式不中断）', async () => {
     const h = await setupChatHarness();
     await sendMessage('你好');
     await h.push(frame('message_start', { messageId: 'm-1', conversationId: 'conv-9', createdAt: '2026-09-28T00:00:00.000Z' }));
     await screen.findByText('正在生成…');
-    expect(replaceMock).toHaveBeenCalledWith('/chat/conv-9', { scroll: false });
+    expect(window.location.pathname).toBe('/chat/conv-9');
+    // M11-P13 回归：不得走 next/navigation 的 router.replace —— /chat → /chat/[id] 是两个 page 组件，
+    // 路由导航会卸载 ChatWorkspace（SSE 回调失效），新实例只读到 content='' / status='streaming' 的历史消息，
+    // 首条消息永远停在“正在生成…”。真实浏览器证据：apps/web/e2e/chat-streaming.spec.ts。
+    expect(replaceMock).not.toHaveBeenCalled();
+  });
+
+  it('M11-P13：token 间隔小于节流窗口时仍按窗口上屏（节流不得退化为“等静默”的防抖）', async () => {
+    const h = await setupChatHarness();
+    await sendMessage('你好');
+    await h.push(frame('message_start', { messageId: 'm-1', conversationId: 'c', createdAt: 'T' }));
+    // 连续推入、彼此无间隔（真实流式里 token 间隔 30ms < 40ms 窗口）
+    for (const ch of '逐字上屏') await h.push(frame('message_delta', { delta: ch }));
+    // 关键：**不**推 message_end —— 内容必须在流未结束时已上屏（旧实现会一直停在空内容）
+    await screen.findByText('逐字上屏');
   });
 
   it('多个 message_delta 帧（含分片到达）拼接为完整文本', async () => {
