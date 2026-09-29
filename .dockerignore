@@ -1,0 +1,44 @@
+# docker/Dockerfile.api / docker/Dockerfile.web 的构建上下文白/黑名单。
+#
+# 为什么必须有这个文件（不是可选项）：
+#   1) 秘密。apps/api/src/env.ts 的第二次 loadEnv 带 override:true —— 工作目录里**只要**有 .env，
+#      它就会盖掉 k8s ConfigMap/Secret 注入的真值。所以 .env 绝不能进镜像（也不能进构建上下文）。
+#   2) 宿主 node_modules。pnpm 会在每个 workspace 包下建 node_modules（含指向宿主路径的符号链接）。
+#      `COPY . .` 会把它们一并搬进镜像，覆盖容器内刚装好的依赖树 —— 表现为"本地能 build、CI 挂"
+#      的经典脏构建。这里排除后由容器内 pnpm install 重建。
+#   3) 上下文体积。.claude/（worktree 目录树）与 node_modules 在宿主上可达数千个文件/数百 MB。
+#
+# 注意：排除的是**构建上下文**，不是镜像内容 —— 运行阶段只从 builder 复制 dist/node_modules。
+
+# ---------- 依赖与构建产物（容器内重新安装/构建）----------
+node_modules
+**/node_modules
+dist
+**/dist
+.next
+**/.next
+.turbo
+**/.turbo
+coverage
+**/coverage
+**/*.tsbuildinfo
+
+# ---------- 秘密（唯一事实源是 k8s Secret / 宿主 env，不进镜像）----------
+.env
+**/.env
+.env.*
+**/.env.*
+*.pem
+*.key
+
+# ---------- 与构建无关 ----------
+.git
+.gitignore
+.gitattributes
+.claude
+docs
+k8s
+monitoring
+**/*.log
+# 注：**故意不排除静态资源**（apps/web/public/**、*.png/svg/ico）——仓库当前一个都没有，
+# 但一旦 M12 加了 favicon/图标，排除规则会让它"静默消失"（构建成功、线上 404）。
