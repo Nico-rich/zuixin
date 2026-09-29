@@ -189,7 +189,7 @@ function printEnvReminder(
   const copies = findEnvBackupCopies(envBackupDir);
   logger.raw(`env 副本目录：${envBackupDir} — 找到 ${copies.length} 份${copies.length ? `（最新：${copies.sort((a, b) => b.mtime.localeCompare(a.mtime))[0].path}）` : '（建议立刻放一份**加密**副本）'}`);
   logger.raw('提醒：本脚本只备份数据库；ENCRYPTION_KEY/JWT_SECRET 必须另有可用副本（Vault/KMS/K8s Secret），');
-  logger.raw('      丢失 ENCRYPTION_KEY ⇒ 已加密凭证永久不可解（见 runbook §2「密钥备份/取回」）。');
+  logger.raw('      丢失 ENCRYPTION_KEY ⇒ 已加密凭证永久不可解（见 runbook §3「密钥备份/取回」）。');
 }
 
 async function main(): Promise<void> {

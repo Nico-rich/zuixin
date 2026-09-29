@@ -13,7 +13,7 @@
  * - **生产**（`NODE_ENV === 'production'`）→ 收集**全部**违规项，一次性抛出并列出（不让运维"修一个报一个"）；
  * - **非生产** → 只 `warn`（开发/测试必须能零配置跑通；不静默：每条替身开关都会出现在启动日志里）；
  * - 本守卫是**配置面**判定，不做任何网络/DB 访问（必须在 NestFactory.create 之前可执行）；
- * - 覆盖范围：API 进程（`main.ts`）与种子脚本（`prisma/seed.ts`）。Worker 进程由 Coordinator 在集成阶段接线
+ * - 覆盖范围：API 进程（`main.ts`）、Worker 进程（`worker.ts`，M11-P10 E-08 已接线）与种子脚本（`prisma/seed.ts`）
  *   （`worker.ts` 不在本 Phase 所有权内）——见 M10-P1 报告"依赖/未覆盖"。
  */
 import { Logger } from '@nestjs/common';

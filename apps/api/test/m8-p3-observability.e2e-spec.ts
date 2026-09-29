@@ -162,9 +162,11 @@ describe('M8-P3 Observability / Audit (e2e)', () => {
   it('P3 队列深度：Worker 启动即采样 image/video/agent-run/workflow 四队列', async () => {
     const rows = await waitUntil(
       () => prisma.metricSample.findMany({ where: { name: 'queue_depth', sampledAt: { gte: suiteStartedAt } } }),
-      (r) => r.length >= 4, 15_000, 'queue_depth 样本',
+      // M11 集成修复（P8 报告）：多 worker 并发时共享库内会交错写入多轮样本（同队列多行），
+      // 原"恰 4 行"断言是共享库全局断言——改为"四队列集合齐备"（去重后恰好覆盖，多余行容忍）
+      (r) => new Set(r.map((x) => (x.labels as { queue?: string }).queue)).size >= 4, 15_000, 'queue_depth 样本',
     );
-    const queues = rows.map((r) => (r.labels as { queue?: string }).queue).sort();
+    const queues = [...new Set(rows.map((r) => (r.labels as { queue?: string }).queue))].sort();
     expect(queues).toEqual(['agent-run', 'image', 'video', 'workflow']);
     for (const row of rows) {
       expect(row.unit).toBe('count');
