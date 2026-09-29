@@ -16,7 +16,23 @@ function makeLease(rows: Array<Record<string, unknown>> = [], over: {
   const prisma = {
     systemSetting: { findUnique: vi.fn(async () => ({ key: 'limits', value: {} })) }, // value {} → deadline = 默认 1h
     workflowRun: {
-      findMany: vi.fn(async () => rows),
+      // M11-P7 D2-12：recoverStale 改为 deadline 下推 SQL + 游标分页两段扫描——
+      // fake 必须忠实实现 where 过滤 + 排序 + cursor/take 分页（原替身无视参数全量返回，
+      // 同一行会被两段扫描各扫一次 → reEnqueued 双计）
+      findMany: vi.fn(async (args?: { where?: Record<string, unknown>; take?: number; cursor?: { id: string }; skip?: number }) => {
+        const cond = (args?.where?.startedAt ?? {}) as { lt?: Date; gte?: Date };
+        let filtered = rows.filter((r) => {
+          const t = (r.startedAt as Date).getTime();
+          if (cond.lt && !(t < cond.lt.getTime())) return false;
+          if (cond.gte && !(t >= cond.gte.getTime())) return false;
+          return true;
+        });
+        filtered = [...filtered].sort((a, b) =>
+          (a.startedAt as Date).getTime() - (b.startedAt as Date).getTime() || String(a.id).localeCompare(String(b.id)));
+        if (args?.cursor?.id) filtered = filtered.filter((r) => String(r.id) > String(args.cursor!.id));
+        if (args?.take) filtered = filtered.slice(0, args.take);
+        return filtered;
+      }),
       updateMany: vi.fn(async () => ({ count: over.wokenCount ?? 1 })),
     },
     agentRun: { findUnique: vi.fn(async () => over.child ?? null) },
