@@ -214,7 +214,9 @@ export function openArtifactStream(
     return stream;
   };
 
-  let stream: Readable = guard(createReadStream(path) as ReadStream, '读取文件');
+  // M11 Final Audit M16：gpg 链路下明文 createReadStream 只是"拿到 handle 确认文件可读"，
+  // 流随即被 child.stdout 覆盖 ⇒ fd 泄漏（每次读取一个，循环调用无界）。改为惰性：仅非 gpg 才建流。
+  let stream: Readable;
   let gpgDone: Promise<{ code: number; spawnError?: string; stderr: string }> = Promise.resolve({ code: 0, stderr: '' });
 
   if (chain.encryption === 'gpg') {
@@ -225,6 +227,8 @@ export function openArtifactStream(
     });
     gpgDone = child.done;
     stream = guard(child.stdout, 'gpg 解密');
+  } else {
+    stream = guard(createReadStream(path) as ReadStream, '读取文件');
   }
   if (chain.compression === 'gzip') {
     stream = guard(stream.pipe(createGunzip()), 'gunzip 解压');

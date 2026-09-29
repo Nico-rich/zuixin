@@ -76,11 +76,11 @@ groups:
       - alert: GracefulShutdownTimeout
         # 现状: [可用] 用**退出码**做近似信号（kube-state-metrics）。为什么可信：
         #       lifecycle/graceful-shutdown.ts 在超时路径上 `exitCode: 1` 且日志打
-        #       `[role] 优雅停机超时（>30s），强制退出——请检查是否有钩子挂住`。
+        #       `[role] 优雅停机超时（>30000ms），强制退出——请检查是否有钩子挂住`。
         #       局限：exit 1 也可能是别的崩溃 ⇒ 需结合日志确认（见 description）。
         #       [待导出] 精确信号是 `increase(graceful_shutdown_timeout_total[10m]) > 0`
         #       （在 shutdown emit 处打点，一次改动；落地前用下面的近似 + 日志）。
-        expr: kube_pod_container_status_last_terminated_exitcode{namespace="agent-platform"} == 1
+        expr: kube_pod_container_status_last_terminated_reason{namespace="agent-platform"} == "Error"
         for: 0m
         labels:
           severity: warning

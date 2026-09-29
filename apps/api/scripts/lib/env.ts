@@ -20,6 +20,7 @@ export const RPO_ZERO_SECRET_KEYS: readonly { key: string; why: string }[] = [
   { key: 'REDIS_URL', why: '含 Redis 口令：同上（Redis 数据本身可丢弃，见 DR 手册 §5）' },
   { key: 'STORAGE_ACCESS_KEY_ID', why: '对象存储访问凭证：泄露即数据面失守' },
   { key: 'STORAGE_SECRET_ACCESS_KEY', why: '对象存储访问凭证：同上' },
+  { key: 'BACKUP_GPG_PASSPHRASE', why: 'M11-P9 备份 gpg 口令：丢失 ⇒ 全部加密备份永久不可解' },
 ];
 
 /** 进程环境变量优先，其次 env 文件；返回实际生效的键（不返回值）。 */

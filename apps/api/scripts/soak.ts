@@ -10,6 +10,7 @@
  * 诚实口径：本机 Docker PG/Redis + 进程内 Worker，绝对数字只在本机可比；是回归基线不是容量承诺。
  */
 import '../src/env';
+import { assertProductionSafety } from '../src/modules/security/production-guards';
 import { performance } from 'node:perf_hooks';
 import { AddressInfo } from 'node:net';
 import { NestFactory } from '@nestjs/core';
@@ -33,6 +34,8 @@ const TERMINAL: AgentRunStatus[] = ['completed', 'failed', 'timeout', 'cancelled
 const PID = process.pid;
 
 async function main() {
+  // M11 Final Audit M2：与 main/worker 同源的生产守卫（镜像内 dist/scripts 可直接运行）
+  assertProductionSafety();
   const app = await NestFactory.create(AppModule, { logger: false });
   app.use(cookieParser());
   app.use('/api/v1', csrfProtection);

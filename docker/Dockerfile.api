@@ -55,8 +55,7 @@ ARG HTTPS_PROXY
 FROM ${NODE_IMAGE} AS base
 # CI=true：pnpm 在 CI 下默认走 frozen lockfile 且不做交互提示；构建必须是确定的。
 ENV CI=true \
-    NPM_CONFIG_UPDATE_NOTIFIER=false \
-    HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY
+    NPM_CONFIG_UPDATE_NOTIFIER=false
 # openssl  ：Prisma 的查询引擎（libquery_engine-*.so.node）动态链接 libssl，alpine 基础镜像不带；
 # libc6-compat：argon2 等 native 模块的 glibc 兼容垫片（有 musl 预编译时不生效，无则兜底）。
 RUN apk add --no-cache openssl libc6-compat \
@@ -67,6 +66,11 @@ WORKDIR /app
 # deps：只装依赖。只 COPY 清单文件 ⇒ 改源码不会击穿这一层缓存（依赖未变时重装 0 秒）
 # -----------------------------------------------------------------------------
 FROM base AS deps
+# 构建期代理只在 deps/builder 生效（绝不烘进 runtime 镜像）：ARG 在每个 FROM 后失效，必须本阶段重声明
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY
+
 COPY pnpm-lock.yaml pnpm-workspace.yaml package.json .npmrc ./
 COPY packages/shared/package.json packages/shared/
 COPY apps/api/package.json apps/api/

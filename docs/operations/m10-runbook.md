@@ -18,7 +18,7 @@
 | 脚本单测 | ✅ 50 用例 / 4 文件全绿（`apps/api/scripts/vitest.config.ts`） |
 | **生产量级**（TB 级库、百万对象桶）的耗时/内存 | ❌ **未验证**——本机库 13.58MB、桶 3 个对象，数字**不可外推**（§9） |
 | **PITR**（WAL 归档 → `recovery_target_time`）| ❌ **未演练**——本脚本只做逻辑备份，RPO = 备份时刻（§2.1、§9） |
-| K8s 清单在**真实集群**中的行为（探针、HPA、Ingress SSE）| ❌ **未验证**——本机无可用集群；且仓库**尚无 Dockerfile**（§6.1、§9） |
+| K8s 清单在**真实集群**中的行为（探针、HPA、Ingress SSE）| ❌ **未验证**——本机无可用集群（§6.1、§9）；镜像已由 `docker/Dockerfile.api` / `docker/Dockerfile.web` 构建验证（M11-P16） |
 | 密钥管理系统（Vault/KMS）取回流程 | ❌ **未验证**——本机为 `.env` 直读；流程见 §3 |
 
 **绝对不要把本机数字当成生产承诺。** 与 m8 手册相比，本文件的增量是"可重复 + 有退出码 + 有机器可读产物"，
@@ -161,7 +161,7 @@ manifest 是整个流程的关键：**恢复前后不必再去翻日志**，"这
   退出码 4——与 tsx 版本行为一致。K8s 里用 CronJob + 只挂备份卷（或 `--upload` 直传备份桶），
   把 `DATABASE_URL` 等从 Secret 注入（进程环境优先于 `.env`，见 §1.4）。
 
-  > ⚠️ 顺带发现（**既有不一致**，本 Phase 未改）：`apps/api/package.json` 的 `start` 写的是
+  > ⚠️ 顺带发现（**既有不一致**，M10 集成已修（753e789：`node dist/src/main.js` 与实际产物一致））：`apps/api/package.json` 的 `start` 写的是
   > `node dist/main.js`，但 `tsconfig.json` 的 `include` 含 `src/scripts/prisma`，rootDir 被提升到 `apps/api`，
   > 实际产物是 **`dist/src/main.js`**（实测）。因此 `k8s/*-deployment.yaml` 的入口用的是
   > `node dist/src/main.js` / `dist/src/worker.js`；顺手修 `start` 脚本前，本地 `pnpm start` 会 MODULE_NOT_FOUND。
@@ -631,7 +631,7 @@ docker exec docker-redis-1 redis-cli --scan --pattern 'ratelimit:global:auth:*'
 | **生产量级**的备份/恢复（TB 级库） | ❌ 未验证 | 本机 13.58MB / 44,072 行 / 1.11s 不能外推；需在预发用脱敏副本实测并记录 |
 | **PITR**（WAL 归档 → `recovery_target_time`） | ❌ 未演练（本脚本**不做** PITR） | 生产开通归档后必须完整走一次并记录 RTO；在此之前 RPO = 备份时刻 |
 | 备份到**对象存储的上传链路** | ⚠️ 代码路径已实现并测过 `mc` 一次性容器（§5.3 用临时桶验证了 mc 通路），但 `backup.ts --upload` 到真实备份桶**未跑过端到端** | 预发建 `db-backups` 桶后执行一次，核对远端大小与 manifest 一致 |
-| K8s 清单实机验证（探针/HPA/Ingress SSE/K8s 的 SIGKILL 边界） | ❌ 未验证（本机无集群；仓库**无 Dockerfile**） | 预发集群按 §6 部署并逐项验；`terminationGracePeriodSeconds` 必须用真实 pod 删除验证 |
+| K8s 清单实机验证（探针/HPA/Ingress SSE/K8s 的 SIGKILL 边界） | ❌ 未验证（本机无集群；仓库已有 `docker/Dockerfile.api` / `docker/Dockerfile.web`（M11-P16）） | 预发集群按 §6 部署并逐项验；`terminationGracePeriodSeconds` 必须用真实 pod 删除验证 |
 | 备份加密（静态加密） | ❌ 未实现 | 本脚本产出的是 **gzip 明文 dump**——落盘/上云前必须由运维侧加密（age/gpg/存储侧 SSE-KMS），否则等于把全库数据裸放在备份目录 |
 | `.env` 备份的加密与取回（§3.3/§3.4） | ❌ 纯流程项，未演练 | 与运维确认工具链后走一次完整"导出→加密→异地→取回→核对指纹" |
 | 告警规则里的 `[待导出]` 项 | ⛔ 未生效 | 见 §7.3；生效前用 §7.2 的人工判据 |

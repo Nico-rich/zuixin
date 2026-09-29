@@ -199,4 +199,4 @@ async function main(): Promise<void> {
   process.exit(EXIT_OK);
 }
 
-void main();
+main().catch((err) => { console.error("[rewrap] FATAL", err); process.exit(1); });

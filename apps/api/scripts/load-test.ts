@@ -18,6 +18,7 @@
  * "回归基线 + 量级判断"，不是容量承诺（生产容量需按生产拓扑重跑）。
  */
 import '../src/env';
+import { assertProductionSafety } from '../src/modules/security/production-guards';
 import { performance } from 'node:perf_hooks';
 import { AddressInfo } from 'node:net';
 import { NestFactory } from '@nestjs/core';

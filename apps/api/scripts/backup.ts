@@ -454,6 +454,12 @@ async function main(): Promise<void> {
   let remoteBytes = 0;
   let remoteEtag: string | null = null;
   let remoteContentVerified = false;
+  // M11 Final Audit M6：内容校验结论必须先于一切副作用——校验不通过的截断 dump
+  // 绝不推异地，也绝不触发 prune 删掉更早的好备份
+  if (failedChecks.length > 0) {
+    logger.error(`备份校验未通过（${failedChecks.map((c) => c.name).join(', ')}）——跳过上传与保留策略，请勿把该文件当作可用备份`);
+    process.exit(EXIT_VERIFY);
+  }
   if (v.upload === true) {
     const storage = storageConfigFromEnv();
     if (!storage.accessKeyId || !storage.secretAccessKey) {

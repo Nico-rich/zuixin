@@ -1,7 +1,7 @@
 # M10-P9 运维交付：API 无状态副本。
 #
 # 与 Worker 的**唯一区别**在于形态，不在于代码：同一镜像、同一 ConfigMap/Secret，
-# 只是入口命令不同（`node dist/main.js` vs `node dist/worker.js`）——两边的停机语义完全一致
+# 只是入口命令不同（`node dist/src/main.js` vs `node dist/worker.js`）——两边的停机语义完全一致
 # （lifecycle/graceful-shutdown.ts 单文件共用）。
 #
 # 探针语义（勿凭直觉改，理由见 docs/operations/m8-production-readiness.md §1）：
@@ -50,12 +50,12 @@ spec:
         - name: api
           # 当前仓库**没有 Dockerfile**（本 Phase 不新增；见 docs/operations/m10-runbook.md §6 依赖项）：
           # 镜像需先由 CI 构建并推到 registry。下面的镜像名/标签是占位符，apply 前必须替换。
-          # 构建要点：pnpm build → node dist/main.js；USER 非 root；.dockerignore 必须排除 .env。
+          # 构建要点：pnpm build → node dist/src/main.js；USER 非 root；.dockerignore 必须排除 .env。
           image: registry.example.com/agent-platform-api:0.1.0
           imagePullPolicy: IfNotPresent
           # 入口路径是 dist/**src**/main.js —— 这不是笔误：tsconfig.json 的 include 含 src/scripts/prisma，
           # 于是 rootDir 被提升到 apps/api，`nest build` 的产物是 dist/src/main.js（实测 2026-09-28）。
-          # ⚠️ 已发现的既有不一致：apps/api/package.json 的 `start` 写的是 `node dist/main.js`，
+          # ⚠️ 已发现的既有不一致：apps/api/package.json 的 `start` 写的是 `node dist/src/main.js`，
           # 在当前构建布局下**不存在该文件**（package.json 不属本 Phase 所有权，未改）。
           # 构建镜像时以实际产物为准，并顺手修 start 脚本（否则本地 `pnpm start` 会 MODULE_NOT_FOUND）。
           command: ["node", "dist/src/main.js"]

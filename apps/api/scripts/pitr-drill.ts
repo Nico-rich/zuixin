@@ -432,7 +432,7 @@ async function buildSchema(client: PgClient, logger: Logger, skipReplay: boolean
   await client.query('CREATE EXTENSION IF NOT EXISTS vector');
   await client.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
 
-  const files = skipReplay ? [] : migrationFiles();
+  const files = skipReplay ? [] : migrationFiles(); // M11 Final Audit M4：skipReplay 时 Plan 播种也必须跳过（见 buildSchema）
   const started = Date.now();
   for (const file of files) {
     const sql = readFileSync(file.path, 'utf8');
@@ -468,14 +468,18 @@ async function buildSchema(client: PgClient, logger: Logger, skipReplay: boolean
     );
   }
 
-  // 真实业务表的播种（Plan 是 m10 §4.4 D 层抽样命中的同一张表，便于沿时间轴对比数字）
-  await client.query(`
-    INSERT INTO "Plan" ("id", "code", "name", "monthlyPrice", "yearlyPrice", "entitlements", "active", "createdAt", "updatedAt")
-    VALUES
-      (gen_random_uuid()::text, 'free', 'Free', 0, 0, '{"llmTokensMonthly":100000,"seats":1}'::jsonb, true, now(), now()),
-      (gen_random_uuid()::text, 'pro',  'Pro',  19, 190, '{"llmTokensMonthly":2000000,"seats":5}'::jsonb, true, now(), now()),
-      (gen_random_uuid()::text, 'team', 'Team', 49, 490, '{"llmTokensMonthly":10000000,"seats":20}'::jsonb, true, now(), now())
-    ON CONFLICT ("code") DO NOTHING`);
+  // 真实业务表的播种（Plan 是 m10 §4.4 D 层抽样命中的同一张表，便于沿时间轴对比数字）。
+  // M11 Final Audit M4：--skip-schema-replay 时不重放迁移 ⇒ Plan 表不存在——播种必须一并跳过
+  //（原实现无条件播种，跳过迁移后必在 INSERT 处 psql 报错，"快速验证 PITR 通路"的文档承诺落空）
+  if (!skipReplay) {
+    await client.query(`
+      INSERT INTO "Plan" ("id", "code", "name", "monthlyPrice", "yearlyPrice", "entitlements", "active", "createdAt", "updatedAt")
+      VALUES
+        (gen_random_uuid()::text, 'free', 'Free', 0, 0, '{"llmTokensMonthly":100000,"seats":1}'::jsonb, true, now(), now()),
+        (gen_random_uuid()::text, 'pro',  'Pro',  19, 190, '{"llmTokensMonthly":2000000,"seats":5}'::jsonb, true, now(), now()),
+        (gen_random_uuid()::text, 'team', 'Team', 49, 490, '{"llmTokensMonthly":10000000,"seats":20}'::jsonb, true, now(), now())
+      ON CONFLICT ("code") DO NOTHING`);
+  }
 
   // 演练自建表（数据层：没有业务数据也不让 B/D 层变成"全 0 空转"）
   await client.query(`
@@ -1167,8 +1171,9 @@ async function main(): Promise<number> {
       { timeoutMs: 120_000 },
     );
     const restoreReady = await waitReady(names.dst, config.timeoutMs);
-    const recoveryLog = await dockerLogs(names.dst);
-    report.recovery.logLines = summarizeRecoveryLog(recoveryLog);
+    // M11 Final Audit M5：promote 完成后再抓恢复日志（此处抓取可能早于 "archive recovery complete"
+    // 落盘 → P1 伪 FAIL）。declaration 移到 promote 之后，这里先空调用不保留结果。
+    report.recovery.logLines = []; // 占位——promote 后以重抓日志填充
     if (restoreReady !== 'ready') {
       throw new DrillError(
         `恢复实例未就绪（${restoreReady}）——这通常意味着归档恢复没能到达目标时刻（见日志）：\n${report.recovery.logLines.join('\n')}`,
@@ -1190,6 +1195,9 @@ async function main(): Promise<number> {
         EXIT_VERIFY,
       );
     }
+    // M11 Final Audit M5：promote 完成后重抓日志——P1 的 "archive recovery complete" 判定以此时为准
+    const recoveryLog = await dockerLogs(names.dst);
+    report.recovery.logLines = summarizeRecoveryLog(recoveryLog);
     report.recovery.timelineId = (await dst.scalar(DRILL_DB, `SELECT timeline_id FROM pg_control_checkpoint()`)).trim();
     report.recovery.recoveredToTime = (await dst.scalar(DRILL_DB, `SELECT to_char(pg_last_xact_replay_timestamp() at time zone 'UTC','YYYY-MM-DD HH24:MI:SS.US') || '+00'`)).trim();
     logger.info(

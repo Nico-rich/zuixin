@@ -46,8 +46,7 @@ ARG HTTPS_PROXY
 # -----------------------------------------------------------------------------
 FROM ${NODE_IMAGE} AS base
 ENV CI=true \
-    NPM_CONFIG_UPDATE_NOTIFIER=false \
-    HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY
+    NPM_CONFIG_UPDATE_NOTIFIER=false
 RUN npm install -g pnpm@9.15.0
 WORKDIR /app
 
@@ -55,6 +54,11 @@ WORKDIR /app
 # deps：只装依赖（改源码不击穿缓存）
 # -----------------------------------------------------------------------------
 FROM base AS deps
+# 构建期代理只在 deps/builder 生效（绝不烘进 runtime 镜像）：ARG 在每个 FROM 后失效，必须本阶段重声明
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY
+
 COPY pnpm-lock.yaml pnpm-workspace.yaml package.json .npmrc ./
 COPY packages/shared/package.json packages/shared/
 COPY apps/api/package.json apps/api/

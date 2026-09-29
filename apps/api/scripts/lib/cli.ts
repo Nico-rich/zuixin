@@ -109,6 +109,8 @@ export function run(command: string, args: readonly string[], options: RunOption
     const errChunks: Buffer[] = [];
     let sink: WriteStream | null = null;
     if (options.stdoutToFile) sink = createWriteStream(options.stdoutToFile);
+  // M11 Final Audit M3：写盘失败（ENOSPC/EACCES）必须以退出码 1 结束且保留清理路径
+  sink?.on('error', () => process.exit(1));
     let timedOut = false;
     const timer = options.timeoutMs
       ? setTimeout(() => {

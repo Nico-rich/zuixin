@@ -217,11 +217,14 @@ async function main(): Promise<void> {
     const chainResult = opened ? await opened.finished : null;
     const what = chain.encryption === 'gpg' ? '解密或解压' : '解压';
     if (chainResult && !chainResult.ok) {
+      // M11 Final Audit M9：gpg 链路失败 = 可能缺前置（口令/私钥，4）；非 gpg 链路 = 产物损坏（3）。
+      // 契约：4=缺前置（去取回口令），3=产物坏（立刻改用别的备份）——两种处置完全不同，绝不混码。
+      const code = chain.encryption === 'gpg' ? EXIT_PRECONDITION : EXIT_VERIFY;
       fail(
         logger,
         `读取/解析备份文件失败（${what}链路中断）：${chainResult.detail}\n  （下游现象：${(err as Error).message}）\n` +
           `  提示：对称加密的备份需要 ${GPG_PASSPHRASE_ENV}（与备份时一致）；公钥加密需要私钥在 keyring 中。`,
-        EXIT_PRECONDITION,
+        code,
       );
     }
     fail(logger, `读取/解析备份文件失败（${what}链路中断）：${(err as Error).message}`, EXIT_VERIFY);
@@ -231,11 +234,13 @@ async function main(): Promise<void> {
     const opened = statsOpened as ReturnType<typeof openArtifactStream> | null;
     const chainResult = opened ? await opened.finished : { ok: true, detail: 'ok' };
     if (!chainResult.ok) {
+      // M11 Final Audit M9 同型：gpg 链路 4、非 gpg 链路 3
+      const code = chain.encryption === 'gpg' ? EXIT_PRECONDITION : EXIT_VERIFY;
       fail(
         logger,
         `产物读取链路失败：${chainResult.detail}\n  提示：对称加密的备份需要 ${GPG_PASSPHRASE_ENV}（与备份时一致）；` +
           '公钥加密需要私钥在 keyring 中。口令错误会以 gpg 的 "Bad session key" 暴露，不会静默产出半个库。',
-        EXIT_PRECONDITION,
+        code,
       );
     }
   }
@@ -434,11 +439,15 @@ async function main(): Promise<void> {
 
     printCredentialCheckInstructions(logger, targetArg, stats);
 
-    if (!keep) {
+    // M11 Final Audit M7：只销毁"本脚本创建的"临时库——--reuse-existing 指向操作员既有库时，
+    // 恢复成功后绝不能把人家原有的库 drop 掉（dropDatabase 先 terminate 再 DROP，破坏性极强）
+    if (!keep && createdByUs) {
       logger.step(`清理：DROP DATABASE ${targetArg}`);
       await resolved.client.dropDatabase(targetArg);
       restored = false;
       logger.info('临时库已销毁（--keep 可保留）');
+    } else if (!keep) {
+      logger.warn(`目标库 ${targetArg} 由 --reuse-existing 指定（非本脚本创建）——按安全原则保留，请人工处置`);
     } else {
       logger.warn(`临时库 ${targetArg} 已保留——请人工销毁，避免占用磁盘/连接数`);
     }

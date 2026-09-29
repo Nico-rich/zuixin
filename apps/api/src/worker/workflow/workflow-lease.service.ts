@@ -116,18 +116,18 @@ export class WorkflowLeaseService {
     let reEnqueued = 0;
     let timedOut = 0;
     // ① 已超 deadline 的活跃行（下推 SQL，绝不漏判）
-    const over = await this.sweepPaged(now, cutoff, true);
+    const over = await this.sweepPaged(now, cutoff, true, deadlineMs);
     reEnqueued += over.reEnqueued;
     timedOut += over.timedOut;
     // ② 未超期但 lease 过期/job 丢失/hook 丢失的兜底
-    const under = await this.sweepPaged(now, cutoff, false);
+    const under = await this.sweepPaged(now, cutoff, false, deadlineMs);
     reEnqueued += under.reEnqueued;
     timedOut += under.timedOut;
     return { reEnqueued, timedOut };
   }
 
   /** M11-P7 D2-12：游标分页扫描 + 逐行判定（单批 200、单周期最多 10 批；余量留下周期） */
-  private async sweepPaged(now: Date, cutoff: Date, beforeCutoff: boolean): Promise<{ reEnqueued: number; timedOut: number }> {
+  private async sweepPaged(now: Date, cutoff: Date, beforeCutoff: boolean, deadlineMs: number): Promise<{ reEnqueued: number; timedOut: number }> {
     let reEnqueued = 0;
     let timedOut = 0;
     let cursorId: string | undefined;
@@ -147,7 +147,7 @@ export class WorkflowLeaseService {
       });
       if (page.length === 0) break;
       cursorId = page[page.length - 1].id;
-      const done = await this.sweepRows(page, now);
+      const done = await this.sweepRows(page, now, deadlineMs);
       reEnqueued += done.reEnqueued;
       timedOut += done.timedOut;
       if (page.length < 200) break;
@@ -159,8 +159,8 @@ export class WorkflowLeaseService {
   private async sweepRows(
     rows: RecoverWorkflowRow[],
     now: Date,
+    deadlineMs: number,
   ): Promise<{ reEnqueued: number; timedOut: number }> {
-    const deadlineMs = await this.deadlineMs();
     let reEnqueued = 0;
     let timedOut = 0;
     for (const row of rows) {
