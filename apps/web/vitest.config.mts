@@ -20,5 +20,8 @@ export default defineConfig({
     include: ['test/**/*.test.ts', 'test/**/*.test.tsx'],
     setupFiles: ['./test/setup.ts'],
     restoreMocks: true,
+    // 环境变量桩（vi.stubEnv）与全局桩（vi.stubGlobal）一样必须逐用例复位，
+    // 否则「默认关闭/默认开启」这类默认值断言会被上一个用例污染（M13-F1 middleware 用例实抓）。
+    unstubEnvs: true,
   },
 });
