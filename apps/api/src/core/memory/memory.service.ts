@@ -2,6 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { MemoryCategory, MemoryScope, MemoryStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../../modules/prisma/prisma.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
+import { MEMORY_LIFECYCLE_KEY, mergeMemoryMetadata } from './memory-provenance';
 
 export interface MemoryListFilter {
   scope?: MemoryScope;
@@ -103,15 +104,29 @@ export class MemoryService {
     });
   }
 
-  /** 更新（scope/projectId 不可变）；candidate→active/rejected 即"确认/拒绝" */
+  /**
+   * 更新（scope/projectId 不可变）；candidate→active/rejected 即"确认/拒绝"。
+   *
+   * M12-P3：人工显式置 `active` 会记 `metadata.lifecycle.userAffirmedAt` —— 记忆生命周期巡逻
+   * （`MemoryLifecycleService`）在窗口内**绝不**再把这条记忆降级。语义：**人工裁决 > 服务端衰减**
+   * （人刚说"这条有用"，服务端不能因为 lastUsedAt 老就立刻推翻它；红线：治理判定不由 LLM 做，
+   * 同样也不由"过期时间"无声覆盖人的决定）。
+   */
   async update(userId: string, id: string, input: UpdateMemoryInput) {
-    await this.requireOwned(userId, id);
+    const existing = await this.requireOwned(userId, id);
     const data: Prisma.MemoryUpdateInput = {};
     if (input.content !== undefined) data.content = input.content;
     if (input.category !== undefined) data.category = input.category;
     if (input.importance !== undefined) data.importance = input.importance;
     if (input.confidence !== undefined) data.confidence = input.confidence;
-    if (input.status !== undefined) data.status = input.status;
+    if (input.status !== undefined) {
+      data.status = input.status;
+      if (input.status === MemoryStatus.active) {
+        data.metadata = mergeMemoryMetadata(existing.metadata, {
+          [MEMORY_LIFECYCLE_KEY]: { userAffirmedAt: new Date().toISOString() },
+        });
+      }
+    }
     return this.prisma.memory.update({ where: { id }, data });
   }
 

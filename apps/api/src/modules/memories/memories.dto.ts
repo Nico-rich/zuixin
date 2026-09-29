@@ -23,3 +23,13 @@ export const UpdateMemoryDtoSchema = z.object({
   status: z.enum(['candidate', 'active', 'rejected']).optional(),
 });
 export type UpdateMemoryDto = z.infer<typeof UpdateMemoryDtoSchema>;
+
+/**
+ * M12-P3：记忆候选人工裁决（`MemoryCandidateService.decide()` 的 HTTP 面）。
+ * 只允许两个终态：`active`（提升进上下文）/ `rejected`（拒绝）——**没有** `candidate`
+ * （候选已是当前态，"裁决为候选"是空操作，不该出现在写面）。
+ */
+export const DecideCandidateDtoSchema = z.object({
+  decision: z.enum(['active', 'rejected']),
+});
+export type DecideCandidateDto = z.infer<typeof DecideCandidateDtoSchema>;

@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { MemoryService } from '../../core/memory/memory.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { withToolCallLedger } from '../../core/tools/tool-call-ledger';
+import { MEMORY_ORIGIN_KEY, type MemoryOrigin } from '../../core/memory/memory-provenance';
 
 const SUBJECT_TYPES = ['artifact', 'creativeBrief', 'product', 'campaign', 'ad', 'generationTask', 'agentRun', 'analysis'] as const;
 /** 绩效记忆阈值（服务端规则，非 LLM）：好/差两档 */
@@ -10,6 +11,29 @@ const GOOD_CTR = 0.03;
 const GOOD_ROAS = 2;
 const BAD_CTR = 0.01;
 const BAD_ROAS = 1;
+
+/**
+ * 记忆来源标注（M12-P3 来源可信度闸门）：**服务端判定，绝不看请求体**。
+ * - 带 `toolCallId` = 从 `feedback.submit` / `performance.capture` **工具**进来（LLM 驱动）→ `agent`；
+ * - 无 `toolCallId` = HTTP 直调（人工操作）→ `user`。
+ * 该标注随派生记忆的 metadata 落库，决定"能否被自动提升"（`canAutoPromote`：agent 来源**只进候选**）。
+ * 同时 agent 来源的派生内容**剔除 LLM 自由文本**（见 `performanceMemoryContent`）——双保险。
+ */
+function memoryOriginOf(opts: { toolCallId?: string | null }): MemoryOrigin {
+  return opts.toolCallId ? 'agent' : 'user';
+}
+
+/**
+ * 派生记忆内容：**结构化事实**由服务端生成（评分/档位都是服务端常量口径）。
+ * `comment` 是唯一自由文本，且只可能来自**人工**（HTTP 直调）——agent 来源（LLM 经工具写入）一律剔除，
+ * 从根上杜绝"LLM 自述文本 → 记忆候选 → 提示注入持久化"这条链路（审计风险 2）。
+ */
+function performanceMemoryContent(input: {
+  subjectType: string; subjectId: string; rating: number; comment?: string; origin: MemoryOrigin;
+}): string {
+  const base = `${input.subjectType} ${input.subjectId} 获得评分 ${input.rating}`;
+  return input.comment && input.origin === 'user' ? `${base}（${input.comment}）` : base;
+}
 
 /**
  * M7-P8 Feedback + Performance Learning（不改模型权重——学习 = Memory 闭环）：
@@ -68,11 +92,16 @@ export class FeedbackService {
     }));
     // 学习闭环：高分/低分 → 记忆候选（元数据幂等——同一对象只产一条）
     if (input.rating >= 4 || input.rating <= 2) {
+      const origin = memoryOriginOf(opts);
       await this.upsertPerformanceMemory(userId, input.projectId ?? null, {
         kind: 'feedback',
         subjectType: input.subjectType, subjectId: input.subjectId,
-        content: `${input.subjectType} ${input.subjectId} 获得评分 ${input.rating}${input.comment ? `（${input.comment}）` : ''}`,
+        content: performanceMemoryContent({
+          subjectType: input.subjectType, subjectId: input.subjectId, rating: input.rating,
+          comment: input.comment, origin,
+        }),
         importance: input.rating >= 4 ? 60 : 40,
+        origin,
       });
     }
     this.logger.log({ userId, subjectType: input.subjectType, rating: input.rating }, '反馈已记录');
@@ -131,13 +160,16 @@ export class FeedbackService {
       };
     });
 
-    // 阈值记忆：好/差（服务端规则；learning = Memory，不改模型）——metadata 幂等，重放再走也不产第二条
+    // 阈值记忆：好/差（服务端规则；learning = Memory，不改模型）——metadata 幂等，重放再走也不产第二条。
+    // 内容全为**服务端计算事实**（derived 由 derive() 从数值算出，不含任何 LLM 文本）；来源标注同上。
+    const origin = memoryOriginOf(opts);
     if (derived.ctr >= GOOD_CTR || derived.roas >= GOOD_ROAS) {
       await this.upsertPerformanceMemory(userId, input.projectId ?? null, {
         kind: 'performance',
         subjectType: 'creativePerformance', subjectId: result.performanceId,
         content: `创意${input.artifactId ? ` ${input.artifactId}` : ''}近一期 CTR ${(derived.ctr * 100).toFixed(1)}% ROAS ${derived.roas}（表现好）`,
         importance: 70,
+        origin,
       });
     } else if (derived.ctr <= BAD_CTR || derived.roas <= BAD_ROAS) {
       await this.upsertPerformanceMemory(userId, input.projectId ?? null, {
@@ -145,6 +177,7 @@ export class FeedbackService {
         subjectType: 'creativePerformance', subjectId: result.performanceId,
         content: `创意${input.artifactId ? ` ${input.artifactId}` : ''}近一期 CTR ${(derived.ctr * 100).toFixed(1)}% ROAS ${derived.roas}（表现差，建议调整方向）`,
         importance: 70,
+        origin,
       });
     }
     return result;
@@ -197,6 +230,8 @@ export class FeedbackService {
   /** 绩效记忆幂等 upsert：同一 (kind, subjectType, subjectId) 只产一条候选 */
   private async upsertPerformanceMemory(userId: string, projectId: string | null, input: {
     kind: string; subjectType: string; subjectId: string; content: string; importance: number;
+    /** M12-P3 来源标注（服务端判定）：agent = LLM 经工具派生（闸门拒绝自动提升） */
+    origin: MemoryOrigin;
   }): Promise<void> {
     // 幂等去重：同 (derivedFrom, subjectId) 只产一条（metadata 判定；kind 统一为 'performance'）
     const existing = await this.prisma.memory.findFirst({
@@ -215,9 +250,12 @@ export class FeedbackService {
       category: 'other',
       importance: input.importance,
       confidence: 0.9,
-      status: 'candidate',
+      status: 'candidate', // 一律候选：能否进上下文由来源闸门 + 人工裁决/结果证据决定，绝不摄取期自升
       source: input.kind === 'feedback' ? 'feedback' : 'assistant',
-      metadata: { kind: 'performance', subjectType: input.subjectType, subjectId: input.subjectId, derivedFrom: input.kind },
+      metadata: {
+        kind: 'performance', subjectType: input.subjectType, subjectId: input.subjectId, derivedFrom: input.kind,
+        [MEMORY_ORIGIN_KEY]: input.origin, // M12-P3：来源闸门锚点（人工 HTTP → user；工具调用 → agent）
+      },
     }).catch((err) => this.logger.warn(`绩效记忆写入失败: ${(err as Error).message}`));
   }
 }

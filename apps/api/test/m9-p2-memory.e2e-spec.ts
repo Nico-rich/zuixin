@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { randomUUID } from 'node:crypto';
 import { Test } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
 import request from 'supertest';
@@ -12,7 +13,9 @@ import { ContextAssembler } from '../src/core/context/context-assembler';
 import { ModelResolverService } from '../src/providers/llm/model-resolver.service';
 import { MockLLMAdapter } from '../src/providers/llm/adapters/mock.adapter';
 import { SummaryRefinerService } from '../src/core/memory/summary-refiner.service';
-import { MemoryCandidateService } from '../src/core/memory/memory-candidate.service';
+import { MemoryCandidateService, memoryContentHash } from '../src/core/memory/memory-candidate.service';
+import { MemoryLifecycleService } from '../src/core/memory/memory-lifecycle.service';
+import { lifecycleOf, MEMORY_LIFECYCLE_KEY, MEMORY_ORIGIN_KEY } from '../src/core/memory/memory-provenance';
 import { ChatParams, ChatResponse, LLMChunk, LLMProvider } from '../src/providers/llm/llm.types';
 
 const XRW = { 'X-Requested-With': 'XMLHttpRequest' };
@@ -97,13 +100,19 @@ describe('M9-P2 Advanced Memory（增量摘要 × 候选提炼 × 上下文注�
   let assembler: ContextAssembler;
   let summaries: SummaryRefinerService;
   let candidates: MemoryCandidateService;
+  let lifecycle: MemoryLifecycleService;
   let adapter: ScriptedAdapter;
   let cookie = '';
   let userId = '';
   let orgId = '';
   let convId = '';
+  /** M12-P3 用例中的"他人"用户（跨用户隔离断言后级联清除） */
+  let otherUserId = '';
 
   const stamp = Date.now();
+  const DAY_MS = 24 * 60 * 60 * 1_000;
+  const daysAgo = (n: number) => new Date(Date.now() - n * DAY_MS);
+  const hoursAgo = (n: number) => new Date(Date.now() - n * 60 * 60_000);
 
   async function chatRound(message: string): Promise<void> {
     const res = await request(app.getHttpServer())
@@ -175,6 +184,7 @@ describe('M9-P2 Advanced Memory（增量摘要 × 候选提炼 × 上下文注�
     assembler = moduleRef.get(ContextAssembler);
     summaries = moduleRef.get(SummaryRefinerService);
     candidates = moduleRef.get(MemoryCandidateService);
+    lifecycle = moduleRef.get(MemoryLifecycleService);
 
     const user = await prisma.user.create({
       data: { email: `m9p2-${stamp}@example.com`, passwordHash: 'unused-hash' },
@@ -197,6 +207,7 @@ describe('M9-P2 Advanced Memory（增量摘要 × 候选提炼 × 上下文注�
 
   afterAll(async () => {
     vi.restoreAllMocks();
+    if (otherUserId) await prisma.user.deleteMany({ where: { id: otherUserId } }).catch(() => undefined);
     await prisma.quotaReservation.deleteMany({ where: { organizationId: orgId } }).catch(() => undefined);
     await prisma.usageLedgerEntry.deleteMany({ where: { organizationId: orgId } }).catch(() => undefined);
     await prisma.usageRecord.deleteMany({ where: { userId } }).catch(() => undefined);
@@ -397,5 +408,199 @@ describe('M9-P2 Advanced Memory（增量摘要 × 候选提炼 × 上下文注�
     await prisma.user.delete({ where: { id: temp.id } });
     expect(await prisma.memory.count({ where: { userId: temp.id } })).toBe(0);
     expect(await prisma.memoryCandidate.count({ where: { userId: temp.id } })).toBe(0);
+  });
+
+  // ===================== M12-P3 记忆生命周期（来源闸门 / 结果驱动 / decide 接线）=====================
+  // 三条改造线在**真实 PG**上端到端跑通：
+  // ① 来源可信度闸门（审计风险 2）——LLM 来源候选**即使**有成功执行证据也绝不自动升格；
+  // ② outcome 驱动的提升/衰减/淘汰（证据 = 真实 AgentRun(completed) + 该 run 的成功 UsageRecord）；
+  // ③ `MemoryCandidateService.decide()` 的 HTTP 接线 + 与 memories 域同口径的 IDOR 纪律。
+
+  /** 真实"成功执行"事实链（生命周期唯一的提升证据来源；**绝不**用 Feedback 评分——表无来源列，Agent 可自打分） */
+  async function successRun(uid: string, completedAt: Date): Promise<void> {
+    const agent = (await prisma.agent.findFirst({ select: { id: true } }))!;
+    const run = await prisma.agentRun.create({
+      data: { userId: uid, agentId: agent.id, status: 'completed', startedAt: completedAt, completedAt },
+    });
+    await prisma.usageRecord.create({
+      data: {
+        userId: uid, organizationId: orgId, runId: run.id, kind: 'llm_chat', status: 'success',
+        inputTokens: 10, outputTokens: 10, estimatedCost: 0, createdAt: completedAt,
+      },
+    });
+  }
+
+  /**
+   * 校验"作为证据被写进生命周期簿记的 run"真实、成功、且**晚于参考时刻**。
+   * 不断言等于某一条具体 run：证据面是"窗口内任意成功执行"，巡逻取最新命中（这本身也是语义的一部分）。
+   */
+  async function assertEvidenceRun(runId: unknown, uid: string, reference: Date): Promise<void> {
+    expect(typeof runId).toBe('string');
+    const run = (await prisma.agentRun.findUnique({ where: { id: runId as string } }))!;
+    expect(run.userId).toBe(uid);
+    expect(run.status).toBe('completed');
+    expect(run.completedAt!.getTime()).toBeGreaterThan(reference.getTime()); // 因果：证据不早于使用/创建
+  }
+
+  const memoryById = (id: string) => prisma.memory.findUnique({ where: { id } });
+  /** 错误响应可比对形状（requestId 天然不同，不属于泄漏面） */
+  const errorOf = (res: { body?: { error?: { code?: string; message?: string } } }) =>
+    ({ code: res.body?.error?.code, message: res.body?.error?.message });
+
+  it('T10 decide 接线：人工裁决走 HTTP（提升落 Memory / 驳回不落）；跨用户与幽灵 id 不可区分、零写入', async () => {
+    const P = '/api/v1/memories/candidates';
+
+    // RBAC：未认证 → 401（且不泄漏"该 id 是否存在"）
+    expect((await request(app.getHttpServer()).patch(`${P}/${randomUUID()}/decide`).set(XRW).send({ decision: 'active' })).status).toBe(401);
+    // zod 闸门：非法 decision → 400（在任何查库之前）
+    expect((await request(app.getHttpServer()).patch(`${P}/${randomUUID()}/decide`).set(XRW).set('Cookie', cookie).send({ decision: 'promote' })).status).toBe(400);
+
+    // 跨用户 / 幽灵 id：**逐字段同形**（防枚举：绝不给越权者"存在性"信息差）+ 零写入
+    otherUserId = (await prisma.user.create({ data: { email: `m9p2-other-${stamp}@example.com`, passwordHash: 'unused-hash' } })).id;
+    const foreignContent = `他人候选#m12p3-${stamp}`;
+    const foreign = await prisma.memoryCandidate.create({
+      data: { userId: otherUserId, content: foreignContent, contentHash: memoryContentHash(foreignContent), category: 'other', importance: 50, confidence: 0.5, status: 'candidate' },
+    });
+    const cross = await request(app.getHttpServer()).patch(`${P}/${foreign.id}/decide`).set(XRW).set('Cookie', cookie).send({ decision: 'active' });
+    const ghost = await request(app.getHttpServer()).patch(`${P}/${randomUUID()}/decide`).set(XRW).set('Cookie', cookie).send({ decision: 'active' });
+    expect(cross.status).toBe(404);
+    expect(ghost.status).toBe(404);
+    expect(errorOf(cross)).toEqual({ code: 'NOT_FOUND', message: '记忆候选不存在' });
+    expect(errorOf(ghost)).toEqual(errorOf(cross));
+    expect(await prisma.memoryCandidate.findUnique({ where: { id: foreign.id } })).toMatchObject({ status: 'candidate' });
+    expect(await prisma.memory.count({ where: { userId: otherUserId } })).toBe(0);
+
+    // 列表面：只出本人的候选（集合相等 = 用户级隔离）
+    const list = await request(app.getHttpServer()).get(P).set('Cookie', cookie).expect(200);
+    const listed = (list.body.data as Array<{ id: string }>).map((r) => r.id).sort();
+    const own = (await prisma.memoryCandidate.findMany({ where: { userId, status: 'candidate' }, select: { id: true } })).map((r) => r.id).sort();
+    expect(listed).toEqual(own);
+    expect(listed).not.toContain(foreign.id);
+
+    // 人工提升：候选行 → active + 落 Memory(status=active) + 可追溯锚（**人工**裁决不受来源闸门限制——闸门的落点就是人）
+    const content = `裁决-提升#m12p3-${stamp}`;
+    const mine = await prisma.memoryCandidate.create({
+      data: { userId, content, contentHash: memoryContentHash(content), category: 'other', importance: 70, confidence: 0.9, status: 'candidate' },
+    });
+    const ok = await request(app.getHttpServer()).patch(`${P}/${mine.id}/decide`).set(XRW).set('Cookie', cookie).send({ decision: 'active' }).expect(200);
+    expect(ok.body.data).toMatchObject({ id: mine.id, status: 'active' });
+    expect(await prisma.memoryCandidate.findUnique({ where: { id: mine.id } })).toMatchObject({ status: 'active' });
+    const promoted = (await prisma.memory.findFirst({ where: { userId, content } }))!;
+    expect(promoted).toMatchObject({ status: 'active', source: 'extractor', scope: 'user' });
+    expect(promoted.metadata).toMatchObject({
+      memoryCandidateId: mine.id,
+      [MEMORY_ORIGIN_KEY]: 'extractor',
+      [MEMORY_LIFECYCLE_KEY]: { promotedBy: 'human', source: 'memory-candidate' },
+    });
+    // 重复裁决 → 404（幂等：绝不二次提升、绝不产生第二条 Memory）
+    expect((await request(app.getHttpServer()).patch(`${P}/${mine.id}/decide`).set(XRW).set('Cookie', cookie).send({ decision: 'active' })).status).toBe(404);
+    expect(await prisma.memory.count({ where: { userId, content } })).toBe(1);
+
+    // 人工驳回：候选行 → rejected；**绝不**落 Memory（驳回不是"晚点生效"）
+    const rejectContent = `裁决-驳回#m12p3-${stamp}`;
+    const rejectRow = await prisma.memoryCandidate.create({
+      data: { userId, content: rejectContent, contentHash: memoryContentHash(rejectContent), category: 'other', importance: 50, confidence: 0.5, status: 'candidate' },
+    });
+    await request(app.getHttpServer()).patch(`${P}/${rejectRow.id}/decide`).set(XRW).set('Cookie', cookie).send({ decision: 'rejected' }).expect(200);
+    expect(await prisma.memoryCandidate.findUnique({ where: { id: rejectRow.id } })).toMatchObject({ status: 'rejected' });
+    expect(await prisma.memory.count({ where: { userId, content: rejectContent } })).toBe(0);
+  });
+
+  it('T11 来源闸门（红线条）：成功执行证据只升格人工/提炼来源候选；LLM 来源与历史无标注候选绝不自动升格', async () => {
+    const createdAt = hoursAgo(3); // 已过静默期（1h），仍在回看窗口（30d）内
+    const trusted = await prisma.memory.create({
+      data: { userId, scope: 'user', content: `闸门-人工来源#${stamp}`, category: 'preference', importance: 60, status: 'candidate', source: 'manual', createdAt },
+    });
+    // LLM 经工具打分派生（feedback.submit 带 toolCallId → origin=agent）
+    const llm = await prisma.memory.create({
+      data: {
+        userId, scope: 'user', content: `闸门-LLM来源#${stamp}`, category: 'other', importance: 60, status: 'candidate', source: 'feedback', createdAt,
+        metadata: { kind: 'performance', subjectType: 'artifact', subjectId: 'a1', derivedFrom: 'feedback', [MEMORY_ORIGIN_KEY]: 'agent' },
+      },
+    });
+    // 历史行（本次改造前落库，无显式标注）→ 无法证明来源 → 兜底最低信任
+    const legacy = await prisma.memory.create({
+      data: { userId, scope: 'user', content: `闸门-历史无标注#${stamp}`, category: 'other', importance: 60, status: 'candidate', source: 'feedback', createdAt },
+    });
+    await successRun(userId, new Date(createdAt.getTime() + 5 * 60_000)); // 三条都有"可用"证据
+
+    const r = await lifecycle.sweep({ now: new Date(), userBudget: 2_000 });
+    expect(r.promoted).toBeGreaterThanOrEqual(1);
+
+    const trustedAfter = (await memoryById(trusted.id))!;
+    expect(trustedAfter.status).toBe('active');
+    const trustedLc = lifecycleOf(trustedAfter.metadata);
+    expect(trustedLc.promotedBy).toBe('outcome');
+    await assertEvidenceRun(trustedLc.promotedByRunId, userId, createdAt);
+    // 闸门：证据齐备也不升格（LLM 来源 / 无标注历史行）
+    expect((await memoryById(llm.id))!.status).toBe('candidate');
+    expect((await memoryById(legacy.id))!.status).toBe('candidate');
+
+    // 未升格的候选绝不进上下文（即便它刚被喂了"成功执行"证据）
+    const conv = await prisma.conversation.create({ data: { userId, title: 'M12-P3 上下文校验' } });
+    const { blocks } = await assembler.assemble({ userId, conversationId: conv.id });
+    const injected = blocks.map((b) => b.content).join('\n');
+    expect(injected).toContain(`闸门-人工来源#${stamp}`);
+    expect(injected).not.toContain(`闸门-LLM来源#${stamp}`);
+    expect(injected).not.toContain(`闸门-历史无标注#${stamp}`);
+  });
+
+  it('T12 结果驱动生命周期：验证提升 / 长期未用降级退出上下文 / 降级过期淘汰；人工恢复不被服务端无声推翻', async () => {
+    const used = hoursAgo(2);
+    const conv = await prisma.conversation.create({ data: { userId, title: 'M12-P3 生命周期校验' } });
+    // ① 新鲜（被用过）+ 相关成功执行 → importance 上调 + 记验证锚（同一次使用只验证一次）
+    const fresh = await prisma.memory.create({
+      data: { userId, scope: 'user', content: `生命周期-验证提升#${stamp}`, category: 'preference', importance: 50, status: 'active', source: 'manual', lastUsedAt: used },
+    });
+    await successRun(userId, new Date(used.getTime() + 5 * 60_000));
+    // ② 长期未用（创建与使用都在窗口外）+ importance 触地板 → 同一次巡逻即降级（退出上下文）
+    const stale = await prisma.memory.create({
+      data: { userId, scope: 'user', content: `生命周期-衰减降级#${stamp}`, category: 'other', importance: 30, status: 'active', source: 'manual', createdAt: daysAgo(60), lastUsedAt: daysAgo(60) },
+    });
+    // ③ 已被降级且 demotedAt 超出淘汰窗口、无人恢复 → 淘汰（rejected；**行保留**，绝不物理删）
+    const evictable = await prisma.memory.create({
+      data: {
+        userId, scope: 'user', content: `生命周期-淘汰#${stamp}`, category: 'other', importance: 20, status: 'candidate', source: 'manual',
+        createdAt: daysAgo(90), lastUsedAt: daysAgo(90), metadata: { [MEMORY_LIFECYCLE_KEY]: { demotedAt: daysAgo(60).toISOString(), demoteReason: 'stale' } },
+      },
+    });
+
+    const r = await lifecycle.sweep({ now: new Date(), userBudget: 2_000 });
+    expect(r.verified).toBeGreaterThanOrEqual(1);
+    expect(r.demoted).toBeGreaterThanOrEqual(1);
+    expect(r.evicted).toBeGreaterThanOrEqual(1);
+
+    const freshAfter = (await memoryById(fresh.id))!;
+    expect(freshAfter.importance).toBe(60); // 50 + 验证提升步长
+    const freshLc = lifecycleOf(freshAfter.metadata);
+    expect(freshLc.lastVerifiedUseAt).toBe(used.toISOString()); // 幂等锚：这次使用已被验证
+    await assertEvidenceRun(freshLc.lastVerifiedRunId, userId, used);
+    const staleAfter = (await memoryById(stale.id))!;
+    expect(staleAfter.status).toBe('candidate'); // 已退出上下文
+    expect(lifecycleOf(staleAfter.metadata)).toMatchObject({ demoteReason: 'stale' });
+    expect((await memoryById(evictable.id))!.status).toBe('rejected'); // 淘汰：行保留、永久退出上下文
+
+    // 退出上下文（对上下文组装**可见**）：降级/淘汰的内容绝不进注入
+    const after = await assembler.assemble({ userId, conversationId: conv.id });
+    const injected = after.blocks.map((b) => b.content).join('\n');
+    expect(injected).not.toContain(`生命周期-衰减降级#${stamp}`);
+    expect(injected).not.toContain(`生命周期-淘汰#${stamp}`);
+
+    // 人工恢复（PATCH /memories/:id → active）：记 userAffirmedAt；此后服务端衰减**绝不**无声推翻人工裁决
+    await request(app.getHttpServer()).patch(`/api/v1/memories/${stale.id}`).set(XRW).set('Cookie', cookie).send({ status: 'active' }).expect(200);
+    const recovered = (await memoryById(stale.id))!;
+    expect(recovered.status).toBe('active');
+    expect(lifecycleOf(recovered.metadata)).toMatchObject({ demoteReason: 'stale' }); // 既有簿记保留（不覆盖）
+    expect(typeof lifecycleOf(recovered.metadata).userAffirmedAt).toBe('string');
+    const importanceAtRecovery = recovered.importance;
+    await lifecycle.sweep({ now: new Date(), userBudget: 2_000 }); // lastUsedAt 仍在窗口外
+    const kept = (await memoryById(stale.id))!;
+    expect(kept.status).toBe('active');
+    expect(kept.importance).toBe(importanceAtRecovery);
+    expect(lifecycleOf(kept.metadata).decayedAt).toBeUndefined(); // 该行零写入
+
+    // 阳性对照：人工恢复后确实回到上下文（证明上面的"不在"是降级造成，而非被注入条数上限裁掉）
+    const back = await assembler.assemble({ userId, conversationId: conv.id });
+    expect(back.blocks.some((b) => b.content.includes(`生命周期-衰减降级#${stamp}`))).toBe(true);
   });
 });
