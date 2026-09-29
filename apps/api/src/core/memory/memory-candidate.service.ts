@@ -6,6 +6,7 @@ import { PrismaService } from '../../modules/prisma/prisma.service';
 import { ModelResolverService } from '../../providers/llm/model-resolver.service';
 import { ExtractedCandidatesSchema, MEMORY_CATEGORIES } from './memory-extractor';
 import { SummaryRefinerService } from './summary-refiner.service';
+import { canAutoPromote, MEMORY_LIFECYCLE_KEY, MEMORY_ORIGIN_KEY, type MemoryOrigin } from './memory-provenance';
 
 /**
  * M9-P2 记忆候选提炼（MemoryCandidate 三态表：candidate | active | rejected）。
@@ -28,6 +29,11 @@ import { SummaryRefinerService } from './summary-refiner.service';
  *   绝不当错误抛出（不影响聊天），也绝无重复候选行。
  *
  * 上限闸门与既有提取器同源：每日候选上限复用 limits.dailyMemoryCandidates（不计入则只留 candidate 不提升）。
+ *
+ * M12-P3 **来源可信度闸门**：本服务的自动提升路径（提取器来源）在闸门白名单内
+ * （`canAutoPromote`——提炼输入只来自真实 Message 行、另有阈值闸门），提升时**显式标注** `metadata.origin`；
+ * LLM 来源（`feedback.*` / `memory.create_candidate` 等 Agent 工具派生）不在白名单 → 只能走 `decide()`
+ * 的人工裁决。闸门口径集中在 `memory-provenance.ts`（唯一实现，绝不各处重写）。
  */
 export const DEFAULT_PROMOTE_CONFIDENCE = 0.8;
 export const DEFAULT_PROMOTE_IMPORTANCE = 70;
@@ -41,6 +47,13 @@ const MAX_ITEMS_PER_SUMMARY = 20;
 const MAX_MESSAGES = 200;
 /** 单条消息进 prompt 的截断长度 */
 const MAX_MESSAGE_CHARS = 500;
+
+/**
+ * M12-P3：本服务产出的记忆来源标注（`source='extractor'` + 显式 `metadata.origin`）。
+ * 显式标注优先于按 source 兜底——避免"来源改名"这类无声漂移把可信来源降级或反之。
+ */
+const EXTRACTOR_ORIGIN: MemoryOrigin = 'extractor';
+const EXTRACTOR_PROVENANCE = { source: 'extractor', metadata: { [MEMORY_ORIGIN_KEY]: EXTRACTOR_ORIGIN } };
 
 /** M10 W0：候选内容指纹（DB UNIQUE(userId, contentHash) 去重锚点；与迁移 SQL 的 sha256 口径一致） */
 export function memoryContentHash(content: string): string {
@@ -129,7 +142,8 @@ export class MemoryCandidateService {
         const eligible = !rejected
           && item.confidence >= promoteLimits.confidence
           && item.importance >= promoteLimits.importance
-          && remaining > 0;
+          && remaining > 0
+          && canAutoPromote(EXTRACTOR_PROVENANCE); // M12-P3：闸门先行（本来源在白名单内；谓词放宽即重开注入通道）
 
         let row: Awaited<ReturnType<typeof this.prisma.memoryCandidate.create>>;
         try {
@@ -156,7 +170,7 @@ export class MemoryCandidateService {
         result.extracted++;
 
         if (eligible && row) {
-          const promoted = await this.promote(conversation.userId, conversation.projectId, row.id, summary.id, item, summary.sourceEndMessageId);
+          const promoted = await this.promote(conversation.userId, conversation.projectId, row.id, summary.id, item, summary.sourceEndMessageId, 'ingest');
           if (promoted) {
             result.promoted++;
             remaining--;
@@ -172,17 +186,40 @@ export class MemoryCandidateService {
     }
   }
 
-  /** 人工确认/拒绝（候选表三态的显式流转；提升同样写入 Memory 表） */
-  async decide(candidateId: string, decision: 'active' | 'rejected'): Promise<boolean> {
-    const row = await this.prisma.memoryCandidate.findUnique({ where: { id: candidateId } });
+  /**
+   * 人工裁决（候选表三态的显式流转；提升同样写入 Memory 表）。
+   *
+   * M12-P3：接入 HTTP 面（`PATCH /memories/candidates/:id/decide`）并补上**归属谓词**——
+   * 谓词含 `userId`（不是先按 id 取行再判归属），跨用户与幽灵 id 走同一条"不存在"路径，
+   * 与 memories/knowledge 域的 IDOR 纪律同口径（`{id, userId}` 谓词，绝不给越权者任何信息差）。
+   * 人工裁决**不受来源闸门限制**（人看着内容做决定，正是闸门的落点）；裁决动作落 metadata.lifecycle。
+   *
+   * @returns true = 本次裁决生效（真状态流转）；false = 行不存在 / 非本人 / 已非 candidate（幂等拒绝）
+   */
+  async decide(userId: string, candidateId: string, decision: 'active' | 'rejected'): Promise<boolean> {
+    const row = await this.prisma.memoryCandidate.findFirst({ where: { id: candidateId, userId } });
     if (!row || row.status !== 'candidate') return false;
     if (decision === 'rejected') {
-      await this.prisma.memoryCandidate.update({ where: { id: candidateId }, data: { status: 'rejected' } });
-      return true;
+      // 条件更新（status='candidate' 参与 WHERE）：并发裁决只有一个赢家，绝不覆盖他人刚做的决定
+      const done = await this.prisma.memoryCandidate.updateMany({
+        where: { id: candidateId, userId, status: 'candidate' },
+        data: { status: 'rejected' },
+      });
+      return done.count > 0;
     }
     return this.promote(row.userId, row.projectId, row.id, row.sourceSummaryId, {
       content: row.content, category: row.category, importance: row.importance, confidence: row.confidence,
-    }, null);
+    }, null, 'human');
+  }
+
+  /** 候选列表（人工裁决的读取面：只出本人的候选，默认待裁决） */
+  async listCandidates(userId: string, filter: { status?: string; take?: number } = {}) {
+    const status = filter.status ?? 'candidate';
+    return this.prisma.memoryCandidate.findMany({
+      where: { userId, status },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: Math.min(Math.max(filter.take ?? 100, 1), 200),
+    });
   }
 
   // ===== 内部实现 =====
@@ -262,11 +299,16 @@ export class MemoryCandidateService {
     return memory > 0 || candidate > 0;
   }
 
-  /** 提升：写既有 Memory 表（active）→ 候选行置 active + promotedAt（追溯双向） */
+  /**
+   * 提升：写既有 Memory 表（active）→ 候选行置 active + promotedAt（追溯双向）。
+   * `by`：`ingest` = 摄取期阈值自动提升（受来源闸门约束）；`human` = 人工裁决（闸门不适用）。
+   * 两种路径都**显式标注** `metadata.origin='extractor'` 与生命周期簿记（谁把它推进上下文的，必须可追溯）。
+   */
   private async promote(
     userId: string, projectId: string | null, candidateId: string, sourceSummaryId: string | null,
     item: { content: string; category: string; importance: number; confidence: number },
     sourceMessageId: string | null,
+    by: 'ingest' | 'human',
   ): Promise<boolean> {
     const memory = await this.prisma.memory.create({
       data: {
@@ -280,7 +322,12 @@ export class MemoryCandidateService {
         status: 'active',
         source: 'extractor',
         sourceMessageId: sourceMessageId ?? null,
-        metadata: { memoryCandidateId: candidateId, sourceSummaryId } as Prisma.InputJsonValue,
+        metadata: {
+          memoryCandidateId: candidateId,
+          sourceSummaryId,
+          [MEMORY_ORIGIN_KEY]: EXTRACTOR_ORIGIN,
+          [MEMORY_LIFECYCLE_KEY]: { promotedBy: by, promotedAt: new Date().toISOString(), source: 'memory-candidate' },
+        } as Prisma.InputJsonValue,
       },
     });
     if (!memory) return false;

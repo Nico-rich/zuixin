@@ -3,6 +3,7 @@ import { Request } from 'express';
 import { CreateMemoryInput, MemoryService, UpdateMemoryInput } from '../../core/memory/memory.service';
 import { CreateMemoryDtoSchema, UpdateMemoryDtoSchema } from './memories.dto';
 import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe';
+import { MEMORY_ORIGIN_KEY } from '../../core/memory/memory-provenance';
 import { AuthedUser, JwtAuthGuard } from '../auth/jwt-auth.guard';
 
 @Controller('memories')
@@ -28,8 +29,13 @@ export class MemoriesController {
     importance?: number; confidence?: number | null; status?: 'candidate' | 'active' | 'rejected';
     source?: string; sourceMessageId?: string | null;
   }) {
-    // zod 已校验；字面量类型与 Prisma 字符串枚举名义不兼容，显式收窄
-    return this.memories.create(req.user.userId, dto as CreateMemoryInput);
+    // zod 已校验；字面量类型与 Prisma 字符串枚举名义不兼容，显式收窄。
+    // M12-P3 来源标注：本面是**人工** HTTP 写面（客户端无法自报来源）→ origin='user'（可被结果证据自动提升）。
+    // 其余写面（Agent 工具 source='agent'、提炼 source='extractor'）各自标注，绝不走这条默认。
+    return this.memories.create(req.user.userId, {
+      ...(dto as CreateMemoryInput),
+      metadata: { [MEMORY_ORIGIN_KEY]: 'user' },
+    });
   }
 
   @Patch(':id')

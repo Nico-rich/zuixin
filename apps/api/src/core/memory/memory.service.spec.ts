@@ -78,11 +78,30 @@ describe('MemoryService.list/search', () => {
 });
 
 describe('MemoryService.update/remove/markUsed', () => {
-  it('update 先校验归属；支持 candidate→active', async () => {
+  it('update 先校验归属；支持 candidate→active（并记人工裁决锚 lifecycle.userAffirmedAt）', async () => {
     const { svc, prisma } = make();
-    prisma.memory.findFirst.mockResolvedValue({ id: 'm1', userId: 'u1' });
+    prisma.memory.findFirst.mockResolvedValue({ id: 'm1', userId: 'u1', metadata: { kind: 'performance' } });
     await svc.update('u1', 'm1', { status: 'active' });
-    expect(prisma.memory.update).toHaveBeenCalledWith({ where: { id: 'm1' }, data: { status: 'active' } });
+    // M12-P3：人工把记忆改回 active = 显式裁决 → 生命周期巡逻在窗口内绝不把它再次自动降级
+    expect(prisma.memory.update).toHaveBeenCalledWith({
+      where: { id: 'm1' },
+      data: {
+        status: 'active',
+        metadata: {
+          kind: 'performance', // 既有幂等锚绝不被覆盖
+          lifecycle: { userAffirmedAt: expect.any(String) },
+        },
+      },
+    });
+    // 归属校验（谓词必须含 userId）在任何写入之前
+    expect(prisma.memory.findFirst).toHaveBeenCalledWith({ where: { id: 'm1', userId: 'u1' } });
+  });
+
+  it('update 非状态字段不写 metadata（人工锚只由显式 active 恢复产生）', async () => {
+    const { svc, prisma } = make();
+    prisma.memory.findFirst.mockResolvedValue({ id: 'm1', userId: 'u1', metadata: { kind: 'performance' } });
+    await svc.update('u1', 'm1', { importance: 80 });
+    expect(prisma.memory.update).toHaveBeenCalledWith({ where: { id: 'm1' }, data: { importance: 80 } });
   });
 
   it('update 非本人 → NOT_FOUND', async () => {

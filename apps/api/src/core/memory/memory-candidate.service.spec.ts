@@ -66,6 +66,10 @@ function makeDb(init: {
     memoryCandidate: {
       count: vi.fn(async ({ where }: { where: Record<string, unknown> }) => candidates.filter((c) => match(c as unknown as Record<string, unknown>, where)).length),
       findUnique: vi.fn(async ({ where }: { where: { id: string } }) => candidates.find((c) => c.id === where.id) ?? null),
+      // M12-P3：人工裁决按 {id, userId} 谓词取行（跨用户与幽灵 id 同路径 → 零信息差）
+      findFirst: vi.fn(async ({ where }: { where: Record<string, unknown> }) => candidates.find((c) => match(c as unknown as Record<string, unknown>, where)) ?? null),
+      findMany: vi.fn(async ({ where, take }: { where: Record<string, unknown>; take?: number }) =>
+        candidates.filter((c) => match(c as unknown as Record<string, unknown>, where)).slice(0, take ?? candidates.length)),
       create: vi.fn(async ({ data }: { data: Partial<CandRow> }) => {
         const created = { id: `cand${++seq}`, createdAt: nextTime(), promotedAt: null, ...data } as CandRow;
         candidates.push(created);
@@ -75,6 +79,12 @@ function makeDb(init: {
         const row = candidates.find((c) => c.id === where.id)!;
         Object.assign(row, data);
         return row;
+      }),
+      // M12-P3：人工拒绝走条件更新（status='candidate' 参与 WHERE → 并发裁决只有一个赢家）
+      updateMany: vi.fn(async ({ where, data }: { where: Record<string, unknown>; data: Partial<CandRow> }) => {
+        const rows = candidates.filter((c) => match(c as unknown as Record<string, unknown>, where));
+        for (const row of rows) Object.assign(row, data);
+        return { count: rows.length };
       }),
     },
     memory: {
@@ -292,13 +302,55 @@ describe('MemoryCandidateService（三态提炼，防循环污染）', () => {
   it('人工裁决：candidate → active 写入 Memory 表；→ rejected 只改候选态', async () => {
     const db = makeDbWithInterval({ candidates: [{ id: 'cand-x', userId: 'u1', projectId: null, sourceSummaryId: 'sum1', content: '偏好：黑金配色', category: 'preference', importance: 85, confidence: 0.9, status: 'candidate', createdAt: at(0), promotedAt: null }] });
     const { svc } = makeService(db);
-    expect(await svc.decide('cand-x', 'rejected')).toBe(true);
+    expect(await svc.decide('u1', 'cand-x', 'rejected')).toBe(true);
     expect(db.candidates[0].status).toBe('rejected');
     expect(db.memories).toHaveLength(0);
     db.candidates[0].status = 'candidate';
-    expect(await svc.decide('cand-x', 'active')).toBe(true);
+    expect(await svc.decide('u1', 'cand-x', 'active')).toBe(true);
     expect(db.candidates[0].status).toBe('active');
     expect(db.memories[0]).toMatchObject({ userId: 'u1', content: '偏好：黑金配色', status: 'active', scope: 'user' });
-    expect(await svc.decide('cand-x', 'active')).toBe(false); // 已非 candidate → 幂等拒绝
+    expect(await svc.decide('u1', 'cand-x', 'active')).toBe(false); // 已非 candidate → 幂等拒绝
+  });
+
+  // ===== M12-P3：人工裁决接线（IDOR 谓词 + 闸门标注 + 候选读取面）=====
+
+  it('decide 归属谓词：跨用户裁决 → false 且零副作用（绝不二次提升）', async () => {
+    const db = makeDbWithInterval({ candidates: [{ id: 'cand-x', userId: 'u1', projectId: null, sourceSummaryId: 'sum1', content: '偏好：黑金配色', category: 'preference', importance: 85, confidence: 0.9, status: 'candidate', createdAt: at(0), promotedAt: null }] });
+    const { svc } = makeService(db);
+    expect(await svc.decide('u2', 'cand-x', 'active')).toBe(false); // 他人候选
+    expect(await svc.decide('u2', 'cand-x', 'rejected')).toBe(false);
+    expect(await svc.decide('u1', 'ghost', 'active')).toBe(false); // 幽灵 id 同路径
+    expect(db.candidates[0].status).toBe('candidate');
+    expect(db.memories).toHaveLength(0);
+    // 谓词锚：一律 {id, userId}（放宽即等于跨租户可改）
+    expect(db.prisma.memoryCandidate.findFirst).toHaveBeenCalledWith({ where: { id: 'cand-x', userId: 'u2' } });
+  });
+
+  it('人工提升标注来源与生命周期簿记：origin=extractor + promotedBy=human（谁把它推进上下文必须可追溯）', async () => {
+    const db = makeDbWithInterval({ candidates: [{ id: 'cand-x', userId: 'u1', projectId: null, sourceSummaryId: 'sum1', content: '偏好：黑金配色', category: 'preference', importance: 85, confidence: 0.9, status: 'candidate', createdAt: at(0), promotedAt: null }] });
+    const { svc } = makeService(db);
+    await svc.decide('u1', 'cand-x', 'active');
+    expect(db.memories[0].metadata).toMatchObject({ origin: 'extractor', lifecycle: { promotedBy: 'human' } });
+  });
+
+  it('候选读取面 listCandidates：只出本人候选（status 默认 candidate，take 收敛 1~200）', async () => {
+    const db = makeDbWithInterval({
+      candidates: [
+        { id: 'c1', userId: 'u1', projectId: null, sourceSummaryId: null, content: '本人候选', category: 'other', importance: 50, confidence: 0.5, status: 'candidate', createdAt: at(0), promotedAt: null },
+        { id: 'c2', userId: 'u2', projectId: null, sourceSummaryId: null, content: '他人候选', category: 'other', importance: 50, confidence: 0.5, status: 'candidate', createdAt: at(1), promotedAt: null },
+      ],
+    });
+    const { svc } = makeService(db);
+    const mine = await svc.listCandidates('u1');
+    expect(mine.map((c) => c.id)).toEqual(['c1']);
+    await svc.listCandidates('u1', { take: 10_000 });
+    expect(db.prisma.memoryCandidate.findMany).toHaveBeenLastCalledWith(expect.objectContaining({ take: 200 }));
+  });
+
+  it('闸门锚：摄取期自动提升路径显式标注 origin=extractor（提升行元数据可追溯来源）', async () => {
+    const db = makeDbWithInterval();
+    const { svc } = makeService(db, JSON.stringify({ memories: [item()] }));
+    await svc.extractFromSummary('sum1');
+    expect(db.memories[0].metadata).toMatchObject({ origin: 'extractor', lifecycle: { promotedBy: 'ingest' } });
   });
 });
