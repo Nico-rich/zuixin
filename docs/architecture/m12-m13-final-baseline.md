@@ -62,6 +62,14 @@
 当日首轮（131 会话/37 运行/14 任务/33 附件/2 制品 + 31 文件）→ 扩至全历史（累计 4798 会话/9905 消息/933 运行/397 任务/1121 附件/116 制品/277 项目/96 工作流/1501 OAuthState 等，两遍 FK 安全序全删无失败）→ 929 个无主磁盘文件经用户确认后删除。
 保留：UsageRecord/AnalyticsAggregate（计费与聚合事实源）、Session、AuditLog、ScheduledJob、SystemSettings、Organization/Member、EventEnvelope。产品面全部端点 200、会话列表 0 条（干净起点）。
 
-## 7. 关键 commit
+## 7. M13+ 模型配置页（用户实测驱动，62683e2）
+
+用户使用中提出：**弃用 mock 替身 + 新增模型配置页**（原「用户级模型指定/后台填写」Deferred 项就此裁决为实现）。
+- **API**：`GET/PATCH /api/v1/providers`（平台管理员、DB 权威角色）——apiKey 加密只写不回显（hasKey 布尔）、enabled/priority/baseUrl（同步 SSRF）/timeoutMs、强制审计 provider.update、写后按 type **热 refresh 零重启生效**；`routingPolicy.defaults` 写面收紧为 strict 四能力键 + 异步生效值校验（默认模型存在/启用/类型匹配；读面宽松保存量 vision）
+- **Web**：`/settings/models`（导航 adminOnly 门控，仅可见性——服务端 403 权威）+ Provider 表/编辑弹窗（Key 密码框只写）/默认模型卡；chat `PROVIDER_UNAVAILABLE` → 琥珀色「去模型配置」引导（不破坏 p.text-red-400 e2e 契约）
+- **测试基建**：`TEST_ENSURE_MOCK_PROVIDERS=1`（vitest setupFile + Playwright stack 注入）幂等启用 mock——用户停用配置与测试互不永久干扰（seed 的 `update:{}` 不恢复停用态）
+- 验证：api 256 文件/2755 通过（+35）；web 45/472；Playwright 19/0（新增 models-config 无模型闭环 spec）；**交付态：5 个 mock 已停用，对话实测返回 PROVIDER_UNAVAILABLE 引导**
+
+## 8. 关键 commit
 
 `d42c678` `1417c76` `a84ad45` `90c6741` `e843d4e`（M12 五并行）→ `961c38a`（F1）→ `133e3e3`~`f2e80d5`（W2~W10）→ `afe6bda`（Final Audit 修复）→ `d2c3b42` `36c0506`（最终验证实抓修复）
