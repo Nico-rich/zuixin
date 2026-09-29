@@ -1497,7 +1497,7 @@ model Plan {
   name        String
   monthlyPrice Float    @default(0)
   yearlyPrice  Float    @default(0)
-  entitlements Json    // { llmTokensMonthly, imageMonthly, videoSecondsMonthly, externalApiMonthly, agentRunsMonthly, workflowRunsMonthly, storageMb, seats }
+  entitlements Json    // { llmTokensMonthly, imageMonthly, videoSecondsMonthly, externalApiMonthly, agentRunsMonthly, workflowRunsMonthly, attachmentsMonthly, imageDaily, videoDaily }（M11 P3：storageMb/seats 死配置已摘除——死配额比无配额更危险）
   active      Boolean  @default(true)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt

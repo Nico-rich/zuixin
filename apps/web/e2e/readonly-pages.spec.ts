@@ -63,7 +63,7 @@ test.describe('只读页面（marketplace / workflows / evaluation）', () => {
     const errors = trackPageErrors(page);
     await page.goto('/evaluation');
 
-    await expect(page.getByRole('heading', { name: '评测' })).toBeVisible({ timeout: 60_000 });
+    await expect(page.getByRole('heading', { name: '评测', exact: true })).toBeVisible({ timeout: 60_000 }); // 子串匹配会撞上『评测运行』
 
     const sections: Array<[string, string]> = [
       ['数据集', '暂无数据集'],

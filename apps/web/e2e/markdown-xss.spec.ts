@@ -44,7 +44,7 @@ test.describe('message-bubble / markdown（XSS 与代码/表格渲染，真实�
 
     // 1) 代码块：语言标签 + 复制按钮 + 代码正文（rehype-highlight 高亮后仍需渲染出源码）
     await expect(bubble.getByText('js', { exact: true })).toBeVisible();
-    await expect(bubble.getByRole('button', { name: /复制/ })).toBeVisible();
+    await expect(bubble.getByRole('button', { name: /复制/ }).first()).toBeVisible(); // 复制按钮有文本+图标两处，取第一个确定断言
     await expect(bubble.locator('pre code, code')).toContainText('const secret');
     await expect(bubble.locator('pre code, code')).toContainText('__xss_code');
 

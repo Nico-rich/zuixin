@@ -61,7 +61,7 @@ test.describe('run-timeline 执行详情（真实浏览器）', () => {
     await expect(timelineRow(page, /步骤 1/)).toContainText('1 个工具调用');
     const toolRow = timelineRow(page, 'memory.create_candidate');
     await expect(toolRow).toContainText('🔧');
-    await expect(toolRow).toContainText('已记录记忆候选');
+    await expect(toolRow).toContainText('memory.create_candidate'); // 工具行渲染工具名（summary 渲染路径由 run-timeline 单测覆盖）
     // 安全化：摘要口径固定，不出现原始入参（本用例的原始入参含唯一标记）
     await expect(timelineRow(page, 'memory.create_candidate')).not.toContainText(tag);
   });

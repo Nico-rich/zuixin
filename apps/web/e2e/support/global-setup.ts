@@ -2,7 +2,7 @@ import type { FullConfig } from '@playwright/test';
 import { execSync } from 'node:child_process';
 import {
   API_ORIGIN, FOREIGN_ORIGIN, LOG_DIR, REDIS_URL, REPO_ROOT, WEB_ORIGIN,
-  buildEnv, ensureDirs, isHttpReachable, killTree, loadEnvValues, readState, resolveChannel,
+  buildEnv, ensureDirs, isHttpReachable, killByCommandLine, killTree, loadEnvValues, readState, resolveChannel,
   startApi, startWeb, startWorker, waitForApi, waitForWeb, writeState,
 } from './stack';
 
@@ -21,6 +21,10 @@ export default async function globalSetup(config: FullConfig): Promise<void> {
   // 残骸回收：只回收“本套件上一次运行记录的 pid”，绝不动别人的进程
   const prev = readState();
   for (const pid of [prev.workerPid, prev.webPid, prev.apiPid]) if (pid) killTree(pid);
+  // 第二道保险：上一次异常中断（Ctrl+C/崩溃）可能留下脱管的 pnpm→cmd→pnpm→node 链，
+  // 继续消费本套件的 Redis DB——task-card 的“无消费者窗口”会因此失效（实抓根因）
+  const strays = killByCommandLine('src/worker.ts', [prev.workerPid]);
+  if (strays.length) console.log(`[e2e] 回收脱管 worker 残留 pid=[${strays.join(',')}]`);
   writeState({ apiPid: null, webPid: null, workerPid: null });
 
   if (process.env.PW_REUSE_SERVERS === '1') {

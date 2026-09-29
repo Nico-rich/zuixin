@@ -1,4 +1,4 @@
-import { API_PORT, WEB_PORT, isAlive, killByPort, killTree, readState, writeState } from './stack';
+import { API_PORT, WEB_PORT, isAlive, killByCommandLine, killByPort, killTree, readState, writeState } from './stack';
 
 /**
  * 全量清理：worker → web → api（顺序保证 worker 不再消费队列后 api 才下线），
@@ -21,8 +21,9 @@ export default async function globalTeardown(): Promise<void> {
   const leftovers = [
     ...killByPort(WEB_PORT, [state.webPid]).map((pid) => `web:${pid}`),
     ...killByPort(API_PORT, [state.apiPid]).map((pid) => `api:${pid}`),
+    ...killByCommandLine('src/worker.ts', [state.workerPid]).map((pid) => `worker:${pid}`),
   ];
-  if (leftovers.length) console.log(`[e2e] 端口兜底回收：${leftovers.join(', ')}`);
+  if (leftovers.length) console.log(`[e2e] 端口/命令行兜底回收：${leftovers.join(', ')}`);
 
   const stillAlive = (state.workerPid && isAlive(state.workerPid)) || (state.apiPid && isAlive(state.apiPid)) || (state.webPid && isAlive(state.webPid));
   writeState({ apiPid: null, webPid: null, workerPid: null });

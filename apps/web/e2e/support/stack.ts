@@ -125,7 +125,7 @@ export function buildEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv 
     CORS_ORIGINS: `http://localhost:${WEB_PORT}`,
     NEXT_TELEMETRY_DISABLED: '1',
     ...extra,
-  } as NodeJS.ProcessEnv;
+  } as unknown as NodeJS.ProcessEnv;
 }
 
 export function adminCredentials(): { email: string; password: string } {
@@ -192,6 +192,23 @@ export function isAlive(pid: number | null | undefined): boolean {
   }
 }
 
+
+/** 按命令行子串回收残留进程（Windows：wmic 枚举 → taskkill /T /F）。
+ *  修复 task-card 偶发失败根因：异常退出/被杀中断的运行会把 pnpm→cmd→pnpm→node 链留在
+ *  队列 DB 上继续消费，"停止 worker 拿到确定性窗口"的假设被破坏。 */
+export function killByCommandLine(substr: string, ignorePids: Array<number | null> = []): number[] {
+  if (process.platform !== 'win32') return [];
+  const res = spawnSync('wmic', ['process', 'get', 'ProcessId,CommandLine', '/format:csv'], { encoding: 'utf8' });
+  const killed = new Set<number>();
+  for (const line of (res.stdout ?? '').split(/\r?\n/)) {
+    if (!line.includes(substr)) continue;
+    const pid = Number(line.split(',')[1]);
+    if (!pid || !Number.isFinite(pid) || pid === process.pid || ignorePids.includes(pid)) continue;
+    killTree(pid);
+    killed.add(pid);
+  }
+  return [...killed];
+}
 /** 杀进程树（Windows: taskkill /T /F；POSIX: 进程组） */
 export function killTree(pid: number | null | undefined): void {
   if (!pid) return;

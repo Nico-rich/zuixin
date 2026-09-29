@@ -40,7 +40,7 @@ test.describe('chat SSE 真流式（真实浏览器 + 真实 api/web 进程）',
     await waitForChatSettled(page);
     const final = samples[samples.length - 1] ?? '';
     const completed = strip(await lastAssistantText(page));
-    expect(completed).toContain('本地 mock 模型回复');
+    expect(completed).toContain('mock模型回复'); // mock 实际回显文本（无空格——与 mock 适配器文案对齐）
     expect(completed).toContain(tag); // mock 回显用户消息 → 确认是本次消息的回复
 
     // token 级增量（MOCK_DELAY_MS 保证中间态可观测）

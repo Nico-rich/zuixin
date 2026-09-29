@@ -122,6 +122,9 @@ npx tsx scripts/backup.ts -o /var/backups/agent-platform --prune --prune-keep 30
 manifest 是整个流程的关键：**恢复前后不必再去翻日志**，"这份备份当时是什么状态"以它为准。
 `restore.ts` 也会把自己那一侧的校验结果写成 `restore-<库>-<stamp>.report.json`。
 
+> **M11-P9 加密备份**：`--encrypt gpg` 产出 `.sql.gz.gpg`（AES256，口令走 stdin，`--batch --pinentry-mode loopback`），
+> 用法/自检/恢复/演练数字见 `docs/operations/m11-backup-encryption.md`。
+
 ### 2.4 实测（2026-09-28，本机 dev 库，只读）
 
 命令：`npx tsx scripts/backup.ts --env-file <仓库根>/.env -o <temp> --label m10p9-drill --expect-tables 88`

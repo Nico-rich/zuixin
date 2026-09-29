@@ -12,6 +12,12 @@ import { CHILD_TERMINAL_STATUSES, WorkflowWakeService } from './workflow-wake.se
 
 export const WORKFLOW_DEADLINE_MS = WORKFLOW_DEADLINE_DEFAULT_MS; // workflow run 上限 1h（可被 limits.workflowDeadlineMs 覆盖）
 
+/** M11-P7 D2-12：恢复域投影行（只取判定必需列；绝不载入 input/output 大字段） */
+type RecoverWorkflowRow = {
+  id: string; status: string; startedAt: Date; workerId: string | null; leaseUntil: Date | null;
+  waitingOnApprovalId: string | null; waitingOnAgentRunId: string | null; currentStep: number;
+};
+
 /**
  * M7-P6 WorkflowRun Lease——复用 M6 AgentRun Lease 原语集（同一状态机形状，独立表）：
  * claim 条件更新（queued/running+stale）→ renew owner fencing → release → recoverStale 兜底：
@@ -103,13 +109,58 @@ export class WorkflowLeaseService {
   async recoverStale(): Promise<{ reEnqueued: number; timedOut: number }> {
     const now = new Date();
     const deadlineMs = await this.deadlineMs();
-    const rows = await this.prisma.workflowRun.findMany({
-      where: { status: { in: ['queued', 'running', 'waiting'] } },
-      select: {
-        id: true, status: true, startedAt: true, workerId: true, leaseUntil: true,
-        waitingOnApprovalId: true, waitingOnAgentRunId: true, currentStep: true,
-      },
-    });
+    // M11-P7 D2-12（集成补做——A6/A7 边界缺口）：不再一次性载入全部活跃行，
+    // 与 agent-run-lease/media-cleanup/scheduler 同范式：deadline 下推 SQL + (startedAt,id) 游标分页。
+    // startedAt 不可变 ⇒ 页间绝不漏行/重行；单批 200、单周期最多 10 批，余量留下周期。
+    const cutoff = new Date(now.getTime() - deadlineMs);
+    let reEnqueued = 0;
+    let timedOut = 0;
+    // ① 已超 deadline 的活跃行（下推 SQL，绝不漏判）
+    const over = await this.sweepPaged(now, cutoff, true);
+    reEnqueued += over.reEnqueued;
+    timedOut += over.timedOut;
+    // ② 未超期但 lease 过期/job 丢失/hook 丢失的兜底
+    const under = await this.sweepPaged(now, cutoff, false);
+    reEnqueued += under.reEnqueued;
+    timedOut += under.timedOut;
+    return { reEnqueued, timedOut };
+  }
+
+  /** M11-P7 D2-12：游标分页扫描 + 逐行判定（单批 200、单周期最多 10 批；余量留下周期） */
+  private async sweepPaged(now: Date, cutoff: Date, beforeCutoff: boolean): Promise<{ reEnqueued: number; timedOut: number }> {
+    let reEnqueued = 0;
+    let timedOut = 0;
+    let cursorId: string | undefined;
+    for (let batch = 0; batch < 10; batch++) {
+      const page: RecoverWorkflowRow[] = await this.prisma.workflowRun.findMany({
+        where: {
+          status: { in: ['queued', 'running', 'waiting'] },
+          startedAt: beforeCutoff ? { lt: cutoff } : { gte: cutoff },
+        },
+        select: {
+          id: true, status: true, startedAt: true, workerId: true, leaseUntil: true,
+          waitingOnApprovalId: true, waitingOnAgentRunId: true, currentStep: true,
+        },
+        orderBy: [{ startedAt: 'asc' }, { id: 'asc' }],
+        take: 200,
+        ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
+      });
+      if (page.length === 0) break;
+      cursorId = page[page.length - 1].id;
+      const done = await this.sweepRows(page, now);
+      reEnqueued += done.reEnqueued;
+      timedOut += done.timedOut;
+      if (page.length < 200) break;
+    }
+    return { reEnqueued, timedOut };
+  }
+
+  /** M11-P7 D2-12：逐行判定与条件更新（原 recoverStale 循环体原样搬移，语义逐字不变） */
+  private async sweepRows(
+    rows: RecoverWorkflowRow[],
+    now: Date,
+  ): Promise<{ reEnqueued: number; timedOut: number }> {
+    const deadlineMs = await this.deadlineMs();
     let reEnqueued = 0;
     let timedOut = 0;
     for (const row of rows) {
