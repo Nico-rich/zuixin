@@ -58,7 +58,9 @@
 3. e2e 自清理：task-card spec 结束删除测试会话（软删除语义，产品视图零残留）+ 新增回归测试
    （adapter 缺失文件/目录 NOT_FOUND ×2；attachments e2e「行在字节失 → 404 进程不崩」）。
 
-**残留清理**：删除共享库中当日测试残留（131 会话/37 运行/14 任务/33 附件/2 制品，单事务 FK 安全序）+ 31 个对应磁盘文件。
+**残留清理（用户确认）**：admin 账号全量测试残留清零（该账号无任何真实用户数据——用户从未创建过内容）：
+当日首轮（131 会话/37 运行/14 任务/33 附件/2 制品 + 31 文件）→ 扩至全历史（累计 4798 会话/9905 消息/933 运行/397 任务/1121 附件/116 制品/277 项目/96 工作流/1501 OAuthState 等，两遍 FK 安全序全删无失败）→ 929 个无主磁盘文件经用户确认后删除。
+保留：UsageRecord/AnalyticsAggregate（计费与聚合事实源）、Session、AuditLog、ScheduledJob、SystemSettings、Organization/Member、EventEnvelope。产品面全部端点 200、会话列表 0 条（干净起点）。
 
 ## 7. 关键 commit
 
