@@ -321,7 +321,7 @@ describe('M7-P6 Workflow Engine (e2e, 真实 Queue + Worker)', () => {
     // 本用例按"存量语义"构造：直接落一份含 event 触发器的 published 版本（绕过写 DTO），
     // 再经服务层 registerEvent 订阅——把"存量仍可运行"变成可回归证据（绝不走已下线的写入面）。
     const latest = await prisma.workflowVersion.findFirst({ where: { workflowId, status: 'published' }, orderBy: { version: 'desc' } });
-    await prisma.workflowVersion.create({
+    const legacyVersion = await prisma.workflowVersion.create({
       data: {
         workflowId,
         version: (latest?.version ?? 0) + 1,
@@ -345,6 +345,11 @@ describe('M7-P6 Workflow Engine (e2e, 真实 Queue + Worker)', () => {
     await new Promise((r) => setTimeout(r, 500));
     expect(await prisma.workflowRun.count({ where: { workflowId, triggerType: 'event' } })).toBe(1);
     expect(await approveAndWait(eventRun!.id)).toBe('completed');
+    // M12 Final Audit 修复：本用例是"存量语义回归"构造（临时直落 legacy 版本）——
+    // 完成后回收该版本与其 run（步骤级联删除、审批 SetNull），恢复后续用例的版本号期望
+    await prisma.workflowRun.deleteMany({ where: { versionId: legacyVersion.id } });
+    await prisma.workflowVersion.delete({ where: { id: legacyVersion.id } }).catch(() => undefined);
+    runIds.splice(runIds.indexOf(eventRun!.id), 1); // afterAll 不再重复删
   });
 
   it('P6 retry：失败 run → 新 run（attempt+1），旧 run 保持终态', async () => {

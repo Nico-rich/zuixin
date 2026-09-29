@@ -165,6 +165,9 @@ export function rollbackOf(steps: readonly LoopRunStepRow[]): LoopRollback {
   return { ...base, status: 'pending', errorCode: anchor.errorCode ?? null, detail: `补偿链状态 ${anchor.status}（待回滚）` };
 }
 
+/** M12 Final Audit M1：事实采集扫描上限（N+1 探测触顶；与 provenance 扫描 fail-closed 同纪律） */
+const FACTS_SCAN_LIMIT = 500;
+
 @Injectable()
 export class CreativeLoopOrchestrator {
   private readonly logger = new Logger('CreativeLoop');
@@ -547,9 +550,13 @@ export class CreativeLoopOrchestrator {
         ...(doc.projectId ? { projectId: doc.projectId } : {}),
         capturedAt: { gte: since },
       },
+      orderBy: { capturedAt: 'desc' },
+      take: FACTS_SCAN_LIMIT + 1, // M12 Final Audit M1：有界扫描（N+1 探测触顶）
     });
+    const factsScanComplete = rows.length <= FACTS_SCAN_LIMIT;
+    const boundedRows = rows.slice(0, FACTS_SCAN_LIMIT);
     const provenance = await this.provenance.agentAuthoredIds(stored.userId);
-    const { rows: externalRows, excludedAgentRows } = excludeAgentPerformance(rows, provenance.ids);
+    const { rows: externalRows, excludedAgentRows } = excludeAgentPerformance(boundedRows, provenance.ids);
     const facts = sumPerfFacts(externalRows);
     const derived = derivePerfMetrics(facts);
     // fail-closed：账本枚举不完整 → 无法证明窗口内没有伪造行 → 派生指标视同缺失（绝不据来源不明的行判定）

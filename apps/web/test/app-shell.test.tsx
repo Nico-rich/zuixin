@@ -44,9 +44,9 @@ describe('AppShell 全局导航', () => {
     expect(NAV_SECTIONS.map((s) => s.id)).toEqual(['workspace', 'capabilities', 'operations', 'system']);
     // 产品规格要求的左栏顺序（对话/工作流/评测/扩展市场/…/设置）
     expect(allNavItems().map((i) => i.label)).toEqual([
-      '首页', '对话', '工作流', '评测', '扩展市场',
-      'Agents', 'Agent 运行', '知识库', '记忆', '创意工作台',
-      '连接', '分析', '反馈', '用量', '账单', '组织团队',
+      '首页', '对话', '工作流', '审批', '评测', '扩展市场',
+      'Agents', 'Agent 运行', '知识库', '记忆', '创意工作台', '制品',
+      '连接', '分析', '电商', '反馈', '用量', '账单', '组织团队',
       '扩展管理', '设置',
     ]);
   });

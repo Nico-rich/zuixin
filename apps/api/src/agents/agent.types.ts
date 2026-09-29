@@ -13,7 +13,7 @@ export interface AgentContext {
   attachments: AttachmentMeta[];
   history: ChatMessage[];
   intent: TaskIntent;
-  mode: 'normal' | 'thinking';
+  mode: 'normal' | 'thinking' // 预留，未接线（M12 Final Audit 登记：零运行时消费者）;
   signal?: AbortSignal; // 用户停止生成 → 传播到 Provider 流
 }
 

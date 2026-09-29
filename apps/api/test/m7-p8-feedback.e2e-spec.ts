@@ -118,10 +118,13 @@ describe('M7-P8 Feedback / Performance Learning (e2e)', () => {
     const memories = await prisma.memory.findMany({
       where: { userId, metadata: { path: ['kind'], equals: 'performance' } },
     });
-    expect(memories).toHaveLength(1);
-    expect(memories[0].content).toContain('评分 5');
-    expect(memories[0].source).toBe('feedback');
-    expect((memories[0].metadata as { subjectId: string }).subjectId).toBe(artifactId);
+    // M12 Final Audit 修复：共享 admin 用户——按 subjectId 收敛断言（绝不与其它套件的性能记忆混计）
+    const scoped = memories.filter((m) => (m.metadata as { subjectId?: string } | null)?.subjectId === artifactId);
+    expect(scoped).toHaveLength(1);
+    expect(memories.length).toBeGreaterThanOrEqual(1);
+    expect(scoped[0].content).toContain('评分 5');
+    expect(scoped[0].source).toBe('feedback');
+    expect((scoped[0].metadata as { subjectId: string }).subjectId).toBe(artifactId);
     // 列表读取
     const list = await request(app.getHttpServer()).get(`/api/v1/feedback?subjectId=${artifactId}`).set(XRW).set('Cookie', cookie).expect(200);
     expect((list.body.data as Array<{ rating: number }>).length).toBe(2);
@@ -141,14 +144,18 @@ describe('M7-P8 Feedback / Performance Learning (e2e)', () => {
     });
     const perf = await prisma.creativePerformance.findFirst({ where: { artifactId } });
     expect(perf).toBeTruthy();
-    // 通用快照层同步
-    const snapshots = await prisma.performanceSnapshot.findMany({ where: { userId } });
+    // 通用快照层同步（M12 Final Audit 修复：共享 admin——按本用例 subject.artifactId 收敛）
+    const snapshots = await prisma.performanceSnapshot.findMany({
+      where: { userId, metrics: { path: ['subject', 'artifactId'], equals: artifactId } },
+    });
     expect(snapshots).toHaveLength(1);
-    // 达标（ctr 5% ≥ 3%）→ 绩效记忆候选（service-rule）
+    // 达标（ctr 5% ≥ 3%）→ 绩效记忆候选（service-rule）（按本 performanceId 收敛）
     const memories = await prisma.memory.findMany({
       where: { userId, metadata: { path: ['kind'], equals: 'performance' } },
     });
-    const perfMemory = memories.find((m) => (m.metadata as { derivedFrom?: string }).derivedFrom === 'performance');
+    const perfMemory = memories.find((m) =>
+      (m.metadata as { derivedFrom?: string }).derivedFrom === 'performance'
+      && (m.metadata as { subjectId?: string }).subjectId === perf!.id);
     expect(perfMemory).toBeTruthy();
     expect(perfMemory!.content).toContain('表现好');
   });

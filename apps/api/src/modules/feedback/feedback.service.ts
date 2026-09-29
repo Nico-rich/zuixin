@@ -242,15 +242,17 @@ export class FeedbackService {
     /** M12-P3 来源标注（服务端判定）：agent = LLM 经工具派生（闸门拒绝自动提升） */
     origin: MemoryOrigin;
   }): Promise<void> {
-    // 幂等去重：同 (derivedFrom, subjectId) 只产一条（metadata 判定；kind 统一为 'performance'）
-    const existing = await this.prisma.memory.findFirst({
+    // 幂等去重：同 (derivedFrom, subjectId) 只产一条（metadata 判定；kind 统一为 'performance'）。
+    // M12 Final Audit 修复：原 findFirst 无排序 + 只按 derivedFrom 过滤——共享用户跨对象累积后
+    // 会命中任意旧行，同 subject 重复提交被误判为新对象（实抓：全量回归 3/5 行重复）。
+    const existing = await this.prisma.memory.findMany({
       where: {
         userId,
         metadata: { path: ['derivedFrom'], equals: input.kind },
       },
-      select: { id: true, metadata: true },
+      select: { metadata: true },
     });
-    const same = existing && (existing.metadata as { subjectId?: string } | null)?.subjectId === input.subjectId;
+    const same = existing.some((m) => (m.metadata as { subjectId?: string } | null)?.subjectId === input.subjectId);
     if (same) return; // 幂等：绝不重复产记忆
     await this.memories.create(userId, {
       scope: projectId ? 'project' : 'user',

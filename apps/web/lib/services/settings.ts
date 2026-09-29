@@ -3,10 +3,9 @@ import { apiFetch, jsonInit } from '@/lib/api';
 /**
  * Settings service（M13-F1）
  *
- * **重要事实**：后端目前**没有** `settings` 控制器（SystemSetting 表只被 Agent 运行时内部读取，
- * 无任何 HTTP 面——见 apps/api/src/core/agent-loop/prisma-runtime-persistence.ts）。
- * 因此本文件只封装「设置页当前真实可达的服务端面」：会话/设备管理（W9 的 Settings 起步面）。
- * 未来后端若开放设置端点，请在此文件追加，**不要**在前端伪造设置读写。
+ * **重要事实**：后端另有仅平台管理员可用的 `/system-settings`（M12-P4 受限写面，Web 无入口），
+ * 本文件只封装「设置页当前真实可达的服务端面」：会话/设备管理（W9 的 Settings 起步面）。
+ * 未来若要在 Web 开放设置端点，请在此文件追加，**不要**在前端伪造设置读写。
  */
 export interface SessionSummary {
   id: string;

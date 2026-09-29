@@ -104,6 +104,10 @@ export const PROTECTED_ENDPOINTS: Probe[] = [
   ['get', `${P}/commerce/analyses/${G}`, '电商分析详情'],
   ['get', `${P}/commerce/briefs`, '创意简报列表'],
   ['get', `${P}/commerce/briefs/${G}`, '创意简报详情'],
+  // ── M12 Final Audit L5：补齐 M12/M13 新增受保护面（此前仅覆盖 artifacts/commerce）──
+  ['get', `${P}/system-settings/routingPolicy`, '策略设置读'],
+  ['patch', `${P}/system-settings/policyThresholds`, '策略阈值写'],
+  ['patch', `${P}/memories/candidates/${G}/decide`, '记忆候选裁决'],
   ['get', `${P}/external-actions`, '外部动作列表'],
   ['get', `${P}/external-actions/${G}`, '外部动作详情'],
   ['get', `${P}/usage/agent-runs/${G}`, 'run 用量'],

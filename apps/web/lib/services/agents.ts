@@ -74,14 +74,8 @@ export const listAgents = () => apiFetch<{ data: Agent[] }>('/api/v1/agents');
 /** GET /api/v1/agents/:id */
 export const getAgent = (id: string) => apiFetch<{ data: Agent }>(`/api/v1/agents/${id}`);
 
-/**
- * GET /api/v1/agents/:id/versions
- * 事实源说明：后端 handler 与 GET /agents/:id 返回同一 payload（版本随 Agent 行返回）
- */
-export const getAgentVersions = (id: string) => apiFetch<{ data: Agent }>(`/api/v1/agents/${id}/versions`);
-
 /** POST /api/v1/agents（仅 admin） */
-export const createAgent = (input: CreateAgentInput) => apiFetch<{ data: Agent }>('/api/v1/agents', jsonInit('POST', input));
+export const createAgent = (input: CreateAgentInput) => apiFetch<{ data: { agent: Agent; draftVersion: AgentVersion } }>('/api/v1/agents', jsonInit('POST', input));
 
 /** PATCH /api/v1/agents/:id/draft（落草稿版本） */
 export const updateAgentDraft = (id: string, input: UpdateAgentDraftInput) =>

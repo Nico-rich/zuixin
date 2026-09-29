@@ -78,7 +78,7 @@ Wave 5：Final Audit（七维+Product+Scope）→ 修复→重验
 
 终局 Deferred：真实厂商端到端（无凭据）、生产量级 PITR/主从/多机、k8s 实机、Vault/KMS、真浏览器生产域、e2e 并行化、托管 PG 受限角色、Prometheus 部署、备份桶生命周期、k8s HPA 起手值（P17 取消连带）。
 永久不做：Temporal、EventEnvelope 物理删除、模型训练、无限自治 Agent、未授权金融交易、独立向量库。
-M13 项（本阶段内做）：OCR、Thinking、Commerce 真适配器、毛利定价、embedding 快分类器、用户级模型指定、预签名直传——**除本 roadmap 明确纳入外均不做**。
+M13 结算项（本阶段裁决；除本表明确纳入外一律不做）：OCR、Thinking、Commerce 真适配器、毛利定价、embedding 快分类器、用户级模型指定、预签名直传。
 
 ## 6. 最终产品定义
 

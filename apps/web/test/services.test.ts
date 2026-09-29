@@ -118,7 +118,6 @@ describe('service 契约：agents / agent-runs', () => {
     const cases: Case[] = [
       { name: 'listAgents', call: () => agents.listAgents(), method: 'GET', url: '/api/v1/agents' },
       { name: 'getAgent', call: () => agents.getAgent('a1'), method: 'GET', url: '/api/v1/agents/a1' },
-      { name: 'getAgentVersions', call: () => agents.getAgentVersions('a1'), method: 'GET', url: '/api/v1/agents/a1/versions' },
       { name: 'createAgent', call: () => agents.createAgent({ slug: 's', name: 'n', kind: 'custom', systemPrompt: 'sp' }), method: 'POST', url: '/api/v1/agents', body: { slug: 's', name: 'n', kind: 'custom', systemPrompt: 'sp' } },
       { name: 'updateAgentDraft', call: () => agents.updateAgentDraft('a1', { temperature: 0.2 }), method: 'PATCH', url: '/api/v1/agents/a1/draft', body: { temperature: 0.2 } },
       { name: 'publishAgent', call: () => agents.publishAgent('a1'), method: 'POST', url: '/api/v1/agents/a1/publish' },

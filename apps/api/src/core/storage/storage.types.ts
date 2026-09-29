@@ -38,6 +38,7 @@ export interface StorageListPage {
 
 export interface StorageAdapter {
   put(key: string, stream: Readable, meta: { contentType: string; sizeBytes: number }): Promise<void>;
+  // 预留，未接线（M12 Final Audit 登记：零生产调用点；上传仍为服务端 multipart）
   createPresignedUrl(key: string, expiresInSec: number): Promise<string>;
   /** 读取文件流（附件回源 / 参考图 base64 转换） */
   getStream?(key: string): Promise<Readable>;
