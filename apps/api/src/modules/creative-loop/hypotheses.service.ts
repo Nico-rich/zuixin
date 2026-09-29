@@ -9,7 +9,9 @@
  * - 终态只读（`isTerminal` → 编辑/删除/再推进一律拒绝）；
  * - 归属：组织/项目 scope = 专表直列 `organizationId`/`projectId`（查询 server-side scope）；
  *   每次读写都过 RBAC（workflow.read/write）；
- * - 本服务**不编排**（loop 启动/收敛在 loop-orchestrator.service.ts），也不消费评测/实验事实（同上）。
+ * - 本服务**不编排**（loop 启动/收敛在 loop-orchestrator.service.ts），也不消费评测/实验事实（同上）；
+ * - M12-P1 学习桥：`create` 额外返回**同 statement 的历史判定先例**（只读参考字段，绝不落库、绝不改写
+ *   历史行——verdict 此前无消费方，闭环在 validated/rejected 处断裂）。
  */
 
 import { Inject, Injectable } from '@nestjs/common';
@@ -25,7 +27,29 @@ export interface HypothesisView extends HypothesisDoc {
   updatedAt: Date;
   /** 终态标记（消费方无需复算状态机） */
   terminal: boolean;
+  /**
+   * （仅 create 返回）同组织/项目内**同 statement** 历史假设的既有判定先例（M12-P1 学习桥）。
+   * **只读参考**：绝不落库、绝不改写历史行、也绝不作为本假设的判定（判定仍只由判据/人工产生）。
+   * 其它读路径不含该字段（不存在于存储文档中）。
+   */
+  priorVerdicts?: PriorVerdictRef[];
 }
+
+/** 历史判定先例（verdict→新假设创建的只读参考字段；来源 = 既有终态假设行的 verdict） */
+export interface PriorVerdictRef {
+  hypothesisId: string;
+  statement: string;
+  status: HypothesisStatus;
+  decision: 'validated' | 'rejected';
+  decidedBy: 'criteria' | 'manual' | 'system';
+  reason: string;
+  decidedAt: string;
+  /** 固定标注：历史判定事实（消费方不得与本假设的判定混淆） */
+  source: 'historical-verdict';
+}
+
+/** 创建时返回的历史先例条数上限（有界；按 updatedAt 倒序取最近 N 条） */
+export const PRIOR_VERDICT_TAKE = 5;
 
 /** 可编辑字段（状态机语义：running 期间假设陈述已渲染进 loop 定义与审批理由，**不可再改**） */
 export interface UpdateHypothesisInput {
@@ -89,7 +113,48 @@ export class HypothesesService {
       history: [],
     };
     const stored = await this.store.create(userId, doc);
-    return this.toView(stored);
+    // M12-P1 verdict→下一次决策桥：把**同 statement 的历史判定**作为参考返回（只读，绝不落库）
+    const priorVerdicts = await this.priorVerdictsFor(scope, doc.statement);
+    return { ...this.toView(stored), priorVerdicts };
+  }
+
+  /**
+   * 历史判定先例（**只读输入**）：同组织（+同项目）内**同 statement** 且已有 verdict 的假设结论，
+   * 供创建方在"再试一次/换方向"时带上上一轮的学到什么（此前 verdict 无任何消费方 → 闭环断裂）。
+   *
+   * 边界：先例只是参考事实——**绝不**写入新假设文档、**绝不**改写历史行、**绝不**据此预判新假设
+   * （判定仍只由判据收敛或人工显式 decision 产生；LLM 不得决定治理判定）。
+   * 查询失败不阻断创建（先例是增益信息，不是创建的前置条件）——降级为空并告警。
+   */
+  private async priorVerdictsFor(scope: LoopScope, statement: string): Promise<PriorVerdictRef[]> {
+    let rows: StoredDoc<HypothesisDoc>[];
+    try {
+      rows = await this.store.listVerdicts({
+        organizationId: scope.organizationId,
+        projectId: scope.projectId,
+        statement,
+        take: PRIOR_VERDICT_TAKE,
+      });
+    } catch {
+      // 只读增益信息：绝不因先例查询失败让创建失败（记录留痕由 store/DB 层承担）
+      return [];
+    }
+    const refs: PriorVerdictRef[] = [];
+    for (const row of rows) {
+      const verdict = row.doc.verdict;
+      if (!verdict || (verdict.decision !== 'validated' && verdict.decision !== 'rejected')) continue;
+      refs.push({
+        hypothesisId: row.id,
+        statement: row.doc.statement,
+        status: row.doc.status,
+        decision: verdict.decision,
+        decidedBy: verdict.decidedBy,
+        reason: verdict.reason,
+        decidedAt: verdict.decidedAt,
+        source: 'historical-verdict',
+      });
+    }
+    return refs;
   }
 
   async list(userId: string, query: { organizationId?: string; projectId?: string; status?: HypothesisStatus; limit?: number }): Promise<{ hypotheses: HypothesisView[] }> {

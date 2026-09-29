@@ -67,7 +67,7 @@ function makeRun(over: Partial<RunFixture> = {}): RunFixture {
 function makeHarness(over: {
   doc?: HypothesisDoc | null;
   run?: RunFixture | null;
-  perfRows?: Array<Record<string, number>>;
+  perfRows?: Array<Record<string, unknown>>;
   existingWorkflow?: { id: string; versions: Array<{ version: number; status: string; definition: unknown }> } | null;
   /** 并发创建收敛用例：创建后"最早一行"再查询的结果（缺省 = 自己刚创建的行，即无并发对手） */
   winnerWorkflow?: { id: string } | null;
@@ -76,6 +76,10 @@ function makeHarness(over: {
   evaluationScope?: { id: string; organizationId: string } | null;
   experimentScope?: { id: string; organizationId: string } | null;
   transitionError?: Error;
+  /** M12-P1 来源判别：被 agent 工具账本引用的绩效行 id（判定窗口须排除） */
+  agentAuthoredIds?: string[];
+  /** 账本枚举是否完整（false = 触顶 → 判定 fail-closed） */
+  provenanceComplete?: boolean;
 } = {}) {
   let current: StoredDoc<HypothesisDoc> | null = over.doc === null ? null : {
     id: 'hyp-1',
@@ -160,12 +164,20 @@ function makeHarness(over: {
   const experiments = {
     scope: vi.fn(async () => (over.experimentScope === undefined ? { id: 'exp-1', organizationId: 'org1' } : over.experimentScope)),
   };
+  // M12-P1 来源判别（真实实现读 ToolCall 幂等账本；此处按 id 集合注入——账本解析本身在
+  // performance-provenance.service.spec.ts 逐条钉死）
+  const provenance = {
+    agentAuthoredIds: vi.fn(async () => {
+      const ids = over.agentAuthoredIds ?? [];
+      return { ids: new Set(ids), complete: over.provenanceComplete ?? true, scanned: ids.length, rule: 'agent-tool-ledger-exclusion' as const };
+    }),
+  };
   const service = new CreativeLoopOrchestrator(
     prisma as never, store as never, insights as never, hypotheses as never,
-    workflows as never, runs as never, evaluationRuns as never, experiments as never,
+    workflows as never, runs as never, evaluationRuns as never, experiments as never, provenance as never,
   );
   return {
-    service, store, hypotheses, prisma, workflows, runs, evaluationRuns, experiments,
+    service, store, hypotheses, prisma, workflows, runs, evaluationRuns, experiments, provenance,
     getCurrent: () => current,
     /** 模拟"另一路并发写入"：行版本前移（非状态字段被编辑 / 执行引用被挂接） */
     advanceVersion: () => {
@@ -341,6 +353,92 @@ describe('CreativeLoopOrchestrator（loop 启动 + 收敛）', () => {
     expect(h.store.cas).not.toHaveBeenCalled();
     expect(result.hypothesis.status).toBe('running');
     expect(result.pending).toMatchObject({ reason: 'awaiting-facts' });
+  });
+
+  it('收敛（M12-P1 来源判别）：agent 工具写入的绩效行不参与判定——伪造绩效绝不促成 validated', async () => {
+    const doc = makeDoc({
+      status: 'running',
+      successCriteria: { metric: 'roas', op: 'gte', value: 2 },
+      loop: { workflowId: 'wf-1', runId: 'run-1', attempts: 1, startedAt: NOW.toISOString() },
+    });
+    // 窗口里只有一行 agent 自证的绩效（performance.capture 伪造：roas 极高）→ 必须视同无事实
+    const h = makeHarness({
+      doc,
+      run: makeRun({ status: 'completed' }),
+      perfRows: [{ id: 'perf-agent', impressions: 100, clicks: 90, spend: 100, conversions: 9, revenue: 100_000, orders: 9 }],
+      agentAuthoredIds: ['perf-agent'],
+    });
+    const result = await h.service.status('u1', 'hyp-1');
+    expect(h.provenance.agentAuthoredIds).toHaveBeenCalledWith('u1'); // 判定窗口必过来源谓词
+    expect(h.store.cas).not.toHaveBeenCalled(); // 绝不自动判定（fail-closed）
+    expect(result.hypothesis.status).toBe('running');
+    expect(result.hypothesis.verdict).toBeNull();
+    expect(result.pending.reason).toBe('awaiting-facts');
+
+    // 显式 manual decision 仍可判定（人工判定不依赖该谓词），但判定事实必须如实记下排除计数
+    const concluded = await h.service.conclude('u1', 'hyp-1', { decision: 'rejected', reason: '绩效仅来自 agent 自证，证据不足' });
+    expect(concluded.hypothesis.verdict).toMatchObject({ decidedBy: 'manual' });
+    expect((concluded.hypothesis.verdict?.facts as Record<string, never>).performance).toMatchObject({
+      rows: 0, excludedAgentRows: 1, rule: 'server-sum',
+    });
+  });
+
+  it('收敛（M12-P1）：窗口内混有 agent 与外部行 → 只用外部行求和判定（排除计数留痕）', async () => {
+    const doc = makeDoc({
+      status: 'running',
+      successCriteria: { metric: 'roas', op: 'gte', value: 2 },
+      loop: { workflowId: 'wf-1', runId: 'run-1', attempts: 1, startedAt: NOW.toISOString() },
+    });
+    const h = makeHarness({
+      doc,
+      run: makeRun({ status: 'completed' }),
+      perfRows: [
+        { id: 'perf-agent', impressions: 100, clicks: 90, spend: 100, conversions: 9, revenue: 100_000, orders: 9 },
+        { id: 'perf-ext', impressions: 1000, clicks: 50, spend: 100, conversions: 5, revenue: 300, orders: 5 },
+      ],
+      agentAuthoredIds: ['perf-agent'],
+    });
+    const result = await h.service.status('u1', 'hyp-1');
+    expect(result.hypothesis.status).toBe('validated');
+    expect(result.hypothesis.verdict).toMatchObject({ decidedBy: 'criteria', reason: expect.stringContaining('roas=3') });
+    expect((result.hypothesis.verdict?.facts as Record<string, never>).performance).toMatchObject({
+      rows: 1, excludedAgentRows: 1, derived: { roas: 3 }, rule: 'server-sum',
+      provenance: { rule: 'agent-tool-ledger-exclusion', complete: true },
+    });
+  });
+
+  it('收敛（M12-P1 fail-closed）：来源判别不可信（账本枚举触顶）→ 绩效指标视同缺失，绝不自动判定', async () => {
+    const doc = makeDoc({
+      status: 'running',
+      successCriteria: { metric: 'roas', op: 'gte', value: 2 },
+      loop: { workflowId: 'wf-1', runId: 'run-1', attempts: 1, startedAt: NOW.toISOString() },
+    });
+    const h = makeHarness({
+      doc,
+      run: makeRun({ status: 'completed' }),
+      perfRows: [{ id: 'perf-ext', impressions: 1000, clicks: 50, spend: 100, conversions: 5, revenue: 300, orders: 5 }],
+      provenanceComplete: false, // 无法证明窗口内绩效行均非 agent 来源
+    });
+    const result = await h.service.status('u1', 'hyp-1');
+    expect(h.store.cas).not.toHaveBeenCalled();
+    expect(result.hypothesis.status).toBe('running');
+    expect(result.pending.reason).toBe('awaiting-facts');
+    // 按判据判定被拒时，缘由必须明示"来源判别不可信"（而不是让人误读成"没数据"）
+    await expect(h.service.conclude('u1', 'hyp-1', {}))
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR', message: expect.stringContaining('来源判别') });
+  });
+
+  it('收敛（M12-P1）：评测类判据不受绩效来源谓词影响（avg_score 来自 M9-P1，非 agent 可写面）', async () => {
+    const doc = makeDoc({
+      status: 'running',
+      successCriteria: { metric: 'avg_score', op: 'gte', value: 0.8 },
+      evaluationRunId: 'eval-1',
+      loop: { workflowId: 'wf-1', runId: 'run-1', attempts: 1, startedAt: NOW.toISOString() },
+    });
+    const h = makeHarness({ doc, run: makeRun({ status: 'completed' }), provenanceComplete: false });
+    const result = await h.service.status('u1', 'hyp-1');
+    expect(result.hypothesis.status).toBe('validated'); // 0.9 >= 0.8（评测摘要）
+    expect(result.hypothesis.verdict).toMatchObject({ decidedBy: 'criteria' });
   });
 
   it('收敛：无判据 → 保持 running，pending=awaiting-criteria（判定交给人工/Agent）', async () => {

@@ -7,6 +7,7 @@ import { HypothesisStore, InsightStore } from './creative-loop-store';
 import { HypothesesService } from './hypotheses.service';
 import { InsightService } from './insight.service';
 import { CreativeLoopOrchestrator } from './loop-orchestrator.service';
+import { PerformanceProvenanceService } from './performance-provenance.service';
 
 /**
  * M9-P5 Creative Performance Loop 服务层（API 与 Worker 共用；HTTP 面在 CreativeLoopApiModule）。
@@ -21,6 +22,7 @@ import { CreativeLoopOrchestrator } from './loop-orchestrator.service';
     CreativeLoopAccessService,
     HypothesisStore,
     InsightStore,
+    PerformanceProvenanceService,
     HypothesesService,
     InsightService,
     CreativeLoopOrchestrator,
@@ -29,6 +31,7 @@ import { CreativeLoopOrchestrator } from './loop-orchestrator.service';
     CreativeLoopAccessService,
     HypothesisStore,
     InsightStore,
+    PerformanceProvenanceService,
     HypothesesService,
     InsightService,
     CreativeLoopOrchestrator,

@@ -33,6 +33,9 @@ function makeHarness(over: {
   insight?: { organizationId: string } | null;
   /** 读取返回后、写入前的并发窗口钩子（模拟"另一路请求已写入" → 本次快照过期） */
   afterRead?: () => void;
+  /** M12-P1 历史判定先例（store.listVerdicts 返回值）；`listVerdictsError` = 先例查询失败 */
+  verdicts?: Array<{ id: string; doc: HypothesisDoc }>;
+  listVerdictsError?: Error;
 } = {}) {
   const doc = over.doc === undefined ? makeDoc() : over.doc;
   let stored: StoredDoc<HypothesisDoc> | null = doc
@@ -56,6 +59,14 @@ function makeHarness(over: {
     casFields: vi.fn(async (_id: string, expectedVersion: number) => (stored && stored.version === expectedVersion ? over.casFields ?? 1 : 0)),
     // 真实实现按 allowed 状态做 SQL 过滤（未命中 → count 0）；mock 同语义
     remove: vi.fn(async (_id: string, allowed: readonly string[]) => (doc && allowed.includes(doc.status) ? over.remove ?? 1 : 0)),
+    // M12-P1 历史判定先例（只读；真实实现按组织/项目/statement + 终态 + verdict 非空查询）
+    listVerdicts: vi.fn(async (filter: { statement?: string }) => {
+      if (over.listVerdictsError) throw over.listVerdictsError;
+      return (over.verdicts ?? []).map((v) => ({
+        id: v.id, userId: 'u1', doc: v.doc, version: 1,
+        createdAt: new Date('2026-01-01T00:00:00Z'), updatedAt: new Date('2026-01-01T00:00:00Z'),
+      })).filter((v) => filter.statement === undefined || v.doc.statement === filter.statement);
+    }),
   };
   const insights = {
     get: vi.fn(async () => (over.insight === undefined
@@ -91,6 +102,56 @@ describe('HypothesesService（CRUD + 状态机 + 归属）', () => {
     expect(h.store.create).toHaveBeenCalledTimes(1);
   });
 
+  it('create（M12-P1 学习桥）：同 statement 的历史判定作为参考返回——只读、绝不落库、绝不预判新假设', async () => {
+    const h = makeHarness({
+      verdicts: [
+        {
+          id: 'hyp-old',
+          doc: makeDoc({
+            status: 'rejected',
+            statement: '高对比主图可提升点击率',
+            verdict: {
+              decision: 'rejected', decidedBy: 'criteria', reason: 'ctr=0.01 ≤ 0.05 → 不成立',
+              criteria: { metric: 'ctr', op: 'gte', value: 0.05 }, facts: null,
+              evaluationRunId: null, experimentId: null, decidedAt: '2026-01-02T00:00:00.000Z',
+            },
+          }),
+        },
+        { id: 'hyp-丢', doc: makeDoc({ status: 'rejected', statement: '高对比主图可提升点击率', verdict: null }) },
+      ],
+    });
+    const view = await h.service.create('u1', { statement: '高对比主图可提升点击率' });
+    expect(h.store.listVerdicts).toHaveBeenCalledWith({
+      organizationId: 'org1', projectId: 'proj1', statement: '高对比主图可提升点击率', take: 5,
+    });
+    expect(view.priorVerdicts).toEqual([{
+      hypothesisId: 'hyp-old',
+      statement: '高对比主图可提升点击率',
+      status: 'rejected',
+      decision: 'rejected',
+      decidedBy: 'criteria',
+      reason: 'ctr=0.01 ≤ 0.05 → 不成立',
+      decidedAt: '2026-01-02T00:00:00.000Z',
+      source: 'historical-verdict',
+    }]);
+    // 新假设自身仍是 draft、无 verdict（先例绝不成为本假设的判定）
+    expect(view).toMatchObject({ status: 'draft', verdict: null, terminal: false });
+    // 先例**绝不落库**：写入 store 的文档里没有该字段（也不含任何历史行内容）
+    const written = h.store.create.mock.calls[0][1] as HypothesisDoc;
+    expect(written).not.toHaveProperty('priorVerdicts');
+    expect(written.verdict).toBeNull();
+  });
+
+  it('create（M12-P1）：无同 statement 先例 → 空数组；先例查询失败不阻断创建（只读增益信息）', async () => {
+    const none = makeHarness();
+    expect((await none.service.create('u1', { statement: '全新的假设陈述' })).priorVerdicts).toEqual([]);
+
+    const broken = makeHarness({ listVerdictsError: new Error('db down') });
+    const view = await broken.service.create('u1', { statement: '全新的假设陈述' });
+    expect(view.priorVerdicts).toEqual([]);
+    expect(view.id).toBe('hyp-new'); // 创建照常完成（降级为空而非失败）
+  });
+
   it('create：来源洞察必须同组织（跨租户引用 → 404，绝不落库）', async () => {
     const h = makeHarness({ insight: { organizationId: 'org-other' } });
     await expect(h.service.create('u1', { statement: '假设陈述', insightId: 'ins-1' }))
@@ -123,6 +184,7 @@ describe('HypothesesService（CRUD + 状态机 + 归属）', () => {
     const h = makeHarness({ doc: makeDoc({ status: 'ready' }) });
     const view = await h.service.update('u1', 'hyp-1', { statement: '新的假设陈述' });
     expect(view.statement).toBe('新的假设陈述');
+    expect(h.store.listVerdicts).not.toHaveBeenCalled(); // 先例只在 create（决策点）返回，读路径不带
     expect(h.store.casFields).toHaveBeenCalledWith('hyp-1', 1, expect.objectContaining({ statement: '新的假设陈述', status: 'ready' }));
     expect(h.store.cas).not.toHaveBeenCalled(); // 非状态字段更新绝不走 status CAS
   });
