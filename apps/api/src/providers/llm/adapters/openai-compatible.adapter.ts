@@ -11,6 +11,34 @@ type RequestOptions = { signal?: AbortSignal };
 type ChatFn = (body: Record<string, unknown>, options?: RequestOptions) => Promise<Record<string, unknown>>;
 type StreamFn = (body: Record<string, unknown>, options?: RequestOptions) => AsyncIterable<Record<string, unknown>> | Promise<AsyncIterable<Record<string, unknown>>>;
 
+/**
+ * M13+ 工具名可逆编码（厂商兼容 shim）。
+ *
+ * 平台内置工具名用点号（`agent.delegate`/`image.generate`…）——OpenAI 接受，
+ * 但 DeepSeek 等厂商强制 `^[a-zA-Z0-9_-]+$`，违者 400「Invalid 'tools[0].function.name'」
+ * （用户实测实抓）。改名会炸穿工具注册表/Agent 声明/DB 存量/扩展清单——因此在**适配器边界**
+ * 做可逆编码：不合规名 → `fn_<base64url(原名)>`（单射可逆、恒合规）；合规名原样透传。
+ * tool_calls 回来时解码还原——引擎全程看到原名，协议不变。
+ */
+const TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
+function encodeToolName(name: string): string {
+  return TOOL_NAME_PATTERN.test(name) ? name : `fn_${Buffer.from(name, 'utf8').toString('base64url')}`;
+}
+function decodeToolName(name: string): string {
+  if (!name.startsWith('fn_')) return name;
+  const payload = name.slice(3);
+  // 载荷必须形如 base64url（否则是恰好以 fn_ 开头的厂商原样名——绝不丢信息，原样返回）
+  if (!/^[A-Za-z0-9_-]{4,}$/.test(payload)) return name;
+  try {
+    const raw = Buffer.from(payload, 'base64url').toString('utf8');
+    // 往返校验：重编码必须逐字一致（宽松解码可能产出乱码字节）
+    if (!raw || Buffer.from(raw, 'utf8').toString('base64url') !== payload) return name;
+    return raw;
+  } catch {
+    return name;
+  }
+}
+
 /** OpenAI / DeepSeek / Kimi / 阿里百炼 / 火山方舟 / 智谱 六家共用一个 adapter（baseUrl + key 配置化） */
 export class OpenAICompatibleAdapter implements LLMProvider {
   readonly kind = 'llm' as const;
@@ -78,7 +106,8 @@ export class OpenAICompatibleAdapter implements LLMProvider {
       // 注：正常结束（服务端发完 [DONE] 并关闭响应体）时信号未中止，不受影响。
       if (guard.signal.aborted) throw new AppError(ErrorCode.PROVIDER_TIMEOUT, '模型流式响应被中断（超时/取消）');
       if (acc.size > 0) {
-        yield { type: 'tool_calls', toolCalls: [...acc.values()].map((t) => ({ id: t.id ?? `call_${Math.random()}`, name: t.name ?? '', arguments: t.args })) };
+        // 解码工具名（编码的逆变换；合规名原样）
+        yield { type: 'tool_calls', toolCalls: [...acc.values()].map((t) => ({ id: t.id ?? `call_${Math.random()}`, name: decodeToolName(t.name ?? ''), arguments: t.args })) };
       }
       if (usage) {
         yield { type: 'usage', usage: { inputTokens: usage.prompt_tokens ?? 0, outputTokens: usage.completion_tokens ?? 0 } };
@@ -97,12 +126,12 @@ export class OpenAICompatibleAdapter implements LLMProvider {
     }
   }
 
-  /** Provider tool_calls → 内部 ToolCallRequest[] */
+  /** Provider tool_calls → 内部 ToolCallRequest[]（工具名解码还原） */
   private mapToolCalls(raw: unknown[] | undefined) {
     if (!raw?.length) return undefined;
     return raw.map((tc) => {
       const t = tc as { id?: string; function?: { name?: string; arguments?: string } };
-      return { id: t.id ?? `call_${Math.random()}`, name: t.function?.name ?? '', arguments: t.function?.arguments ?? '{}' };
+      return { id: t.id ?? `call_${Math.random()}`, name: decodeToolName(t.function?.name ?? ''), arguments: t.function?.arguments ?? '{}' };
     });
   }
 
@@ -120,7 +149,10 @@ export class OpenAICompatibleAdapter implements LLMProvider {
         ? { type: 'json_schema', json_schema: { name: 'intent', strict: true, schema: p.responseFormat.schema } }
         : { type: 'json_object' };
     }
-    if (p.tools?.length) body.tools = p.tools; // 内部协议与 OpenAI 格式同构，直接透传
+    if (p.tools?.length) {
+      // 工具名编码（DeepSeek 严格模式兼容；描述/参数原样透传）
+      body.tools = p.tools.map((t) => ({ ...t, function: { ...t.function, name: encodeToolName(t.function.name) } }));
+    }
     return body;
   }
 
@@ -129,7 +161,8 @@ export class OpenAICompatibleAdapter implements LLMProvider {
     const mapped: Record<string, unknown> = { role: m.role, content: this.mapContent(m) };
     if (m.role === 'tool' && m.tool_call_id) mapped.tool_call_id = m.tool_call_id;
     if (m.role === 'assistant' && m.tool_calls?.length) {
-      mapped.tool_calls = m.tool_calls.map((t) => ({ id: t.id, type: 'function', function: { name: t.name, arguments: t.arguments } }));
+      // 历史消息里的 tool_calls 同样编码（多轮工具对话回放时厂商侧看到同一口径）
+      mapped.tool_calls = m.tool_calls.map((t) => ({ id: t.id, type: 'function', function: { name: encodeToolName(t.name), arguments: t.arguments } }));
     }
     return mapped;
   }
