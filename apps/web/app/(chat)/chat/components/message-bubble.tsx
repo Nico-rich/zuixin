@@ -38,7 +38,7 @@ export function MessageBubble({ message, streaming, onRetry, onEdit, onDelete, a
 
   if (isUser) {
     return (
-      <div className="group/user flex flex-col items-end gap-1">
+      <div data-testid="user-bubble" className="group/user flex flex-col items-end gap-1">
         <div className="max-w-[85%] rounded-2xl rounded-br-sm bg-zinc-800 px-4 py-2.5 text-[15px] leading-relaxed text-zinc-100">
           {message.content}
         </div>

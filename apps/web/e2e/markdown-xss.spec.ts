@@ -36,8 +36,8 @@ test.describe('message-bubble / markdown（XSS 与代码/表格渲染，真实�
     await sendChat(page, payload);
     await waitForChatSettled(page);
 
-    // 用户气泡：原文可见（React 纯文本转义）
-    await expect(page.locator('div.flex.justify-end').last()).toContainText(XSS_BLOCK);
+    // 用户气泡：原文可见（React 纯文本转义）——M13-W10 起定位 testid（外层改为 group/user，见 message-bubble DOM 约束注释）
+    await expect(page.locator('[data-testid="user-bubble"]').last()).toContainText(XSS_BLOCK);
 
     const bubble = assistantBubbles(page).last();
     await expect(bubble).toContainText('本地 mock 模型回复');
