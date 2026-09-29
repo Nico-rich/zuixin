@@ -35,6 +35,7 @@ import { buildPgDumpArgs, createDumpStatsCollector, verifyDumpStats, type Backup
 import { KEY_TABLES, PgClient, type PgMode } from './lib/pg';
 import { MANIFEST_TOOL, MANIFEST_VERSION, backupFileName, buildBackupManifest, manifestSummaryLines, manifestVerdict } from './lib/manifest';
 import { McClient, parseMcListJson, parseMcStatJson, etagAsMd5, safeMcError } from './lib/mc';
+import { assessPlaintextUpload } from './lib/upload-gate';
 import { openArtifactStream, planRetention, type Compression, type Encryption } from './lib/artifact';
 import { GPG_CIPHER_ALGO, GPG_PASSPHRASE_ENV, describeGpgMode, encryptFile, gpgPreflight, type GpgMode } from './lib/gpg';
 import { helpText, parseArgs, type FlagSpec } from './lib/args';
@@ -58,6 +59,7 @@ const SPECS: readonly FlagSpec[] = [
   { name: 'prune', type: 'boolean', help: '执行保留策略清理（默认只提示不删除）' },
   { name: 'prune-keep', type: 'number', valueName: '<n>', default: 30, help: '保留最近 N 份备份（默认 30，与 DR 手册 §3.4 一致）' },
   { name: 'upload', type: 'boolean', help: '把备份上传到 MinIO（mc 一次性容器；默认关闭）' },
+  { name: 'allow-plaintext-upload', type: 'boolean', help: '**显式承认风险**：允许把未加密备份上传到非本机端点（不加则直接拒绝，退出码 4；本机端点如 localhost 自动放行）' },
   { name: 'bucket', type: 'string', valueName: '<name>', default: 'db-backups', help: '远端归档桶（默认 db-backups，**不要**与对象存储业务桶混用）' },
   { name: 'prefix', type: 'string', valueName: '<path>', default: 'postgres/', help: '远端归档前缀（默认 postgres/）' },
   { name: 'mc-mode', type: 'string', valueName: '<docker|native>', default: 'docker', help: 'mc 运行形态（默认 docker）' },
@@ -211,6 +213,8 @@ async function main(): Promise<void> {
             + '绝不进 argv/日志；加密后立刻解密回读比对 sha256（失败 ⇒ 退出码 3 且**不删**明文产物，避免删掉唯一可用副本）。',
           '公钥模式（--encrypt-recipient）：加密只需公钥、解密只需私钥在 keyring，运维机不需要放口令（生产推荐）。',
           '--upload 在传完后用 mc stat 比对**体积 + ETag**（单段对象 ETag == 内容 md5，零传输的内容级核对）。',
+          '明文外发闸门（M12-P5）：--upload + --encrypt none 且端点为非本机时，必须显式 --allow-plaintext-upload，'
+            + '否则前置条件失败（退出码 4）；本机端点（localhost/127.0.0.1/::1）自动放行。--dry-run 也会做这项检查。',
           '本脚本不做 PITR（需 WAL 归档）；RPO = 备份时刻（DR 手册 §1）。',
           '默认不执行保留策略清理（--prune 才删），且只删本脚本命名规则的产物（含 .gpg 形态）。',
         ],
@@ -220,6 +224,7 @@ async function main(): Promise<void> {
           'npx tsx scripts/backup.ts --label pre-migration --expect-tables 88   # 88 = 当前真实表数，随迁移递增',
           'BACKUP_GPG_PASSPHRASE=$(pass show db-backup) npx tsx scripts/backup.ts --label daily --encrypt gpg',
           'npx tsx scripts/backup.ts --label offsite --encrypt gpg --encrypt-recipient ops@example.com --upload --bucket db-backups',
+          'npx tsx scripts/backup.ts --label dev --upload   # 本机 MinIO（localhost）自动放行；非本机端点需 --allow-plaintext-upload',
           'BACKUP_DIR=D:/backups npx tsx scripts/backup.ts --prune --prune-keep 14',
         ],
         exitCodes: DEFAULT_EXIT_CODES,
@@ -298,6 +303,24 @@ async function main(): Promise<void> {
     if (!preflight.ok) fail(logger, `加密备份无法执行：${preflight.detail}`, EXIT_PRECONDITION);
   }
 
+  // ---- 明文外发闸门（M12-P5）：**即使 --dry-run 也要做** ——
+  // dry-run 的价值正是"在没有任何副作用前暴露问题"；若只在真实上传前拦截，dry-run 就会给出假绿灯。
+  const uploadGate = assessPlaintextUpload({
+    upload: v.upload === true,
+    encryption,
+    endpoint: process.env.STORAGE_ENDPOINT ?? '',
+    allowPlaintextUpload: v['allow-plaintext-upload'] === true,
+  });
+  if (v.upload === true) {
+    // 拒绝时**不要**打"无需确认"（那会让人以为已经放行）；直接把"被拒"写在计划里，原因紧跟在下方错误行
+    logger.raw(
+      `上传闸门    ：${
+        uploadGate.ok ? (uploadGate.notice ?? '无需确认（已加密或未上传）') : '**未加密外发被拒绝**（原因见下）'
+      }`,
+    );
+  }
+  if (!uploadGate.ok) fail(logger, uploadGate.reason ?? '明文外发被拒绝', EXIT_PRECONDITION);
+
   const resolved = await resolvePgClient({
     requested: String(v['pg-mode']),
     container: String(v['pg-container']),
@@ -363,6 +386,17 @@ async function main(): Promise<void> {
 
   // ---- 3) 校验 ----
   const checks: BackupCheck[] = verifyDumpStats(stats, { sizeBytes: plainBytes, expectTables, minRows });
+  // M12-P5：明文外发的**事实留痕**（machine-readable）——"这次上传是明文"必须能从 manifest 读出来，
+  // 而不是只活在一次性日志里；ok=true（它记录的是"已按闸门口径放行"，不是"校验通过"）。
+  if (v.upload === true && encryption === 'none') {
+    checks.push({
+      name: 'plaintext-upload-acknowledged',
+      ok: true,
+      detail: uploadGate.local
+        ? `未加密备份上传到**本机**端点 ${process.env.STORAGE_ENDPOINT ?? '（未配置）'}（开发链路自动放行）`
+        : `未加密备份上传到**非本机**端点 ${process.env.STORAGE_ENDPOINT ?? '（未配置）'}，已由 --allow-plaintext-upload 显式确认`,
+    });
+  }
   const failedChecks = checks.filter((c) => !c.ok);
   logger.info(`内容统计：表 ${stats.tables} / COPY 段 ${stats.copySegments} / 行 ${stats.totalRows} / 扩展 [${stats.extensions.join(',')}]`);
   for (const c of checks) logger.raw(`  [${c.ok ? 'ok' : 'FAIL'}] ${c.name} — ${c.detail}`);
@@ -479,6 +513,13 @@ async function main(): Promise<void> {
     mcMounts = mc.mountFor(outDir, '/backup', mcMode);
     mcDirRef = mcMode === 'native' ? outDir : '/backup';
     remoteTarget = `${bucket}/${prefix}`;
+    if (encryption === 'none') {
+      // 放行 ≠ 无所谓：闸门只在"本机端点 / 已显式确认"两种情形下放行，这里把事实再喊一次（日志 + manifest 都有）
+      logger.warn(
+        `明文外发：本次上传的产物**未加密**（${uploadGate.local ? '本机端点自动放行' : '--allow-plaintext-upload 显式确认'}）；` +
+          'manifest.checks.plaintext-upload-acknowledged 已记录该事实。生产请改用 --encrypt gpg。',
+      );
+    }
     logger.step(`远端归档到 ${remoteTarget}（${mc.description}）`);
     const mk = await mc.makeBucket(bucket);
     if (mk.code !== 0) logger.warn(`建桶返回非 0（可能已存在）：${safeMcError(mk)}（未阻断）`);

@@ -11,6 +11,11 @@
  *   （argv 会出现在 `ps`/`docker ps`/审计日志里）；
  * - docker 模式下该环境变量经**临时 env 文件**（0600、用完即删）传给容器；
  * - 所有回显/错误都过 `redactSecrets()`。
+ *
+ * M12-P5（审计项："mc 凭据 SIGINT 残留"）：临时 env 文件此前只在**正常返回路径**（`finally`）里删除
+ * ——`Ctrl+C`（SIGINT）/`SIGTERM` 直接终止进程时，含密钥的文件会**留在临时目录里**（残留凭证）。
+ * 现在：只要有临时文件在场，本模块就临时接管 SIGINT/SIGTERM——先删除全部临时文件，再按 shell 惯例
+ * 退出（SIGINT → 130、SIGTERM → 143）；临时文件清零后立刻卸载处理器（**不在空转时改变进程的信号语义**）。
  */
 
 import { chmodSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -180,7 +185,99 @@ export function hostEnvValue(opts: { origin: string; accessKey: string; secretKe
   return `${url.protocol}//${encodeURIComponent(opts.accessKey)}:${encodeURIComponent(opts.secretKey)}@${url.host}`;
 }
 
-/** 临时 env 文件（0600；用完必删）。内容含密钥 ⇒ 只在临时目录、只通过 `--env-file` 传给 docker。 */
+// ===== M12-P5：临时凭证文件的**信号清理**（SIGINT/SIGTERM 不留残留）=====
+
+/** 信号源（可注入：单测用假信号源验证"清理 + 退出码"，绝不真的杀测试进程） */
+export interface SignalSource {
+  on(signal: NodeJS.Signals, listener: () => void): unknown;
+  off(signal: NodeJS.Signals, listener: () => void): unknown;
+  exit(code: number): void;
+  /** 退出前的留痕（默认写 stderr；注入以便断言文案） */
+  notify(message: string): void;
+}
+
+const DEFAULT_SIGNAL_SOURCE: SignalSource = {
+  on: (signal, listener) => process.on(signal, listener),
+  off: (signal, listener) => process.off(signal, listener),
+  exit: (code) => process.exit(code),
+  notify: (message) => process.stderr.write(message),
+};
+
+/** 信号 → 退出码（shell 惯例 128+signo：SIGINT=2→130、SIGTERM=15→143） */
+export const SIGNAL_EXIT_CODES: Readonly<Record<string, number>> = { SIGINT: 130, SIGTERM: 143 };
+const HANDLED_SIGNALS: readonly NodeJS.Signals[] = ['SIGINT', 'SIGTERM'];
+
+/** 进程内**存活**的临时凭证文件（现阶段只有 docker 模式的 env 文件；native 模式凭证只经环境变量，不落盘） */
+const liveTempEnvFiles = new Set<{ path: string; dispose: () => void }>();
+const listeners = new Map<NodeJS.Signals, () => void>();
+let signalSource: SignalSource = DEFAULT_SIGNAL_SOURCE;
+let installed = false;
+
+/** 删除全部存活临时凭证文件，返回清理个数（幂等；清理失败不抛——绝不因清理失败卡住退出） */
+export function disposeAllTempEnvFiles(): number {
+  const entries = [...liveTempEnvFiles];
+  liveTempEnvFiles.clear();
+  for (const entry of entries) {
+    try {
+      entry.dispose();
+    } catch {
+      /* 逐个兜底：一个删不掉不影响其余 */
+    }
+  }
+  if (liveTempEnvFiles.size === 0) uninstallSignalHandlers();
+  return entries.length;
+}
+
+/** 存活临时凭证文件数（观测/测试用） */
+export function liveTempEnvFileCount(): number {
+  return liveTempEnvFiles.size;
+}
+
+/**
+ * **仅供测试**：注入信号源并重置状态（`null` = 还原默认源）。
+ * 生产代码绝不调用——信号源在生产恒为 process。
+ */
+export function __setSignalSourceForTest(source: SignalSource | null): void {
+  uninstallSignalHandlers();
+  disposeAllTempEnvFiles();
+  signalSource = source ?? DEFAULT_SIGNAL_SOURCE;
+}
+
+/** **仅供测试**：信号处理器是否已接管（空转时必须为 false） */
+export function __isSignalCleanupInstalledForTest(): boolean {
+  return installed;
+}
+
+function handleSignal(signal: NodeJS.Signals): void {
+  const cleaned = disposeAllTempEnvFiles(); // 先删凭证文件（幂等），任何情况下都不带着残留退出
+  uninstallSignalHandlers();
+  signalSource.notify(`[mc] 收到 ${signal}：已清理 ${cleaned} 个含凭证的临时文件\n`);
+  signalSource.exit(SIGNAL_EXIT_CODES[signal] ?? 1);
+}
+
+/** 接管信号（仅在**有临时凭证文件在场**时；幂等） */
+function installSignalHandlers(): void {
+  if (installed) return;
+  for (const signal of HANDLED_SIGNALS) {
+    const listener = () => handleSignal(signal);
+    listeners.set(signal, listener);
+    signalSource.on(signal, listener);
+  }
+  installed = true;
+}
+
+/** 卸载信号处理器（临时文件清零后调用——空转时不改变进程原有的信号语义） */
+function uninstallSignalHandlers(): void {
+  if (!installed) return;
+  for (const [signal, listener] of listeners) signalSource.off(signal, listener);
+  listeners.clear();
+  installed = false;
+}
+
+/**
+ * 临时 env 文件（0600；用完必删）。内容含密钥 ⇒ 只在临时目录、只通过 `--env-file` 传给 docker。
+ * 创建即登记进存活集合（安装信号清理）；`dispose()` 幂等（重复调用无副作用）。
+ */
 export function createTempEnvFile(vars: Record<string, string>): { path: string; dispose: () => void } {
   const dir = mkdtempSync(join(tmpdir(), 'm10p9-mc-'));
   const path = join(dir, 'mc.env');
@@ -190,9 +287,11 @@ export function createTempEnvFile(vars: Record<string, string>): { path: string;
   } catch {
     /* Windows 上 chmod 语义有限；文件在临时目录且用完即删，不阻断 */
   }
-  return {
+  const entry = {
     path,
     dispose: () => {
+      liveTempEnvFiles.delete(entry);
+      if (liveTempEnvFiles.size === 0) uninstallSignalHandlers();
       try {
         rmSync(dir, { recursive: true, force: true });
       } catch {
@@ -200,6 +299,9 @@ export function createTempEnvFile(vars: Record<string, string>): { path: string;
       }
     },
   };
+  liveTempEnvFiles.add(entry);
+  installSignalHandlers();
+  return entry;
 }
 
 export interface McRunOptions {

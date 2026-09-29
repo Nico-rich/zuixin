@@ -1,9 +1,13 @@
-import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { DeleteObjectCommand, GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import { Readable } from 'node:stream';
-import { StorageAdapter } from '../storage.types';
+import { StorageAdapter, StorageListOptions, StorageListPage, StorageObjectInfo } from '../storage.types';
 import { StorageTimeoutError, storageConnectTimeoutMs, storageRequestTimeoutMs } from '../storage-timeouts';
+
+/** S3 `MaxKeys` 的服务端硬上限（协议规定 ≤1000；超出会被服务端拒绝或用默认值——驱动侧先收敛） */
+export const S3_MAX_KEYS = 1_000;
+const DEFAULT_LIST_LIMIT = 1_000;
 
 export interface S3Config {
   endpoint: string; region: string; bucket: string;
@@ -66,6 +70,41 @@ export class StorageS3Adapter implements StorageAdapter {
     await this.withAbort('s3:delete', (abortSignal) => this.client.send(new DeleteObjectCommand({
       Bucket: this.cfg.bucket, Key: key,
     }), { abortSignal }));
+  }
+
+  /**
+   * M12-P5：`ListObjectsV2` 分页枚举（孤儿对象清扫的数据来源；MinIO/R2/AWS 同一套协议）。
+   *
+   * 语义与边界：
+   * - `Prefix` 是**字面前缀**（S3 协议语义），不做目录推断；未给 ⇒ 全桶；
+   * - `MaxKeys` 收敛到协议上限 `S3_MAX_KEYS`（1000），续页用服务端返回的 `NextContinuationToken`；
+   * - 只返回**对象**（`Key` 以 `/` 结尾的"目录占位对象"被过滤——它们不是可清扫的数据对象）；
+   * - `lastModified` 取服务端 `LastModified`；缺失 ⇒ null（调用方按"年龄未知"保守处理）；
+   * - 有界性：与其余方法同一 `withAbort` 兜底（存储端点半开时不会永久挂住清扫任务）。
+   */
+  async list(options: StorageListOptions = {}): Promise<StorageListPage> {
+    const limit = Math.min(Math.max(Math.trunc(options.limit ?? DEFAULT_LIST_LIMIT) || DEFAULT_LIST_LIMIT, 1), S3_MAX_KEYS);
+    const res = await this.withAbort('s3:list', (abortSignal) => this.client.send(new ListObjectsV2Command({
+      Bucket: this.cfg.bucket,
+      ...(options.prefix ? { Prefix: options.prefix } : {}),
+      MaxKeys: limit,
+      ...(options.cursor ? { ContinuationToken: options.cursor } : {}),
+    }), { abortSignal }));
+    const objects: StorageObjectInfo[] = [];
+    for (const entry of res.Contents ?? []) {
+      const key = typeof entry.Key === 'string' ? entry.Key : '';
+      if (!key || key.endsWith('/')) continue; // 目录占位对象不是数据对象
+      objects.push({
+        key,
+        sizeBytes: typeof entry.Size === 'number' && Number.isFinite(entry.Size) ? entry.Size : 0,
+        lastModified: entry.LastModified instanceof Date ? entry.LastModified : null,
+      });
+    }
+    // IsTruncated=true 但服务端没给 token（协议异常）⇒ 如实结束本页并置 null（调用方据此停手，绝不空转翻页）
+    const nextCursor = res.IsTruncated === true && typeof res.NextContinuationToken === 'string' && res.NextContinuationToken.length > 0
+      ? res.NextContinuationToken
+      : null;
+    return { objects, nextCursor };
   }
 
   /**

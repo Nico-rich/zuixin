@@ -33,6 +33,12 @@ export { addDays, dayRange, periodOf, round };
  * - **M12-P2 agentId 维度**：kind=agent 聚合的 select 增加 run.agentId，metrics 增 `byAgent`
  *   （逐 agent 的 runs/状态分布/时长合计+样本，读时派生成功率/失败率/均值），dimensions.agents 列出桶键；
  *   纯投影——**不建汇总表**；按 agent 读面见 agentMetrics()（有界窗口，只读聚合行）。
+ *
+ * M12-P5 增量（两处，均**不改**上述语义）：
+ * - `snapshotSummary`：PerformanceSnapshot 死端接线（overview.snapshots）；读路径，不写任何行；
+ * - 聚合 cron 化：`refreshStaleOrganizations`（本文件，有界轮转）+ scheduler 侧周期任务注册
+ *   （modules/scheduler/analytics-aggregation.service.ts）——读路径的"只补刷当日"原样保留，
+ *   历史日期由该周期任务维护，显式 POST /analytics/refresh 仍是人工兜底。
  */
 
 export type AnalyticsKind = 'usage' | 'agent' | 'generation' | 'provider' | 'workflow';
@@ -56,6 +62,73 @@ export type AnalyticsRange = 'day' | 'week' | 'month';
 const ATTRIBUTION_LOOKBACK_MS = 7 * 86_400_000;
 
 // ===== 日粒度工具（实现见 analytics-primitives；本模块 re-export 保持既有导入路径）=====
+// ===== M12-P5：周期聚合（cron）与绩效快照接线 =====
+
+/** 周期聚合单次执行的组织预算（每轮最多刷这么多组织，余量下轮继续——有界工作，绝不长占 worker） */
+export const DEFAULT_ANALYTICS_AGGREGATION_MAX_ORGS = 50;
+/**
+ * 周期聚合窗口（含今日）：2 = 今日 + 昨日。
+ * 语义：**昨日在这一整天内持续重算**（迟到事实/跨零点事实的修复），到下一个 UTC 日界后不再被周期任务触碰
+ * ——即"一天只在其后一天内可修，再往后冻结（只由显式刷新维护）"。读路径语义（见 refreshToday）不变。
+ */
+export const DEFAULT_ANALYTICS_AGGREGATION_DAYS = 2;
+/** 窗口天数上限（周期任务误配成 366 天会让单轮变成全历史重算） */
+const MAX_ANALYTICS_AGGREGATION_DAYS = 31;
+/** 绩效快照读面的回看窗（与创意反馈的绩效观察窗同量级） */
+export const PERFORMANCE_SNAPSHOT_WINDOW_DAYS = 30;
+/** 快照归因名单（组织成员 / 项目）一次载入的上界：超限只取前 N 并显式标注 truncated（绝不静默截断） */
+export const PERFORMANCE_ATTRIBUTION_CAP = 1_000;
+
+/** 聚合窗口天数解析（env ANALYTICS_AGGREGATION_DAYS；非法/非正 → 默认 2 天） */
+export function analyticsAggregationDays(): number {
+  const raw = process.env.ANALYTICS_AGGREGATION_DAYS ?? process.env.analyticsAggregationDays;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : DEFAULT_ANALYTICS_AGGREGATION_DAYS;
+}
+
+export interface RefreshOrganizationsOptions {
+  /** 单次执行的组织预算（测试/运维覆盖；周期作业不写 payload → 按默认/env 生效） */
+  maxOrganizations?: number;
+  /** 刷新窗口天数（含今日） */
+  days?: number;
+  /** 注入"当前时间"（测试确定性；生产绝不用） */
+  now?: Date;
+}
+
+export interface RefreshOrganizationsResult {
+  /** 本轮参与刷新的组织数 */
+  organizations: number;
+  /** 每组织的刷新天数（窗口长度） */
+  days: number;
+  /** 本轮刷新的 (org, period) 组合数 */
+  periods: number;
+  /** 成功刷新的组合数 */
+  refreshed: number;
+  /** 失败的组织数（失败隔离：单个组织出错绝不打断整轮） */
+  failed: number;
+  /** 组织预算用尽（本轮取到的是"前 N 个"，仍有组织未覆盖 → 下一轮按游标继续） */
+  truncated: boolean;
+  /** 下一轮的起始组织 id（null = 本轮已扫到末尾，下轮从头开始——轮转保证最终覆盖全部组织） */
+  nextCursor: string | null;
+  /** 生效窗口（含端点，UTC 日粒度） */
+  from: string;
+  to: string;
+}
+
+/** M12-P5：overview 里快照摘要的**行数上界**（读路径有界：绝不把快照表全读进内存） */
+const SNAPSHOT_SUMMARY_LIMIT = 200;
+
+/**
+ * M12-P5：快照合计的**可加标量白名单**。
+ *
+ * `PerformanceSnapshot.metrics` 是自由 Json（写入方 feedback.capturePerformance 放的是
+ * `{...六个标量, derived:{...}, subject:{...}}`）。摘要只对白名单里的六个标量求和：
+ * 其余键（含 derived/subject 这类嵌套对象）语义上是"某一期的派生值/主体指针"，
+ * 跨快照相加或递归合并只会产出一个**混合了多期数据的假对象**——宁可不算，也不伪造。
+ */
+const SNAPSHOT_FACT_KEYS = ['impressions', 'clicks', 'spend', 'conversions', 'revenue', 'orders'] as const;
+
+// ===== 日粒度工具（实现在 analytics-primitives；本模块 re-export——见文件头）=====
 
 export function rangeOf(range: AnalyticsRange, today: Date = new Date()): { from: string; to: string; days: number } {
   const days = range === 'day' ? 1 : range === 'week' ? 7 : 30;
@@ -98,6 +171,13 @@ function num(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
+/** 正整数收敛（非法/非正 → 回退默认；越界 → 收敛到 [min, max]）——绝不把 0/Infinity 直接下推到 take */
+function clampInt(value: number | undefined, fallback: number, min: number, max: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(Math.max(Math.trunc(n), min), max);
+}
+
 interface OrgAttribution {
   id: string;
   isPersonal: boolean;
@@ -117,9 +197,37 @@ interface Metrics {
   dimensions?: Record<string, unknown> | null;
 }
 
+/** M12-P5：`PerformanceSnapshot` 摘要（overview.snapshots；口径见 AnalyticsService.snapshotSummary） */
+export interface PerformanceSnapshotSummary {
+  window: { from: string; to: string };
+  count: number;
+  /** 命中行数超过 SNAPSHOT_SUMMARY_LIMIT：摘要只覆盖最近 N 条（如实标注，绝不当成全量） */
+  truncated: boolean;
+  bySource: Record<string, number>;
+  projects: number;
+  newestCapturedAt: Date | null;
+  oldestCapturedAt: Date | null;
+  /** 白名单标量合计（+ entries）；绝不把 metrics 里的嵌套对象混进来 */
+  facts: Record<string, number>;
+  /** 由合计值重算的比率（体量加权；分母为 0 → 0） */
+  derived: Record<string, number>;
+  /** 最近一条的原文（metrics 全键；要看未被合计的 derived/subject 走这里） */
+  latest: {
+    id: string; source: string; projectId: string | null;
+    periodStart: Date; periodEnd: Date; capturedAt: Date; metrics: Record<string, unknown>;
+  } | null;
+  layering: { facts: string; derived: string; interpretation: string };
+}
+
 @Injectable()
 export class AnalyticsService {
   private readonly logger = new Logger('Analytics');
+  /**
+   * M12-P5：周期聚合的**组织轮转游标**（内存态；进程重启即从头开始——重启不该跳过任何组织）。
+   * 只由 `refreshStaleOrganizations` 读写；多进程各有各的游标 ⇒ 覆盖范围可能重叠，但刷新是幂等的，
+   * 重叠只浪费一点算力，绝不产生错误数据。
+   */
+  private aggregationCursor: string | null = null;
 
   constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
 
@@ -224,6 +332,74 @@ export class AnalyticsService {
     }
     for (const period of periods) await this.refreshOrganization(organizationId, period);
     return { organizationId, from, to, days: periods.length, periods };
+  }
+
+  /**
+   * M12-P5：**周期聚合**（cron 化的写路径）——给"历史聚合只由显式刷新维护"补上后台维护端。
+   *
+   * 背景（M12 审计项："Analytics 没有 cron 聚合"）：读路径只补刷**当日**（P2 性能包，语义不变），
+   * 于是没有任何读请求的组织**从不产生聚合行**；而 23:5x 写下的当日行会永远停在"缺最后几分钟"。
+   * 唯一兜底原为人工 POST /analytics/refresh。
+   *
+   * 本方法给周期任务一个**有界、幂等、失败隔离**的执行体：
+   * - **窗口 = [今天-(days-1), 今天]**（默认 2 天 ⇒ 今日 + 昨日）：昨日在这一整天内被持续重算
+   *   （迟到事实 / 跨零点事实的修复），到下一个 UTC 日界后不再被周期任务触碰（此后只由显式刷新维护）；
+   * - **有界**：单轮最多 `maxOrganizations` 个组织（默认 50），每组织最多 `days` 天——绝不长占 worker；
+   * - **轮转**：按 id 升序取"游标之后"的组织（内存游标；id 不可变 ⇒ 分页稳定），取满预算即停，
+   *   下轮从游标继续——组织数超预算时**每个组织都会被轮到**，绝不总是刷前 N 个；
+   * - **失败隔离**：单个组织刷新抛错只记 warn 并计入 failed，绝不打断整轮（一个坏组织不该饿死其它组织）；
+   * - **幂等**：底层 refreshOrganization 是幂等 upsert（先查后写 + P2002 兜底）⇒ 重复/多进程并发安全。
+   *
+   * 绝不改读路径语义：overview/breakdown 仍只补刷当日；显式 POST /analytics/refresh 仍是历史兜底。
+   */
+  async refreshStaleOrganizations(opts: RefreshOrganizationsOptions = {}): Promise<RefreshOrganizationsResult> {
+    const maxOrganizations = clampInt(opts.maxOrganizations, DEFAULT_ANALYTICS_AGGREGATION_MAX_ORGS, 1, 5_000);
+    const days = clampInt(opts.days, analyticsAggregationDays(), 1, MAX_ANALYTICS_AGGREGATION_DAYS);
+    const to = periodOf(opts.now ?? new Date());
+    const from = addDays(to, -(days - 1));
+    const periods: string[] = [];
+    for (let cursor = from; cursor <= to; cursor = addDays(cursor, 1)) periods.push(cursor);
+
+    const rows = await this.prisma.organization.findMany({
+      where: { deletedAt: null, ...(this.aggregationCursor ? { id: { gt: this.aggregationCursor } } : {}) },
+      select: { id: true },
+      orderBy: { id: 'asc' }, // id 不可变 ⇒ 游标分页不漏不重
+      take: maxOrganizations + 1, // +1：用于判定"仍有组织未覆盖"（不额外查询）
+    });
+    const truncated = rows.length > maxOrganizations;
+    const batch = truncated ? rows.slice(0, maxOrganizations) : rows;
+
+    let refreshed = 0;
+    let failed = 0;
+    for (const org of batch) {
+      try {
+        for (const period of periods) {
+          await this.refreshOrganization(org.id, period);
+          refreshed += 1;
+        }
+      } catch (err) {
+        // 失败隔离：单组织失败不影响其它组织；下轮轮到它时自然重试（幂等）
+        failed += 1;
+        this.logger.warn(
+          { organizationId: org.id, err: err instanceof Error ? err.message : String(err) },
+          '周期聚合：该组织刷新失败（本轮跳过，下一轮重试）',
+        );
+      }
+    }
+    // 游标：取满预算 ⇒ 停在本轮最后一个组织，下轮继续；取不满 ⇒ 已扫到末尾，下轮从头轮转
+    this.aggregationCursor = truncated && batch.length > 0 ? batch[batch.length - 1].id : null;
+    if (batch.length === 0) {
+      this.logger.debug({ from, to }, '周期聚合：无组织（空库）');
+    } else {
+      this.logger.log(
+        { organizations: batch.length, days, refreshed, failed, truncated, from, to },
+        '周期聚合刷新完成',
+      );
+    }
+    return {
+      organizations: batch.length, days, periods: periods.length, refreshed, failed,
+      truncated, nextCursor: this.aggregationCursor, from, to,
+    };
   }
 
   /**
@@ -507,6 +683,118 @@ export class AnalyticsService {
     };
   }
 
+  /**
+   * M12-P5：`PerformanceSnapshot` 摘要——**死端接线**（M12 审计项："只写不读的死端"）。
+   *
+   * 背景与边界：快照由 `feedback.capturePerformance` 在**同一事务**里与 CreativePerformance 事实一起写
+   * （G11），但此前**没有任何读路径**。本方法把它接进 analytics 读面，**不改写入方语义**（写入仍是绩效捕获），
+   * 也不做任何 LLM 解读——只是让既有事实可见、可加、可追溯。
+   *
+   * 归因：`PerformanceSnapshot.projectId` 是**裸列**（schema 里没有指向 Project 的关系，无法
+   * `project: { organizationId }` 过滤），因此按「组织成员 userId」∪「组织项目 id」两侧取并集——
+   * 与 analytics 其它维度的 org 归属同一目标（跨组织绝不串号）。
+   *
+   * 口径（**绝不猜测**）：
+   * - 窗口 = 快照 period 与 [from, to) **相交**（不是 capturedAt）：快照陈述的是"它覆盖的那段时间"，
+   *   什么时候捕获的不改变它说的是哪一期；
+   * - `facts` 只对白名单六个标量求和；`derived`（ctr/roas/cpc/cpa/cvr）由**合计值**重算——
+   *   这是体量加权的正确聚合，绝不把各快照的 derived 相加或求平均；
+   * - 同一周期被重复捕获会产生多行（capture 不去重）⇒ 本摘要是**窗口内快照的朴素合计**：
+   *   它回答"窗口里有哪些快照、合起来多大"，**不是**去重后的业绩口径；业绩事实源始终是
+   *   `CreativePerformance`（本方法是概览辅助，不是计费/结算依据）；
+   * - `latest` 给最近一条的**原文**（含 metrics 全部键），要看未被合计的 derived/subject 走这里。
+   */
+  async snapshotSummary(organizationId: string, from: Date, to: Date): Promise<PerformanceSnapshotSummary> {
+    const empty = (): PerformanceSnapshotSummary => {
+      const facts = this.zeroSnapshotFacts();
+      facts.entries = 0; // 与有数据分支同形：entries 恒为"窗口内快照条数"（此处 0）
+      return {
+        window: { from: from.toISOString(), to: to.toISOString() },
+        count: 0, truncated: false, bySource: {}, projects: 0,
+        newestCapturedAt: null, oldestCapturedAt: null,
+        facts, derived: this.deriveSnapshot(facts), latest: null,
+        layering: { facts: 'reported', derived: 'service-computed', interpretation: 'none' },
+      };
+    };
+    const members = await this.prisma.organizationMember.findMany({
+      where: { organizationId }, select: { userId: true },
+    });
+    const projects = await this.prisma.project.findMany({
+      where: { organizationId, deletedAt: null }, select: { id: true },
+    });
+    const userIds = members.map((m) => m.userId);
+    const projectIds = projects.map((p) => p.id);
+    // 两侧都空 ⇒ 该组织不可能有任何快照（`in: []` 恒假）；直接返回空摘要，省一次查询
+    if (userIds.length === 0 && projectIds.length === 0) return empty();
+
+    const rows = await this.prisma.performanceSnapshot.findMany({
+      where: {
+        periodStart: { lt: to },
+        periodEnd: { gte: from },
+        OR: [{ userId: { in: userIds } }, { projectId: { in: projectIds } }],
+      },
+      // 上界 +1 用于判定截断（有界读路径：绝不整表读入）
+      orderBy: [{ capturedAt: 'desc' }, { id: 'desc' }],
+      take: SNAPSHOT_SUMMARY_LIMIT + 1,
+      select: { id: true, source: true, projectId: true, periodStart: true, periodEnd: true, capturedAt: true, metrics: true },
+    });
+    const truncated = rows.length > SNAPSHOT_SUMMARY_LIMIT;
+    const page = truncated ? rows.slice(0, SNAPSHOT_SUMMARY_LIMIT) : rows;
+
+    const facts = this.zeroSnapshotFacts();
+    const bySource: Record<string, number> = {};
+    const projectSet = new Set<string>();
+    let newest: Date | null = null;
+    let oldest: Date | null = null;
+    for (const row of page) {
+      const metrics = (row.metrics ?? {}) as Record<string, unknown>;
+      for (const key of SNAPSHOT_FACT_KEYS) facts[key] += num(metrics[key]);
+      bySource[row.source] = (bySource[row.source] ?? 0) + 1;
+      if (row.projectId) projectSet.add(row.projectId);
+      if (newest === null || row.capturedAt > newest) newest = row.capturedAt;
+      if (oldest === null || row.capturedAt < oldest) oldest = row.capturedAt;
+    }
+    facts.entries = page.length;
+    for (const key of SNAPSHOT_FACT_KEYS) facts[key] = round(facts[key]);
+    const latest = page[0];
+    return {
+      window: { from: from.toISOString(), to: to.toISOString() },
+      count: page.length,
+      truncated,
+      bySource,
+      projects: projectSet.size,
+      newestCapturedAt: newest,
+      oldestCapturedAt: oldest,
+      facts,
+      derived: this.deriveSnapshot(facts),
+      latest: latest
+        ? {
+          id: latest.id, source: latest.source, projectId: latest.projectId,
+          periodStart: latest.periodStart, periodEnd: latest.periodEnd, capturedAt: latest.capturedAt,
+          metrics: (latest.metrics ?? {}) as Record<string, unknown>,
+        }
+        : null,
+      layering: { facts: 'reported', derived: 'service-computed', interpretation: 'none' },
+    };
+  }
+
+  private zeroSnapshotFacts(): Record<string, number> {
+    return Object.fromEntries(SNAPSHOT_FACT_KEYS.map((k) => [k, 0])) as Record<string, number>;
+  }
+
+  /** 由**合计值**重算比率（分母为 0 → 0，与 feedback.derive 同一"不猜测"口径） */
+  private deriveSnapshot(facts: Record<string, number>): Record<string, number> {
+    const ratio = (a: number, b: number) => (b > 0 ? round(a / b) : 0);
+    return {
+      ctr: ratio(facts.clicks, facts.impressions),
+      cvr: ratio(facts.conversions, facts.clicks),
+      roas: ratio(facts.revenue, facts.spend),
+      cpc: ratio(facts.spend, facts.clicks),
+      cpa: ratio(facts.spend, facts.conversions),
+      costPerOrder: ratio(facts.spend, facts.orders),
+    };
+  }
+
   /** 跨 kind 汇总（facts 各维度 + derived 服务端计算，均标注分层） */
   async overview(organizationId: string, range: AnalyticsRange = 'day') {
     const { from, to, days } = rangeOf(range);
@@ -527,7 +815,11 @@ export class AnalyticsService {
     const mediaCost = num(provider.mediaCost);
     const providerCost = round(llmCost + mediaCost);
     const totalCost = providerCost;
-    const members = await this.prisma.organizationMember.count({ where: { organizationId } });
+    const [members, snapshots] = await Promise.all([
+      this.prisma.organizationMember.count({ where: { organizationId } }),
+      // M12-P5：快照摘要（死端接线）——窗口与本次 overview 的 [from, to] 同日粒度对齐（UTC，闭开端）
+      this.snapshotSummary(organizationId, dayRange(from).start, dayRange(to).end),
+    ]);
 
     return {
       organizationId,
@@ -537,6 +829,8 @@ export class AnalyticsService {
       days,
       facts: { usage, agent, generation, provider, workflow },
       context: { members },
+      // M12-P5：PerformanceSnapshot 摘要（此前该表只写不读）；口径与边界见 snapshotSummary 注释
+      snapshots,
       derived: {
         totalCost,
         llmCost: round(llmCost),
