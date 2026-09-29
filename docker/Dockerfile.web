@@ -46,7 +46,8 @@ ARG HTTPS_PROXY
 # -----------------------------------------------------------------------------
 FROM ${NODE_IMAGE} AS base
 ENV CI=true \
-    NPM_CONFIG_UPDATE_NOTIFIER=false
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY
 RUN npm install -g pnpm@9.15.0
 WORKDIR /app
 
