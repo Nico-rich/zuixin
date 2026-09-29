@@ -40,11 +40,12 @@ async function waitForApproval(prisma: PrismaService, workflowRunId: string, tim
   throw new Error(`workflowRun ${workflowRunId} 未在 ${timeoutMs}ms 内出现审批`);
 }
 
+// M12-P5：event 触发器已从写入面下线（DTO 拒绝）——DEFINITION 不再含 event；
+// 存量语义回归见下方 event 触发用例（直接落库构造存量版本）
 const DEFINITION = {
   triggers: [
     { type: 'manual' }, { type: 'webhook' },
     { type: 'schedule', cron: '0 9 * * 1' },
-    { type: 'event', event: 'wf-e2e-events' },
   ],
   steps: [
     { id: 'analyze', type: 'tool', tool: { name: 'commerce.analytics.summary', arguments: { timeRange: { days: 30 } } } },
@@ -315,7 +316,21 @@ describe('M7-P6 Workflow Engine (e2e, 真实 Queue + Worker)', () => {
     expect(await approveAndWait(run!.id)).toBe('completed');
   });
 
-  it('P6 event 触发：EventBus 事件 → run（同 event id 幂等）', async () => {
+  it('P6 event 触发（存量语义回归）：EventBus 事件 → run（同 event id 幂等）', async () => {
+    // M12-P5：event 触发器类型已从写入面下线（无生产发布端）——存量已发布工作流仍可运行。
+    // 本用例按"存量语义"构造：直接落一份含 event 触发器的 published 版本（绕过写 DTO），
+    // 再经服务层 registerEvent 订阅——把"存量仍可运行"变成可回归证据（绝不走已下线的写入面）。
+    const latest = await prisma.workflowVersion.findFirst({ where: { workflowId, status: 'published' }, orderBy: { version: 'desc' } });
+    await prisma.workflowVersion.create({
+      data: {
+        workflowId,
+        version: (latest?.version ?? 0) + 1,
+        status: 'published',
+        definition: { ...DEFINITION, triggers: [...DEFINITION.triggers, { type: 'event', event: 'wf-e2e-events' }] } as never,
+      },
+    });
+    const triggers = worker.get(WorkflowTriggersService);
+    await triggers.registerEvent(workflowId, 'wf-e2e-events');
     const bus = app.get(EventBusService);
     await bus.publish('wf-e2e-events', { id: 'evt-100', payload: { x: 1 } });
     // 等待 event run 出现
