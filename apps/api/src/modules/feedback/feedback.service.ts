@@ -3,7 +3,6 @@ import { PrismaService } from '../prisma/prisma.service';
 import { MemoryService } from '../../core/memory/memory.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { withToolCallLedger } from '../../core/tools/tool-call-ledger';
-<<<<<<< HEAD
 import { MEMORY_ORIGIN_KEY, type MemoryOrigin } from '../../core/memory/memory-provenance';
 import { readPolicyThresholds } from '../system-settings/policy-thresholds';
 
@@ -169,7 +168,6 @@ export class FeedbackService {
     });
 
     // 阈值记忆：好/差（服务端规则；learning = Memory，不改模型）——metadata 幂等，重放再走也不产第二条。
-<<<<<<< HEAD
     // M12-P3：内容全为服务端计算事实（derived 由 derive() 从数值算出，不含任何 LLM 文本）；来源标注同上。
     const origin = memoryOriginOf(opts);
     // M12-P4：阈值 = SystemSetting 优先 / 编译期常量兜底（绝不采信 LLM 或调用方传入的阈值）。

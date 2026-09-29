@@ -24,7 +24,6 @@ import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { CreativeLoopAccessService, LoopScope } from './creative-loop-access.service';
 import { HypothesisStore, InsightDoc, InsightStore, StoredDoc, VERDICT_PRECEDENT_TAKE } from './creative-loop-store';
 import {
-<<<<<<< HEAD
   ComparisonEntry, InsightThresholds, RatingFacts, assertFactsUnchanged, comparePeriods, derivePerfMetrics,
   excludeAgentPerformance, factsHashOf, sumPerfFacts, summarizeRatings,
 } from './insight-rules';
