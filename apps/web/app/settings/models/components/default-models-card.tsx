@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { ProviderView } from '@/lib/services/providers';
 import { patchSystemSetting, systemSettingKeys } from '@/lib/services/settings';
 import { useApiMutation, useApiQuery, useApiQueryClient } from '@/lib/api';
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Select } from '@/components/ui/select';
@@ -17,10 +18,10 @@ import { useToast } from '@/components/ui/toast';
  * 后端会在写入时做存在性/类型/启用校验（400 如实回显）。
  */
 const CAPABILITIES = [
-  { key: 'llm', label: 'LLM（对话/Agent）' },
-  { key: 'image', label: '生图' },
-  { key: 'video', label: '生视频' },
-  { key: 'embedding', label: 'Embedding（检索/记忆）' },
+  { key: 'llm', label: 'LLM（对话/Agent）', badge: 'info' },
+  { key: 'image', label: '生图', badge: 'success' },
+  { key: 'video', label: '生视频', badge: 'warning' },
+  { key: 'embedding', label: 'Embedding（检索/记忆）', badge: 'secondary' },
 ] as const;
 
 interface RoutingDefaults { defaults?: Record<string, string | null> }
@@ -50,13 +51,17 @@ export function DefaultModelsCard({ providers, enabled }: { providers: ProviderV
   );
 
   const modelsOf = (cap: string) =>
-    (providers ?? []).flatMap((p) => p.models).filter((m) => m.type === cap && m.enabled);
+    (providers ?? [])
+      .flatMap((p) => p.models.filter((m) => m.type === cap && m.enabled).map((m) => ({ ...m, providerName: p.name })));
 
   return (
     <Card>
       <CardHeader>
-        <CardTitle>默认模型</CardTitle>
-        <CardDescription>各能力的运营者偏好模型（只影响排序与兜底，不做硬过滤；停用默认模型后自动落到其他可用 provider）</CardDescription>
+        <CardTitle>默认模型（优先级偏好）</CardTitle>
+        <CardDescription>
+          同一能力启用多家厂商时，决定优先用哪家（只影响排序与兜底，不做硬过滤）；只启用一家时无实际影响。
+          停用的厂商/模型会被路由自动跳过，落到下一个可用厂商。
+        </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
         {CAPABILITIES.map((cap) => {
@@ -65,7 +70,10 @@ export function DefaultModelsCard({ providers, enabled }: { providers: ProviderV
           const value = pending[cap.key] ?? current;
           return (
             <div key={cap.key} className="flex items-center gap-3">
-              <span className="w-44 shrink-0 text-sm text-zinc-400">{cap.label}</span>
+              <span className="flex w-44 shrink-0 items-center gap-2 text-sm text-zinc-400">
+                <Badge variant={cap.badge as 'info' | 'success' | 'warning' | 'secondary'} className="w-14 justify-center">{cap.label.split('（')[0]}</Badge>
+                {cap.label}
+              </span>
               <Select
                 className="min-w-0 flex-1"
                 aria-label={`${cap.label} 默认模型`}
@@ -74,7 +82,9 @@ export function DefaultModelsCard({ providers, enabled }: { providers: ProviderV
               >
                 <option value="">未指定（路由自由选择）</option>
                 {models.map((m) => (
-                  <option key={m.id} value={m.id}>{m.name}{m.isDefault ? '（默认）' : ''} · {m.apiModelId}</option>
+                  <option key={m.id} value={m.id}>
+                    {m.providerName} · {m.name}{m.isDefault ? '（默认）' : ''} · {m.apiModelId}
+                  </option>
                 ))}
               </Select>
               <Button

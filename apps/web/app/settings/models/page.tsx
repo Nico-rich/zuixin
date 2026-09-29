@@ -22,6 +22,7 @@ import { DefaultModelsCard } from './components/default-models-card';
  * - 改动经 PATCH 落库后由服务端热刷新 manager——保存即生效，无需重启。
  */
 const TYPE_LABELS: Record<string, string> = { llm: 'LLM', image: '生图', video: '生视频', embedding: 'Embedding' };
+const TYPE_BADGES: Record<string, 'info' | 'success' | 'warning' | 'secondary'> = { llm: 'info', image: 'success', video: 'warning', embedding: 'secondary' };
 
 export default function ModelsSettingsPage() {
   const { data: me } = useCurrentUser();
@@ -93,7 +94,11 @@ export default function ModelsSettingsPage() {
                       <div className="font-medium text-zinc-200">{p.name}</div>
                       <div className="text-xs text-zinc-500">{p.adapter}{p.managedByExtension ? ' · 扩展托管' : ''}</div>
                     </TableCell>
-                    <TableCell>{TYPE_LABELS[p.type] ?? p.type}</TableCell>
+                    <TableCell>
+                      <Badge variant={TYPE_BADGES[p.type] ?? 'secondary'} className="w-16 justify-center">
+                        {TYPE_LABELS[p.type] ?? p.type}
+                      </Badge>
+                    </TableCell>
                     <TableCell>
                       <Badge variant={p.enabled ? 'success' : 'secondary'}>{p.enabled ? '已启用' : '已停用'}</Badge>
                       {p.enabled && !p.loaded && <Badge variant="warning" className="ml-1">未加载</Badge>}

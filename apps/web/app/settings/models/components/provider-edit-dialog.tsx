@@ -82,9 +82,9 @@ export function ProviderEditDialog({
     <Dialog open={open} onOpenChange={(next) => { if (!next) { setFormError(''); onOpenChange(false); } }}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>编辑 Provider</DialogTitle>
+          <DialogTitle>编辑 {provider.name}（{TYPE_LABELS[provider.type] ?? provider.type}）</DialogTitle>
           <DialogDescription>
-            {provider.name}（{TYPE_LABELS[provider.type] ?? provider.type} · {provider.adapter}）
+            适配器：{provider.adapter}
             {provider.managedByExtension && ' · 扩展托管'}
           </DialogDescription>
         </DialogHeader>

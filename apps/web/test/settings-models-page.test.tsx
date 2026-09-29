@@ -84,7 +84,7 @@ describe('/settings/models 模型配置页（M13+）', () => {
     expect(screen.getByText('已停用')).toBeInTheDocument();
     expect(screen.getByText('无 Key')).toBeInTheDocument();
     expect(screen.getByText('已配置')).toBeInTheDocument();
-    expect(screen.getByText('生图')).toBeInTheDocument(); // 默认模型卡能力标签
+    expect(screen.getAllByText('生图').length).toBeGreaterThan(0); // 默认模型卡能力徽标/标签
   });
 
   it('编辑弹窗：apiKey 只写（password、初值空）；提交空 Key 时 PATCH body 无 apiKey 键', async () => {
