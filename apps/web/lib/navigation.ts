@@ -1,6 +1,6 @@
 import {
   Activity, BarChart3, Blocks, Bot, Brain, CreditCard, FlaskConical, Gauge, LayoutDashboard,
-  Library, MessagesSquare, Plug, Puzzle, Settings, Sparkles, Store, Users, Workflow,
+  Library, MessagesSquare, Package, Plug, Puzzle, Settings, ShieldCheck, ShoppingCart, Sparkles, Store, Users, Workflow,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -40,6 +40,7 @@ export const NAV_SECTIONS: readonly NavSection[] = [
       { href: '/', label: '首页', icon: LayoutDashboard, exact: true },
       { href: '/chat', label: '对话', icon: MessagesSquare },
       { href: '/workflows', label: '工作流', icon: Workflow },
+      { href: '/approvals', label: '审批', icon: ShieldCheck },
       { href: '/evaluation', label: '评测', icon: FlaskConical },
       { href: '/marketplace', label: '扩展市场', icon: Store },
     ],
@@ -53,6 +54,7 @@ export const NAV_SECTIONS: readonly NavSection[] = [
       { href: '/knowledge', label: '知识库', icon: Library },
       { href: '/memory', label: '记忆', icon: Brain },
       { href: '/creative', label: '创意工作台', icon: Sparkles },
+      { href: '/artifacts', label: '制品', icon: Package },
     ],
   },
   {
@@ -61,6 +63,7 @@ export const NAV_SECTIONS: readonly NavSection[] = [
     items: [
       { href: '/connections', label: '连接', icon: Plug },
       { href: '/analytics', label: '分析', icon: BarChart3 },
+      { href: '/ecommerce', label: '电商', icon: ShoppingCart },
       { href: '/feedback', label: '反馈', icon: Gauge },
       { href: '/usage', label: '用量', icon: Blocks },
       { href: '/billing', label: '账单', icon: CreditCard },
