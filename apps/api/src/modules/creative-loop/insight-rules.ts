@@ -149,6 +149,18 @@ export interface SuccessCriteria {
 
 export const SUCCESS_CRITERIA_METRICS: readonly SuccessCriteria['metric'][] = ['avg_score', 'pass_rate', 'roas', 'ctr'];
 
+/**
+ * 判据指标 → 事实来源（M12-P1 来源判别的影响面）：
+ * `roas`/`ctr` 来自 `CreativePerformance`（**agent 可经 performance.capture 写**）→ 受来源谓词约束；
+ * `avg_score`/`pass_rate` 来自 M9-P1 评测摘要（agent 无写工具面）→ 不受绩效来源谓词影响。
+ */
+export const PERF_DERIVED_CRITERIA_METRICS: readonly SuccessCriteria['metric'][] = ['roas', 'ctr'];
+
+/** 该判据指标是否取自绩效回流事实（受来源判别约束） */
+export function isPerfDerivedMetric(metric: SuccessCriteria['metric']): boolean {
+  return PERF_DERIVED_CRITERIA_METRICS.includes(metric);
+}
+
 export function isCriteriaSatisfied(
   criteria: SuccessCriteria,
   facts: Readonly<Record<string, number | null | undefined>>,
@@ -165,6 +177,47 @@ export function isCriteriaSatisfied(
     actual,
     reason: `${criteria.metric}=${actual} ${criteria.op === 'gte' ? '≥' : '≤'} ${criteria.value} → ${satisfied ? '成立' : '不成立'}`,
   };
+}
+
+// ===== M12-P1 来源判别（审计 R1：agent 可写工具绝不自证假设）=====
+
+/**
+ * agent 可写绩效工具名（`performance.capture`，M7-P8）。它是**唯一**能写 `CreativePerformance` 的
+ * 工具路径（HTTP 路径 `POST /feedback/performance` 需用户 JWT，非 agent 工具面）。
+ *
+ * 为什么需要这条谓词：绩效回流行一旦被计入判定窗口，agent 就能用工具**伪造绩效自证自己的假设**
+ * （闭环判定不得被一个可写副作用的工具所操纵）。`CreativePerformance` 在冻结 schema 下**没有来源列**
+ * （不新增迁移的红线优先），故来源信号只能取**既有 ToolCall 幂等账本**：
+ * agent 工具路径一律经 `withToolCallLedger(prisma, ctx.toolCallId, …)` 写入，
+ * 该事务把工具返回值（含 `performanceId`）**与副作用行同时提交**到 `ToolCall.output`。
+ */
+export const AGENT_PERFORMANCE_TOOL = 'performance.capture';
+
+/**
+ * 从 ToolCall 账本载荷（= 工具返回值）中提取"由 agent 工具写入"的绩效行 id（纯函数）。
+ * 账本载荷形状 = `performance.capture` 的返回 `{ performanceId, facts, derived, layering }`；
+ * 非该形状（缺 `performanceId`/类型不符）一律忽略——绝不把无关账本读成绩效来源。
+ */
+export function agentPerformanceIds(ledgerOutputs: readonly unknown[]): Set<string> {
+  const ids = new Set<string>();
+  for (const output of ledgerOutputs) {
+    const candidate = (output ?? null) as { performanceId?: unknown } | null;
+    const id = candidate && typeof candidate === 'object' ? candidate.performanceId : undefined;
+    if (typeof id === 'string' && id.length > 0) ids.add(id);
+  }
+  return ids;
+}
+
+/**
+ * 事实窗口过滤：**排除 agent 来源的绩效行**（纯函数——判定/洞察的事实层只计入非 agent 来源）。
+ * 返回保留行与排除计数：计数必须随事实一并留痕（**绝不静默丢弃事实**，排除本身也是可审计事实）。
+ */
+export function excludeAgentPerformance<T extends { id: string }>(
+  rows: readonly T[],
+  agentAuthoredIds: ReadonlySet<string>,
+): { rows: T[]; excludedAgentRows: number } {
+  const kept = rows.filter((row) => !agentAuthoredIds.has(row.id));
+  return { rows: kept, excludedAgentRows: rows.length - kept.length };
 }
 
 /** 稳定序列化（键排序；绝不受对象键插入顺序影响——facts 指纹的可复现前提） */

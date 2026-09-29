@@ -43,6 +43,9 @@ import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { HypothesisStatus, isHypothesisStatus } from './hypothesis-status';
 import { SuccessCriteria } from './insight-rules';
 
+/** 历史判定先例的单次读取上限（读路径有界；按 updatedAt 倒序取最近 N 条） */
+export const VERDICT_PRECEDENT_TAKE = 20;
+
 /** 旧容器判别（**仅存量回填使用**；新读写一律走专表，绝不读 Artifact） */
 export const CREATIVE_LOOP_ARTIFACT_TYPE = 'other';
 export const HYPOTHESIS_KIND = 'creative_hypothesis';
@@ -523,6 +526,33 @@ export class HypothesisStore {
       },
       orderBy: { createdAt: 'desc' },
       take: filter.take ?? 50,
+    });
+    return rows.map((row) => rowToHypothesis(row as unknown as HypothesisRow));
+  }
+
+  /**
+   * 历史判定读路径（M12-P1 verdict→下一次决策桥的**只读输入**）：
+   * - server-side 组织 scope（+ 可选项目 scope / 可选 statement 谓词），绝不 JS 侧过滤；
+   * - 只返回**已有 verdict 的终态行**（validated/rejected）——未判定/执行中的行不进入参考集；
+   * - 只读：绝不改写历史行（调用方仅把结论作为新洞察/新假设的输入事实）。
+   */
+  async listVerdicts(filter: {
+    organizationId: string;
+    projectId?: string | null;
+    statement?: string;
+    take?: number;
+  }): Promise<Array<StoredDoc<HypothesisDoc>>> {
+    await ensureLegacyBackfill(this.prisma);
+    const rows = await this.prisma.creativeHypothesis.findMany({
+      where: {
+        organizationId: filter.organizationId,
+        ...(filter.projectId ? { projectId: filter.projectId } : {}),
+        ...(filter.statement !== undefined ? { statement: filter.statement } : {}),
+        status: { in: ['validated', 'rejected'] as never[] },
+        verdict: { not: Prisma.DbNull }, // 判定事实必须存在（终态但无 verdict 的历史行不可作为先例）
+      },
+      orderBy: { updatedAt: 'desc' },
+      take: filter.take ?? VERDICT_PRECEDENT_TAKE,
     });
     return rows.map((row) => rowToHypothesis(row as unknown as HypothesisRow));
   }

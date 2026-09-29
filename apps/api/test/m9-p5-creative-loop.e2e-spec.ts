@@ -20,7 +20,8 @@ import { LOOP_STEP_IDS, buildLoopDefinition } from '../src/modules/creative-loop
 import {
   BACKFILL_BATCH_SIZE, HYPOTHESIS_KIND, INSIGHT_KIND, HypothesisStore, InsightStore,
 } from '../src/modules/creative-loop/creative-loop-store';
-import { factsHashOf } from '../src/modules/creative-loop/insight-rules';
+import { FeedbackService } from '../src/modules/feedback/feedback.service';
+import { AGENT_PERFORMANCE_TOOL, factsHashOf } from '../src/modules/creative-loop/insight-rules';
 
 /**
  * M9-P5 Creative Performance Loop e2e（真实 PostgreSQL/Redis/BullMQ + Worker 进程内实例）。
@@ -46,6 +47,12 @@ import { factsHashOf } from '../src/modules/creative-loop/insight-rules';
  *   ⑨ 存储隔离：假设/洞察落在**专表**（CreativeHypothesis/CreativeInsight），绝不进入 `Artifact` 容器
  *      （既无"制品列表污染"风险，也无需 conversationId/storageKey 空值兜底）。
  *   ⑩ M11-P5/D2-01：旧容器行存量回填在**真实 PG** 上按主键游标**分批**（跨批不丢行）、幂等、只读不删。
+ *   ⑪ M12-P1 来源判别（审计 R1）：`performance.capture` 是 agent 可写工具——走**真实 agent 工具路径**
+ *      （AgentRun → AgentRunStep → ToolCall 账本 → FeedbackService 写副作用）伪造高 ROAS 绩效，
+ *      判定窗口必须**排除 agent 来源行**（排除计数留痕），绝不据伪造绩效自证 validated；
+ *      外部行回流后才按判据成立（derived 只含外部行）。
+ *   ⑫ M12-P1 verdict→下一次决策桥：既有 verdict 进入新洞察的事实层（只读引用 + 来源标注），
+ *      同 statement 新假设在 create 响应带上历史判定先例（**绝不落库**、绝不预判、绝不改写历史行）。
  *
  * 说明：M10-P4 起假设/洞察写入 creative-loop 专表（organizationId 直列，查询一律 server-side scope）；
  * 历史 `Artifact(type='other')` 行由 store 层**首次访问幂等回填**（本 spec 不再产生这类行）。
@@ -84,6 +91,8 @@ describe('M9-P5 Creative Performance Loop (e2e, 真实 Queue + Worker)', () => {
   const runIds: string[] = [];
   const childRunIds: string[] = [];
   const extraUserIds: string[] = [];
+  /** M12-P1 来源判别用例的 agent 事实链（删除 run 级联 steps/toolCalls） */
+  const agentRunIds: string[] = [];
 
   let outsiderCookie = '';
   let perfCurrentId = '';
@@ -190,6 +199,9 @@ describe('M9-P5 Creative Performance Loop (e2e, 真实 Queue + Worker)', () => {
       where: { id: { in: [...hypothesisIds, ...legacyArtifactIds] } },
     }).catch(() => undefined);
     await prisma.artifact.deleteMany({ where: { id: { in: legacyArtifactIds } } }).catch(() => undefined);
+    // M12-P1 来源判别用例的 agent 侧事实链（AgentRun 级联 steps/toolCalls）+ 工具路径写入的快照
+    await prisma.agentRun.deleteMany({ where: { id: { in: agentRunIds } } }).catch(() => undefined);
+    await prisma.performanceSnapshot.deleteMany({ where: { userId, projectId } }).catch(() => undefined);
     await prisma.creativePerformance.deleteMany({ where: { userId, projectId } }).catch(() => undefined);
     await prisma.feedback.deleteMany({ where: { userId, projectId } }).catch(() => undefined);
     await prisma.project.delete({ where: { id: projectId } }).catch(() => undefined);
@@ -875,5 +887,141 @@ describe('M9-P5 Creative Performance Loop (e2e, 真实 Queue + Worker)', () => {
     expect((await store.get(ids[0]))?.doc.statement).toBe('专表内的最新陈述');
     // 只读迁移：旧容器行全部保留（审计痕迹）
     expect(await prisma.artifact.count({ where: { id: { in: ids } } })).toBe(total);
+  });
+
+  it('⑪ 来源判别（M12-P1 审计 R1）：agent 工具写入的绩效行不参与判定——伪造绩效绝不促成 validated', async () => {
+    const feedback = app.get(FeedbackService, { strict: false });
+
+    const h5 = await createHypothesis({
+      statement: '来源判别假设：agent 自证绩效不算数',
+      successCriteria: { metric: 'roas', op: 'gte', value: 50 },
+    });
+    await api().post(`/api/v1/creative-loop/hypotheses/${h5}/status`).set(XRW).set('Cookie', cookie)
+      .send({ status: 'ready' }).expect(201);
+    const started = await api().post(`/api/v1/creative-loop/hypotheses/${h5}/start`).set(XRW).set('Cookie', cookie)
+      .send({ waitMs: 800 }).expect(201);
+    const runId = started.body.data.run.runId as string;
+    runIds.push(runId);
+    const loopStartedAt = new Date((started.body.data.hypothesis.loop as { startedAt: string }).startedAt);
+
+    // loop 运行中，走**真实 agent 工具路径**伪造绩效：AgentRun → AgentRunStep → ToolCall（账本行）→
+    // FeedbackService 写副作用。ToolCall.output 是既有 schema 下唯一的来源信号（零 schema 变更）：
+    // 账本与副作用**同事务**落库。
+    const agent = await prisma.agent.findFirstOrThrow({ select: { id: true } });
+    const agentRun = await prisma.agentRun.create({
+      data: { userId, agentId: agent.id, projectId, status: 'completed', completedAt: new Date() },
+    });
+    agentRunIds.push(agentRun.id);
+    const step = await prisma.agentRunStep.create({
+      data: { runId: agentRun.id, stepIndex: 0, type: 'tool_call', status: 'completed', completedAt: new Date() },
+    });
+    const toolCall = await prisma.toolCall.create({
+      data: {
+        runStepId: step.id, toolName: AGENT_PERFORMANCE_TOOL, idempotencyKey: `e2e-m9p5-forge-${randomUUID()}`,
+        input: {}, status: 'completed', completedAt: new Date(),
+      },
+    });
+    // 伪造绩效：roas 极高——若来源判别失效，Agent 就能用自己回传的绩效**自证**假设成立
+    const forged = await feedback.capturePerformance(userId, {
+      projectId, platform: 'mock',
+      metrics: { impressions: 10, clicks: 1, spend: 100, conversions: 1, revenue: 1_000_000, orders: 1 },
+    }, { toolCallId: toolCall.id });
+    const ledger = await prisma.toolCall.findUniqueOrThrow({ where: { id: toolCall.id } });
+    expect(ledger.output).toMatchObject({ performanceId: forged.performanceId }); // 账本 = 副作用行 id（判别依据）
+    // 伪造行**确实落在判定窗口内**（capturedAt >= loop.startedAt）——排除是判别在起作用，绝非窗口没覆盖
+    const forgedRow = await prisma.creativePerformance.findUniqueOrThrow({ where: { id: forged.performanceId } });
+    expect(forgedRow.capturedAt.getTime()).toBeGreaterThanOrEqual(loopStartedAt.getTime());
+
+    const approval = (await waitFor(
+      '来源判别 loop 审批',
+      () => prisma.approval.findFirst({ where: { workflowRunId: runId, status: 'requested' } }),
+      (a) => a !== null,
+    ))!;
+    await api().post(`/api/v1/approvals/${approval.id}/approve`).set(XRW).set('Cookie', cookie).expect(201);
+    await waitFor(
+      '来源判别 run 终态',
+      () => prisma.workflowRun.findUniqueOrThrow({ where: { id: runId } }),
+      (r) => ['completed', 'failed', 'timeout'].includes(r.status),
+    );
+
+    // 窗口内只有 agent 伪造行 → 判别把该行整段排除 → 事实缺失 → **绝不自动判定**（伪造的自证不成立）
+    const blocked = await api().get(`/api/v1/creative-loop/hypotheses/${h5}/status`).set('Cookie', cookie).expect(200);
+    expect(blocked.body.data.hypothesis.status).toBe('running');
+    expect(blocked.body.data.hypothesis.verdict).toBeNull();
+    expect(blocked.body.data.pending.reason).toBe('awaiting-facts');
+
+    // 外部（非 agent）事实回流 → 只用外部行求和判定：roas = 6000/100 = 60（伪造行的 1e6 收入绝不计入）
+    await api().post('/api/v1/feedback/performance').set(XRW).set('Cookie', cookie)
+      .send({
+        projectId, platform: 'mock',
+        metrics: { impressions: 1000, clicks: 60, spend: 100, conversions: 6, revenue: 6000, orders: 6 },
+      }).expect(201);
+    const converged = await api().get(`/api/v1/creative-loop/hypotheses/${h5}/status`).set('Cookie', cookie).expect(200);
+    expect(converged.body.data.hypothesis.status).toBe('validated');
+    expect(converged.body.data.hypothesis.verdict).toMatchObject({
+      decision: 'validated',
+      decidedBy: 'criteria',
+      facts: {
+        performance: {
+          rows: 1, // 只有外部行参与求和
+          excludedAgentRows: 1, // 被排除的 agent 行**留痕**（绝不静默丢弃）
+          derived: { roas: 60, ctr: 0.06 },
+          provenance: { rule: 'agent-tool-ledger-exclusion', complete: true },
+        },
+      },
+    });
+    // 判别是"判定豁免"，不是"数据删除"：伪造行本身仍在（审计痕迹完整）
+    expect(await prisma.creativePerformance.count({ where: { id: forged.performanceId } })).toBe(1);
+  });
+
+  it('⑫ verdict 回流（M12-P1 学习桥）：既有判定作为新洞察/新假设的**只读**事实输入，绝不改写历史', async () => {
+    // ① 新洞察：既有 verdict 作为事实层输入（服务端聚合 + 来源标注；解读层仍留空）
+    const res = await api().post('/api/v1/creative-loop/insights').set(XRW).set('Cookie', cookie)
+      .send({ projectId, days: 30, includeEvaluation: false }).expect(201);
+    insightIds.push(res.body.data.id as string);
+    const verdicts = (res.body.data.facts as Record<string, never>).verdicts as unknown as {
+      entries: Array<Record<string, unknown>>; totals: Record<string, never>; source: string; rule: string;
+    };
+    expect(verdicts.source).toBe('historical-verdicts');
+    expect(verdicts.rule).toBe('server-aggregate');
+    const priorEntry = verdicts.entries.find((e) => e.hypothesisId === hypothesisId)!;
+    expect(priorEntry).toMatchObject({
+      statement, status: 'validated', projectId,
+      decision: 'validated', decidedBy: 'criteria', rule: 'historical-verdict',
+    });
+    expect(priorEntry.criteria).toEqual({ metric: 'roas', op: 'gte', value: 1 });
+    expect(verdicts.totals).toMatchObject({
+      entries: verdicts.entries.length, // 无未判定行混入（只有终态且带 verdict 的行）
+      validated: expect.any(Number), rejected: expect.any(Number),
+      byDecider: { criteria: expect.any(Number), manual: 0, system: expect.any(Number) },
+    });
+    expect(verdicts.entries.map((e) => e.decidedBy)).toEqual(expect.arrayContaining(['criteria', 'system']));
+    expect(res.body.data.interpretation).toBeNull();
+
+    // ② 同 statement 新假设：历史判定作为**只读参考字段**返回（创建方可看到"上一轮学到什么"）
+    const created = await api().post('/api/v1/creative-loop/hypotheses').set(XRW).set('Cookie', cookie)
+      .send({ statement, projectId }).expect(201);
+    const newId = created.body.data.id as string;
+    hypothesisIds.push(newId);
+    expect(created.body.data).toMatchObject({ status: 'draft', verdict: null, terminal: false });
+    expect(created.body.data.priorVerdicts).toEqual([
+      expect.objectContaining({
+        hypothesisId, statement, status: 'validated',
+        decision: 'validated', decidedBy: 'criteria', source: 'historical-verdict',
+      }),
+    ]);
+    // 响应字段**绝不落库**：专表行仍是干净的 draft（无 verdict/历史，也无任何历史行痕迹）
+    const newRow = await prisma.creativeHypothesis.findUniqueOrThrow({ where: { id: newId } });
+    expect(newRow.status).toBe('draft');
+    expect(newRow.verdict).toBeNull();
+    expect(newRow.history).toEqual([]);
+    expect(JSON.stringify(newRow)).not.toContain(hypothesisId);
+    // 读路径不含该字段（先例只出现在 create 决策点）
+    const read = await api().get(`/api/v1/creative-loop/hypotheses/${newId}`).set('Cookie', cookie).expect(200);
+    expect(read.body.data.priorVerdicts).toBeUndefined();
+    // ③ 历史行未被改写（只读引用 = 绝不重写历史）
+    const oldRow = await prisma.creativeHypothesis.findUniqueOrThrow({ where: { id: hypothesisId } });
+    expect(oldRow.status).toBe('validated');
+    expect(oldRow.verdict).toMatchObject({ decision: 'validated', decidedBy: 'criteria' });
   });
 });

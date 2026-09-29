@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { Prisma } from '@prisma/client';
 import {
   BACKFILL_BATCH_SIZE, BACKFILL_RETRY_BACKOFF_MS, HYPOTHESIS_KIND, HypothesisDoc, HypothesisStore,
-  INSIGHT_KIND, InsightDoc, InsightStore,
+  HypothesisVerdict, INSIGHT_KIND, InsightDoc, InsightStore, VERDICT_PRECEDENT_TAKE,
 } from './creative-loop-store';
 import { factsHashOf } from './insight-rules';
 
@@ -82,6 +82,12 @@ function makeFakePrisma(seed: {
       if (typeof status === 'string') {
         if (row.status !== status) return false;
       } else if (status.in && !status.in.includes(row.status as string)) return false;
+    }
+    if (where.statement !== undefined && row.statement !== where.statement) return false;
+    if (where.verdict !== undefined) {
+      // store 只用 `verdict: { not: DbNull }`（"判定事实必须存在"）：假实现按 SQL NULL 语义求值
+      const verdict = where.verdict as { not?: unknown };
+      if ('not' in verdict && (row.verdict ?? null) === null) return false;
     }
     return true;
   };
@@ -248,6 +254,46 @@ describe('HypothesisStore（专表：映射 + status/version CAS + 删除语义�
     expect(await store.list({ organizationId: 'org1', projectId: 'proj1' })).toHaveLength(2);
     expect(await store.list({ organizationId: 'org2' })).toHaveLength(1);
     expect(await store.list({ organizationId: 'org1', take: 1 })).toHaveLength(1);
+  });
+
+  it('listVerdicts（M12-P1 只读先例）：只返回**已判定终态**（且 verdict 非空）；谓词全 server-side + 有界 + 绝不写', async () => {
+    const { prisma } = makeFakePrisma();
+    const store = new HypothesisStore(prisma as never);
+    const verdictOf = (decision: 'validated' | 'rejected', decidedBy: 'criteria' | 'manual' | 'system'): HypothesisVerdict => ({
+      decision, decidedBy, reason: `${decision} 缘由`, criteria: null, facts: null,
+      evaluationRunId: null, experimentId: null, decidedAt: '2026-01-02T00:00:00.000Z',
+    });
+    await store.create('u1', makeHypothesisDoc({ statement: 'S1', status: 'validated', verdict: verdictOf('validated', 'criteria') }));
+    await store.create('u1', makeHypothesisDoc({ statement: 'S1', status: 'rejected', verdict: verdictOf('rejected', 'manual') }));
+    await store.create('u1', makeHypothesisDoc({ statement: 'S1', status: 'rejected' })); // 终态但无判定事实 → 不作先例
+    await store.create('u1', makeHypothesisDoc({ statement: 'S1', status: 'running', verdict: verdictOf('validated', 'criteria') })); // 非终态 → 不作先例
+    await store.create('u1', makeHypothesisDoc({ statement: 'S1', organizationId: 'org2', status: 'validated', verdict: verdictOf('validated', 'criteria') }));
+    await store.create('u1', makeHypothesisDoc({ statement: 'S1', projectId: 'proj2', status: 'validated', verdict: verdictOf('validated', 'criteria') }));
+    await store.create('u1', makeHypothesisDoc({ statement: 'S2', status: 'validated', verdict: verdictOf('validated', 'system') }));
+
+    // 组织 scope：排除 org2；终态 + verdict 非空：排除未判定/仍执行中的行
+    expect((await store.listVerdicts({ organizationId: 'org1' })).map((r) => r.doc.statement).sort())
+      .toEqual(['S1', 'S1', 'S1', 'S2']);
+    expect(await store.listVerdicts({ organizationId: 'org1', projectId: 'proj1' })).toHaveLength(3);
+    expect(await store.listVerdicts({ organizationId: 'org1', projectId: null })).toHaveLength(4); // 空项目 = 不限项目
+    expect((await store.listVerdicts({ organizationId: 'org1', projectId: 'proj1', statement: 'S1' })).map((r) => r.doc.verdict?.decidedBy))
+      .toEqual(['criteria', 'manual']);
+    expect(await store.listVerdicts({ organizationId: 'org1', take: 1 })).toHaveLength(1);
+    expect(await store.listVerdicts({ organizationId: 'org3' })).toHaveLength(0);
+
+    // 查询形状：谓词全在 SQL（server-side）+ 倒序有界（默认上限），绝不 JS 侧过滤
+    const [args] = (prisma.creativeHypothesis.findMany as unknown as {
+      mock: { calls: Array<[Record<string, unknown>]> };
+    }).mock.calls.at(-1)!;
+    expect(args).toEqual({
+      where: { organizationId: 'org3', status: { in: ['validated', 'rejected'] }, verdict: { not: Prisma.DbNull } },
+      orderBy: { updatedAt: 'desc' },
+      take: VERDICT_PRECEDENT_TAKE,
+    });
+    // 只读：先例查询绝不产生任何写入
+    expect(prisma.creativeHypothesis.updateMany).not.toHaveBeenCalled();
+    expect(prisma.creativeHypothesis.deleteMany).not.toHaveBeenCalled();
+    expect(prisma.creativeHypothesis.create).toHaveBeenCalledTimes(7); // 仅夹具写入
   });
 
   it('cas（status CAS）：锚定 from 状态 + 组织 scope；version 递增；未命中 count=0 绝不覆盖', async () => {

@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
-  COMPARISON_THRESHOLD_PCT, EMPTY_PERF_FACTS, FACT_LAYER_KEYS, RATING_BAD, RATING_GOOD,
-  assertFactsUnchanged, comparePeriods, derivePerfMetrics, factsHashOf, isCriteriaSatisfied,
+  COMPARISON_THRESHOLD_PCT, EMPTY_PERF_FACTS, FACT_LAYER_KEYS, PERF_DERIVED_CRITERIA_METRICS, RATING_BAD, RATING_GOOD,
+  SUCCESS_CRITERIA_METRICS, agentPerformanceIds, assertFactsUnchanged, comparePeriods, derivePerfMetrics,
+  excludeAgentPerformance, factsHashOf, isCriteriaSatisfied, isPerfDerivedMetric,
   stableStringify, sumPerfFacts, summarizeRatings,
 } from './insight-rules';
 
@@ -58,6 +59,43 @@ describe('insight-rules：绩效事实求和与派生（服务端计算）', () 
     expect(isCriteriaSatisfied({ metric: 'ctr', op: 'lte', value: 0.08 }, { ctr: 0.05 })).toMatchObject({ satisfiable: true, satisfied: true });
     expect(isCriteriaSatisfied({ metric: 'avg_score', op: 'gte', value: 0.8 }, { avg_score: null })).toMatchObject({ satisfiable: false, satisfied: false, actual: null });
     expect(isCriteriaSatisfied({ metric: 'pass_rate', op: 'gte', value: 0.5 }, {})).toMatchObject({ satisfiable: false, satisfied: false });
+  });
+});
+
+/** M12-P1 来源判别（纯函数）：agent 工具账本 → 被排除的绩效行；只认账本形状，绝不误伤 */
+describe('insight-rules：绩效事实来源判别（M12-P1 审计 R1）', () => {
+  it('agentPerformanceIds：只从账本载荷提取 performanceId（形状不符/类型不符一律忽略）', () => {
+    const ids = agentPerformanceIds([
+      { performanceId: 'perf-1', facts: {}, derived: {}, layering: {} }, // performance.capture 的返回值形状
+      { performanceId: 'perf-2', extra: true },
+      { performanceId: 42 }, // 类型不符 → 忽略
+      { performanceId: '' }, // 空串 → 忽略
+      { someOther: 'payload' }, // 别的工具账本 → 忽略
+      null,
+      undefined,
+      'not-an-object',
+    ]);
+    expect([...ids].sort()).toEqual(['perf-1', 'perf-2']);
+    expect(agentPerformanceIds([]).size).toBe(0);
+  });
+
+  it('excludeAgentPerformance：按 id 排除并回报计数（绝不静默丢弃事实）', () => {
+    const rows = [{ id: 'a' }, { id: 'b' }, { id: 'c' }];
+    expect(excludeAgentPerformance(rows, new Set(['b']))).toEqual({
+      rows: [{ id: 'a' }, { id: 'c' }], excludedAgentRows: 1,
+    });
+    expect(excludeAgentPerformance(rows, new Set())).toEqual({ rows, excludedAgentRows: 0 });
+    expect(excludeAgentPerformance(rows, new Set(['a', 'b', 'c']))).toEqual({ rows: [], excludedAgentRows: 3 });
+    expect(excludeAgentPerformance([], new Set(['x']))).toEqual({ rows: [], excludedAgentRows: 0 });
+  });
+
+  it('判据指标来源归属：roas/ctr 受来源谓词约束；avg_score/pass_rate（M9-P1）不受', () => {
+    expect(SUCCESS_CRITERIA_METRICS).toEqual(['avg_score', 'pass_rate', 'roas', 'ctr']);
+    expect(PERF_DERIVED_CRITERIA_METRICS).toEqual(['roas', 'ctr']);
+    expect(isPerfDerivedMetric('roas')).toBe(true);
+    expect(isPerfDerivedMetric('ctr')).toBe(true);
+    expect(isPerfDerivedMetric('avg_score')).toBe(false);
+    expect(isPerfDerivedMetric('pass_rate')).toBe(false);
   });
 });
 

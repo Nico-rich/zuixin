@@ -4,6 +4,10 @@
  * 事实来源（**全部复用既有系统，绝不新建第二套**）：
  * - 绩效回流：M7-P8 `Feedback`（评分）+ `CreativePerformance`（曝光/点击/花费/转化/营收/订单原始事实）——
  *   只读聚合，事实层 = 窗口内行的求和（规则层由 insight-rules.ts 纯函数计算）；
+ *   **只计入非 agent 来源的行**（M12-P1 来源判别：`performance.capture` 是 agent 可写工具，
+ *   排除计数随事实留痕 `sources.agentExcluded`，绝不静默丢弃）；
+ * - 判定先例（M12-P1 verdict→下一次决策桥）：本组织/项目**既有** validated/rejected 假设的判定结论
+ *   （`facts.verdicts`）——**只读引用**，绝不改写历史假设行；新洞察把先例作为决策输入事实；
  * - 评测事实：M9-P1 `EvaluationRunsService`（列出组织内 run + 读其 `scores` 摘要——聚合口径由 P1 的
  *   `summarizeScores` 独家提供，本模块**不重算**评测分数）；
  * - 解读层：LLM 文本（可选）经 `attachInterpretation` 独立字段写入，**绝不触碰 facts/derived**
@@ -17,12 +21,13 @@ import { Inject, Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { EvaluationRunsService } from '../evaluation/evaluation-runs.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
-import { CreativeLoopAccessService } from './creative-loop-access.service';
-import { InsightDoc, InsightStore, StoredDoc } from './creative-loop-store';
+import { CreativeLoopAccessService, LoopScope } from './creative-loop-access.service';
+import { HypothesisStore, InsightDoc, InsightStore, StoredDoc, VERDICT_PRECEDENT_TAKE } from './creative-loop-store';
 import {
   ComparisonEntry, RatingFacts, assertFactsUnchanged, comparePeriods, derivePerfMetrics,
-  factsHashOf, sumPerfFacts, summarizeRatings,
+  excludeAgentPerformance, factsHashOf, sumPerfFacts, summarizeRatings,
 } from './insight-rules';
+import { PerformanceProvenanceService } from './performance-provenance.service';
 
 /** 洞察窗口默认跨度（天） */
 export const DEFAULT_INSIGHT_DAYS = 30;
@@ -51,8 +56,10 @@ export class InsightService {
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(InsightStore) private readonly store: InsightStore,
+    @Inject(HypothesisStore) private readonly hypotheses: HypothesisStore,
     @Inject(CreativeLoopAccessService) private readonly access: CreativeLoopAccessService,
     @Inject(EvaluationRunsService) private readonly evaluationRuns: EvaluationRunsService,
+    @Inject(PerformanceProvenanceService) private readonly provenance: PerformanceProvenanceService,
   ) {}
 
   /**
@@ -93,8 +100,12 @@ export class InsightService {
       }),
     ]);
 
-    const currentFacts = sumPerfFacts(currentRows);
-    const previousFacts = sumPerfFacts(previousRows);
+    // M12-P1 来源判别：agent 工具写入的绩效行绝不进入事实层（排除计数留痕——绝不静默丢弃）
+    const provenance = await this.provenance.agentAuthoredIds(userId);
+    const current = excludeAgentPerformance(currentRows, provenance.ids);
+    const previous = excludeAgentPerformance(previousRows, provenance.ids);
+    const currentFacts = sumPerfFacts(current.rows);
+    const previousFacts = sumPerfFacts(previous.rows);
     const currentDerived = derivePerfMetrics(currentFacts);
     const previousDerived = derivePerfMetrics(previousFacts);
     const ratings: RatingFacts = summarizeRatings(feedbackRows.map((f) => f.rating));
@@ -107,16 +118,28 @@ export class InsightService {
       ? { runs: [], aggregate: null }
       : await this.evaluationFacts(scope.organizationId);
 
+    const verdicts = await this.verdictFacts(scope);
     const facts: Record<string, unknown> = {
       window: { start: currentStart.toISOString(), end: now.toISOString(), days },
       performance: {
         current: currentFacts,
         previous: previousFacts,
-        sources: { current: currentRows.length, previous: previousRows.length },
+        sources: {
+          current: current.rows.length,
+          previous: previous.rows.length,
+          agentExcluded: { current: current.excludedAgentRows, previous: previous.excludedAgentRows },
+        },
+        provenance: {
+          rule: provenance.rule,
+          scanned: provenance.scanned,
+          complete: provenance.complete,
+          ...(provenance.complete ? {} : { reason: 'agent 工具账本枚举触顶：事实层可能仍含 agent 来源行，消费方须自行复核' }),
+        },
         rule: 'server-sum',
       },
       ratings: { ...ratings, rule: 'server-sum' },
       evaluation: { runs: evaluation.runs, rule: 'evaluation-run-summary' },
+      verdicts,
     };
     const derived: Record<string, unknown> = {
       metrics: currentDerived,
@@ -216,6 +239,55 @@ export class InsightService {
     if (!stored) throw new AppError(ErrorCode.NOT_FOUND, '洞察不存在');
     await this.access.authorizeResource(userId, { organizationId: stored.doc.organizationId, userId: stored.userId }, 'workflow.write', '洞察不存在');
     return stored;
+  }
+
+  /**
+   * 判定先例事实（M12-P1 verdict→下一次决策桥的**事实输入**；只读、服务端聚合）。
+   *
+   * 为什么属于事实层：先例是"系统内已发生的治理判定"记录（谁在何时依据什么判成什么），
+   * 不是解读——新洞察/新假设据此建立"上一轮学到什么"的上下文（此前 verdict 无任何消费方，
+   * 闭环在 validated/rejected 处断裂）。**只读引用**：绝不改写来源假设行，也绝不把先例当成
+   * 新假设的判定（判定仍只由判据收敛或人工显式 decision 产生）。
+   *
+   * scope 口径与绩效事实一致：同组织；给了项目则收窄到项目（绝不跨租户）。
+   * 有界：按 `updatedAt` 倒序取最近 `VERDICT_PRECEDENT_TAKE` 条。
+   */
+  private async verdictFacts(scope: LoopScope): Promise<Record<string, unknown>> {
+    const rows = await this.hypotheses.listVerdicts({
+      organizationId: scope.organizationId,
+      projectId: scope.projectId,
+      take: VERDICT_PRECEDENT_TAKE,
+    });
+    const entries: Array<Record<string, unknown>> = [];
+    for (const row of rows) {
+      const verdict = row.doc.verdict;
+      if (!verdict || (verdict.decision !== 'validated' && verdict.decision !== 'rejected')) continue;
+      entries.push({
+        hypothesisId: row.id,
+        statement: row.doc.statement,
+        status: row.doc.status,
+        projectId: row.doc.projectId,
+        decision: verdict.decision,
+        decidedBy: verdict.decidedBy,
+        reason: verdict.reason,
+        decidedAt: verdict.decidedAt,
+        criteria: verdict.criteria,
+        rule: 'historical-verdict',
+      });
+    }
+    const countBy = (decision: 'validated' | 'rejected') => entries.filter((e) => e.decision === decision).length;
+    const byDecider = (by: string) => entries.filter((e) => e.decidedBy === by).length;
+    return {
+      entries,
+      totals: {
+        entries: entries.length,
+        validated: countBy('validated'),
+        rejected: countBy('rejected'),
+        byDecider: { criteria: byDecider('criteria'), manual: byDecider('manual'), system: byDecider('system') },
+      },
+      source: 'historical-verdicts',
+      rule: 'server-aggregate',
+    };
   }
 
   /** 评测事实聚合（**只读 P1 摘要**：avgScore/passRate 由 EvaluationRunsService 独家计算） */

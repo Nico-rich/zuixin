@@ -16,6 +16,10 @@
  *   M11-P5/D2-02；失败绝不覆盖，见 systemTransition 注释）。
  *
  * 边界（M8 冻结边界延续）：loop 只在**单次人工审批**后提交一次平台写操作；绝不批量投放、绝不无审批写。
+ *
+ * M12-P1 来源判别（审计 R1）：判定窗口的绩效事实**只计入非 agent 来源的行**——`performance.capture`
+ * 是 agent 可写工具，若不判别，Agent 可伪造绩效自证假设（详见 collectFacts 与
+ * performance-provenance.service.ts）。判别不可信时 **fail-closed**（视同事实缺失，绝不自动判定）。
  */
 
 import { Inject, Injectable, Logger } from '@nestjs/common';
@@ -31,7 +35,10 @@ import { HypothesisStatus, assertTransition } from './hypothesis-status';
 import {
   LOOP_STEP_IDS, LoopTemplateInput, buildLoopDefinition, loopRunIdempotencyKey, loopWorkflowName,
 } from './loop-template';
-import { derivePerfMetrics, isCriteriaSatisfied, stableStringify, sumPerfFacts } from './insight-rules';
+import {
+  derivePerfMetrics, excludeAgentPerformance, isCriteriaSatisfied, isPerfDerivedMetric, stableStringify, sumPerfFacts,
+} from './insight-rules';
+import { PerformanceProvenanceService } from './performance-provenance.service';
 
 /** run 终态（与 M7-P6 一致；本服务**只读**run 状态，绝不写 run 生命周期） */
 const RUN_TERMINAL = ['completed', 'failed', 'cancelled', 'timeout'] as const;
@@ -171,6 +178,7 @@ export class CreativeLoopOrchestrator {
     @Inject(WorkflowRunsService) private readonly runs: WorkflowRunsService,
     @Inject(EvaluationRunsService) private readonly evaluationRuns: EvaluationRunsService,
     @Inject(ExperimentsService) private readonly experiments: ExperimentsService,
+    @Inject(PerformanceProvenanceService) private readonly provenance: PerformanceProvenanceService,
   ) {}
 
   /**
@@ -296,7 +304,18 @@ export class CreativeLoopOrchestrator {
       reason = input.reason ?? `人工判定：${input.decision === 'validated' ? '假设成立' : '假设不成立'}`;
     } else {
       if (!criteriaVerdict) throw new AppError(ErrorCode.VALIDATION_ERROR, '假设未声明成功判据，需显式 decision');
-      if (!criteriaVerdict.satisfiable) throw new AppError(ErrorCode.VALIDATION_ERROR, `判据不可评估：${criteriaVerdict.reason}`);
+      if (!criteriaVerdict.satisfiable) {
+        // 绩效类判据的"不可评估"有两种：事实缺失 vs 来源判别关闭（fail-closed）——必须区分（处置不同）
+        const untrusted = isPerfDerivedMetric(doc.successCriteria!.metric)
+          ? this.untrustedProvenanceReason(collected)
+          : null;
+        throw new AppError(
+          ErrorCode.VALIDATION_ERROR,
+          untrusted
+            ? `判据不可评估：${untrusted}；需人工显式 decision`
+            : `判据不可评估：${criteriaVerdict.reason}`,
+        );
+      }
       target = criteriaVerdict.satisfied ? 'validated' : 'rejected';
       by = 'criteria';
       reason = criteriaVerdict.reason;
@@ -493,7 +512,14 @@ export class CreativeLoopOrchestrator {
   /**
    * 判定事实（服务端聚合，**不含任何解读文本**）：
    * - 评测：M9-P1 `EvaluationRunsService.get` 的 `scores` 摘要（avgScore/passRate 由 P1 独家计算）；
-   * - 绩效：M7-P8 回流事实 `CreativePerformance`（窗口 = loop 启动时刻起）求和 + 服务端派生。
+   * - 绩效：M7-P8 回流事实 `CreativePerformance`（窗口 = loop 启动时刻起）求和 + 服务端派生，
+   *   **只计入非 agent 来源的行**（M12-P1 来源判别，见 performance-provenance.service.ts）。
+   *
+   * 来源判别为何是判定的前置条件（审计 R1）：`performance.capture` 是 agent 可写工具——若把 agent 自己
+   * 回传的绩效计入窗口，Agent 就能伪造绩效**自证**假设（治理判定被可写副作用的工具操纵）。故：
+   * - 被 agent 工具账本引用的行**一律排除**（排除计数随事实留痕，绝不静默丢弃）；
+   * - 账本枚举不完整（触顶）→ 绩效派生指标**视同缺失**（`null`）→ 按判据判定必然 `satisfiable=false`
+   *   （fail-closed：宁可停在 awaiting-facts 等人工判定，也绝不据来源不明的行自动 validated）。
    */
   private async collectFacts(stored: StoredDoc<HypothesisDoc>): Promise<{ flat: Record<string, number | null>; detail: Record<string, unknown> }> {
     const doc = stored.doc;
@@ -522,12 +548,38 @@ export class CreativeLoopOrchestrator {
         capturedAt: { gte: since },
       },
     });
-    const facts = sumPerfFacts(rows);
+    const provenance = await this.provenance.agentAuthoredIds(stored.userId);
+    const { rows: externalRows, excludedAgentRows } = excludeAgentPerformance(rows, provenance.ids);
+    const facts = sumPerfFacts(externalRows);
     const derived = derivePerfMetrics(facts);
-    flat.roas = rows.length > 0 ? derived.roas : null;
-    flat.ctr = rows.length > 0 ? derived.ctr : null;
-    detail.performance = { rows: rows.length, facts, derived, rule: 'server-sum' };
+    // fail-closed：账本枚举不完整 → 无法证明窗口内没有伪造行 → 派生指标视同缺失（绝不据来源不明的行判定）
+    const trusted = provenance.complete;
+    flat.roas = trusted && externalRows.length > 0 ? derived.roas : null;
+    flat.ctr = trusted && externalRows.length > 0 ? derived.ctr : null;
+    detail.performance = {
+      rows: externalRows.length,
+      excludedAgentRows,
+      provenance: {
+        rule: provenance.rule,
+        scanned: provenance.scanned,
+        complete: provenance.complete,
+        ...(trusted ? {} : { reason: '来源判别不可信：agent 工具账本枚举触顶，无法证明窗口内绩效行均非 agent 来源，按判据自动判定已关闭' }),
+      },
+      facts,
+      derived,
+      rule: 'server-sum',
+    };
     return { flat, detail };
+  }
+
+  /**
+   * 事实层的"来源判别不可信"缘由（只读投影；用于把 fail-closed 原因**明示给调用方**，
+   * 而不是让人只看到"事实缺失"——这两者的处置完全不同）。
+   */
+  private untrustedProvenanceReason(collected: { detail: Record<string, unknown> }): string | null {
+    const perf = collected.detail.performance as { provenance?: { complete?: boolean; reason?: string } } | undefined;
+    if (perf?.provenance?.complete !== false) return null;
+    return perf.provenance.reason ?? '绩效事实来源判别不可信';
   }
 
   /**
