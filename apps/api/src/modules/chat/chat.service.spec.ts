@@ -308,6 +308,44 @@ describe('ChatService.streamChat（Agent 注册表驱动）', () => {
     }));
   });
 
+  it('M13-W9 白名单：approval.* / delegation.waiting / artifact.created 原样透传（闭环断裂修复）', async () => {
+    const { svc } = makeChat(async function* () {
+      yield { type: 'run.created', runId: 'r1', agentId: 'a1' };
+      yield { type: 'approval.requested', approvalId: 'ap-1', runId: 'r1', toolName: 'external_action.demo' };
+      yield { type: 'delegation.waiting', delegationId: 'dg-1', runId: 'r1', childRunId: 'r2' };
+      // artifact.created 只有锁定的线上命名（shared 尚无 schema）→ 前向兼容形状
+      yield { type: 'artifact.created', artifactId: 'art-1', runId: 'r1', artifactType: 'report', title: '周报' } as never;
+      yield { type: 'approval.decided', approvalId: 'ap-1', runId: 'r1', status: 'approved' };
+    });
+    const { writer, events } = collectFrames();
+    await svc.streamChat(baseCtx(), writer, new AbortController().signal, 'req1');
+
+    const names = events.map((e) => e.event);
+    expect(names).toEqual(expect.arrayContaining(['approval.requested', 'approval.decided', 'delegation.waiting', 'artifact.created']));
+    // 逐字透传（payload 不改写、不裁剪——客户端据此渲染"等待审批"）
+    expect(events.find((e) => e.event === 'approval.requested')!.data).toEqual({
+      type: 'approval.requested', approvalId: 'ap-1', runId: 'r1', toolName: 'external_action.demo',
+    });
+    expect(events.find((e) => e.event === 'delegation.waiting')!.data).toEqual({
+      type: 'delegation.waiting', delegationId: 'dg-1', runId: 'r1', childRunId: 'r2',
+    });
+    expect(events.find((e) => e.event === 'artifact.created')!.data).toEqual({
+      type: 'artifact.created', artifactId: 'art-1', runId: 'r1', artifactType: 'report', title: '周报',
+    });
+  });
+
+  it('M13-W9 白名单之外的事件仍被丢弃（白名单语义未被放宽）', async () => {
+    const { svc } = makeChat(async function* () {
+      yield { type: 'run.created', runId: 'r1', agentId: 'a1' };
+      yield { type: 'task.progress', taskId: 't1', progress: 50 } as never; // 非 SSE 白名单事件
+      yield { type: 'agent.end', agentId: 'a1', runId: 'r1', status: 'completed' };
+    });
+    const { writer, events } = collectFrames();
+    await svc.streamChat(baseCtx(), writer, new AbortController().signal, 'req1');
+
+    expect(events.map((e) => e.event)).not.toContain('task.progress');
+  });
+
   it('AbortError → 保留部分内容 status=cancelled，不发 error', async () => {
     const { svc, prisma } = makeChat(async function* () {
       yield { type: 'text.delta', text: '部分' };

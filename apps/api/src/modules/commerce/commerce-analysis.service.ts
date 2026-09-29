@@ -245,4 +245,48 @@ export class CommerceAnalysisService {
     if (!row) throw new AppError(ErrorCode.NOT_FOUND, '创意简报不存在');
     return row;
   }
+
+  // ===== M13-W9 只读展示面（HTTP 列表；写路径仍是 Agent 工具 —— "工具即接口"）=====
+
+  /**
+   * 分析列表：`userId` 恒为首条件（服务端归属）；只投影列表渲染所需字段
+   * （facts/derived/anomalies 等证据体走详情端点，避免列表接口搬运大 JSON）。
+   */
+  async listAnalyses(userId: string, limit?: number) {
+    const take = listLimit(limit);
+    const rows = await this.prisma.commerceAnalysis.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      take,
+      select: { id: true, analysisType: true, status: true, timeRange: true, agentRunId: true, createdAt: true },
+    });
+    return rows.map((r) => ({
+      analysisId: r.id, analysisType: r.analysisType, status: r.status,
+      timeRange: r.timeRange, agentRunId: r.agentRunId, createdAt: r.createdAt,
+    }));
+  }
+
+  /** 创意简报列表（同上；evidence/product 等证据体走详情端点） */
+  async listBriefs(userId: string, limit?: number) {
+    const take = listLimit(limit);
+    const rows = await this.prisma.creativeBrief.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      take,
+      select: {
+        id: true, problem: true, objective: true, platform: true, status: true,
+        artifactId: true, commerceAnalysisId: true, createdAt: true,
+      },
+    });
+    return rows.map((r) => ({
+      briefId: r.id, problem: r.problem, objective: r.objective, platform: r.platform,
+      status: r.status, artifactId: r.artifactId, analysisId: r.commerceAnalysisId, createdAt: r.createdAt,
+    }));
+  }
+}
+
+/** 列表上限（防一次拉全表；与详情端点无关） */
+const MAX_LIST_LIMIT = 100;
+function listLimit(limit?: number): number {
+  return Math.min(Math.max(1, Math.trunc(limit ?? 30)), MAX_LIST_LIMIT);
 }

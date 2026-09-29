@@ -1,6 +1,6 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
-import { AppError, ErrorCode, TaskIntent } from '@ai-agent/shared';
+import { AgentEvent, AppError, ErrorCode, TaskIntent } from '@ai-agent/shared';
 import { PrismaService } from '../prisma/prisma.service';
 import { AttachmentsService } from '../attachments/attachments.service';
 import { RedisKVService } from '../../core/circuit-breaker/redis-kv.service';
@@ -24,6 +24,29 @@ export interface ChatRunContext {
   projectId?: string | null;
   attachments: AttachmentMeta[];
 }
+
+/**
+ * M13-W9 闭环断裂修复 · SSE 转发白名单事件类型。
+ *
+ * 背景（Web 审计两处闭环断裂之一）：`streamChat` 的 switch 白名单**没有**审批/委派生命周期事件，
+ * 引擎 `yield` 出来的 `approval.requested` / `delegation.waiting`（以及 `ApprovalsService` 经
+ * EventBus 发布、由 run 观察通道送出的 `approval.decided`）全部被静默丢弃 →
+ * run 进入 `waiting_approval` 后**客户端收不到任何信号**（流无终态事件、界面停在"生成中"）。
+ *
+ * `artifact.created` 目前只有**已锁定的线上命名**（`ChatStreamEventNames.artifact_created`，
+ * M6 预留，shared 尚无 schema、仓库内无产出方）——这里按"转发即透传"的最小形状显式建模，
+ * 使未来产出方接入时零改动；`AgentEvent` 联合不动（shared 属冻结面）。
+ */
+export interface ArtifactCreatedForwardEvent {
+  type: 'artifact.created';
+  artifactId: string;
+  runId: string;
+  artifactType: string;
+  title: string;
+}
+
+/** Agent 事件流中**允许原样转发**到线上协议的事件（白名单；其余一律丢弃） */
+export type ChatForwardEvent = AgentEvent | ArtifactCreatedForwardEvent;
 
 /** M10-P3 消息编辑/删除的响应投影（只暴露客户端渲染所需字段，不外泄内部列） */
 const MESSAGE_MUTATION_SELECT = {
@@ -120,7 +143,7 @@ export class ChatService {
         projectId: ctx.projectId ?? undefined,
         userMessage: ctx.userMessage, attachments: ctx.attachments, history: ctx.history, intent: ctx.intent,
         mode: 'normal', signal,
-      });
+      }) as AsyncIterable<ChatForwardEvent>;
       for await (const ev of events) {
         switch (ev.type) {
           case 'status': writer.event('status', ev); break;
@@ -128,6 +151,11 @@ export class ChatService {
           case 'task.created': writer.event('task.created', ev); break;
           case 'done':
             writer.event('message_end', { type: 'message_end', messageId: ctx.assistantMessageId, status: 'completed' });
+            break;
+          // M13-W9：审批/委派/制品生命周期事件原样透传（**只转发，绝不改 run 状态机**）。
+          // 丢弃它们 = run 卡 waiting_approval 时前端静默（闭环断裂的根因）。
+          case 'approval.requested': case 'approval.decided': case 'delegation.waiting': case 'artifact.created':
+            writer.event(ev.type, ev);
             break;
           case 'agent.start': case 'agent.end': case 'tool.start': case 'tool.end':
           case 'run.created': case 'run.progress': case 'run.completed':

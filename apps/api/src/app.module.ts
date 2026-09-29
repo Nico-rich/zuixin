@@ -21,6 +21,9 @@ import { AgentsModule } from './agents/agents.module';
 import { AgentRunsApiModule } from './modules/agent-runs/agent-runs-api.module';
 import { AgentsAdminModule } from './modules/agents-admin/agents-admin.module';
 import { ApprovalsApiModule } from './modules/approvals/approvals-api.module';
+// M13-W9 闭环断裂修复：Artifacts 只读 REST（此前只有 service 无 HTTP 面）+ 电商只读展示端点
+import { ArtifactsApiModule } from './modules/artifacts/artifacts-api.module';
+import { CommerceApiModule } from './modules/commerce/commerce-api.module';
 import { ConnectionsApiModule } from './modules/connections/connections-api.module';
 import { ExternalActionsApiModule } from './modules/external-actions/external-actions-api.module';
 import { WorkflowsApiModule } from './modules/workflows/workflows-api.module';
@@ -91,6 +94,8 @@ import { SseModule } from './core/sse/sse.module';
     AgentRunsApiModule,
     AgentsAdminModule,
     ApprovalsApiModule,
+    ArtifactsApiModule,
+    CommerceApiModule,
     ConnectionsApiModule,
     ExternalActionsApiModule,
     WorkflowsApiModule,
