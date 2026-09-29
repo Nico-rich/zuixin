@@ -1,6 +1,6 @@
 'use client';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useRouter, useSearchParams } from 'next/navigation';
+import { useSearchParams } from 'next/navigation';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiFetch, ApiError, API_BASE } from '@/lib/api';
 import { consumeSSE } from '@/lib/sse';
@@ -18,11 +18,12 @@ interface HistoryMessage {
 }
 
 export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
-  const router = useRouter();
   const searchParams = useSearchParams();
   const projectId = searchParams.get('projectId') ?? undefined;
   const queryClient = useQueryClient();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  /** 侧边栏高亮用的当前会话 id：新会话在首条消息落库后由 SSE 回填（不依赖路由重挂载） */
+  const [activeConversationId, setActiveConversationId] = useState<string | undefined>(conversationId);
   const [tasks, setTasks] = useState<ActiveTask[]>([]);
   // M10-P13（ARCH-07）：task 通道 SSE 事件（taskId → 最新事件），透传给对应 TaskCard 免轮询
   const [taskEvents, setTaskEvents] = useState<Record<string, TaskStreamEvent>>({});
@@ -62,8 +63,15 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
 
   const appendDelta = useCallback((messageId: string, delta: string) => {
     deltaBuf.current += delta;
-    if (deltaTimer.current) clearTimeout(deltaTimer.current);
-    deltaTimer.current = setTimeout(() => flushDelta(messageId), 40); // 40ms 节流合并渲染
+    // 40ms 节流合并渲染：**已排队的窗口不再顺延**（原实现在每个 token 上 clearTimeout 重置计时器，
+    // 于是 token 间隔 < 40ms 时计时器永远不触发 —— 真实 provider 与 mock（MOCK_DELAY_MS=30）都稳定低于
+    // 该间隔，导致流式期间始终只显示「正在生成…」，全部文本在 message_end 才一次性上屏。
+    // 真实浏览器实测见 apps/web/e2e/chat-streaming.spec.ts 的中间态采样断言。）
+    if (deltaTimer.current) return;
+    deltaTimer.current = setTimeout(() => {
+      deltaTimer.current = null;
+      flushDelta(messageId);
+    }, 40);
   }, [flushDelta]);
 
   const send = useCallback(async (text: string, attachmentIds: string[]) => {
@@ -99,7 +107,15 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
             assistantIdRef.current = d.messageId;
             if (!activeIdRef.current) {
               activeIdRef.current = d.conversationId;
-              router.replace(`/chat/${d.conversationId}${projectId ? `?projectId=${projectId}` : ''}`, { scroll: false });
+              setActiveConversationId(d.conversationId);
+              // M11-P13（真实浏览器验证暴露的缺陷修复）：**不再**用 router.replace 换 URL。
+              // /chat 与 /chat/[id] 是两个 page 组件，App Router 导航会卸载当前 ChatWorkspace 实例，
+              // SSE 回调（闭包持有旧实例的 setState）随之失效，而新实例从历史接口读到的是一条
+              // content='' / status='streaming' 的消息 → 首条消息永远停在「正在生成…▍」。
+              // 改用原生 History API 只换地址栏：Next 15 会把 URL 同步进路由状态（usePathname 等），
+              // 组件树不重挂载，流式渲染与侧边栏高亮由本实例继续驱动；
+              // 刷新后地址栏仍是 /chat/<id>，回放同一会话（已由 e2e 覆盖）。
+              window.history.replaceState(null, '', `/chat/${d.conversationId}${projectId ? `?projectId=${projectId}` : ''}`);
               queryClient.invalidateQueries({ queryKey: ['conversations'] });
             }
             setMessages((prev) => prev.some((m) => m.id === d.messageId) ? prev
@@ -173,7 +189,7 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
       assistantIdRef.current = null;
       queryClient.invalidateQueries({ queryKey: ['conversations'] });
     }
-  }, [streaming, router, projectId, queryClient, appendDelta, flushDelta]);
+  }, [streaming, projectId, queryClient, appendDelta, flushDelta]);
 
   const stop = useCallback(() => { abortRef.current?.abort(); }, []);
 
@@ -193,7 +209,7 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
 
   return (
     <div className="flex h-screen">
-      <Sidebar activeId={conversationId} />
+      <Sidebar activeId={activeConversationId} />
       <main className="flex flex-1 flex-col">
         <div ref={scrollRef} className="flex-1 overflow-y-auto">
           <div className="mx-auto max-w-3xl space-y-6 px-4 py-6">

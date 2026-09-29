@@ -30,6 +30,23 @@ describe('MessageBubble', () => {
     expect(screen.queryByText('正在生成…')).not.toBeInTheDocument();
   });
 
+  it('M11-P13：代码块渲染源码文本（高亮后的子节点不得退化成 [object Object]），复制内容为源码', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } });
+    render(<MessageBubble message={assistant({ content: '```js\nconst secret = 1;\n```', status: 'completed' })} streaming={false} onRetry={noop} />);
+    const code = document.querySelector('pre code')!;
+    expect(code.textContent).toContain('const secret = 1;');
+    expect(code.textContent).not.toContain('[object Object]');
+    expect(screen.getByText('js')).toBeInTheDocument(); // 语言标签
+    // 气泡自带复制入口（标题“复制”，无文案）与代码块复制按钮同名，按文案取代码块那个
+    const codeCopy = screen.getAllByRole('button', { name: /复制/ }).find((b) => b.textContent?.includes('复制'))!;
+    await act(async () => {
+      fireEvent.click(codeCopy);
+      await Promise.resolve();
+    });
+    expect(writeText).toHaveBeenCalledWith('const secret = 1;');
+  });
+
   it('failed：展示失败文案与错误码，点击“重试”回调一次', () => {
     const onRetry = vi.fn();
     render(<MessageBubble message={assistant({ content: '半截', status: 'failed', errorCode: 'PROVIDER_TIMEOUT' })} streaming={false} onRetry={onRetry} />);
