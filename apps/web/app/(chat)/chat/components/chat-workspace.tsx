@@ -38,20 +38,47 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
   const assistantIdRef = useRef<string | null>(null);
   const activeIdRef = useRef<string | undefined>(conversationId);
 
-  // 历史消息加载（含附件）
+  // 历史消息加载（含附件）。
+  // M11-P13 真实浏览器验证实抓的缺陷修复：查询键必须用 **activeConversationId（状态）**——
+  // 新会话 id 在首条消息落库后由 SSE message_start 回填，而路由 prop conversationId 在
+  // pushState（非 router 导航）下永不更新 ⇒ 原查询对 /chat 新建会话**永不启用**，
+  // 任务完成后 onTaskDone 的 invalidateQueries(['messages', activeIdRef.current]) 打在
+  // 从未注册的 key 上 ⇒ 附件（generated_image）永不刷新到消息气泡。
   const history = useQuery({
-    queryKey: ['messages', conversationId],
+    queryKey: ['messages', activeConversationId],
     queryFn: async () => {
-      if (!conversationId) return [];
-      const res = await apiFetch<{ data: HistoryMessage[] }>(`/api/v1/conversations/${conversationId}/messages`);
+      if (!activeConversationId) return [];
+      const res = await apiFetch<{ data: HistoryMessage[] }>(`/api/v1/conversations/${activeConversationId}/messages`);
       return res.data.map((m) => ({ ...m, status: m.status as ChatMessage['status'] }));
     },
-    enabled: !!conversationId,
+    enabled: !!activeConversationId,
   });
 
   useEffect(() => {
-    setMessages(history.data ?? []);
-    setThinking(''); setFatalError(''); setTasks([]);
+    // M11-P13 修复：**按 id 合并而非整体替换**——message_start 后查询启用触发的 refetch
+    // 与 SSE 文本增量存在竞态（整体替换会把已上屏的流式内容打回服务器旧快照）；
+    // 空数据不覆盖本地状态（单测与降级场景）；流式中的消息保留本地 content/status，
+    // 其余字段（含任务完成后挂上的 attachments）以服务器行为准。
+    setMessages((prev) => {
+      const server = history.data ?? [];
+      if (server.length === 0) return prev;
+      const byId = new Map(prev.map((m) => [m.id, m]));
+      for (const s of server) {
+        const existing = byId.get(s.id);
+        byId.set(s.id, existing && existing.status === 'streaming'
+          ? { ...s, content: existing.content, status: existing.status }
+          : (existing
+            ? { ...s, content: existing.content || s.content, status: existing.status === 'completed' ? existing.status : s.status }
+            : s));
+      }
+      return server.map((s) => byId.get(s.id)!);
+    });
+    // 注意：**不在此清 thinking/fatalError/tasks**——message_start 后启用查询触发的 refetch
+    // 与流式状态存在竞态（refetch 落地会误清「正在分析需求…」/错误横幅/刚建的任务卡）。
+    // thinking 由 message_end 清、fatalError 由下一次 send 清、tasks 由路由重挂载重置。
+    // 注意：**不在此清 tasks**——新会话的 refetch（message_start 后启用查询）与 task.created
+    // SSE 事件存在竞态，若在此 setTasks([]) 会把刚建的任务卡清掉（卡片只由 SSE 添加）。
+    // 会话切换由路由导航重挂载组件天然重置。
   }, [history.data]);
 
   const flushDelta = useCallback((targetId: string) => {
