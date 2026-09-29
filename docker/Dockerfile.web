@@ -36,6 +36,11 @@
 
 ARG NODE_IMAGE=node:22-alpine
 
+# 构建期代理（可选）：本机直连 registry.npmjs.org 通、但 Alpine CDN 的 gcc 大包极慢时，
+# 用 --build-arg HTTP_PROXY=http://host.docker.internal:1080 注入（BuildKit 下 ARG 必须显式声明才会进环境）
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+
 # -----------------------------------------------------------------------------
 # base：与 Dockerfile.api 同款工具链（node/pnpm 版本一致，避免两个镜像行为漂移）
 # -----------------------------------------------------------------------------
