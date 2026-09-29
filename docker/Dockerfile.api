@@ -1,0 +1,121 @@
+# ⚠️ 刻意**不写** `# syntax=docker/dockerfile:1`：该指令会让 buildkit 去 Docker Hub 拉
+# docker/dockerfile frontend 镜像；在只允许 npm/alpine 源出网的环境（本机实测：
+# registry-1.docker.io 超时，registry.npmjs.org 200）会直接 "failed to fetch anonymous token" 构建失败。
+# 本文件只用默认 frontend 就支持的语法（多阶段 + ARG before FROM + RUN --mount=type=cache），
+# 因此不需要固定 syntax 版本 —— 少一个外部依赖，多一分可复现性。
+# =============================================================================
+# ai-agent-platform —— API / Worker 共用镜像（M11-P16 / E-06 / NV-22）
+#
+# 一个镜像两个入口（k8s/api-deployment.yaml 与 k8s/worker-deployment.yaml 用同一个 image，
+# 只有 command 不同）：
+#   API     : node dist/src/main.js      ← K8s 里的默认（本文件的 CMD）
+#   Worker  : node dist/src/worker.js    ← K8s 用 command 覆盖
+#   运维脚本 : node dist/scripts/backup.js | restore.js | minio-mirror.js（tsconfig 把 scripts/ 一起编译了）
+#
+# ── 产物路径：dist/**src**/main.js（不是 dist/main.js）────────────────────────
+# 这不是笔误。apps/api/tsconfig.json 的 include 含 src/scripts/prisma，TS 把 rootDir 提升到
+# apps/api，于是 `nest build` 的产物是 dist/src/main.js、dist/src/worker.js。
+# 本机实测（2026-09-28，工作区 HEAD f86b4a3，`pnpm build` 后）：
+#   apps/api/dist/{src,scripts,prisma,prisma.config.js}  —— 没有 apps/api/dist/main.js
+#   apps/api/dist/src/main.js  ✓  apps/api/dist/src/worker.js ✓
+# 镜像内的工作目录因此必须是 /app/apps/api（见 STAGE runtime 的 WORKDIR 注释）——
+# k8s 清单写的是相对路径 `node dist/src/main.js`，改 WORKDIR 会让 Pod 直接 MODULE_NOT_FOUND。
+#
+# ── 健康探针端点（K8s 探针配置的权威口径，理由见 docs/operations/m8-production-readiness.md §1）──
+#   liveness  → GET /api/v1/live   零 I/O：依赖抖动绝不触发重启
+#   readiness → GET /api/v1/ready  DB/Redis critical；对象存储故障**不摘流量**
+#   startup   → GET /api/v1/live   抢在 readiness 前给冷启动（Prisma/ioredis 建连）留时间
+# 端口 3001（env API_PORT 可覆盖）。本 Dockerfile **刻意不写 HEALTHCHECK**：K8s 会忽略镜像级
+# HEALTHCHECK，而 Worker 入口不监听任何端口（同一镜像）——写上去只会让 `docker run` worker 永远 unhealthy。
+# 裸 docker run 时自测健康用：docker run --rm -p 3001:3001 <image> 然后 curl 127.0.0.1:3001/api/v1/live
+#
+# ── preStop 钩子 ─────────────────────────────────────────────────────────────
+# k8s 两个 Deployment 都有 `preStop: exec: ["sleep","5"]`。alpine 基础镜像带 busybox sleep，
+# 该钩子开箱可用（清单注释里担心的 distroless/slim 缺 sleep 问题**不存在**，不需要改清单）。
+#
+# ── runAsNonRoot ─────────────────────────────────────────────────────────────
+# 两个 Deployment 都设了 runAsNonRoot: true；本镜像 USER node（uid 1000），满足该约束。
+#
+# 构建（在仓库根执行；上下文 = 仓库根，见 .dockerignore）：
+#   docker build -f docker/Dockerfile.api -t agent-platform-api:0.1.0 .
+# 运行：
+#   docker run --rm -p 3001:3001 --env-file <...> agent-platform-api:0.1.0
+# =============================================================================
+
+ARG NODE_IMAGE=node:22-alpine
+
+# -----------------------------------------------------------------------------
+# base：三个构建阶段共用的工具链（保证 builder 与 runtime 的 node/pnpm 完全一致）
+# -----------------------------------------------------------------------------
+FROM ${NODE_IMAGE} AS base
+# CI=true：pnpm 在 CI 下默认走 frozen lockfile 且不做交互提示；构建必须是确定的。
+ENV CI=true \
+    NPM_CONFIG_UPDATE_NOTIFIER=false
+# openssl  ：Prisma 的查询引擎（libquery_engine-*.so.node）动态链接 libssl，alpine 基础镜像不带；
+# libc6-compat：argon2 等 native 模块的 glibc 兼容垫片（有 musl 预编译时不生效，无则兜底）。
+RUN apk add --no-cache openssl libc6-compat \
+ && npm install -g pnpm@9.15.0    # 与根 package.json 的 packageManager 字段逐字对齐
+WORKDIR /app
+
+# -----------------------------------------------------------------------------
+# deps：只装依赖。只 COPY 清单文件 ⇒ 改源码不会击穿这一层缓存（依赖未变时重装 0 秒）
+# -----------------------------------------------------------------------------
+FROM base AS deps
+COPY pnpm-lock.yaml pnpm-workspace.yaml package.json .npmrc ./
+COPY packages/shared/package.json packages/shared/
+COPY apps/api/package.json apps/api/
+COPY apps/web/package.json apps/web/
+# 缓存挂在 pnpm store 的**父目录**（store 版本号子目录名会随 pnpm 大版本变，挂父目录更稳）。
+RUN --mount=type=cache,id=pnpm-store,target=/root/.local/share/pnpm \
+    pnpm install --frozen-lockfile
+
+# -----------------------------------------------------------------------------
+# builder：编译产物（Prisma Client + shared + api）
+# -----------------------------------------------------------------------------
+FROM deps AS builder
+# argon2 是 native 模块：musl 上没有匹配的预编译包时 node-gyp 会源码编译，需要这套工具。
+# 放在 builder（不进 runtime）⇒ 构建镜像里可以有编译器，交付镜像里没有。
+RUN apk add --no-cache python3 make g++
+# 全量源码（.dockerignore 已排除 node_modules/dist/.env）
+COPY . .
+# 顺序即依赖关系：
+#   shared  → apps/api 的运行时 `require('@ai-agent/shared')` 走 workspace 链接到 packages/shared/dist
+#   generate→ Prisma Client 生成在 node_modules/.pnpm/@prisma+client@…/node_modules/@prisma/client
+#             （Prisma 6.19 的实际落点，本机实测），必须早于 nest build
+RUN pnpm --filter @ai-agent/shared build \
+ && pnpm --filter api exec prisma generate \
+ && pnpm --filter api build
+
+# -----------------------------------------------------------------------------
+# runtime：只带 dist + node_modules 产物，不带源码、不带编译器
+# -----------------------------------------------------------------------------
+FROM base AS runtime
+ENV NODE_ENV=production
+WORKDIR /app
+
+# 依赖树整体搬运，**不做二次裁剪**（这是有意的，不是偷懒）：
+#   * pnpm 的 node_modules 是符号链接农场：@ai-agent/shared 是指向 packages/shared 的相对链接，
+#     所有包实体在 .pnpm 虚拟 store 里，而 Prisma 生成的 client **就在** .pnpm/@prisma+client@…/
+#     目录内（不在 node_modules/.prisma）——按"生产依赖"重装会改变 peer 解析哈希（devDep prisma/
+#     typescript 消失），指向一个不含生成产物的新目录 ⇒ 镜像能起但一查库就崩。
+#   * 同一镜像还要跑 Worker 与 backup/restore 脚本（runbook §5.3 的备份 Job 依赖这点）。
+#   代价是镜像里含 devDependencies（体积见构建记录）。要瘦身需先解掉上面两个约束，
+#   属独立工作项，不在本 Phase 假装解决。
+COPY --from=builder --chown=node:node /app/node_modules ./node_modules
+COPY --from=builder --chown=node:node /app/packages/shared ./packages/shared
+COPY --from=builder --chown=node:node /app/apps/api/package.json ./apps/api/
+COPY --from=builder --chown=node:node /app/apps/api/dist ./apps/api/dist
+# schema/migrations + prisma.config.ts：让**同一个镜像**能跑 `npx prisma migrate deploy` 的 Job，
+# 不必为迁移单独做一个镜像（prisma CLI 随 node_modules 一起进来了）。
+COPY --from=builder --chown=node:node /app/apps/api/prisma ./apps/api/prisma
+COPY --from=builder --chown=node:node /app/apps/api/prisma.config.ts ./apps/api/
+
+# ⚠️ 工作目录必须是 /app/apps/api，两个理由：
+#   1) k8s 清单的 command 是相对路径（node dist/src/main.js / dist/src/worker.js）；
+#   2) apps/api/src/env.ts 用 process.cwd() 找 .env（../../.env 与 .env）。镜像里**没有** .env
+#      （.dockerignore 已排除）⇒ dotenv 静默跳过 ⇒ ConfigMap/Secret 注入的环境变量不会被覆盖。
+WORKDIR /app/apps/api
+
+USER node
+EXPOSE 3001
+CMD ["node", "dist/src/main.js"]

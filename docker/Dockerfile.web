@@ -1,0 +1,94 @@
+# ⚠️ 刻意**不写** `# syntax=docker/dockerfile:1`（理由同 Dockerfile.api：本机 Docker Hub 不可达，
+# 该指令会强制拉 docker/dockerfile frontend 镜像并导致构建失败；本文件只用默认 frontend 的语法）。
+# =============================================================================
+# ai-agent-platform —— Web 镜像（M11-P16 / E-06 / NV-23）
+#
+# 构建（在仓库根执行；上下文 = 仓库根，见 .dockerignore）：
+#   docker build -f docker/Dockerfile.web \
+#     --build-arg NEXT_PUBLIC_API_URL=https://api.example.com \
+#     -t agent-platform-web:0.1.0 .
+# 运行：
+#   docker run --rm -p 3000:3000 agent-platform-web:0.1.0
+#
+# ── NEXT_PUBLIC_API_URL 是**构建期**参数（不是运行时 env）─────────────────────
+# 两处会被烤进产物，运行期改 env 无效：
+#   1) NEXT_PUBLIC_* 前缀在 `next build` 时被内联进客户端 bundle；
+#   2) apps/web/next.config.ts 的 rewrites() 把 /api/* 反代到它——rewrites 在构建期求值并写进
+#      .next/routes-manifest.json（服务端读的也是构建期那份）。
+# ⇒ **改 API 地址 = 必须重新构建镜像**（这正是本文件把它做成 ARG 而不是 ENV 的原因：
+#   显式暴露"这是构建期的事实"，避免运维以为改 Deployment env 就能生效）。
+# 默认值 localhost:3001 只适用于本机裸跑；上了集群必须显式传 --build-arg。
+#
+# ── 不启用 output:'standalone'（有意）───────────────────────────────────────
+# next.config.ts 里写明了原因：standalone 的构建追踪在 Windows 上建 symlink 会 EPERM，
+# 故仓库当前关闭。容器内虽然是 Linux，但**该配置不属本 Phase 所有权**（apps/web/** 归 M11-P13），
+# 所以这里按"非 standalone"构建：运行阶段带完整 node_modules + .next，而不是 standalone 的极简产物。
+# 若后续在 next.config.ts 打开 standalone，本文件可再砍掉一大截（那是一次独立的瘦身改动）。
+#
+# ── 探针 ────────────────────────────────────────────────────────────────────
+# 仓库 k8s/ 目前**只有 API 与 Worker 的清单，没有 Web 的 Deployment/Service**（web 不在本阶段范围内）。
+# 本镜像只暴露 3000 端口；若后续给 Web 加清单，探针应打 `/`（或 /login），而不是 API 的 /api/v1/live。
+#
+# ── Next 15 的 musl 支持 ────────────────────────────────────────────────────
+# alpine 下 `next build` 需要 @next/swc-linux-x64-musl（optionalDependency，容器内 pnpm install 自动装
+# 对应的 linux-musl 版；宿主是 Windows 时装的是 win32 版，这也是必须"在容器内构建"的原因）。
+# =============================================================================
+
+ARG NODE_IMAGE=node:22-alpine
+
+# -----------------------------------------------------------------------------
+# base：与 Dockerfile.api 同款工具链（node/pnpm 版本一致，避免两个镜像行为漂移）
+# -----------------------------------------------------------------------------
+FROM ${NODE_IMAGE} AS base
+ENV CI=true \
+    NPM_CONFIG_UPDATE_NOTIFIER=false
+RUN npm install -g pnpm@9.15.0
+WORKDIR /app
+
+# -----------------------------------------------------------------------------
+# deps：只装依赖（改源码不击穿缓存）
+# -----------------------------------------------------------------------------
+FROM base AS deps
+COPY pnpm-lock.yaml pnpm-workspace.yaml package.json .npmrc ./
+COPY packages/shared/package.json packages/shared/
+COPY apps/api/package.json apps/api/
+COPY apps/web/package.json apps/web/
+RUN --mount=type=cache,id=pnpm-store,target=/root/.local/share/pnpm \
+    pnpm install --frozen-lockfile
+
+# -----------------------------------------------------------------------------
+# builder：next build（构建期注入 NEXT_PUBLIC_API_URL）
+# -----------------------------------------------------------------------------
+FROM deps AS builder
+# 构建期参数 → 必须在本阶段成为 ENV，否则 `next build` 读不到（ARG 不会自动进子进程环境）。
+ARG NEXT_PUBLIC_API_URL=http://localhost:3001
+ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL} \
+    NEXT_TELEMETRY_DISABLED=1
+COPY . .
+# web 依赖 @ai-agent/shared（workspace:*），先出 shared 的 dist 再 build web。
+RUN pnpm --filter @ai-agent/shared build \
+ && pnpm --filter web build
+
+# -----------------------------------------------------------------------------
+# runtime：.next 构建产物 + node_modules（非 root）
+# -----------------------------------------------------------------------------
+FROM base AS runtime
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1
+WORKDIR /app
+# 保留完整 node_modules：`next start` 运行期要解析 next/react/react-dom 与 workspace 包
+# （.next/server 里的 require 仍指向 node_modules，不是自包含的——只有 standalone 模式才自包含）。
+COPY --from=builder --chown=node:node /app/node_modules ./node_modules
+COPY --from=builder --chown=node:node /app/packages/shared ./packages/shared
+COPY --from=builder --chown=node:node /app/apps/web/package.json ./apps/web/
+# next.config.ts 运行期仍会被读（rewrites/headers 等配置对象的装载入口）；postcss 配置一并带上（极小）。
+COPY --from=builder --chown=node:node /app/apps/web/next.config.ts ./apps/web/
+COPY --from=builder --chown=node:node /app/apps/web/postcss.config.mjs ./apps/web/
+COPY --from=builder --chown=node:node /app/apps/web/.next ./apps/web/.next
+# 不需要 app/ 源码：App Router 的产物（含 RSC 载荷）都在 .next 里。
+
+WORKDIR /app/apps/web
+USER node
+EXPOSE 3000
+# 直接用 next 的可执行入口（不经 pnpm/shell）：SIGTERM 直达 node 进程，停机语义与 API 一致。
+CMD ["node", "/app/node_modules/next/dist/bin/next", "start", "-p", "3000"]
