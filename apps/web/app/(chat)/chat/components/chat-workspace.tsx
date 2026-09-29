@@ -2,8 +2,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { apiFetch, ApiError, API_BASE } from '@/lib/api';
+import { apiFetch, ApiError, API_BASE, jsonInit } from '@/lib/api';
 import { consumeSSE } from '@/lib/sse';
+import { ConfirmDialog } from '@/components/confirm-dialog';
+import { PromptDialog } from '@/components/prompt-dialog';
+import { toApiError } from '@/components/write-error';
 import { Sidebar } from './sidebar';
 import { ChatInput } from './chat-input';
 import { MessageBubble } from './message-bubble';
@@ -13,8 +16,18 @@ import { ActiveTask, AttachmentView, ChatMessage, ChatStreamEventMap } from './t
 
 interface HistoryMessage {
   id: string; role: 'user' | 'assistant'; content: string; status: string; errorCode: string | null;
-  intentType: string | null; createdAt: string;
+  intentType: string | null; createdAt: string; editedAt: string | null;
   attachments: Array<{ id: string; kind: AttachmentView['kind']; type: AttachmentView['type']; mimeType: string; originalName: string | null }>;
+}
+
+/**
+ * agent.start / agent.end 的线上载荷只有 `agentId`（字段集被 shared ChatStreamEventSchema +
+ * type-drift 防线锁定，见 test/type-drift.test.ts）。可读名称在 timeline 投影里（RunTimeline
+ * 展开时按 runId 拉取 agentName）——这里不臆造名称，也**不**为了取名去调 admin-only 的
+ * GET /agents（非管理员会 403，拿不到名字反而多一次失败请求）。
+ */
+function agentLabel(agentId: string): string {
+  return agentId.length > 12 ? `${agentId.slice(0, 8)}…` : agentId;
 }
 
 export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
@@ -32,6 +45,13 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
   const [runIds, setRunIds] = useState<Record<string, string>>({});
   const [streaming, setStreaming] = useState(false);
   const [fatalError, setFatalError] = useState('');
+  // M13-W10：消息编辑/删除（后端 M10-P3：仅本人 user 消息，服务端独立裁决）
+  const [editing, setEditing] = useState<ChatMessage | null>(null);
+  const [deleting, setDeleting] = useState<ChatMessage | null>(null);
+  const [actionPending, setActionPending] = useState(false);
+  const [actionError, setActionError] = useState<ApiError | null>(null);
+  /** 右键唤出的操作行（与悬浮显示二选一） */
+  const [actionMenuFor, setActionMenuFor] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const deltaTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const deltaBuf = useRef('');
@@ -155,6 +175,19 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
             break;
           }
           case 'status': { setThinking((data as ChatStreamEventMap['status']).message); break; }
+          // M13-W10：agent.start/agent.end 由 api 的 chat SSE 白名单原样转发（chat.service.ts 的
+          // switch）——此前 web 丢弃（types.ts 声明了却无人消费），用户看不出「当前由哪个 Agent 在跑」。
+          // 复用既有 status 通道（setThinking）：后续 status/tool.* 事件照旧覆盖这一行，收流时统一清空。
+          case 'agent.start': {
+            const d = data as ChatStreamEventMap['agent_start'];
+            setThinking(`正在由 ${agentLabel(d.agentId)} Agent 处理…`);
+            break;
+          }
+          case 'agent.end': {
+            const d = data as ChatStreamEventMap['agent_end'];
+            setThinking(d.status === 'completed' ? '' : `Agent 处理结束（${d.status}）`);
+            break;
+          }
           case 'tool.start': {
             const t = data as ChatStreamEventMap['tool_start'];
             setCurrentTool(t.toolName);
@@ -215,6 +248,10 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
       abortRef.current = null;
       assistantIdRef.current = null;
       queryClient.invalidateQueries({ queryKey: ['conversations'] });
+      // M13-W10：收流后把**已落库的用户消息行**换成服务器行（本地乐观气泡的 id 是 local-*，
+      // 没有服务端 id 就不能编辑/删除）。merge 逻辑以 server 行为集合 → 本地气泡被自然替换，
+      // 流式 assistant 消息因 status==='streaming' 分支被保留（不受影响）。
+      queryClient.invalidateQueries({ queryKey: ['messages', activeIdRef.current] });
     }
   }, [streaming, projectId, queryClient, appendDelta, flushDelta]);
 
@@ -225,6 +262,51 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
     const userMsg = [...messages.slice(0, idx)].reverse().find((m) => m.role === 'user');
     if (userMsg) void send(userMsg.content, []);
   }, [messages, send]);
+
+  /* ------------------------------------------------------------------ *
+   * M13-W10：消息编辑/删除（PATCH / DELETE /api/v1/chat/messages/:id，后端 M10-P3）
+   *
+   * 授权口径与后端同源：**本人 + role='user'** 的消息才可改可删（服务端仍独立裁决：
+   * 越权 → 404 反枚举；本人的 assistant 消息 → 403 MESSAGE_EDIT/DELETE_FORBIDDEN）。
+   * 本地乐观气泡（id 以 local- 开头）**不呈现入口**——它还没有服务端 id，改/删无可指向的行。
+   * ------------------------------------------------------------------ */
+
+  const canMutate = useCallback((m: ChatMessage) => m.role === 'user' && !m.id.startsWith('local-'), []);
+
+  const openEdit = (m: ChatMessage) => { setActionError(null); setActionMenuFor(null); setEditing(m); };
+  const openDelete = (m: ChatMessage) => { setActionError(null); setActionMenuFor(null); setDeleting(m); };
+
+  const submitEdit = useCallback(async (content: string) => {
+    if (!editing) return;
+    setActionPending(true); setActionError(null);
+    try {
+      // 响应是消息投影（id/content/role/status/editedAt/createdAt）——以服务端返回的内容为准，
+      // 不做本地乐观改写（编辑可能被服务端拒绝，先改再回滚会闪出错误内容）。
+      const res = await apiFetch<{ data: { id: string; content: string; editedAt: string | null } }>(
+        `/api/v1/chat/messages/${editing.id}`, jsonInit('PATCH', { content }));
+      setMessages((prev) => prev.map((m) => (m.id === res.data.id ? { ...m, content: res.data.content, editedAt: res.data.editedAt } : m)));
+      setEditing(null);
+    } catch (err) {
+      setActionError(toApiError(err, '编辑失败，请重试'));
+    } finally {
+      setActionPending(false);
+    }
+  }, [editing]);
+
+  const confirmDelete = useCallback(async () => {
+    if (!deleting) return;
+    setActionPending(true); setActionError(null);
+    try {
+      await apiFetch(`/api/v1/chat/messages/${deleting.id}`, { method: 'DELETE' });
+      setMessages((prev) => prev.filter((m) => m.id !== deleting.id));
+      setDeleting(null);
+      queryClient.invalidateQueries({ queryKey: ['messages', activeIdRef.current] });
+    } catch (err) {
+      setActionError(toApiError(err, '删除失败，请重试'));
+    } finally {
+      setActionPending(false);
+    }
+  }, [deleting, queryClient]);
 
   // 任务完成 → 刷新消息（generated_image 附件挂到 assistant 消息）
   const onTaskDone = useCallback(() => {
@@ -238,7 +320,7 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
     <div className="flex h-screen">
       <Sidebar activeId={activeConversationId} />
       <main className="flex flex-1 flex-col">
-        <div ref={scrollRef} className="flex-1 overflow-y-auto">
+        <div ref={scrollRef} className="flex-1 overflow-y-auto" onClick={() => setActionMenuFor(null)}>
           <div className="mx-auto max-w-3xl space-y-6 px-4 py-6">
             {messages.length === 0 && tasks.length === 0 && (
               <div className="pt-32 text-center">
@@ -247,8 +329,18 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
               </div>
             )}
             {messages.map((m) => (
-              <div key={m.id}>
-                <MessageBubble message={m} streaming={m.status === 'streaming'} onRetry={() => retry(m.id)} />
+              <div
+                key={m.id}
+                onContextMenu={canMutate(m) ? (e) => { e.preventDefault(); setActionMenuFor(m.id); } : undefined}
+              >
+                <MessageBubble
+                  message={m}
+                  streaming={m.status === 'streaming'}
+                  onRetry={() => retry(m.id)}
+                  onEdit={canMutate(m) ? () => openEdit(m) : undefined}
+                  onDelete={canMutate(m) ? () => openDelete(m) : undefined}
+                  actionsPinned={actionMenuFor === m.id}
+                />
                 {runIds[m.id] && <RunTimeline runId={runIds[m.id]} />}
               </div>
             ))}
@@ -270,6 +362,33 @@ export function ChatWorkspace({ conversationId }: { conversationId?: string }) {
           </div>
         </div>
       </main>
+
+      {/* 编辑：只读本人 user 消息（服务端二次裁决；400/403/404 原文照实呈现） */}
+      <PromptDialog
+        open={editing !== null}
+        onOpenChange={(open) => { if (!open) { setEditing(null); setActionError(null); } }}
+        title="编辑消息"
+        description="仅本人发送的消息可编辑；服务端上限与发消息同源（20000 字）。"
+        label="消息内容"
+        initialValue={editing?.content ?? ''}
+        confirmLabel="保存"
+        multiline
+        maxLength={20000}
+        pending={actionPending}
+        error={actionError}
+        onSubmit={(value) => void submitEdit(value)}
+      />
+      <ConfirmDialog
+        open={deleting !== null}
+        onOpenChange={(open) => { if (!open) { setDeleting(null); setActionError(null); } }}
+        title="删除消息"
+        description="删除后不可恢复（服务端硬删除）；该消息触达的摘要记忆会被标记陈旧并自愈重算。"
+        confirmLabel="删除"
+        destructive
+        pending={actionPending}
+        error={actionError}
+        onConfirm={() => void confirmDelete()}
+      />
     </div>
   );
 }

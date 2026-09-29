@@ -213,3 +213,50 @@ describe('ChatWorkspace 消息流（SSE 解析 → 渲染）', () => {
     expect(screen.getByText('你好')).toBeInTheDocument();
   });
 });
+
+/**
+ * M13-W10：agent 事件呈现。
+ * api 的 chat SSE 白名单本就转发 agent.start/agent.end（chat.service.ts），但 web 此前整体丢弃
+ * （types.ts 声明了 agent_start/agent_end 却无人消费）→ 用户看不出「当前由哪个 Agent 在处理」。
+ * 载荷只有 agentId/runId（字段集被 packages/shared zod + type-drift 防线锁定，不得加 agentName），
+ * 因此这里只呈现 agentId 的截断标签，绝不臆造可读名称、也不为此多打一次 admin-only 的 GET /agents。
+ */
+describe('ChatWorkspace：agent.start / agent.end 状态呈现（M13-W10）', () => {
+  it('agent.start 复用 status 通道显示「正在由 X Agent 处理…」（后续 status 事件照旧覆盖）', async () => {
+    const h = await setupChatHarness();
+    await sendMessage('帮我做一张图');
+    await h.push(frame('message_start', { messageId: 'm-1', conversationId: 'c', createdAt: 'T' }));
+    expect(screen.getByText(/正在分析需求/)).toBeInTheDocument();
+
+    await h.push(frame('agent.start', { agentId: 'agent-1', runId: 'run-1' }));
+    await screen.findByText(/正在由 agent-1 Agent 处理…/);
+
+    await h.push(frame('status', { stage: 'planning', message: '正在规划步骤…' }));
+    await screen.findByText(/正在规划步骤…/);
+    expect(screen.queryByText(/正在由 agent-1 Agent 处理/)).not.toBeInTheDocument();
+  });
+
+  it('长 agentId 截断为 8 位 + 省略号（不臆造名称、也不撑破状态行）', async () => {
+    const h = await setupChatHarness();
+    await sendMessage('帮我做一张图');
+    await h.push(frame('message_start', { messageId: 'm-1', conversationId: 'c', createdAt: 'T' }));
+    await h.push(frame('agent.start', { agentId: '0193a1b2-ffff-4eee-9ddd-0123456789ab', runId: 'run-1' }));
+    await screen.findByText(/正在由 0193a1b2… Agent 处理…/);
+  });
+
+  it('agent.end(completed) 清空状态行；非 completed 原文呈现结束状态', async () => {
+    const h = await setupChatHarness();
+    await sendMessage('帮我做一张图');
+    await h.push(frame('message_start', { messageId: 'm-1', conversationId: 'c', createdAt: 'T' }));
+    await h.push(frame('agent.start', { agentId: 'agent-1', runId: 'run-1' }));
+    await screen.findByText(/正在由 agent-1 Agent 处理…/);
+
+    await h.push(frame('agent.end', { agentId: 'agent-1', runId: 'run-1', status: 'completed' }));
+    await waitFor(() => expect(screen.queryByText(/正在由 agent-1 Agent 处理/)).not.toBeInTheDocument());
+
+    await h.push(frame('agent.start', { agentId: 'agent-1', runId: 'run-2' }));
+    await screen.findByText(/正在由 agent-1 Agent 处理…/);
+    await h.push(frame('agent.end', { agentId: 'agent-1', runId: 'run-2', status: 'timeout' }));
+    await screen.findByText(/Agent 处理结束（timeout）/);
+  });
+});

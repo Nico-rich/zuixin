@@ -2,7 +2,7 @@
 import { useState } from 'react';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
-import { RunTimeline as RunTimelineData, TimelineItem } from './types';
+import { RunTimeline as RunTimelineData, RunTimelineUsage, TimelineItem } from './types';
 
 /**
  * 时间线项图标（api 侧 TimelineItemType 全类型覆盖；未命中才回退 '•'）。
@@ -36,6 +36,67 @@ function Row({ item }: { item: TimelineItem }) {
         {item.summary && <span className="ml-2 text-zinc-500">{item.summary}</span>}
       </span>
       {item.durationMs != null && <span className="shrink-0 text-zinc-600">{fmtDuration(item.durationMs)}</span>}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * M13-W10：usage 渲染
+ *
+ * 后端 `RunUsageAggregate`（apps/api/src/modules/usage/usage.service.ts）此前被 web 整体丢弃
+ * （types.ts 定义了 RunTimelineUsage 但没有任何渲染点）→ 用户看不到 token/成本/媒体用量。
+ * 这里只做**如实呈现**（不做预算判定、不四舍五入掉小额成本）：
+ *  - 成本单位是计价事实源里的原始数值，小额成本保留有效数字（0.000048 不能显示成 0.00）；
+ *  - 用量为 0 的维度仍显示（"0" 与"没有该维度"是两件事，绝不用空白冒充）；
+ *  - `failedCalls > 0` 时显式告警（失败调用已计费/已计入用量事实表）。
+ * ------------------------------------------------------------------ */
+
+/** 成本格式化：按量级保有效数字，避免小额成本被抹成 0.00 */
+function fmtCost(value: number): string {
+  if (!Number.isFinite(value) || value === 0) return '$0';
+  const abs = Math.abs(value);
+  if (abs >= 1) return `$${value.toFixed(2)}`;
+  if (abs >= 0.01) return `$${value.toFixed(4)}`;
+  return `$${value.toFixed(6)}`;
+}
+
+function fmtTokens(value: number): string {
+  return Number.isFinite(value) ? value.toLocaleString('en-US') : '0';
+}
+
+function Stat({ label, value, tone = 'default' }: { label: string; value: string; tone?: 'default' | 'warn' }) {
+  return (
+    <div className="flex items-baseline gap-1">
+      <span className="text-zinc-600">{label}</span>
+      <span className={tone === 'warn' ? 'font-medium text-amber-300' : 'font-medium text-zinc-300'}>{value}</span>
+    </div>
+  );
+}
+
+function UsagePanel({ usage }: { usage: RunTimelineUsage }) {
+  return (
+    <div className="mb-2 rounded border border-zinc-800/80 bg-zinc-950/40 px-2.5 py-2" data-testid="run-usage">
+      <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs">
+        <Stat label="耗时" value={fmtDuration(usage.durationMs)} />
+        <Stat label="tokens" value={`${fmtTokens(usage.inputTokens)} 入 + ${fmtTokens(usage.outputTokens)} 出 = ${fmtTokens(usage.totalTokens)}`} />
+        <Stat label="成本" value={`${fmtCost(usage.llmCost)} LLM + ${fmtCost(usage.imageCost)} 图片 + ${fmtCost(usage.videoCost)} 视频 = ${fmtCost(usage.totalCost)}`} />
+      </div>
+      <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs">
+        <Stat label="LLM 轮次" value={String(usage.llmRounds)} />
+        <Stat label="图片" value={`${usage.imageCount} 张`} />
+        <Stat label="视频" value={`${usage.videoSeconds} 秒`} />
+        <Stat label="失败调用" value={String(usage.failedCalls)} tone={usage.failedCalls > 0 ? 'warn' : 'default'} />
+      </div>
+      {usage.byKind.length > 0 && (
+        <div className="mt-1.5 border-t border-zinc-800/60 pt-1.5 text-[11px] text-zinc-500">
+          {usage.byKind.map((k) => (
+            <span key={k.kind} className="mr-3 inline-block">
+              <span className="font-mono text-zinc-400">{k.kind}</span>
+              {' · '}{k.count} 次 · {fmtTokens(k.tokens)} tokens · {fmtCost(k.cost)}
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -76,6 +137,7 @@ export function RunTimeline({ runId }: { runId: string }) {
           {error && <p className="py-1 text-xs text-red-400">{error}</p>}
           {data && (
             <div>
+              {data.usage && <UsagePanel usage={data.usage} />}
               {data.items.map((item) => <Row key={item.id} item={item} />)}
             </div>
           )}
