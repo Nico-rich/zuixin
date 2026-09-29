@@ -170,7 +170,7 @@ describe('FeedbackService（M7-P8 学习闭环 + Pre-M9 G11 幂等）', () => {
   });
 });
 
-/** 记忆沉淀断言辅助（高分/低分才写；本例 rating=5） */
-function memories_call(prisma: { memory: { findFirst: ReturnType<typeof vi.fn> } }): boolean {
-  return prisma.memory.findFirst.mock.calls.length > 0;
+/** 记忆沉淀断言辅助（高分/低分才写；本例 rating=5）——幂等去重查询（M12 Final Audit 起为 findMany 全量 subjectId 匹配） */
+function memories_call(prisma: { memory: { findMany: ReturnType<typeof vi.fn> } }): boolean {
+  return prisma.memory.findMany.mock.calls.length > 0;
 }
