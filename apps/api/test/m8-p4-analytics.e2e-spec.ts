@@ -9,7 +9,7 @@ import { GlobalExceptionFilter } from '../src/common/filters/global-exception.fi
 import { TransformInterceptor } from '../src/common/interceptors/transform.interceptor';
 import { csrfProtection } from '../src/modules/auth/csrf.middleware';
 import { PrismaService } from '../src/modules/prisma/prisma.service';
-import { addDays, dayRange, periodOf } from '../src/modules/analytics/analytics.service';
+import { addDays, AnalyticsService, dayRange, periodOf } from '../src/modules/analytics/analytics.service';
 
 const XRW = { 'X-Requested-With': 'XMLHttpRequest' };
 
@@ -235,6 +235,70 @@ describe('M8-P4 Analytics / BI (e2e)', () => {
     }
     const agent = data.sources.find((s: { kind: string }) => s.kind === 'agent');
     expect(agent.metricKeys).toEqual(expect.arrayContaining(['runs', 'completed', 'failed', 'cancelled', 'timeout']));
+  });
+
+  /**
+   * M12-P2：agentId 维度（纯查询投影）——真实 run → 真实刷新 → 读面逐项与 DB 独立聚合一致；
+   * byAgent 是同一批事实的**分桶视图**（绝非第二事实源/汇总表），agentMetrics() 只读不写。
+   */
+  it('M12-P2 byAgent：kind=agent 聚合按 run.agentId 分桶（与 DB 独立聚合一致），agentMetrics() 只读不写', async () => {
+    const period = periodOf(new Date());
+    // 经读面触发当日补刷（既有语义：读只补当日），再取 byAgent 分桶
+    const breakdown = await request(app.getHttpServer()).get(`/api/v1/analytics/breakdown?organizationId=${orgA}&kind=agent&days=1`)
+      .set(XRW).set('Cookie', cookieA).expect(200);
+    const data = breakdown.body.data;
+    const byAgent = data.facts.agent.byAgent as Record<string, {
+      runs: number; completed: number; terminal: number; successRate: number; failureRate: number; avgDurationMs: number;
+    }>;
+    expect(data.meta.layering).toMatchObject({ facts: 'deterministic-projection', derived: 'service-computed' });
+
+    // 与 DB 独立聚合核对（不复用服务实现；口径 = 终态进分母、均值按合计/样本重算）
+    const { start, end } = dayRange(period);
+    const runs = await prisma.agentRun.findMany({
+      where: { userId: userAId, projectId: null, createdAt: { gte: start, lt: end } },
+      select: { agentId: true, status: true, startedAt: true, completedAt: true },
+    });
+    const expected = new Map<string, { runs: number; completed: number; failed: number; terminal: number; durationMsTotal: number; durationSamples: number }>();
+    for (const run of runs) {
+      const acc = expected.get(run.agentId) ?? { runs: 0, completed: 0, failed: 0, terminal: 0, durationMsTotal: 0, durationSamples: 0 };
+      acc.runs += 1;
+      if (run.status === 'completed') { acc.completed += 1; acc.terminal += 1; }
+      else if (run.status === 'failed') { acc.failed += 1; acc.terminal += 1; }
+      else if (run.status === 'cancelled' || run.status === 'timeout') acc.terminal += 1;
+      if (run.completedAt) { acc.durationMsTotal += run.completedAt.getTime() - run.startedAt.getTime(); acc.durationSamples += 1; }
+      expected.set(run.agentId, acc);
+    }
+    expect(Object.keys(byAgent).sort()).toEqual([...expected.keys()].sort());
+    for (const [agentId, exp] of expected) {
+      expect(byAgent[agentId]).toMatchObject({ runs: exp.runs, completed: exp.completed, failed: exp.failed, terminal: exp.terminal });
+      expect(byAgent[agentId].successRate).toBeCloseTo(exp.terminal > 0 ? exp.completed / exp.terminal : 0, 6);
+      expect(byAgent[agentId].failureRate).toBeCloseTo(exp.terminal > 0 ? exp.failed / exp.terminal : 0, 6);
+      expect(byAgent[agentId].avgDurationMs).toBeCloseTo(exp.durationSamples > 0 ? exp.durationMsTotal / exp.durationSamples : 0, 0);
+    }
+    // 分桶恒等：byAgent 各桶 runs 之和 = 顶层 runs（无 agentId 的历史 run 只进顶层，绝不伪造桶）
+    expect(Object.values(byAgent).reduce((sum, a) => sum + a.runs, 0)).toBeLessThanOrEqual(data.facts.agent.runs);
+
+    // 聚合行本身携带 dimensions.agents（桶键 = 归因键，供审计追溯）
+    const row = await prisma.analyticsAggregate.findFirst({
+      where: { organizationId: orgA, period, kind: 'agent' }, select: { metrics: true, dimensions: true },
+    });
+    expect((row!.dimensions as { agents: string[] }).agents).toEqual([...expected.keys()].sort());
+
+    // agentMetrics()：组织级读面 = 聚合行的纯投影（含成功率/失败率/平均时长），读前后聚合行逐字不变
+    const rowsBefore = await prisma.analyticsAggregate.findMany({ where: { organizationId: orgA }, select: { id: true, metrics: true, refreshedAt: true } });
+    const metrics = await app.get(AnalyticsService).agentMetrics({ organizationId: orgA, days: 1 });
+    expect(metrics).toMatchObject({ scope: 'organization', organizationId: orgA, days: 1, from: period, to: period });
+    expect(metrics.meta).toMatchObject({ source: 'analytics_aggregate', kind: 'agent' });
+    expect(metrics.agents.map((a) => a.agentId)).toEqual([...expected.keys()].sort());
+    for (const stat of metrics.agents) {
+      const exp = expected.get(stat.agentId)!;
+      expect(stat).toMatchObject({ runs: exp.runs, completed: exp.completed, failed: exp.failed, terminal: exp.terminal });
+      expect(stat.successRate).toBeCloseTo(exp.terminal > 0 ? exp.completed / exp.terminal : 0, 6);
+      expect(stat.failureRate).toBeCloseTo(exp.terminal > 0 ? exp.failed / exp.terminal : 0, 6);
+      expect(stat.avgDurationMs).toBeCloseTo(exp.durationSamples > 0 ? exp.durationMsTotal / exp.durationSamples : 0, 0);
+    }
+    const rowsAfter = await prisma.analyticsAggregate.findMany({ where: { organizationId: orgA }, select: { id: true, metrics: true, refreshedAt: true } });
+    expect(rowsAfter).toEqual(rowsBefore); // 纯读：不写聚合、不刷新、不建汇总表
   });
 
   /**

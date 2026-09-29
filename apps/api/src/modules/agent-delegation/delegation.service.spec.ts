@@ -1,6 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { DelegationService } from './delegation.service';
 
+/** 目标 Agent 行（显式 id 路径与缺省候选池路径共用同一份形状） */
+const childAgentRow = {
+  id: 'agent-child', slug: 'general-assistant', enabled: true, scope: 'system',
+  activeVersion: { id: 'v-child', tools: ['knowledge.search', 'image.generate'] },
+};
+
 function makeService(overrides: Record<string, unknown> = {}) {
   const prisma = {
     systemSetting: { findUnique: vi.fn().mockResolvedValue({ key: 'limits', value: {} }) },
@@ -23,11 +29,11 @@ function makeService(overrides: Record<string, unknown> = {}) {
       findFirst: vi.fn().mockResolvedValue({ content: '子任务完成' }),
     },
     agent: {
-      findFirst: vi.fn().mockResolvedValue({
-        id: 'agent-child', enabled: true, scope: 'system',
-        activeVersion: { id: 'v-child', tools: ['knowledge.search', 'image.generate'] },
-      }),
+      findFirst: vi.fn().mockResolvedValue(childAgentRow), // 显式 agentId 路径（语义不变）
+      // 缺省目标候选池路径（M12-P2）：routingPolicy.delegationDefaultTargets 缺省 = ['general-assistant']
+      findMany: vi.fn().mockResolvedValue([{ ...childAgentRow, slug: 'general-assistant' }]),
     },
+    analyticsAggregate: { findMany: vi.fn().mockResolvedValue([]) }, // 表现排序输入（缺省无数据 → 静态顺序）
     ...overrides,
   };
   const queue = { add: vi.fn().mockResolvedValue({ id: 'j1' }) };
@@ -331,5 +337,158 @@ describe('DelegationService（M11-P7 维度2#19 幂等重入补订阅）', () =>
     expect(await svc.delegate(input())).toMatchObject({ __waiting_delegation: true });
     expect(svc.pendingChildSubscriptions()).toBe(0); // 绝不订阅一个不会再产生事件的 run
     expect(prisma.agentRunMessage.create).toHaveBeenCalledTimes(1); // 只来自首次委派（落败方绝不重建子 run 数据）
+  });
+});
+
+/**
+ * M12-P2 Agent 表现回流（委派缺省目标的候选排序）。
+ * 回归靶心：缺省目标原本是硬编码单候选 general-assistant——多候选必须**只调顺序**：
+ * 候选集合（enabled + scope=system + 有 activeVersion）、权限交集（child ⊆ parent）、
+ * 上限/环检测/幂等语义一律不变；表现数据缺失或读取失败 → **逐字回退静态顺序**（零行为漂移）。
+ */
+describe('DelegationService（M12-P2 缺省目标按表现排序：只调顺序，不调权限）', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  /** 候选池行（active=false 模拟无 activeVersion） */
+  const poolRow = (slug: string, id: string, tools: string[] = ['knowledge.search'], active = true) => ({
+    id, slug, enabled: true, scope: 'system',
+    activeVersion: active ? { id: `v-${slug}`, tools } : null,
+  });
+
+  /** 聚合行（byAgent 维度；mock 忽略 where —— 窗口/period 边界由 agent-performance.spec 覆盖） */
+  const perfRows = (byAgent: Record<string, { completed: number; failed: number }>) => [
+    { period: '2026-09-25', metrics: { runs: 0, byAgent } },
+  ];
+
+  /** 多候选池：agent-a 静态在前，agent-b 在后 */
+  function makePoolService() {
+    const made = makeService({
+      agent: {
+        findFirst: vi.fn().mockResolvedValue(null),
+        findMany: vi.fn().mockResolvedValue([poolRow('agent-a', 'id-a'), poolRow('agent-b', 'id-b')]),
+      },
+    });
+    made.prisma.systemSetting.findUnique.mockResolvedValue({
+      key: 'routingPolicy', value: { delegationDefaultTargets: ['agent-a', 'agent-b'] },
+    });
+    made.prisma.agentRun.findUnique.mockResolvedValue(parentRun as never); // 父 run（委派前置）
+    return made;
+  }
+
+  it('多候选 + 样本充足：失败率低的候选优先（顺序被打破，候选集合不变）', async () => {
+    const { svc, prisma } = makePoolService();
+    prisma.analyticsAggregate.findMany.mockResolvedValue(perfRows({
+      'id-a': { completed: 2, failed: 8 }, // 失败率 0.8
+      'id-b': { completed: 9, failed: 1 }, // 失败率 0.1
+    }) as never);
+    expect(await svc.delegate(input())).toMatchObject({ __waiting_delegation: true });
+    expect(prisma.agentRun.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ agentId: 'id-b', agentVersionId: 'v-agent-b' }),
+    }));
+  });
+
+  it('表现数据缺失 → 静态顺序（池内第一个），零行为漂移；读取失败同样回退且绝不抛错', async () => {
+    const empty = makePoolService();
+    empty.prisma.analyticsAggregate.findMany.mockResolvedValue([] as never);
+    await empty.svc.delegate(input());
+    expect(empty.prisma.agentRun.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ agentId: 'id-a', agentVersionId: 'v-agent-a' }),
+    }));
+
+    const failing = makePoolService();
+    failing.prisma.analyticsAggregate.findMany.mockRejectedValue(new Error('analytics 暂不可用'));
+    await expect(failing.svc.delegate(input())).resolves.toMatchObject({ __waiting_delegation: true }); // 表现数据只是建议性输入
+    expect(failing.prisma.agentRun.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ agentId: 'id-a' }),
+    }));
+  });
+
+  it('样本不足（terminal < minSamples=5）→ 不参与排序，静态顺序保持', async () => {
+    const { svc, prisma } = makePoolService();
+    prisma.analyticsAggregate.findMany.mockResolvedValue(perfRows({
+      'id-a': { completed: 0, failed: 3 }, // 失败率 1.0，但终态样本 3 < 5
+      'id-b': { completed: 4, failed: 0 }, // 终态样本 4 < 5
+    }) as never);
+    await svc.delegate(input());
+    expect(prisma.agentRun.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ agentId: 'id-a' }),
+    }));
+  });
+
+  it('routingPolicy.performanceRanking.minSamples 可调：放开样本门槛后排序生效（运维显式配置）', async () => {
+    const { svc, prisma } = makePoolService();
+    prisma.systemSetting.findUnique.mockResolvedValue({
+      key: 'routingPolicy',
+      value: { delegationDefaultTargets: ['agent-a', 'agent-b'], performanceRanking: { minSamples: 2 } },
+    });
+    prisma.analyticsAggregate.findMany.mockResolvedValue(perfRows({
+      'id-a': { completed: 0, failed: 2 },
+      'id-b': { completed: 2, failed: 0 },
+    }) as never);
+    await svc.delegate(input());
+    expect(prisma.agentRun.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ agentId: 'id-b' }),
+    }));
+  });
+
+  it('单候选（缺省池 general-assistant）→ 绝不查询表现数据（既有路径零开销/零漂移）', async () => {
+    const { svc, prisma } = makeService();
+    prisma.agentRun.findUnique.mockResolvedValue(parentRun);
+    await svc.delegate(input());
+    expect(prisma.analyticsAggregate.findMany).not.toHaveBeenCalled();
+    expect(prisma.agent.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { slug: { in: ['general-assistant'] }, enabled: true, scope: 'system' },
+    }));
+  });
+
+  it('显式 agentId 路径不受影响：仍按 id+enabled+scope=system 精确定位，绝不排序/绝不读表现', async () => {
+    const { svc, prisma } = makeService();
+    prisma.agentRun.findUnique.mockResolvedValue(parentRun);
+    await svc.delegate(input({ agentId: 'agent-explicit' }));
+    expect(prisma.agent.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'agent-explicit', enabled: true, scope: 'system' },
+    }));
+    expect(prisma.analyticsAggregate.findMany).not.toHaveBeenCalled();
+    expect(prisma.agentRun.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ agentId: 'agent-child' }),
+    }));
+  });
+
+  it('候选池无可用行（不存在/未启用/无 activeVersion）→ 既有 400 语义不变，绝不建子 run', async () => {
+    const { svc, prisma } = makeService({
+      agent: {
+        findFirst: vi.fn().mockResolvedValue(null),
+        findMany: vi.fn().mockResolvedValue([poolRow('agent-a', 'id-a', [], false)]),
+      },
+    });
+    prisma.systemSetting.findUnique.mockResolvedValue({ key: 'routingPolicy', value: { delegationDefaultTargets: ['agent-a'] } });
+    prisma.agentRun.findUnique.mockResolvedValue(parentRun);
+    await expect(svc.delegate(input())).rejects.toMatchObject({ code: 'VALIDATION_ERROR', message: '目标 Agent 不存在或无可执行版本' });
+    expect(prisma.agentRun.create).not.toHaveBeenCalled();
+  });
+
+  it('排序不改权限语义：胜出候选的工具仍与父工具求交集（child ⊆ parent）', async () => {
+    const { svc, prisma } = makeService({
+      agent: {
+        findFirst: vi.fn().mockResolvedValue(null),
+        findMany: vi.fn().mockResolvedValue([
+          poolRow('agent-a', 'id-a', ['knowledge.search', 'image.generate']),
+          poolRow('agent-b', 'id-b', ['knowledge.search', 'agent.delegate', 'finance.trade']),
+        ]),
+      },
+    });
+    prisma.systemSetting.findUnique.mockResolvedValue({ key: 'routingPolicy', value: { delegationDefaultTargets: ['agent-a', 'agent-b'] } });
+    prisma.agentRun.findUnique.mockResolvedValue(parentRun);
+    prisma.analyticsAggregate.findMany.mockResolvedValue(perfRows({
+      'id-a': { completed: 1, failed: 9 }, 'id-b': { completed: 10, failed: 0 },
+    }) as never);
+    await svc.delegate(input());
+    expect(prisma.agentRun.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        agentId: 'id-b',
+        // 父工具 = agent.delegate/knowledge.search/image.generate；『finance.trade』不在父权限内 → 剔除
+        metadata: { delegation: true, delegationTools: ['knowledge.search', 'agent.delegate'] },
+      }),
+    }));
   });
 });

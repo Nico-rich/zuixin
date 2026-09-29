@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { AnalyticsService, addDays, dayRange, mergeMetrics, periodOf, rangeOf } from './analytics.service';
+import { AnalyticsService, addDays, dayRange, finalizeMetrics, mergeMetrics, periodOf, rangeOf } from './analytics.service';
 
 const DAY_START = new Date('2026-09-25T00:00:00.000Z');
 
@@ -78,19 +78,62 @@ describe('AnalyticsService（M8-P4 确定性聚合投影）', () => {
     });
   });
 
-  it('kind=agent：状态分布 + 时长合计/样本/均值（未终态无时长样本）', async () => {
+  it('kind=agent：状态分布 + 时长合计/样本/均值（未终态无时长样本）+ M12-P2 byAgent 维度逐 agent 投影', async () => {
     const { svc, prisma } = makeService();
     prisma.agentRun.findMany.mockResolvedValue([
-      { id: 'r1', status: 'completed', startedAt: DAY_START, completedAt: new Date(DAY_START.getTime() + 10_000) },
-      { id: 'r2', status: 'completed', startedAt: DAY_START, completedAt: new Date(DAY_START.getTime() + 20_000) },
-      { id: 'r3', status: 'failed', startedAt: DAY_START, completedAt: new Date(DAY_START.getTime() + 500) },
-      { id: 'r4', status: 'cancelled', startedAt: DAY_START, completedAt: null },
-      { id: 'r5', status: 'timeout', startedAt: DAY_START, completedAt: new Date(DAY_START.getTime() + 30_000) },
+      { id: 'r1', agentId: 'agent-general', status: 'completed', startedAt: DAY_START, completedAt: new Date(DAY_START.getTime() + 10_000) },
+      { id: 'r2', agentId: 'agent-general', status: 'completed', startedAt: DAY_START, completedAt: new Date(DAY_START.getTime() + 20_000) },
+      { id: 'r3', agentId: 'agent-general', status: 'failed', startedAt: DAY_START, completedAt: new Date(DAY_START.getTime() + 500) },
+      { id: 'r4', agentId: 'agent-x', status: 'cancelled', startedAt: DAY_START, completedAt: null },
+      { id: 'r5', agentId: 'agent-x', status: 'timeout', startedAt: DAY_START, completedAt: new Date(DAY_START.getTime() + 30_000) },
     ]);
     await svc.refreshOrganization('org-1', '2026-09-25');
-    expect(createdRow(prisma, 'agent')!.metrics).toMatchObject({
+    const row = createdRow(prisma, 'agent')!;
+    expect(row.metrics).toMatchObject({
       runs: 5, completed: 2, failed: 1, cancelled: 1, timeout: 1, queued: 0, running: 0, waiting: 0,
       durationSamples: 4, durationMsTotal: 60_500, avgDurationMs: 15_125,
+      // 逐 agent 同一套事实 + 读时派生（终态口径的成功率/失败率/均值）
+      byAgent: {
+        'agent-general': {
+          runs: 3, completed: 2, failed: 1, cancelled: 0, timeout: 0, terminal: 3,
+          durationSamples: 3, durationMsTotal: 30_500, avgDurationMs: 10_166.666667,
+          successRate: 0.666667, failureRate: 0.333333,
+        },
+        'agent-x': {
+          runs: 2, completed: 0, cancelled: 1, timeout: 1, terminal: 2,
+          durationSamples: 1, durationMsTotal: 30_000, avgDurationMs: 30_000,
+          successRate: 0, failureRate: 0, // 失败率只数 failed（cancelled/timeout 各自独立计数，绝不混算）
+        },
+      },
+    });
+    expect(row.dimensions).toMatchObject({ agents: ['agent-general', 'agent-x'] }); // agentId 维度可追溯
+  });
+
+  it('kind=agent：run 无 agentId（历史行）只进顶层合计，绝不伪造 agent 桶', async () => {
+    const { svc, prisma } = makeService();
+    prisma.agentRun.findMany.mockResolvedValue([
+      { id: 'r1', agentId: '', status: 'completed', startedAt: DAY_START, completedAt: null },
+    ]);
+    await svc.refreshOrganization('org-1', '2026-09-25');
+    const row = createdRow(prisma, 'agent')!;
+    expect(row.metrics).toMatchObject({ runs: 1, completed: 1 });
+    expect((row.metrics as Record<string, unknown>).byAgent).toBeUndefined();
+    expect(row.dimensions).toMatchObject({ agents: [] });
+  });
+
+  it('finalizeMetrics：byAgent 维度的均值/派生按合并后的 facts 重算（绝不跨天求平均的平均）', () => {
+    const merged = mergeMetrics(
+      { byAgent: { a: { runs: 2, completed: 2, durationMsTotal: 100, durationSamples: 2, avgDurationMs: 50 } } },
+      { byAgent: { a: { runs: 8, failed: 8, durationMsTotal: 200, durationSamples: 8, avgDurationMs: 25 } } },
+    );
+    const out = finalizeMetrics('agent', merged);
+    expect(out.byAgent).toMatchObject({
+      a: {
+        runs: 10, completed: 2, failed: 8, terminal: 10,
+        durationMsTotal: 300, durationSamples: 10,
+        avgDurationMs: 30, // 300/10；绝不是 (50+25)/2 = 37.5 的"平均的平均"
+        successRate: 0.2, failureRate: 0.8,
+      },
     });
   });
 
@@ -286,6 +329,54 @@ describe('AnalyticsService（M8-P4 确定性聚合投影）', () => {
     await svc.query('org-1', { from: '2026-08-27', to: '2026-09-25' });
     await svc.sources('org-1', '2026-09-25');
     expect(prisma.analyticsAggregate.create).not.toHaveBeenCalled(); // 只读端点绝不写
+  });
+
+  it('query：agent facts 的 byAgent 维度逐 agent 重算（跨天合并后成功率/失败率/均值正确）', async () => {
+    const { svc, prisma } = makeService();
+    prisma.analyticsAggregate.findMany.mockResolvedValue([
+      { kind: 'agent', period: '2026-09-24', metrics: { runs: 2, byAgent: { a: { runs: 2, completed: 2, durationMsTotal: 100, durationSamples: 2 } } }, dimensions: { agents: ['a'] }, source: 'agent_run', refreshedAt: new Date('2026-09-24T23:00:00.000Z') },
+      { kind: 'agent', period: '2026-09-25', metrics: { runs: 2, byAgent: { a: { runs: 2, failed: 2, durationMsTotal: 900, durationSamples: 2 } } }, dimensions: { agents: ['a'] }, source: 'agent_run', refreshedAt: new Date('2026-09-25T10:00:00.000Z') },
+    ]);
+    const res = await svc.query('org-1', { from: '2026-09-24', to: '2026-09-25' });
+    expect(res.facts.agent.byAgent).toMatchObject({
+      a: { runs: 4, completed: 2, failed: 2, terminal: 4, durationSamples: 4, avgDurationMs: 250, successRate: 0.5, failureRate: 0.5 },
+    });
+  });
+
+  it('agentMetrics（组织级读面）：按 agent 的成功率/平均时长/失败率——有界只读，绝不写聚合/绝不建汇总表', async () => {
+    const { svc, prisma } = makeService();
+    prisma.analyticsAggregate.findMany.mockResolvedValue([
+      { period: '2026-09-24', metrics: { byAgent: { a: { runs: 2, completed: 2, durationMsTotal: 100, durationSamples: 2 } } } },
+      { period: '2026-09-25', metrics: { byAgent: { a: { runs: 2, failed: 2, durationMsTotal: 900, durationSamples: 2 }, b: { runs: 3, completed: 3, durationMsTotal: 30, durationSamples: 3 } } } },
+    ]);
+    const res = await svc.agentMetrics({ organizationId: 'org-1', days: 3, now: new Date('2026-09-25T10:00:00.000Z') });
+    expect(res).toMatchObject({
+      scope: 'organization', organizationId: 'org-1', from: '2026-09-23', to: '2026-09-25', days: 3,
+      meta: { source: 'analytics_aggregate', kind: 'agent', layering: { facts: 'deterministic-projection', interpretation: 'none' } },
+    });
+    expect(res.agents.map((a) => a.agentId)).toEqual(['a', 'b']);
+    expect(res.agents[0]).toMatchObject({
+      runs: 4, terminal: 4, successRate: 0.5, failureRate: 0.5, avgDurationMs: 250, durationSamples: 4,
+    });
+    expect(res.agents[1]).toMatchObject({ runs: 3, terminal: 3, successRate: 1, failureRate: 0, avgDurationMs: 10 });
+    expect(prisma.analyticsAggregate.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { kind: 'agent', period: { gte: '2026-09-23', lte: '2026-09-25' }, organizationId: 'org-1' },
+      orderBy: [{ period: 'desc' }],
+    }));
+    expect(prisma.analyticsAggregate.create).not.toHaveBeenCalled(); // 只读：绝不触发刷新/写入
+    expect(prisma.analyticsAggregate.update).not.toHaveBeenCalled();
+    expect(prisma.agentRun.findMany).not.toHaveBeenCalled(); // 绝不回扫事务表
+  });
+
+  it('agentMetrics（缺省作用域）：平台级 = 不带 organizationId 过滤（仅内部排序输入；窗口上限夹取 90 天）', async () => {
+    const { svc, prisma } = makeService();
+    prisma.analyticsAggregate.findMany.mockResolvedValue([]);
+    const res = await svc.agentMetrics({ days: 10_000 });
+    expect(res).toMatchObject({ scope: 'platform', organizationId: null, days: 90 });
+    const call = (prisma.analyticsAggregate.findMany.mock.calls[0] as unknown as [{ where: Record<string, unknown> }])[0];
+    expect(call.where).toEqual({ kind: 'agent', period: { gte: addDays(periodOf(new Date()), -89), lte: periodOf(new Date()) } });
+    expect(call.where.organizationId).toBeUndefined();
+    expect(res.agents).toEqual([]); // 无数据 → 消费方回退静态顺序
   });
 
   it('mergeMetrics：数字求和、嵌套对象递归（byProvider），非数字原样覆盖', () => {

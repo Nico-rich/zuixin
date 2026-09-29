@@ -7,7 +7,16 @@ import { addJobBounded, addJobBestEffort } from '../../core/queue/bounded-add';
 import { EventBusService, agentRunChannel } from '../../core/events/event-bus.service';
 import { AppError, ErrorCode } from '../../common/errors/app-error';
 import { AuditService } from '../audit/audit.service';
+import {
+  loadAgentPerformance,
+  parsePerformanceRanking,
+  rankByAgentPerformance,
+  type AgentPerformanceStat,
+  type PerformanceRankingConfig,
+} from '../analytics/agent-performance';
 
+/** 委派缺省目标（routingPolicy.delegationDefaultTargets 缺省值 = 既有硬编码语义，逐字不变） */
+const DEFAULT_DELEGATION_TARGET = 'general-assistant';
 const CHILD_TERMINAL = ['completed', 'failed', 'cancelled', 'timeout'] as const;
 /** 子 run 终态事件（订阅侧过滤：非终态事件绝不触发唤醒） */
 const CHILD_TERMINAL_EVENTS: readonly string[] = ['run.completed', 'run.failed', 'run.cancelled', 'run.timeout'];
@@ -32,6 +41,9 @@ export interface DelegateInput {
  * - 幂等：idempotencyKey 唯一——resume 重放 → 子 run 终态则返回结构化结果（绝不重开子 run）；
  * - 唤醒：子 run 终态事件（本进程订阅）+ recoverStale 兜底双通道；父 run waitingOnDelegationId 条件更新去重；
  * - 级联取消：父 cancelled → 子（及其后代）条件取消，已终态容忍。
+ * - M12-P2 表现回流：**缺省目标**（未显式给 agentId）由候选池 routingPolicy.delegationDefaultTargets
+ *   （缺省 ['general-assistant']）按静态顺序解析；多候选时用近期表现（失败率低者优先）打破静态顺序。
+ *   表现数据只调顺序——候选仍是 enabled+scope=system+有 activeVersion 的行，权限仍是 child ⊆ parent。
  */
 @Injectable()
 export class DelegationService {
@@ -271,15 +283,66 @@ export class DelegationService {
     return ids;
   }
 
+  /**
+   * 委派缺省目标候选池（systemSetting.routingPolicy）：
+   * - `delegationDefaultTargets`（slug 数组；**顺序 = 静态顺序**）缺省 `['general-assistant']`
+   *   ——与既有硬编码逐字等价（单候选 → 零行为漂移）；
+   * - `performanceRanking`（windowDays/minSamples）与 agent-registry 同一份配置口径。
+   */
+  private async delegationRoutingPolicy(): Promise<{ targets: string[]; ranking: PerformanceRankingConfig }> {
+    const row = await this.prisma.systemSetting.findUnique({ where: { key: 'routingPolicy' } });
+    const value = (row?.value ?? null) as { delegationDefaultTargets?: unknown; performanceRanking?: unknown } | null;
+    const configured = Array.isArray(value?.delegationDefaultTargets)
+      ? value.delegationDefaultTargets.filter((slug): slug is string => typeof slug === 'string' && slug.length > 0)
+      : [];
+    const targets = [...new Set(configured)];
+    return {
+      targets: targets.length > 0 ? targets : [DEFAULT_DELEGATION_TARGET],
+      ranking: parsePerformanceRanking(value?.performanceRanking),
+    };
+  }
+
+  /**
+   * 目标 Agent 解析：
+   * - 显式 agentId（工具入参，来自服务端注册表）→ 按 id + enabled + scope=system 定位（语义不变，**绝不排序**）；
+   * - 缺省 → 候选池（routingPolicy.delegationDefaultTargets，缺省 general-assistant）按静态顺序解析，
+   *   **多候选**时用近期表现（失败率低者优先）打破静态顺序（M12-P2）。
+   *
+   * 红线：表现数据只调**顺序**——候选仍必须是 enabled + scope=system 且有 activeVersion 的行，
+   * 目标确定后的权限继承仍是 child tools ⊆ parent tools（交集），工具/权限语义零变化。
+   */
   private async resolveAgent(agentId?: string) {
-    const agent = await this.prisma.agent.findFirst({
-      where: agentId
-        ? { id: agentId, enabled: true, scope: 'system' }
-        : { slug: 'general-assistant', enabled: true, scope: 'system' },
+    if (agentId) {
+      const agent = await this.prisma.agent.findFirst({
+        where: { id: agentId, enabled: true, scope: 'system' },
+        include: { activeVersion: true },
+      });
+      if (!agent || !agent.activeVersion) throw new AppError(ErrorCode.VALIDATION_ERROR, '目标 Agent 不存在或无可执行版本');
+      return agent;
+    }
+    const { targets, ranking } = await this.delegationRoutingPolicy();
+    const rows = await this.prisma.agent.findMany({
+      where: { slug: { in: targets }, enabled: true, scope: 'system' },
       include: { activeVersion: true },
     });
-    if (!agent || !agent.activeVersion) throw new AppError(ErrorCode.VALIDATION_ERROR, '目标 Agent 不存在或无可执行版本');
-    return agent;
+    const ordered = targets
+      .map((slug) => rows.find((row) => row.slug === slug))
+      .filter((row): row is (typeof rows)[number] => !!row && !!row.activeVersion);
+    const first = ordered[0];
+    if (!first) throw new AppError(ErrorCode.VALIDATION_ERROR, '目标 Agent 不存在或无可执行版本');
+    if (ordered.length === 1) return first; // 单候选：既有语义逐字不变，绝不查询表现数据
+    let stats: AgentPerformanceStat[] = [];
+    try {
+      stats = await loadAgentPerformance(this.prisma, { days: ranking.windowDays });
+    } catch (err) {
+      this.logger.warn({ err: (err as Error).message }, 'Agent 表现数据读取失败 → 回退静态顺序（表现数据仅作排序建议）');
+      return first;
+    }
+    const selected = rankByAgentPerformance(ordered, { agentId: (row) => row.id, stats, minSamples: ranking.minSamples })[0];
+    if (selected.slug !== first.slug) {
+      this.logger.debug({ candidates: targets, selected: selected.slug }, '委派缺省目标按表现重排（仅顺序）');
+    }
+    return selected;
   }
 
   /** 级联取消（父 cancelled → 子及后代；已终态容忍；visited 防环） */
