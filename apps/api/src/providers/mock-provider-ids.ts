@@ -13,3 +13,12 @@ export const MOCK_PROVIDER_IDS = [
   'seed-vid-mock',
   'seed-emb-mock',
 ] as const;
+
+/** mock 替身的**模型** id（与 seed 逐字一致）——用户在配置页可停用模型，测试基建同样要幂等启用 */
+export const MOCK_MODEL_IDS = [
+  'seed-model-mock-echo',
+  'seed-model-mock-router-1',
+  'seed-img-mock-model',
+  'seed-vid-mock-model',
+  'seed-emb-mock-model',
+] as const;

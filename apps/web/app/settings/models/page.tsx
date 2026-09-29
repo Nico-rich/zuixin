@@ -50,7 +50,8 @@ export default function ModelsSettingsPage() {
   }
 
   return (
-    <div className="mx-auto max-w-5xl space-y-6 p-6">
+    <div className="min-h-0 flex-1 overflow-y-auto">
+      <div className="mx-auto max-w-5xl space-y-6 px-4 py-8">
       <div>
         <h1 className="text-lg font-semibold text-zinc-100">模型配置</h1>
         <p className="mt-1 text-sm text-zinc-400">
@@ -126,6 +127,7 @@ export default function ModelsSettingsPage() {
         open={editing !== null}
         onOpenChange={(open) => { if (!open) setEditing(null); }}
       />
+      </div>
     </div>
   );
 }

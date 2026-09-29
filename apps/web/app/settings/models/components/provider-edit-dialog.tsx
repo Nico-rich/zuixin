@@ -37,6 +37,10 @@ export function ProviderEditDialog({
   const [priority, setPriority] = useState(String(provider?.priority ?? 100));
   const [baseUrl, setBaseUrl] = useState(provider?.baseUrl ?? '');
   const [timeoutMs, setTimeoutMs] = useState(String(provider?.timeoutMs ?? 60000));
+  // 模型级启停初值（Map：modelId → enabled）；保存时只提交**与初值不同**的项
+  const [modelStates, setModelStates] = useState<Map<string, boolean>>(
+    () => new Map((provider?.models ?? []).map((m) => [m.id, m.enabled])),
+  );
   const [formError, setFormError] = useState('');
 
   const save = useApiMutation(
@@ -53,6 +57,10 @@ export function ProviderEditDialog({
       const timeoutNum = Number(timeoutMs);
       if (!Number.isInteger(timeoutNum) || timeoutNum < 1000) throw new Error('超时必须是 ≥1000 的整数（毫秒）');
       if (timeoutNum !== provider.timeoutMs) patch.timeoutMs = timeoutNum;
+      const modelPatch = (provider.models ?? [])
+        .filter((m) => modelStates.get(m.id) !== m.enabled)
+        .map((m) => ({ id: m.id, enabled: modelStates.get(m.id) === true }));
+      if (modelPatch.length > 0) patch.models = modelPatch;
       if (Object.keys(patch).length === 0) throw new Error('没有需要保存的改动');
       return updateProvider(provider.id, patch);
     },
@@ -124,6 +132,31 @@ export function ProviderEditDialog({
             <label htmlFor="provider-baseurl" className="mb-1 block text-xs text-zinc-400">Base URL（https；mock adapter 可为空）</label>
             <Input id="provider-baseurl" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://api.example.com/v1" />
           </div>
+
+          {provider.models.length > 0 && (
+            <div>
+              <span className="mb-1 block text-xs text-zinc-400">
+                模型启停（seed 里部分真实模型默认停用——勾选启用后才会进入路由候选与默认模型选择）
+              </span>
+              <div className="space-y-1.5">
+                {provider.models.map((m) => (
+                  <div key={m.id} className="flex items-center gap-2">
+                    <input
+                      id={`model-${m.id}`}
+                      type="checkbox"
+                      checked={modelStates.get(m.id) === true}
+                      onChange={(e) => setModelStates((prev) => new Map(prev).set(m.id, e.target.checked))}
+                      data-testid={`model-enabled-${m.id}`}
+                    />
+                    <label htmlFor={`model-${m.id}`} className="text-sm text-zinc-300">
+                      {m.name} <span className="text-xs text-zinc-500">· {m.apiModelId}</span>
+                      {m.isDefault && <span className="ml-1 text-xs text-zinc-500">（默认）</span>}
+                    </label>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {provider.degradedReason && (
             <p className="text-xs text-amber-400">加载失败归因：{provider.degradedReason}</p>

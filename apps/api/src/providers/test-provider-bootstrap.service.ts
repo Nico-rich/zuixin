@@ -1,6 +1,6 @@
 import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../modules/prisma/prisma.service';
-import { MOCK_PROVIDER_IDS } from './mock-provider-ids';
+import { MOCK_MODEL_IDS, MOCK_PROVIDER_IDS } from './mock-provider-ids';
 import { LLMManagerService } from './llm/llm-manager.service';
 import { ImageManagerService } from './image/image-manager.service';
 import { VideoManagerService } from './video/video-manager.service';
@@ -44,7 +44,14 @@ export class TestProviderBootstrapService implements OnModuleInit {
         where: { id: { in: [...MOCK_PROVIDER_IDS] }, enabled: false },
         data: { enabled: true },
       });
-      if (res.count > 0) this.logger.warn({ count: res.count }, '测试基建：已幂等启用 mock 替身（TEST_ENSURE_MOCK_PROVIDERS=1）');
+      // 模型级同样幂等启用（用户在配置页停用的 mock 模型必须恢复——路由候选按 Model.enabled 过滤）
+      const modelRes = await this.prisma.model.updateMany({
+        where: { id: { in: [...MOCK_MODEL_IDS] }, enabled: false },
+        data: { enabled: true },
+      });
+      if (res.count > 0 || modelRes.count > 0) {
+        this.logger.warn({ providers: res.count, models: modelRes.count }, '测试基建：已幂等启用 mock 替身（TEST_ENSURE_MOCK_PROVIDERS=1）');
+      }
       // 无条件刷新：即便 count=0（本就启用），也要让内存 adapter 表与 DB 对齐
       await Promise.all([this.llm.refresh(), this.image.refresh(), this.video.refresh(), this.embedding.refresh()]);
     } catch (err) {

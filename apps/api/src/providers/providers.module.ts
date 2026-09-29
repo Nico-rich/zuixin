@@ -5,6 +5,7 @@ import { ImageManagerService } from './image/image-manager.service';
 import { VideoManagerService } from './video/video-manager.service';
 import { EmbeddingManagerService } from './embedding/embedding-manager.service';
 import { TestProviderBootstrapService } from './test-provider-bootstrap.service';
+import { ProviderConfigBusService } from './provider-config-bus.service';
 import { RoutingServiceModule } from '../modules/provider-routing/routing-service.module';
 
 /**
@@ -12,15 +13,16 @@ import { RoutingServiceModule } from '../modules/provider-routing/routing-servic
  * RoutingServiceModule 在此挂入，LLM（引擎）/ Image / Video / Embedding 四条链路
  * 共用同一 RoutingService 实例（决策输入全部为服务端事实，LLM 不参与 provider 选择）。
  * M13+：TestProviderBootstrapService（TEST_ENSURE_MOCK_PROVIDERS=1 时幂等启用 mock；
- * 生产环境变量不设则零开销）。@Global ⇒ API 与 Worker 两进程都执行。
+ * 生产环境变量不设则零开销）+ ProviderConfigBusService（PATCH 后跨进程传播刷新——
+ * API 与 Worker 两进程都订阅，配置立即全实例生效）。@Global ⇒ 两进程都执行。
  */
 @Global()
 @Module({
   imports: [RoutingServiceModule],
   providers: [
     LLMManagerService, ModelResolverService, ImageManagerService, VideoManagerService, EmbeddingManagerService,
-    TestProviderBootstrapService,
+    TestProviderBootstrapService, ProviderConfigBusService,
   ],
-  exports: [LLMManagerService, ModelResolverService, ImageManagerService, VideoManagerService, EmbeddingManagerService],
+  exports: [LLMManagerService, ModelResolverService, ImageManagerService, VideoManagerService, EmbeddingManagerService, ProviderConfigBusService],
 })
 export class ProvidersModule {}

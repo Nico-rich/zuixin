@@ -53,6 +53,8 @@ export interface ProviderPatch {
   priority?: number;
   baseUrl?: string;
   timeoutMs?: number;
+  /** 模型级启停（seed 里真实生图/生视频模型默认停用——必须可改 Model.enabled 才能被路由选中） */
+  models?: Array<{ id: string; enabled: boolean }>;
 }
 
 export const providerKeys = {

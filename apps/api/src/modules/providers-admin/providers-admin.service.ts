@@ -10,6 +10,7 @@ import { LLMManagerService } from '../../providers/llm/llm-manager.service';
 import { ImageManagerService } from '../../providers/image/image-manager.service';
 import { VideoManagerService } from '../../providers/video/video-manager.service';
 import { EmbeddingManagerService } from '../../providers/embedding/embedding-manager.service';
+import { ProviderConfigBusService, ProviderTypeName } from '../../providers/provider-config-bus.service';
 
 /** GET 投影（手写字段——**绝不回显 apiKeyEncrypted**；行内含密文，投影即安全边界） */
 export interface ProviderModelView {
@@ -64,6 +65,7 @@ export class ProvidersAdminService {
     @Inject(ImageManagerService) private readonly image: ImageManagerService,
     @Inject(VideoManagerService) private readonly video: VideoManagerService,
     @Inject(EmbeddingManagerService) private readonly embedding: EmbeddingManagerService,
+    @Inject(ProviderConfigBusService) private readonly configBus: ProviderConfigBusService,
   ) {}
 
   /** 平台管理员判定（DB 权威，绝不采信 token 声明——与 system-settings 同口径） */
@@ -124,15 +126,34 @@ export class ProvidersAdminService {
       }
     }
 
-    const updated = await this.prisma.provider.update({ where: { id }, data });
+    // 模型级启停：每个 id 必须属于本 provider（跨厂商 id → 400 零副作用）
+    if (patch.models) {
+      const owned = await this.prisma.model.findMany({
+        where: { id: { in: patch.models.map((m) => m.id) }, providerId: id },
+        select: { id: true },
+      });
+      const ownedIds = new Set(owned.map((m) => m.id));
+      for (const m of patch.models) {
+        if (!ownedIds.has(m.id)) {
+          throw new AppError(ErrorCode.VALIDATION_ERROR, `模型 ${m.id} 不属于本 provider`);
+        }
+      }
+    }
 
-    // 热生效：按 type 刷新对应 manager（整体重建内存 adapter 表；在途请求持有的旧 adapter 不受影响）
+    const updated = await this.prisma.provider.update({ where: { id }, data });
+    for (const m of patch.models ?? []) {
+      await this.prisma.model.update({ where: { id: m.id }, data: { enabled: m.enabled } });
+    }
+
+    // 热生效：本进程按 type 刷新对应 manager（整体重建内存 adapter 表；在途请求持有的旧 adapter 不受影响）
     try {
       await this.managerFor(provider.type).refresh();
     } catch (err) {
       // 刷新失败不掩盖配置结果（内存面可能滞后，重启自愈）；审计面同样降级可见
       this.logger.warn(`provider 已更新但 refresh 失败（重启后生效）: id=${id} err=${(err as Error).message}`);
     }
+    // 跨进程传播（Worker/其他 API 实例各自刷新）——尽力而为，失败只 warn（对方重启后生效）
+    await this.configBus.notify(provider.type as ProviderTypeName);
 
     // 审计（best-effort；metadata 显式投影，**绝不 spread 行**——行内含 apiKeyEncrypted）
     try {
@@ -146,6 +167,7 @@ export class ProvidersAdminService {
         metadata: {
           changed: Object.keys(patch),
           keyChanged: data.apiKeyEncrypted !== undefined,
+          modelsChanged: patch.models?.map((m) => m.id) ?? [],
           before: { enabled: provider.enabled, priority: provider.priority, baseUrl: provider.baseUrl, timeoutMs: provider.timeoutMs, hasKey: provider.apiKeyEncrypted !== '' },
           after: { enabled: updated.enabled, priority: updated.priority, baseUrl: updated.baseUrl, timeoutMs: updated.timeoutMs, hasKey: updated.apiKeyEncrypted !== '' },
         },

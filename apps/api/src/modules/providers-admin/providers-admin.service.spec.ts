@@ -33,6 +33,10 @@ function makeService(over: {
       findUniqueOrThrow: vi.fn(async () => row),
       update: vi.fn(async ({ data }: { data: Record<string, unknown> }) => ({ ...row!, ...data })),
     },
+    model: {
+      findMany: vi.fn(async (): Promise<Array<{ id: string }>> => []),
+      update: vi.fn(async ({ where, data }: { where: { id: string }; data: { enabled: boolean } }) => ({ id: where.id, ...data })),
+    },
   };
   const audit = {
     write: vi.fn(async (_args: {
@@ -50,11 +54,13 @@ function makeService(over: {
     refresh: vi.fn(async () => undefined),
     providerStatus: vi.fn(() => status),
   };
+  const configBus = { notify: vi.fn(async () => undefined) };
   const svc = new ProvidersAdminService(
     prisma as never, audit as never, crypto as never,
     manager as never, manager as never, manager as never, manager as never,
+    configBus as never,
   );
-  return { svc, prisma, audit, crypto, manager };
+  return { svc, prisma, audit, crypto, manager, configBus };
 }
 
 describe('ProvidersAdminService RBAC（平台管理员闸门）', () => {
@@ -114,11 +120,12 @@ describe('ProvidersAdminService PATCH 写路径（加密/热刷新/审计）', (
   beforeEach(() => { delete process.env.PROVIDER_ALLOW_HTTP; });
   afterEach(() => { delete process.env.PROVIDER_ALLOW_HTTP; });
 
-  it('enabled:false → 写库 + 对应 manager refresh 被调', async () => {
+  it('enabled:false → 写库 + 对应 manager refresh + 跨进程传播 notify（Worker 同步刷新）', async () => {
     const h = makeService();
     await h.svc.patch('u1', 'seed-llm-mock', { enabled: false });
     expect(h.prisma.provider.update).toHaveBeenCalledWith({ where: { id: 'seed-llm-mock' }, data: { enabled: false } });
     expect(h.manager.refresh).toHaveBeenCalledTimes(1);
+    expect(h.configBus.notify).toHaveBeenCalledWith('llm');
   });
 
   it('apiKey 空串/缺省 → update data 无 apiKeyEncrypted（只写语义，不改密文）', async () => {
@@ -154,6 +161,27 @@ describe('ProvidersAdminService PATCH 写路径（加密/热刷新/审计）', (
     const h = makeService();
     h.manager.refresh.mockRejectedValueOnce(new Error('refresh down'));
     await expect(h.svc.patch('u1', 'seed-llm-mock', { enabled: false })).resolves.toBeDefined();
+  });
+});
+
+describe('ProvidersAdminService models 模型级启停（M13+ 生图/生视频 seed 默认停用）', () => {
+  it('模型属于本 provider → model.update 逐个落库 + 审计 modelsChanged', async () => {
+    const h = makeService();
+    h.prisma.model.findMany.mockResolvedValue([{ id: 'seed-model-mock-echo' }]);
+    await h.svc.patch('u1', 'seed-llm-mock', { models: [{ id: 'seed-model-mock-echo', enabled: false }] });
+    expect(h.prisma.model.update).toHaveBeenCalledWith({ where: { id: 'seed-model-mock-echo' }, data: { enabled: false } });
+    expect(h.audit.write.mock.calls[0][0].metadata.modelsChanged).toEqual(['seed-model-mock-echo']);
+    expect(JSON.stringify(h.audit.write.mock.calls[0][0].metadata.changed)).toContain('models');
+  });
+
+  it('跨厂商模型 id → 400 且零副作用（不写 provider、不写 model、不审计）', async () => {
+    const h = makeService();
+    h.prisma.model.findMany.mockResolvedValue([]); // 归属查询空 → 校验拒绝
+    await expect(h.svc.patch('u1', 'seed-llm-mock', { models: [{ id: 'seed-img-openai-model', enabled: true }] }))
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR', message: expect.stringContaining('不属于本 provider') });
+    expect(h.prisma.provider.update).not.toHaveBeenCalled();
+    expect(h.prisma.model.update).not.toHaveBeenCalled();
+    expect(h.audit.write).not.toHaveBeenCalled();
   });
 });
 

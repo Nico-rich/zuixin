@@ -132,6 +132,23 @@ describe('/settings/models 模型配置页（M13+）', () => {
     });
   });
 
+  it('编辑弹窗：模型启停开关 → PATCH body 只含状态变化的模型（seed 生图/生视频模型默认停用，必须可启用）', async () => {
+    const fetchMock = mockApi();
+    rendered();
+    await screen.findByText('本地Mock');
+    fireEvent.click(screen.getAllByRole('button', { name: '编辑' })[0]);
+    const dialog = await screen.findByRole('dialog');
+
+    // 停用 Mock Echo（初值 enabled=true）→ body 只含该模型
+    fireEvent.click(within(dialog).getByTestId('model-enabled-seed-model-mock-echo'));
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存' }));
+    await waitFor(() => {
+      const patchCall = fetchMock.mock.calls.find((c) => String(c[0]).includes('/api/v1/providers/seed-llm-mock') && (c[1] as RequestInit)?.method === 'PATCH');
+      expect(patchCall).toBeDefined();
+      expect(JSON.parse(String((patchCall![1] as RequestInit).body))).toEqual({ models: [{ id: 'seed-model-mock-echo', enabled: false }] });
+    });
+  });
+
   it('默认模型卡：只列同类型模型；保存 → PATCH routingPolicy {defaults:{llm}}', async () => {
     const fetchMock = mockApi();
     rendered();

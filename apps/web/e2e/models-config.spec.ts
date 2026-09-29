@@ -79,8 +79,13 @@ test.describe('模型配置页（admin）', () => {
     expect(pageErrors).toEqual([]);
   });
 
-  test('默认模型切换：保存 → routingPolicy 读回已变（finally 还原）', async ({ authedPage: page }) => {
+  test('默认模型切换：保存 → routingPolicy 读回已变（快照还原）', async ({ authedPage: page }) => {
     test.setTimeout(180_000);
+    // 快照当前 llm 默认值（还原不硬编码 mock id——用户在配置页可能已停用 mock 模型）
+    const beforeRes = await page.request.get('/api/v1/system-settings/routingPolicy', { headers: XRW });
+    const beforeBody = await beforeRes.json();
+    const beforeDefault: string | null = (beforeBody.data.value as { defaults?: Record<string, string | null> })?.defaults?.llm ?? null;
+
     // 找一个非 mock 的 llm 模型 id 作为切换目标（provider 可停用——defaults 不要求 provider 启用）
     const providers = await fetchProviders(page);
     const target = providers.flatMap((p) => p.models).find((m) => m.type === 'llm' && m.id !== 'seed-model-mock-echo');
@@ -99,7 +104,7 @@ test.describe('模型配置页（admin）', () => {
       expect((body.data.value as { defaults: Record<string, string> }).defaults.llm).toBe(target.id);
     } finally {
       await page.request.patch('/api/v1/system-settings/routingPolicy', {
-        headers: XRW, data: { defaults: { llm: 'seed-model-mock-echo' } },
+        headers: XRW, data: { defaults: { llm: beforeDefault } },
       }).catch(() => undefined);
     }
   });

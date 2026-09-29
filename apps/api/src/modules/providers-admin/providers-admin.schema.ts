@@ -18,6 +18,16 @@ export const ProviderPatchSchema = z
     /** mock adapter 允许 ''；其余必须过 SSRF 同步判定（服务层裁决） */
     baseUrl: z.string().trim().max(2048).optional(),
     timeoutMs: z.number().int().min(1_000).max(600_000).optional(),
+    /**
+     * 模型级启停（M13+ 模型配置页）：seed 里真实生图/生视频模型默认停用，
+     * 仅靠 provider 级 enabled 无法让它们可被路由选中——必须可改 Model.enabled。
+     * 每个 id 必须**属于该 provider**（服务层裁决；跨厂商模型 id → 400）。
+     */
+    models: z
+      .array(z.strictObject({ id: z.string().min(1).max(200), enabled: z.boolean() }))
+      .min(1)
+      .max(100)
+      .optional(),
   })
   .refine((o) => Object.keys(o).length > 0, { message: '补丁不能为空（空补丁不产生任何变更）' });
 
