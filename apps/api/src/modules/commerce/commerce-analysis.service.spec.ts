@@ -21,11 +21,15 @@ function makeService(ledgerOutput: unknown = null) {
     commerceAnalysis: {
       create: vi.fn(async (args: { data: Record<string, unknown> }) => ({ id: 'an-1', createdAt: new Date(), ...args.data })),
       findFirst: vi.fn().mockResolvedValue(null),
+      // M13-W9 只读列表面
+      findMany: vi.fn().mockResolvedValue([]),
     },
     creativeBrief: {
       create: vi.fn(async (args: { data: Record<string, unknown> }) => ({ id: 'cb-1', ...args.data })),
       findFirst: vi.fn().mockResolvedValue(null),
       update: vi.fn().mockResolvedValue({}),
+      // M13-W9 只读列表面
+      findMany: vi.fn().mockResolvedValue([]),
     },
     memory: { findMany: vi.fn().mockResolvedValue([]) },
     $transaction: vi.fn(async (fn: (t: unknown) => Promise<unknown>) => fn(tx)),
@@ -150,5 +154,61 @@ describe('CommerceAnalysisService（M7-P5 事实/推测分层）', () => {
     const res2 = await replay.svc.createBrief('u1', { problem: 'p', objective: 'o' }, { toolCallId: 'tc-cb', idempotencyKey: 'idem-9' });
     expect(res2.briefId).toBe('cb-first'); // 复用首次简报行，绝不重复建
     expect(replay.tx.creativeBrief.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('CommerceAnalysisService 只读列表面（M13-W9）', () => {
+  it('listAnalyses：userId 恒为首条件 + 只投影列表字段（证据体不进列表）', async () => {
+    const { svc, prisma } = makeService();
+    (prisma.commerceAnalysis.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 'an-1', analysisType: 'sales', status: 'ready', timeRange: { start: 'S', end: 'E' }, agentRunId: null, createdAt: new Date('2026-01-01') },
+    ]);
+
+    const rows = await svc.listAnalyses('u1');
+
+    expect(prisma.commerceAnalysis.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { userId: 'u1' }, // 归属只在服务端判定（无任何客户端传入的 userId/org 参与）
+      orderBy: { createdAt: 'desc' },
+      take: 30,
+    }));
+    // select 白名单：facts/derived/anomalies/possibleCauses/recommendations 一律不取
+    const select = (prisma.commerceAnalysis.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].select as Record<string, boolean>;
+    expect(Object.keys(select).sort()).toEqual(['agentRunId', 'analysisType', 'createdAt', 'id', 'status', 'timeRange']);
+    expect(rows).toEqual([{ analysisId: 'an-1', analysisType: 'sales', status: 'ready', timeRange: { start: 'S', end: 'E' }, agentRunId: null, createdAt: expect.any(Date) }]);
+  });
+
+  it('listAnalyses：limit 收敛到 1..100（0/负数/超限/小数都不产生越界查询）', async () => {
+    const { svc, prisma } = makeService();
+    const calls = () => (prisma.commerceAnalysis.findMany as ReturnType<typeof vi.fn>).mock.calls.map((c) => (c[0] as { take: number }).take);
+
+    await svc.listAnalyses('u1', 0);
+    await svc.listAnalyses('u1', -5);
+    await svc.listAnalyses('u1', 10_000);
+    await svc.listAnalyses('u1', 7.9);
+
+    expect(calls()).toEqual([1, 1, 100, 7]);
+  });
+
+  it('listBriefs：userId 归属 + 只投影列表字段（problem/objective/platform/status/artifactId）', async () => {
+    const { svc, prisma } = makeService();
+    (prisma.creativeBrief.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 'cb-1', problem: 'p', objective: 'o', platform: 'meta', status: 'ready', artifactId: 'art-1', commerceAnalysisId: 'an-1', createdAt: new Date('2026-01-02') },
+    ]);
+
+    const rows = await svc.listBriefs('u1', 5);
+
+    expect(prisma.creativeBrief.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { userId: 'u1' }, take: 5 }));
+    const select = (prisma.creativeBrief.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].select as Record<string, boolean>;
+    expect(Object.keys(select).sort()).toEqual(['artifactId', 'commerceAnalysisId', 'createdAt', 'id', 'objective', 'platform', 'problem', 'status']);
+    expect(rows).toEqual([{
+      briefId: 'cb-1', problem: 'p', objective: 'o', platform: 'meta', status: 'ready',
+      artifactId: 'art-1', analysisId: 'an-1', createdAt: expect.any(Date),
+    }]);
+  });
+
+  it('listAnalyses/listBriefs 无数据 → 空数组（列表端点不回退到"最新一条"）', async () => {
+    const { svc } = makeService();
+    await expect(svc.listAnalyses('u1')).resolves.toEqual([]);
+    await expect(svc.listBriefs('u1')).resolves.toEqual([]);
   });
 });
