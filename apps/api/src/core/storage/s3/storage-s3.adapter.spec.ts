@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Readable } from 'node:stream';
 import { NodeHttpHandler } from '@smithy/node-http-handler';
-import { StorageS3Adapter, S3_ABORT_SLACK_MS } from './storage-s3.adapter';
+import { StorageS3Adapter, S3_ABORT_SLACK_MS, S3_MAX_KEYS } from './storage-s3.adapter';
 import { StorageTimeoutError } from '../storage-timeouts';
 
 /**
@@ -33,6 +33,7 @@ vi.mock('@aws-sdk/client-s3', () => {
     PutObjectCommand: class extends FakeCommand {},
     GetObjectCommand: class extends FakeCommand {},
     DeleteObjectCommand: class extends FakeCommand {},
+    ListObjectsV2Command: class extends FakeCommand {},
   };
 });
 
@@ -189,5 +190,94 @@ describe('StorageS3Adapter 单请求 abort 兜底', () => {
     const adapter = new StorageS3Adapter({ ...CONFIG });
     await expect(adapter.createPresignedUrl('u/1.png', 900)).resolves.toContain('X-Amz-Signature');
     expect(h.send).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * M12-P5：`list`（ListObjectsV2）——孤儿对象清扫的数据来源。
+ * 覆盖点：请求入参语义（字面前缀/分页/上限收敛）、返回值净化（目录占位对象、缺失时间）、
+ * 以及"协议异常时不空转翻页"这条防呆。
+ */
+describe('StorageS3Adapter list（M12-P5 对象枚举）', () => {
+  const inputOf = (call: number) => (h.send.mock.calls[call][0] as { input: Record<string, unknown> }).input;
+
+  it('默认入参：只带 Bucket + MaxKeys（不传 Prefix/ContinuationToken），解析 Contents', async () => {
+    const adapter = new StorageS3Adapter({ ...CONFIG });
+    h.send.mockResolvedValueOnce({
+      Contents: [{ Key: 'u/2026/01/a.png', Size: 12, LastModified: new Date('2026-01-02T03:04:05Z') }],
+      IsTruncated: false,
+    });
+
+    const page = await adapter.list();
+
+    expect(inputOf(0)).toEqual({ Bucket: 'agent-storage', MaxKeys: 1_000 });
+    expect(page.objects).toEqual([{ key: 'u/2026/01/a.png', sizeBytes: 12, lastModified: new Date('2026-01-02T03:04:05Z') }]);
+    expect(page.nextCursor).toBeNull();
+  });
+
+  it('前缀是字面前缀（原样传给 Prefix，不做目录推断）+ 续页游标原样传给 ContinuationToken', async () => {
+    const adapter = new StorageS3Adapter({ ...CONFIG });
+    h.send.mockResolvedValueOnce({ Contents: [], IsTruncated: false });
+
+    await adapter.list({ prefix: 'u1/2026', limit: 25, cursor: 'tok-abc' });
+
+    // 关键：`u1/2026` 不补 `/`（补了就会漏掉对象），与本地驱动同一语义
+    expect(inputOf(0)).toEqual({ Bucket: 'agent-storage', Prefix: 'u1/2026', MaxKeys: 25, ContinuationToken: 'tok-abc' });
+  });
+
+  it('IsTruncated=true + 有 token ⇒ nextCursor=token（可续页）；空串 token ⇒ null（绝不空转）', async () => {
+    const adapter = new StorageS3Adapter({ ...CONFIG });
+    h.send
+      .mockResolvedValueOnce({ Contents: [{ Key: 'a', Size: 1, LastModified: new Date(1) }], IsTruncated: true, NextContinuationToken: 'tok-2' })
+      .mockResolvedValueOnce({ Contents: [], IsTruncated: true, NextContinuationToken: '' });
+
+    await expect(adapter.list()).resolves.toMatchObject({ nextCursor: 'tok-2' });
+    // IsTruncated 与 token 自相矛盾（协议异常）：如实结束本页，调用方据此停手
+    await expect(adapter.list()).resolves.toMatchObject({ nextCursor: null });
+  });
+
+  it('返回值净化：目录占位对象（Key 以 / 结尾）与无 Key 条目被过滤；Size/LastModified 缺失不猜测', async () => {
+    const adapter = new StorageS3Adapter({ ...CONFIG });
+    h.send.mockResolvedValueOnce({
+      Contents: [
+        { Key: 'dir/', Size: 0, LastModified: new Date(1) },
+        { Size: 9 },
+        { Key: 'real.bin' },                                  // Size/LastModified 均缺失
+        { Key: 'odd.bin', Size: Number.NaN, LastModified: '2026-01-01' }, // 类型不对
+      ],
+      IsTruncated: false,
+    });
+
+    const page = await adapter.list();
+
+    expect(page.objects.map((o) => o.key)).toEqual(['real.bin', 'odd.bin']);
+    // 拿不到就是 null（"年龄未知"），绝不猜成 0 字节 / 1970 年
+    expect(page.objects[0]).toEqual({ key: 'real.bin', sizeBytes: 0, lastModified: null });
+    expect(page.objects[1]).toEqual({ key: 'odd.bin', sizeBytes: 0, lastModified: null });
+  });
+
+  it('limit 收敛到协议上限 1000（调用方传 Infinity / 超大值不得打穿 MaxKeys）', async () => {
+    const adapter = new StorageS3Adapter({ ...CONFIG });
+    h.send.mockResolvedValue({ Contents: [], IsTruncated: false });
+    await adapter.list({ limit: 5_000 });
+    expect(inputOf(0)).toMatchObject({ MaxKeys: S3_MAX_KEYS });
+    await adapter.list({ limit: Number.POSITIVE_INFINITY });
+    expect(inputOf(1)).toMatchObject({ MaxKeys: S3_MAX_KEYS });
+    await adapter.list({ limit: 0 }); // 非法值 → 回退默认，不落 MaxKeys=0（S3 会当成默认 1000，语义漂移）
+    expect(inputOf(2)).toMatchObject({ MaxKeys: 1_000 });
+  });
+
+  it('有界性：list 同样走 abort 兜底（存储端点半开时不会永久挂住清扫任务）', async () => {
+    vi.useFakeTimers();
+    const adapter = new StorageS3Adapter({ ...CONFIG, requestTimeoutMs: 30 });
+    h.send.mockImplementation((_cmd: unknown, options?: { abortSignal?: AbortSignal }) => new Promise((_resolve, reject) => {
+      options?.abortSignal?.addEventListener('abort', () => reject(new Error('Request aborted')));
+    }));
+
+    const pending = adapter.list();
+    const assertion = expect(pending).rejects.toBeInstanceOf(StorageTimeoutError);
+    await vi.advanceTimersByTimeAsync(30 + S3_ABORT_SLACK_MS + 1);
+    await assertion;
+    await expect(pending).rejects.toMatchObject({ code: 'STORAGE_TIMEOUT', label: 's3:list' });
   });
 });

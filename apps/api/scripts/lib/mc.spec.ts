@@ -1,8 +1,23 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
-import { diffMirror, etagAsMd5, hostEnvValue, parseMcListJson, parseMcStatJson, sampleKeys, summarizeDir } from './mc';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  SIGNAL_EXIT_CODES,
+  __isSignalCleanupInstalledForTest,
+  __setSignalSourceForTest,
+  createTempEnvFile,
+  diffMirror,
+  disposeAllTempEnvFiles,
+  etagAsMd5,
+  hostEnvValue,
+  liveTempEnvFileCount,
+  parseMcListJson,
+  parseMcStatJson,
+  sampleKeys,
+  summarizeDir,
+  type SignalSource,
+} from './mc';
 import { backupFileName, stampFromBackupName } from './manifest';
 import { redactSecrets } from './cli';
 
@@ -140,5 +155,179 @@ describe('备份命名与保留策略（按文件名时间戳排序，不依赖 
     expect(encrypted).toBe('db-20260101-000000.sql.gz.gpg');
     expect(stampFromBackupName(encrypted)).toBe('20260101-000000');
     expect(stampFromBackupName('random.txt')).toBeNull();
+  });
+});
+
+describe('临时凭证文件的信号清理（SIGINT/SIGTERM 不留残留）', () => {
+  /**
+   * 可注入的假信号源：捕获监听器、记录 exit/notify，**绝不真的动测试进程的信号语义**
+   * （否则 `process.exit(130)` 会把跑测试的进程带走，`process.on('SIGINT')` 会污染整个 runner）。
+   */
+  function makeSignalSource() {
+    const listeners = new Map<NodeJS.Signals, Array<() => void>>();
+    const offCalls: Array<{ signal: NodeJS.Signals; listener: () => void }> = [];
+    const events: string[] = [];
+    const exit = vi.fn((code: number) => {
+      events.push(`exit:${code}`);
+    });
+    const notify = vi.fn((message: string) => {
+      events.push(`notify:${message}`);
+    });
+    const source: SignalSource = {
+      on: (signal, listener) => {
+        const list = listeners.get(signal);
+        if (list) list.push(listener);
+        else listeners.set(signal, [listener]);
+      },
+      off: (signal, listener) => {
+        offCalls.push({ signal, listener });
+      },
+      exit,
+      notify,
+    };
+    return {
+      source,
+      listeners,
+      offCalls,
+      exit,
+      notify,
+      events,
+      /** 模拟 OS 投递信号（等价于运维按下 Ctrl+C / 编排器发 SIGTERM） */
+      fire(signal: NodeJS.Signals) {
+        for (const listener of [...(listeners.get(signal) ?? [])]) listener();
+      },
+      /** notify 的文案拼接（含 exit 前留痕里的清理个数） */
+      notified(): string {
+        return notify.mock.calls.map((call) => call[0]).join('');
+      },
+    };
+  }
+
+  let fake!: ReturnType<typeof makeSignalSource>;
+
+  beforeEach(() => {
+    fake = makeSignalSource();
+    __setSignalSourceForTest(fake.source); // 同时重置模块级状态（存活集合 + 已安装标记）
+  });
+
+  afterEach(() => {
+    // 兜底：清空存活临时文件、卸载处理器并还原默认信号源。否则模块级 set/installed 会跨用例泄漏。
+    __setSignalSourceForTest(null);
+  });
+
+  it('创建临时凭证文件即接管 SIGINT/SIGTERM；SIGINT ⇒ 先删文件再按 130 退出', () => {
+    expect(liveTempEnvFileCount()).toBe(0);
+    expect(__isSignalCleanupInstalledForTest()).toBe(false);
+
+    const entry = createTempEnvFile({ MC_HOST_m10: 'http://key:secret@localhost:9000' });
+    expect(existsSync(entry.path)).toBe(true);
+    expect(readFileSync(entry.path, 'utf8')).toContain('MC_HOST_m10='); // 落盘的确实是含凭证的那份
+    expect(liveTempEnvFileCount()).toBe(1);
+    expect(__isSignalCleanupInstalledForTest()).toBe(true);
+    // 两个信号都要接管，且各只注册一次（不因多次创建而叠加监听器）
+    expect(fake.listeners.get('SIGINT')).toHaveLength(1);
+    expect(fake.listeners.get('SIGTERM')).toHaveLength(1);
+
+    fake.fire('SIGINT');
+
+    expect(existsSync(entry.path)).toBe(false); // 磁盘上不留残留
+    expect(liveTempEnvFileCount()).toBe(0);
+    expect(__isSignalCleanupInstalledForTest()).toBe(false); // 清空后立刻卸载，不在空转时改变信号语义
+    expect(fake.exit).toHaveBeenCalledTimes(1);
+    expect(fake.exit).toHaveBeenCalledWith(130);
+    expect(fake.exit).toHaveBeenCalledWith(SIGNAL_EXIT_CODES['SIGINT']);
+    expect(fake.notified()).toContain('SIGINT');
+    expect(fake.notified()).toContain('已清理 1 个');
+    // 卸载要成对：两个信号都要 off，否则默认源上会留着悬空监听器
+    expect(fake.offCalls.map((c) => c.signal).sort()).toEqual(['SIGINT', 'SIGTERM']);
+    // 顺序：先删文件、后退出（带着残留退出是本审计项的原始缺陷）
+    expect(fake.events.at(-1)).toBe('exit:130');
+    expect(fake.events.some((e) => e.startsWith('notify:'))).toBe(true);
+  });
+
+  it('SIGTERM ⇒ 同样清理并按 143 退出（与 SIGINT 分开验证各自的退出码）', () => {
+    const entry = createTempEnvFile({ MC_HOST_m10: 'http://key:secret@localhost:9000' });
+    expect(liveTempEnvFileCount()).toBe(1);
+
+    fake.fire('SIGTERM');
+
+    expect(existsSync(entry.path)).toBe(false);
+    expect(liveTempEnvFileCount()).toBe(0);
+    expect(__isSignalCleanupInstalledForTest()).toBe(false);
+    expect(fake.exit).toHaveBeenCalledTimes(1);
+    expect(fake.exit).toHaveBeenCalledWith(143);
+    expect(fake.exit).toHaveBeenCalledWith(SIGNAL_EXIT_CODES['SIGTERM']);
+    expect(fake.notified()).toContain('SIGTERM');
+    expect(fake.notified()).toContain('已清理 1 个');
+    expect(fake.events.at(-1)).toBe('exit:143');
+  });
+
+  it('多个存活临时文件：一次信号全部清理，计数归零、处理器卸载', () => {
+    const first = createTempEnvFile({ MC_HOST_m10: 'http://k:s@localhost:9000' });
+    const second = createTempEnvFile({ MC_HOST_m10: 'http://k:s@minio.example.com' });
+    const third = createTempEnvFile({ MC_HOST_m11: 'http://k:s@minio.example.com' });
+    expect(liveTempEnvFileCount()).toBe(3);
+    expect(fake.listeners.get('SIGINT')).toHaveLength(1); // 接管幂等：不叠加
+
+    fake.fire('SIGINT');
+
+    for (const entry of [first, second, third]) expect(existsSync(entry.path)).toBe(false);
+    expect(liveTempEnvFileCount()).toBe(0);
+    expect(__isSignalCleanupInstalledForTest()).toBe(false);
+    expect(fake.notified()).toContain('已清理 3 个');
+    expect(fake.exit).toHaveBeenCalledWith(130);
+  });
+
+  it('已单独 dispose 的文件不被重复删除（只清剩下的那个）', () => {
+    const done = createTempEnvFile({ MC_HOST_m10: 'http://k:s@localhost:9000' });
+    const pending = createTempEnvFile({ MC_HOST_m10: 'http://k:s@localhost:9000' });
+    done.dispose(); // 正常返回路径（finally）已经删掉它
+    expect(existsSync(done.path)).toBe(false);
+    expect(liveTempEnvFileCount()).toBe(1);
+    expect(__isSignalCleanupInstalledForTest()).toBe(true); // 还有存活文件 ⇒ 仍需接管
+
+    expect(() => done.dispose()).not.toThrow(); // dispose 幂等，rmSync 不因路径消失而抛
+    fake.fire('SIGINT');
+
+    expect(liveTempEnvFileCount()).toBe(0);
+    expect(existsSync(pending.path)).toBe(false);
+    expect(fake.notified()).toContain('已清理 1 个'); // 只报了 1 个：已删的没被算进去/重复删
+    expect(fake.exit).toHaveBeenCalledWith(130);
+  });
+
+  it('dispose 幂等：重复调用安全，最后一个 dispose 之后处理器卸载', () => {
+    const first = createTempEnvFile({ A: '1' });
+    const second = createTempEnvFile({ B: '2' });
+    expect(__isSignalCleanupInstalledForTest()).toBe(true);
+
+    expect(() => {
+      first.dispose();
+      first.dispose();
+    }).not.toThrow();
+    expect(liveTempEnvFileCount()).toBe(1);
+    expect(__isSignalCleanupInstalledForTest()).toBe(true); // 还剩一个 ⇒ 继续接管
+
+    expect(() => {
+      second.dispose();
+      second.dispose();
+    }).not.toThrow();
+    expect(liveTempEnvFileCount()).toBe(0);
+    expect(__isSignalCleanupInstalledForTest()).toBe(false);
+    expect(fake.offCalls.map((c) => c.signal).sort()).toEqual(['SIGINT', 'SIGTERM']);
+  });
+
+  it('disposeAllTempEnvFiles 返回清理个数、可重复调用，且空转时不再注册监听器', () => {
+    createTempEnvFile({ A: '1' });
+    createTempEnvFile({ B: '2' });
+    expect(disposeAllTempEnvFiles()).toBe(2);
+    expect(disposeAllTempEnvFiles()).toBe(0); // 幂等：没有可清的
+    expect(__isSignalCleanupInstalledForTest()).toBe(false);
+    expect(fake.offCalls.map((c) => c.signal).sort()).toEqual(['SIGINT', 'SIGTERM']);
+
+    // 空转期间不得改变进程的信号语义：只有再次出现临时文件才重新接管
+    createTempEnvFile({ C: '3' });
+    expect(__isSignalCleanupInstalledForTest()).toBe(true);
+    expect(fake.listeners.get('SIGINT')).toHaveLength(2); // 只在"有文件在场"时注册
+    expect(fake.offCalls).toHaveLength(2);
   });
 });

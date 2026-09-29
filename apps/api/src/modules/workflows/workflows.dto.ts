@@ -62,12 +62,36 @@ const StepSchema = z.strictObject({
   onError: z.enum(['fail', 'skip']).optional(),
 });
 
+/**
+ * M12-P5：**event 触发器已下线**（裁决见 docs/operations/m12-workflow-event-trigger-retirement.md）。
+ *
+ * 裁决依据（审计）：`type: 'event'` 自 M7-P6 起就没有**生产发布端**——平台没有任何路径把真实事件
+ * （EventEnvelope）投递给它，唯一能让它"跑起来"的方式是测试/脚本直接调触发服务；而"补上发布端"
+ * 又会违反 G10（EventEnvelope 冻结：不得为触发器新增事件投递语义）。一个永远不会被真实触发的
+ * 触发器类型留在契约里只会误导使用者（配了不生效，且看不出来）。
+ *
+ * 处置（**只收写入面，不动存量**）：
+ * - 新建/更新（本 DTO = 唯一 HTTP 写入口）拒绝 `event`：400 + VALIDATION_ERROR + 明确文案；
+ * - **既有**含 event 触发器的工作流原样保留：读、列表、运行（手工/API 触发）、发布（走
+ *   `validateDefinition`，未改）全部照常——绝不因下线而让存量工作流变成不可用；
+ * - `manual`（手工/API）、`webhook`（签名 + 重放防护）、`schedule`（cron）三条真实链路不受影响。
+ */
+export const EVENT_TRIGGER_RETIRED_MESSAGE =
+  'event 触发器已下线（M12-P5）：平台无生产事件发布端，该类型从未被真实事件驱动过；请改用 manual / webhook / schedule（既有含 event 触发器的工作流仍可读取与运行）';
+
 export const WorkflowDefinitionSchema = z.strictObject({
   triggers: z.array(z.strictObject({
     type: z.enum(['manual', 'webhook', 'schedule', 'event']),
     cron: z.string().min(5).max(100).optional(),
     event: z.string().min(1).max(100).optional(),
-  })).max(8).optional(),
+  })).max(8).superRefine((triggers, ctx) => {
+    triggers.forEach((trigger, index) => {
+      if (trigger.type === 'event') {
+        // path 指到具体数组元素：错误信息里能看出是第几个触发器（多触发器时不必靠猜）
+        ctx.addIssue({ code: 'custom', message: EVENT_TRIGGER_RETIRED_MESSAGE, path: [index, 'type'] });
+      }
+    });
+  }).optional(),
   steps: z.array(StepSchema).min(1).max(50),
 });
 
