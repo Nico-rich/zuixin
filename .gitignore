@@ -11,3 +11,6 @@ data/
 
 # Claude Code 会话目录（worktrees/settings 本地态不入库）
 .claude/
+
+# 增量编译信息（构建自动生成）
+*.tsbuildinfo
