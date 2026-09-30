@@ -1,6 +1,7 @@
 # AI Agent 智能创作平台
 
 架构文档：`docs/architecture/ai-agent-platform-architecture-v1.md`（V1.1 已确认）
+**小白部署文档**：`docs/deployment-guide.md`（从零装环境到跑通真实 AI 对话，含模型配置与 FAQ）
 
 ## 快速开始
 
